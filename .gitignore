@@ -1,0 +1,4 @@
+node_modules/
+.scratch/
+.claude/settings.local.json
+*.log

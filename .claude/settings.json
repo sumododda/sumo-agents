@@ -1,0 +1,64 @@
+{
+  "autoMemoryEnabled": false,
+  "permissions": {
+    "allow": ["Bash(mem *)", "Bash(codegraph explore *)"]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 15,
+            "command": "m=\"$HOME/.sumo-agents/bin/mem\"; [ -x \"$m\" ] || { echo \"sumo-agents is not set up on this machine — run: node bin/mem.mjs setup\"; exit 0; }; \"$m\" hook session-start --harness claude || echo \"sumo-agents: the memory launcher failed, so nothing is being remembered — run: node bin/mem.mjs setup\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "m=\"$HOME/.sumo-agents/bin/mem\"; [ -x \"$m\" ] || exit 0; \"$m\" hook prompt --harness claude || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "m=\"$HOME/.sumo-agents/bin/mem\"; [ -x \"$m\" ] || exit 0; \"$m\" hook pre-tool --harness claude || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "m=\"$HOME/.sumo-agents/bin/mem\"; [ -x \"$m\" ] || exit 0; \"$m\" hook stop --harness claude || true"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "m=\"$HOME/.sumo-agents/bin/mem\"; [ -x \"$m\" ] || exit 0; \"$m\" hook session-end --harness claude || true"
+          }
+        ]
+      }
+    ]
+  }
+}
