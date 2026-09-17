@@ -69,30 +69,61 @@ function stack(root, pkg) {
   return parts.length > 0 ? `stack: ${parts.join(', ')}` : null;
 }
 
-function commands(root, pkg) {
+/**
+ * The commands a project declares about itself, as data: the card prints them
+ * and a job's verification runs them, so the two can never disagree.
+ */
+export function projectCommands(root, pkg = readJson(join(root, 'package.json'))) {
   const found = [];
   if (pkg?.scripts) {
     const pm = nodePackageManager(root);
     // `bun test` is bun's own runner, not the package's test script, so bun always goes through `run`.
     const run = (script) => (script === 'test' && pm !== 'bun' ? `${pm} test` : `${pm} run ${script}`);
-    for (const script of ['test', 'lint', 'typecheck', 'build', 'dev']) {
-      if (script in pkg.scripts) found.push(`${script} \`${run(script)}\``);
+    for (const script of ['check', 'test', 'lint', 'typecheck', 'build', 'dev']) {
+      if (script in pkg.scripts) found.push({ name: script, command: run(script) });
     }
   }
   const makefile = read(join(root, 'Makefile'));
   if (makefile) {
-    for (const target of ['test', 'lint', 'build']) {
-      if (new RegExp(`^${target}:`, 'm').test(makefile) && !found.some((f) => f.startsWith(`${target} `))) {
-        found.push(`${target} \`make ${target}\``);
+    for (const target of ['check', 'test', 'lint', 'build']) {
+      if (new RegExp(`^${target}:`, 'm').test(makefile) && !found.some((f) => f.name === target)) {
+        found.push({ name: target, command: `make ${target}` });
       }
     }
   }
   if (found.length === 0) {
-    if (existsSync(join(root, 'go.mod'))) found.push('test `go test ./...`');
-    if (existsSync(join(root, 'Cargo.toml'))) found.push('test `cargo test`');
-    if (/\bpytest\b/.test(read(join(root, 'pyproject.toml')) ?? '')) found.push('test `pytest`');
+    if (existsSync(join(root, 'go.mod'))) found.push({ name: 'test', command: 'go test ./...' });
+    if (existsSync(join(root, 'Cargo.toml'))) found.push({ name: 'test', command: 'cargo test' });
+    if (/\bpytest\b/.test(read(join(root, 'pyproject.toml')) ?? '')) found.push({ name: 'test', command: 'pytest' });
   }
+  return found;
+}
+
+/**
+ * What proves a change in this project. `check` is the project's own gate — the
+ * one command its CI runs — so when it exists it is the whole answer; running
+ * its parts beside it would only pay for the suite twice.
+ */
+export function verifyCommands(root) {
+  const all = projectCommands(root);
+  const gate = all.filter((c) => c.name === 'check');
+  return gate.length > 0 ? gate : all.filter((c) => ['test', 'lint', 'typecheck'].includes(c.name));
+}
+
+function commands(root, pkg) {
+  const found = projectCommands(root, pkg).map((c) => `${c.name} \`${c.command}\``);
   return found.length > 0 ? `commands: ${found.join(' · ')}` : null;
+}
+
+/** What this project has not set up, so nobody mistakes "nothing failed" for "it was checked". Said once, on the card. */
+function gaps(root, pkg) {
+  const names = new Set(projectCommands(root, pkg).map((c) => c.name));
+  const missing = [];
+  if (!names.has('test') && !names.has('check')) missing.push('a test command');
+  if (!names.has('lint') && !names.has('check')) missing.push('a lint command');
+  if (ci(root) === null) missing.push('a CI workflow');
+  if (instructions(root) === null) missing.push('AGENTS.md');
+  return missing.length > 0 ? `not set up here: ${missing.join(', ')}` : null;
 }
 
 /** The first real paragraph of the README: not a heading, badge, image, or HTML. */
@@ -141,6 +172,7 @@ export function scan(root) {
     ['index', existsSync(join(root, '.codegraph')) ? 'indexed by CodeGraph — locate code with `codegraph explore` before grep' : null],
     ['workspaces', workspaces(root, pkg)],
     ['ci', ci(root)],
+    ['gaps', gaps(root, pkg)],
     ['about', about(root)],
   ];
   return facts.filter(([, body]) => body !== null).map(([key, body]) => ({ key, body }));

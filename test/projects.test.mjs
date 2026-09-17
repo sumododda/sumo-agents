@@ -70,10 +70,11 @@ test('a rescan replaces exactly the facts that changed and retires the ones that
   rmSync(join(dir, 'CLAUDE.md'));
 
   const rescanned = s.mem(['project', 'rescan', 'simba']);
-  assert.match(rescanned.out, /^rescanned: 0 new, 2 changed, 1 gone/);
+  assert.match(rescanned.out, /^rescanned: 1 new, 2 changed, 1 gone/);
   assert.match(rescanned.out, /stack: TypeScript, React, bun/);
   assert.match(rescanned.out, /test `bun run test`/);
   assert.doesNotMatch(rescanned.out, /has its own instructions/);
+  assert.match(rescanned.out, /^not set up here: AGENTS\.md$/m, 'the instruction file that went away is now named as a gap');
 
   const stacks = s.sql((db) => db.prepare(`SELECT id, state, superseded_by FROM memories WHERE scan_key = 'stack' ORDER BY id`).all());
   assert.equal(stacks.length, 2);
@@ -92,6 +93,22 @@ test('what the user stated is never replaced by what was read off disk, and outr
   const found = s.mem(['search', 'stack pnpm', '--project', 'simba']).out.trim().split('\n');
   assert.match(found[0], /\[fact·proj-simba·stated\] stack note/);
   assert.match(found[1], /\[fact·proj-simba·scanned\] stack:/);
+});
+
+test("a project's own gate is found, and what it never set up is said on the card", () => {
+  const s = sandbox();
+  const gated = join(s.root, 'gated');
+  mkdirSync(gated, { recursive: true });
+  writeFileSync(join(gated, 'Makefile'), 'check: test\n\t@true\ntest:\n\t@true\n');
+  const added = s.mem(['project', 'add', gated]);
+  assert.match(added.out, /commands: check `make check` · test `make test`/);
+  assert.match(added.out, /^not set up here: a CI workflow, AGENTS\.md$/m, 'a check command stands in for test and lint');
+
+  const bare = join(s.root, 'bare');
+  mkdirSync(bare, { recursive: true });
+  assert.match(s.mem(['project', 'add', bare]).out, /^not set up here: a test command, a lint command, a CI workflow, AGENTS\.md$/m);
+
+  assert.doesNotMatch(s.mem(['project', 'add', fixtureRepo(s)]).out, /not set up here/, 'a project with everything says nothing');
 });
 
 test('the card stays under its budget however much the project knows, and says what it left out', () => {

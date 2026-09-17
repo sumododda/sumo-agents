@@ -5,7 +5,7 @@ const CARD_BUDGET_TOKENS = 200;
 const LINE_MAX = 110;
 
 /** Lower number = kept first when the card has to shrink. Scanned facts are ranked by their key. */
-const SCAN_PRIORITY = { instructions: 1, stack: 2, commands: 3, index: 7, workspaces: 9, ci: 10, about: 11 };
+const SCAN_PRIORITY = { instructions: 1, stack: 2, commands: 3, index: 7, workspaces: 9, gaps: 9, ci: 10, about: 11 };
 const PRIORITY = { rule: 4, last: 5, gotcha: 6, workflow: 6, fact: 8 };
 
 export function ago(iso, now) {
