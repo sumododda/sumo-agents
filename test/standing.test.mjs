@@ -60,3 +60,15 @@ test('sub-agents run on cheaper models, the scout cannot edit, and neither works
   assert.match(scout, /^tools: Read, Grep, Glob, Bash$/m);
   for (const agent of [scout, worker]) assert.match(agent, /If it does not name a job, do no work\./);
 });
+
+test('the reviewer cannot edit, is never a weaker model than the one that writes the code, and does not work without a job', () => {
+  const reviewer = read('.claude', 'agents', 'reviewer.md');
+  const worker = read('.claude', 'agents', 'worker.md');
+  assert.match(reviewer, /^tools: Read, Grep, Glob, Bash$/m);
+  const strength = (text) => ['haiku', 'sonnet', 'opus'].indexOf(/^model: (\w+)$/m.exec(text)[1]);
+  assert.ok(strength(reviewer) > strength(worker), 'a weaker judge makes the work worse, not better');
+  assert.match(reviewer, /If it does not name a job, do no work\./);
+  for (const name of ['fix', 'feature', 'review']) {
+    assert.match(read('.claude', 'commands', `${name}.md`), new RegExp(`guides/${name}\\.md`), `/${name} points at its guide instead of repeating it`);
+  }
+});

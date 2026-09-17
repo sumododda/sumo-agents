@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { SCHEMA_VERSION } from '../src/db.mjs';
 import { sandbox } from './helpers.mjs';
 
 const SESSION = { session_id: 'sess-w', cwd: '/work/home' };
@@ -160,7 +161,7 @@ test('a memory from before gates existed upgrades in place and keeps working', (
   });
 
   assert.match(s.mem(['search', 'concise']).out, /m2 .*be concise/, 'opening it migrates it; nothing is lost');
-  assert.equal(s.sql((db) => db.prepare('PRAGMA user_version').get().user_version), 4);
+  assert.equal(s.sql((db) => db.prepare('PRAGMA user_version').get().user_version), SCHEMA_VERSION);
   assert.equal(decision(bash(s, 'gh pr create --fill')).permissionDecision, 'deny', 'the old workflow still triggers by its cue');
   assert.match(s.mem(['gate', 'm1', 'gh pr create']).out, /gates shell commands matching/);
 });

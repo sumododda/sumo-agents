@@ -16,6 +16,7 @@ import { buildBundle, modelStats, runScribe, scribeStatus } from './scribe.mjs';
 import { searchTurns } from './sessions.mjs';
 import { config, doctor, setup } from './setup.mjs';
 import { ftsQuery } from './text.mjs';
+import { verdictLines } from './verify.mjs';
 
 const HELP = `mem — local memory for the sumo-agents process
 
@@ -28,7 +29,8 @@ const HELP = `mem — local memory for the sumo-agents process
   mem forget <id> [--purge]
   mem confirm <id>     mem reject <id>
   mem project add <path> [--slug S] [--alias A]...   show S · list · rescan S · alias S A · archive S
-  mem job new --project S --title T [--agent scout|worker]   brief ID · note ID · ask ID · answer ID
+  mem job new --project S --title T [--agent scout|worker|reviewer] [--guide fix|feature|review]
+        brief ID · note ID · ask ID · answer ID · baseline ID · verify ID · changes ID
         finish ID --status DONE|FAILED · show ID · list [--all] · abandon ID      (text on stdin)
   mem prime            the block a session starts with
   mem scribe run|show|status|stats  mem dream run|status       the cheap-model passes
@@ -66,10 +68,16 @@ ${LEARN_USAGE}`,
   reject: 'mem reject <id>',
   project: `mem project add <path> [--slug S] [--alias A]...
 mem project show <name> | list [--all] | rescan <name> | alias <name> <alias> | archive <name>`,
-  job: `mem job new --project S --title T [--agent scout|worker]        (task on stdin)
+  job: `mem job new --project S --title T [--agent scout|worker|reviewer]   (task on stdin)
+        [--guide fix|feature|review]     carry guides/<name>.md into the brief
+        [--reviews <id>]                 reviewer: judge that job's change (default: what is uncommitted)
+        [--tests-may-change]             worker: this task is allowed to edit tests that already exist
 mem job brief|show|abandon <id>
 mem job note|ask|answer <id>                                    (text on stdin)
-mem job finish <id> --status DONE|FAILED                        (report on stdin)
+mem job baseline <id>        the project's checks, before the work
+mem job verify <id>          the same checks now, judged against the baseline
+mem job changes <id>         everything the job changed, as one file
+mem job finish <id> --status DONE|FAILED [--accept "<why>"]     (report on stdin)
 mem job list [--all]`,
   prime: 'mem prime [--budget N]',
   scribe: 'mem scribe run|show|status|stats',
@@ -99,7 +107,7 @@ const COMMANDS = {
   confirm: { value: [], bool: [], run: (db, { args }) => [`confirmed ${line(memory.confirm(db, memory.parseId(args[0])))}`] },
   reject: { value: [], bool: [], run: (db, { args }) => [`rejected ${line(memory.reject(db, memory.parseId(args[0])))}`] },
   project: { value: ['slug'], multi: ['alias'], bool: ['all'], run: runProject },
-  job: { value: ['project', 'title', 'agent', 'status', 'from-file'], bool: ['all'], run: runJob },
+  job: { value: ['project', 'title', 'agent', 'status', 'from-file', 'guide', 'reviews', 'accept'], bool: ['all', 'tests-may-change'], run: runJob },
   prime: { value: ['budget'], bool: [], run: (db, { flags }) => [prime(db, { budget: flags.budget === undefined ? undefined : Number(flags.budget) })] },
   scribe: { value: [], bool: [], run: runScribeCommand },
   dream: { value: [], bool: [], run: runDreamCommand },
@@ -271,7 +279,15 @@ function runJob(db, { args, flags }) {
   const [sub, rawId] = args;
   if (sub === 'new') {
     if (!flags.project) throw new UsageError(`usage: ${USAGE.job}`);
-    const { job, warnings } = jobs.newJob(db, { project: flags.project, title: flags.title, agent: flags.agent, task: stdinText(flags) });
+    const { job, warnings } = jobs.newJob(db, {
+      project: flags.project,
+      title: flags.title,
+      agent: flags.agent,
+      task: stdinText(flags),
+      guide: flags.guide,
+      reviews: flags.reviews === undefined ? undefined : jobs.parseJobId(flags.reviews),
+      testsMayChange: Boolean(flags['tests-may-change']),
+    });
     return [
       `created ${jobs.jobLine(job)}`,
       ...warnings,
@@ -283,7 +299,7 @@ function runJob(db, { args, flags }) {
     const all = jobs.listJobs(db, { all: flags.all });
     return all.length > 0 ? all.map(jobs.jobLine) : ['no open jobs'];
   }
-  if (!['brief', 'note', 'ask', 'answer', 'finish', 'show', 'abandon'].includes(sub)) {
+  if (!['brief', 'note', 'ask', 'answer', 'finish', 'show', 'abandon', 'baseline', 'verify', 'changes'].includes(sub)) {
     throw new UsageError(`usage: ${USAGE.job}`);
   }
   const id = jobs.parseJobId(rawId);
@@ -307,9 +323,24 @@ function runJob(db, { args, flags }) {
     case 'abandon':
       jobs.abandon(db, id);
       return [`abandoned j${id}`];
+    case 'baseline':
+      return jobs.baseline(db, id);
+    case 'verify': {
+      const verdict = jobs.verifyJob(db, id);
+      return [verdict.ok ? `j${id} would be accepted as DONE:` : `j${id} would be REFUSED as DONE:`, ...verdictLines(verdict).map((l) => `  ${l}`)];
+    }
+    case 'changes': {
+      const { file, files } = jobs.changes(db, id);
+      return [`${files} file${files === 1 ? '' : 's'} changed — ${file}`];
+    }
     default: {
-      const { job, learned } = jobs.finish(db, id, { status: String(flags.status ?? '').toUpperCase(), report: stdinText(flags) });
-      return [`STATUS: ${job.status === 'done' ? 'DONE' : 'FAILED'} — j${id}`, ...learned.applied.map((l) => `  ${l}`)];
+      const { job, learned, verdict, unverified } = jobs.finish(db, id, { status: String(flags.status ?? '').toUpperCase(), report: stdinText(flags), accept: flags.accept });
+      // A worker's plain DONE means the checks agreed; the verdict is in the report. Only the exceptions are said here.
+      return [
+        `STATUS: ${job.status === 'done' ? 'DONE' : 'FAILED'}${unverified ? ' (UNVERIFIED — taken without running the checks)' : ''} — j${id}`,
+        ...(verdict?.flags ?? []).map((f) => `  look at: ${f}`),
+        ...learned.applied.map((l) => `  ${l}`),
+      ];
     }
   }
 }

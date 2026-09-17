@@ -1,16 +1,15 @@
 # Delegation
 
-Delegate when the work is big, parallel, or would flood this conversation with file contents.
-Small, sequential things you do yourself: every delegation costs a brief and a whole fresh context.
+Every delegation costs a brief and a whole fresh context.
 
-**Who.** `scout` (Haiku, no edit tools) for finding, tracing, auditing, summarizing — the cheapest, use it
-for anything reading-heavy. `worker` (Sonnet) for building and fixing. A stronger model only when the user
-asks or a cheaper attempt failed its check twice. The user's routing preferences live in memory:
-`mem search "which model sub-agent"`.
+**Who.** `scout` (Haiku, no edit tools): finding, tracing, auditing — cheapest, for anything reading-heavy.
+`worker` (Sonnet): building and fixing. `reviewer` (Opus, no edit tools): judging a change it did not write.
+A stronger model only when the user asks or a cheaper attempt failed its check twice; a stuck job is never
+resent unchanged. Routing preferences: `mem search "which model sub-agent"`.
 
 **1. Write the brief** — a contract, not a wish:
 
-    mem job new --project <slug> --title "<short title>" --agent scout|worker <<'EOF_TASK'
+    mem job new --project <slug> --title "<title>" --agent scout|worker [--guide fix|feature] <<'EOF_TASK'
     ## Goal            the outcome, in a sentence or two
     ## Non-goals       what must not be attempted
     ## Must not change behavior, APIs and files that have to stay as they are
@@ -18,20 +17,20 @@ asks or a cheaper attempt failed its check twice. The user's routing preferences
     ## Report          what you need back beyond the standard report
     EOF_TASK
 
-The project's rules, gotchas and commands are added from memory for you.
+Rules, gotchas and commands are added from memory. One job is the smallest piece with its own check.
+Tests already there must change → `--tests-may-change`.
 
-**2. Start it** with the sub-agent the command names and exactly the `JOB:` line it prints. Independent jobs
-go in the same turn so they run in parallel.
+**2. Start it** with the sub-agent the command names and exactly the `JOB:` line it prints. Independent
+scouts go in the same turn; one worker per project at a time — they share a working tree.
 
-**3. Read the result:** a STATUS line and one line per file changed. The full report is on disk
-(`mem job show <id>`) — open it only if you need more. Run the Check yourself before calling it done.
-No STATUS line → the job was never closed: close it with what the sub-agent told you,
-`mem job finish <id> --status DONE|FAILED`.
+**3. Read the result:** a STATUS line and one line per file changed; the report is on disk
+(`mem job show <id>`). A worker's DONE means code ran the project's checks against a baseline;
+`UNVERIFIED` or `look at:` → open the report. Relay its Concerns and Decisions. Work that matters →
+`--agent reviewer --reviews <id>`, then guides/review.md.
+No STATUS line → never closed: `mem job finish <id> --status DONE|FAILED`.
 
-**`NEEDS_INPUT`.** `mem job show <id>` for the question → `mem search`, the user may have answered it
-before → only if memory has nothing, ask the user once → `mem job answer <id>` (answer on stdin) and
-resume the sub-agent as that command tells you.
+**`NEEDS_INPUT`.** `mem job show <id>` → `mem search` first → nothing there: ask the user once →
+`mem job answer <id>` (answer on stdin), resume as that command says.
 
 **A job from an earlier session** (listed at session start): `mem job show <id>`. Worth finishing → a fresh
-sub-agent with the same `JOB:` line continues from the notes and answers in its brief. Not worth it →
-`mem job abandon <id>`.
+sub-agent with the same `JOB:` line continues from its brief. Not worth it → `mem job abandon <id>`.

@@ -22,8 +22,8 @@ No card in context for a known project → `mem project show <slug>`.
 
 ## Work
 Small or sequential → do it yourself, absolute paths. Big, parallel or context-heavy → delegate:
-`scout` to look, `worker` to build. Both refuse to start without a job from `mem job new` — read
-guides/delegation.md first.
+`scout` to look, `worker` to build, `reviewer` to judge. All refuse to start without a job from
+`mem job new` — read guides/delegation.md first.
 
 ## Coding
 - Before changing code, trace how it works now: the smallest complete slice — signature, callers,
@@ -31,9 +31,10 @@ guides/delegation.md first.
 - One-sentence change → just make it. Multi-file or unfamiliar → plan first.
 - Reproduce first (failing test or command), fix, show the same check passing. No passing check → not done.
 - Smallest patch that fixes the root cause. No unrelated refactors — list what else you notice.
-  Refactors keep behavior identical. Never silence an error or weaken a test.
+  Refactors keep behavior identical. Never silence an error or weaken what judges the change.
 - Reuse existing helpers; copy an in-repo example before inventing a pattern.
 - Never fake it: no invented APIs, flags or files; no placeholders. Unsure or unfinished → say so.
 - Two failed attempts at the same fix → stop and rethink from the evidence. No third variation.
-- Reviews: the diff only. Findings by severity, each with a concrete failure scenario; then residual risks.
+- Fix, feature or review → read guides/<that>.md first.
+- No new dependency, no secret in a file or in output.
 - Output: failures, not whole logs. No preamble, no restating the request.

@@ -20,7 +20,8 @@ function withSimba(s) {
   const dir = join(s.root, 'proj-simba');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'go.mod'), 'module simba\n');
-  writeFileSync(join(dir, 'Makefile'), 'test:\n\tgo test ./...\n');
+  // A worker's DONE runs this for real, so it has to be something every machine can pass.
+  writeFileSync(join(dir, 'Makefile'), 'test:\n\t@true\n');
   s.mem(['project', 'add', dir, '--alias', 'simba']);
   s.mem(['add', 'preference', 'never push to main; always open a PR', '--project', 'simba']);
   s.mem(['add', 'gotcha', 'time-zone tests need SIMBA_TZ exported', '--project', 'simba']);

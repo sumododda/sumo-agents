@@ -186,6 +186,28 @@ const MIGRATIONS = [
   `
   ALTER TABLE memories ADD COLUMN gate TEXT;
   `,
+
+  // 5 — a third kind of sub-agent: the reviewer. SQLite cannot alter a CHECK, so the table is rebuilt; ids are kept.
+  `
+  CREATE TABLE jobs_next (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project    TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
+    title      TEXT NOT NULL,
+    agent      TEXT NOT NULL CHECK (agent IN ('scout', 'worker', 'reviewer')),
+    status     TEXT NOT NULL CHECK (status IN ('running', 'needs_input', 'done', 'failed', 'abandoned')),
+    session_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+  INSERT INTO jobs_next (id, project, title, agent, status, session_id, created_at, updated_at)
+    SELECT id, project, title, agent, status, session_id, created_at, updated_at FROM jobs;
+  -- A job's files live in a directory named by its id, so an id must never be handed out twice:
+  -- carry the counter over, not just the rows that happen to be left.
+  DELETE FROM sqlite_sequence WHERE name = 'jobs_next';
+  INSERT INTO sqlite_sequence (name, seq) SELECT 'jobs_next', seq FROM sqlite_sequence WHERE name = 'jobs';
+  DROP TABLE jobs;
+  ALTER TABLE jobs_next RENAME TO jobs;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
