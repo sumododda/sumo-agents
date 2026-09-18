@@ -15,6 +15,8 @@ created, a release routine, how they start a project — save it once, as steps:
   command that does the thing, and nothing else: `'gh(-axi)? pr create|glab mr create'`. Leave it
   out only when no command marks the moment — then the cue's words are matched against commands instead,
   which is a guess. Tell the user what you gated. Change it later with `mem gate <id> '<regex>'`.
+  A held command is held whole: `git add && git commit` stages nothing when the hold fires, so you
+  stage again after doing the steps.
 - Write the steps as you would brief a colleague: commands in backticks, the order that matters, the
   check that proves each step worked. Leave out anything a project's own files already say.
 - Project-specific routine → `--project`. The way they do it everywhere → no project.
