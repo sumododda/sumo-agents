@@ -34,7 +34,8 @@ test('adding a project scans it, shows its card, and opens the directory to Clau
   assert.match(added.out, /\nhas its own instructions — read CLAUDE\.md in the project root before editing\n/);
   assert.match(added.out, /stack: TypeScript, React, pnpm/);
   assert.match(added.out, /commands: test `pnpm test` · lint `pnpm run lint` · build `pnpm run build`/);
-  assert.match(added.out, /indexed by CodeGraph/);
+  // An index the agent is told to prefer costs more than the grep it replaces, so the card never names one.
+  assert.doesNotMatch(added.out, /CodeGraph|codegraph/);
   assert.match(added.out, /about: Simba writes a daily briefing from your calendar and inbox\./);
   assert.match(added.out, /\/add-dir /);
 

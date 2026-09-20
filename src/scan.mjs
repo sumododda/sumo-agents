@@ -169,7 +169,6 @@ export function scan(root) {
     ['instructions', instructions(root)],
     ['stack', stack(root, pkg)],
     ['commands', commands(root, pkg)],
-    ['index', existsSync(join(root, '.codegraph')) ? 'indexed by CodeGraph — locate code with `codegraph explore` before grep' : null],
     ['workspaces', workspaces(root, pkg)],
     ['ci', ci(root)],
     ['gaps', gaps(root, pkg)],

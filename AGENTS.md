@@ -21,13 +21,13 @@ Unknown project → find it on disk, confirm the path once, `mem project add` (g
 No card in context for a known project → `mem project show <slug>`.
 
 ## Work
-Small or sequential → do it yourself, absolute paths. Big, parallel or context-heavy → delegate:
-`scout` to look, `worker` to build, `reviewer` to judge. All refuse to start without a job from
+Small or sequential → do it yourself, absolute paths. Big, parallel, context-heavy, or your context past
+half full → delegate: `scout` looks, `worker` builds, `reviewer` judges. None starts without a job from
 `mem job new` — read guides/delegation.md first.
 
 ## Coding
 - Before changing code, trace how it works now: the smallest complete slice — signature, callers,
-  callees, types, tests. Never a whole-repo read.
+  callees, types, tests. One grep, not a fan-out.
 - One-sentence change → just make it. Multi-file or unfamiliar → plan first.
 - Reproduce first (failing test or command), fix, show the same check passing. No passing check → not done.
 - Smallest patch that fixes the root cause. No unrelated refactors — list what else you notice.
