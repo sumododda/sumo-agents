@@ -40,6 +40,7 @@ the repo, or changed Node versions). Start a new Claude Code session afterwards,
 |---|---|---|
 | Session starts | A hook prints the core block: your global preferences, workflows, projects, where you left off, open jobs, things to confirm. Hard cap 800 tokens. | ≤ 800 tokens, once |
 | You send a message | A hook stores it word for word (secrets redacted). First mention of a project adds its card: path, stack, commands, your rules for it, gotchas. | 0, or ≤ 200 once per project |
+| The agent is about to run a command that would wipe a tree (`rm -rf ~`, `git reset --hard`, `git clean -f`, `DROP TABLE` …), or to print or open a secret file (`.env`, a private key, `~/.aws/credentials`) | A hook refuses it before it runs, in plain code, and says why. No memory is consulted. The way through is you: `! <command>` runs it yourself. A force-push is not on the list — it is an accepted way of cleaning up history here. | 0 |
 | The agent is about to run a shell command a taught workflow gates (`gh pr create`, for a workflow taught with `--gate 'gh(-axi)? pr create'`) | A hook holds the command back once and hands the agent the workflow's steps. It follows them, then runs the command. The same steps ride in with your message when you ask for the thing yourself. | 0 until it fires |
 | The agent is about to ask you something — a turn ending on a question, or the question tool | A hook searches memory with the question's own words, in plain code. If something close is there, the agent is handed it once and carries on instead of waiting for you; if nothing is, the question reaches you untouched. | 0 unless memory answers |
 | The assistant finishes a turn | A hook wakes the **scribe** — a detached, headless Haiku call that reads the new turns and proposes memories. Code checks every proposal against what you actually typed before saving it. | 0 |
@@ -127,7 +128,9 @@ kept in the job's folder.
 | a check `FAILED` and no baseline was taken | nothing shows it was already broken, so it counts as the job's | **blocks DONE** |
 | a test that already existed was edited, renamed or deleted | tests judge the change; they are not part of it | **blocks DONE** — unless the job was created with `--tests-may-change` |
 | a check `was already failing` | broken before the job began, and still is | allowed; both outputs are kept to compare |
+| a key, token or private key was added (`ghp_…`, `sk-…`, `AKIA…`, a PEM block, a JWT), or a secret file (`.env`, `*.pem`, `id_rsa`) is in the change | a credential is about to be committed | **blocks DONE** |
 | `look at:` added lines with `eslint-disable`, `@ts-ignore`, `# noqa`, `.skip(`, `t.Skip(` … | a checker was told to look away | allowed, and printed beside the STATUS line for a person to judge |
+| `look at:` added lines with `password=`, `token=`, or a long random string | a credential, or a fixture that looks like one | allowed, and printed for a person to judge |
 | `note:` not a git repository / no commands | it could not be known | said, never guessed |
 
 A refused worker always has an honest way out, and the refusal names it: fix it, finish as `FAILED`, or
@@ -176,6 +179,8 @@ in for test and lint. `mem project rescan <slug>` after setting one up.
 | no reviewer or scout can edit (no edit tools) | a worker running `mem job baseline` first — though skipping it only hurts the worker |
 | a taught workflow's steps before a gated shell command | |
 | no job, no sub-agent | |
+| a destructive command, or a read of a secret file, refused before it runs | |
+| a key or token in a worker's change blocks DONE | |
 
 The split is deliberate: a line in a prompt is a request, and the things that are cheap to check by
 running something are checked by running something.
@@ -194,7 +199,7 @@ Measured on this machine, Claude Code 2.1, Haiku 4.5, subscription login:
 ## Tests
 
 ```sh
-npm test                              # 88 tests, no network, no model calls (recorded answers)
+npm test                              # 95 tests, no network, no model calls (recorded answers)
 node probes/scope-accuracy.mjs        # live: real model, about 7 cents
 ```
 

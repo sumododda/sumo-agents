@@ -22,6 +22,20 @@ const GENERIC = /(?<![A-Za-z0-9+_=-])[A-Za-z0-9+_=-]{48,}(?![A-Za-z0-9+_=-])/g;
 
 const MARK = '[redacted]';
 
+/**
+ * What a line looks like, for a change under judgment: 'key' is a shape only a
+ * real credential has (a PEM block, a vendor token, a JWT); 'maybe' is an
+ * assignment to password= or token=, or a long random string — real in code,
+ * fine in a fixture, so a person decides.
+ */
+export function secretShape(line) {
+  if (PATTERNS.some((p) => line.search(p) !== -1)) return 'key';
+  if (line.search(ASSIGNMENT) !== -1) return 'maybe';
+  const long = line.match(GENERIC);
+  if (long?.some((m) => /[a-z]/.test(m) && /[A-Z]/.test(m) && /\d/.test(m))) return 'maybe';
+  return null;
+}
+
 export function redact(text) {
   let count = 0;
   const hit = () => {

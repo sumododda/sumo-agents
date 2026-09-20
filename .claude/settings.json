@@ -28,7 +28,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|AskUserQuestion",
+        "matcher": "Bash|AskUserQuestion|Read",
         "hooks": [
           {
             "type": "command",

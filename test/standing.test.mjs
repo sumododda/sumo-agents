@@ -48,7 +48,7 @@ test('Claude Code is wired to the launcher for all five events, with its own mem
     assert.ok(command.includes(`"$m" hook ${name} --harness claude`), event);
     assert.ok(command.includes('$HOME/.sumo-agents/bin/mem'), `${event} must not depend on PATH`);
   }
-  assert.equal(settings.hooks.PreToolUse[0].matcher, 'Bash|AskUserQuestion', 'shell commands for the workflow gate, questions for the memory gate — no other tool pays for a hook');
+  assert.equal(settings.hooks.PreToolUse[0].matcher, 'Bash|AskUserQuestion|Read', 'shell commands for the guard and the workflow gate, questions for the memory gate, reads for secret files — no other tool pays for a hook');
   assert.match(settings.hooks.SessionStart[0].hooks[0].command, /launcher failed/, 'a broken launcher has to say so, not fail silently');
 });
 

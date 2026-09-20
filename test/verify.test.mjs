@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { sandbox } from './helpers.mjs';
@@ -116,6 +116,31 @@ test('a line that tells a checker to look away is put in front of a person, not 
   const done = finish(s);
   assert.equal(done.code, 0, done.err);
   assert.match(done.out, /^STATUS: DONE — j1\n {2}look at: added lines tell a checker to look away \(skip, ignore, disable\): src\.js:2, extra\.py:1/);
+});
+
+test('a key or token in the change blocks DONE; a credential-looking assignment is put in front of a person', () => {
+  const s = sandbox();
+  const p = gitProject(s);
+  newWorker(s);
+  p.write('src.js', 'export const thing = 2;\nconst gh = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";\n');
+  const refused = finish(s);
+  assert.equal(refused.code, 2, 'a token in the diff is never DONE');
+  assert.match(refused.err, /blocking: a key, token or private key was added: src\.js:2 — remove it and read it from the environment/);
+
+  p.write('src.js', 'export const thing = 2;\n');
+  p.write('.env', 'API_KEY=whatever\n');
+  const envFile = finish(s);
+  assert.equal(envFile.code, 2, 'a secret file in the change is never DONE');
+  assert.match(envFile.err, /blocking: a secret file was added or changed: \.env/);
+
+  s.mem(['job', 'abandon', '1']);
+  p.git('checkout', '--', 'src.js');
+  unlinkSync(join(p.dir, '.env'));
+  newWorker(s);
+  p.write('test/login.test.js', 'const user = { password: "hunter22-not-real" };\n');
+  const done = finish(s, '2');
+  assert.equal(done.code, 0, done.err);
+  assert.match(done.out, /look at: added lines look like credentials \(password=, token=, or a long random string\): test\/login\.test\.js:1/);
 });
 
 test('work can be taken without verification, but never quietly', () => {

@@ -2,7 +2,9 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { isSecretPath } from './guard.mjs';
 import { UsageError } from './memory.mjs';
+import { secretShape } from './redact.mjs';
 import { verifyCommands } from './scan.mjs';
 
 /**
@@ -113,29 +115,38 @@ export function takeBaseline(root, snap, dir) {
   return { checks: runChecks(root, verifyCommands(root), dir, 'baseline') };
 }
 
-function lookingAway(root, snap, changes) {
-  const found = [];
+/**
+ * Every line the job added, read once: a checker told to look away is flagged
+ * for a person; a credential shape only a real key has blocks; an assignment
+ * to password= or a long random string is flagged, since a fixture has those too.
+ */
+function scanAdded(root, snap, changes) {
+  const found = { away: [], key: [], maybe: [] };
+  const look = (where, l) => {
+    if (LOOKS_AWAY.test(l)) found.away.push(where);
+    const shape = secretShape(l);
+    if (shape) found[shape].push(where);
+  };
   let file = null;
   let at = 0;
   for (const l of (git(root, ['diff', '-U0', snap.base, '--', '.']) ?? '').split('\n')) {
     if (l.startsWith('+++ ')) file = l.slice(6);
     else if (l.startsWith('@@')) at = Number(/\+(\d+)/.exec(l)?.[1] ?? 0) - 1;
-    else if (l.startsWith('+')) {
-      at++;
-      if (LOOKS_AWAY.test(l)) found.push(`${file}:${at}`);
-    }
+    else if (l.startsWith('+')) look(`${file}:${++at}`, l);
   }
   for (const created of changes.created) {
     try {
       const full = join(root, created);
       if (statSync(full).size > MAX_SCANNED_FILE_BYTES) continue;
-      readFileSync(full, 'utf8').split('\n').forEach((l, i) => LOOKS_AWAY.test(l) && found.push(`${created}:${i + 1}`));
+      readFileSync(full, 'utf8').split('\n').forEach((l, i) => look(`${created}:${i + 1}`, l));
     } catch {
       // unreadable or binary: nothing to say about it
     }
   }
   return found;
 }
+
+const some = (list) => `${list.slice(0, 8).join(', ')}${list.length > 8 ? ` and ${list.length - 8} more` : ''}`;
 
 /**
  * The verdict. `blocking` is what stops a job being called done; `flags` are
@@ -174,8 +185,12 @@ export function verify(root, { snap, baseline, testsMayChange }, dir, now = new 
     if (judges.length > 0 && !testsMayChange) {
       blocking.push(`tests that were already here were changed: ${judges.join(', ')} — they judge this change and are not part of it. If one is genuinely wrong, say why: mem job ask`);
     }
-    const away = lookingAway(root, snap, changes);
-    if (away.length > 0) flags.push(`added lines tell a checker to look away (skip, ignore, disable): ${away.slice(0, 8).join(', ')}${away.length > 8 ? ` and ${away.length - 8} more` : ''}`);
+    const secretFiles = [...changes.tracked.filter((c) => c.status !== 'D').map((c) => c.to ?? c.path), ...changes.created].filter(isSecretPath);
+    if (secretFiles.length > 0) blocking.push(`a secret file was added or changed: ${some(secretFiles)} — it belongs in the environment, never in the change`);
+    const added = scanAdded(root, snap, changes);
+    if (added.key.length > 0) blocking.push(`a key, token or private key was added: ${some(added.key)} — remove it and read it from the environment`);
+    if (added.away.length > 0) flags.push(`added lines tell a checker to look away (skip, ignore, disable): ${some(added.away)}`);
+    if (added.maybe.length > 0) flags.push(`added lines look like credentials (password=, token=, or a long random string): ${some(added.maybe)}`);
   } else {
     notes.push('not a git repository — what changed, and whether existing tests were touched, could not be checked');
   }

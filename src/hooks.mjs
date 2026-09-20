@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { card } from './card.mjs';
 import { getMeta, openDb } from './db.mjs';
 import { backup } from './export.mjs';
+import { guardCommand, guardPath } from './guard.mjs';
 import { paths } from './paths.mjs';
 import { prime } from './prime.mjs';
 import { detect, touch } from './projects.mjs';
@@ -25,11 +26,23 @@ const READERS = {
     prompt: p.prompt ?? '',
     toolName: p.tool_name ?? null,
     command: p.tool_input?.command ?? '',
+    path: p.tool_input?.file_path ?? '',
     agentId: p.agent_id ?? null,
     questions: Array.isArray(p.tool_input?.questions) ? p.tool_input.questions.map((q) => q?.question ?? '') : [],
     reply: p.last_assistant_message ?? '',
     stopHookActive: p.stop_hook_active === true,
   }),
+};
+
+const refuse = (reason) => JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } });
+
+/** The guard, first and without memory: a destructive command or a secret file is refused on sight. */
+const EARLY = {
+  'pre-tool'(e) {
+    if (e.toolName === 'Bash' && e.command) return guardCommand(e.command) ?? '';
+    if (e.toolName === 'Read' && e.path) return guardPath(e.path) ?? '';
+    return '';
+  },
 };
 
 const alreadyKnown = (known) => `memory already holds\n${known.map(line).join('\n')}\nIf one of these answers your question, act on it instead of asking.`;
@@ -151,6 +164,8 @@ export function runHook(event, harness, stdin) {
     if (!handler || !reader) throw new Error(`no handler for ${harness} ${event}`);
     const fields = reader(JSON.parse(stdin || '{}'));
     if (!fields.sessionId) throw new Error('the hook payload had no session id');
+    const refused = EARLY[event]?.(fields);
+    if (refused) return refuse(refused);
     db = openDb();
     return handler(db, { ...fields, harness }, new Date().toISOString());
   } catch (cause) {
