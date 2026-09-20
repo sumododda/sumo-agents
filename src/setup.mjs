@@ -78,8 +78,10 @@ export function setup({ binDir, link = true } = {}) {
   chmodSync(p.db, 0o600);
   if (!getMeta(db, 'machine')) setMeta(db, 'machine', hostname().replace(/\.local$/, ''));
   // Pinned for the same reason the launcher pins node: the background passes run where PATH cannot be trusted.
+  // The PATH entry itself, not what it resolves to: Claude Code's updater repoints that symlink and deletes
+  // the old version folder, so a resolved path stops existing at the next update.
   const claude = commandOnPath('claude');
-  if (claude) setMeta(db, 'claude.path', realpathSync(claude));
+  if (claude) setMeta(db, 'claude.path', claude);
   db.close();
 
   writeFileSync(p.launcher, launcherScript(), { mode: 0o755 });

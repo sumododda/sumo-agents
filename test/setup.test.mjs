@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { lstatSync, mkdirSync, readlinkSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readlinkSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { SCHEMA_VERSION } from '../src/db.mjs';
@@ -86,4 +86,19 @@ test('config reads defaults, stores changes and rejects names it does not know',
   const typo = s.mem(['config', 'scribe.modle', 'sonnet']);
   assert.equal(typo.code, 2);
   assert.match(typo.err, /unknown setting/);
+});
+
+test('setup pins the claude launcher on PATH, not the versioned binary behind it', () => {
+  // Claude Code's updater swaps the symlink and deletes old version folders; pinning a version pins a future ENOENT.
+  const s = sandbox();
+  const binDir = join(s.root, 'bin');
+  const versions = join(s.root, 'versions');
+  mkdirSync(binDir);
+  mkdirSync(versions);
+  writeFileSync(join(versions, '2.1.274'), '#!/bin/sh\necho claude\n', { mode: 0o755 });
+  symlinkSync(join(versions, '2.1.274'), join(binDir, 'claude'));
+
+  const run = s.mem(['setup', '--bin-dir', binDir], { extraEnv: { PATH: `${binDir}:/usr/bin:/bin` } });
+  assert.equal(run.code, 0, run.err);
+  assert.equal(s.sql((db) => db.prepare("SELECT value FROM meta WHERE key = 'claude.path'").get().value), join(binDir, 'claude'));
 });

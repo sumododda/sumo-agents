@@ -1,11 +1,25 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { accessSync, constants, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { getMeta } from './db.mjs';
 import { paths } from './paths.mjs';
 
 const TIMEOUT_MS = 180_000;
 const MAX_SPEND_USD = '0.25';
+
+/** The path setup pinned, unless it has since vanished — then whatever PATH offers, which may still be nothing. */
+function pinnedOrOnPath(db) {
+  const pinned = getMeta(db, 'claude.path');
+  if (pinned) {
+    try {
+      accessSync(pinned, constants.X_OK);
+      return pinned;
+    } catch {
+      // Pinned before a reinstall or a move; fall through.
+    }
+  }
+  return 'claude';
+}
 
 /**
  * One call to the cheap model, outside any conversation.
@@ -26,7 +40,7 @@ export function callModel(db, { system, prompt, schema, model }) {
   mkdirSync(cwd, { recursive: true, mode: 0o700 });
 
   const standIn = process.env.SUMO_AGENTS_MODEL_CMD;
-  const command = standIn ?? getMeta(db, 'claude.path') ?? 'claude';
+  const command = standIn ?? pinnedOrOnPath(db);
   const args = standIn
     ? []
     : [
