@@ -91,6 +91,7 @@ function workerRules(job, { testsMayChange }) {
   } Never loosen a lint or type setting, add an ignore, or special-case a test's input to get green.
 - A question you can settle yourself: decide, carry on, and list it under Decisions. Stop and ask only for something destructive or irreversible, security-sensitive, outside this project, or a task so unclear that every path is a guess.
 - You do not start sub-agents. Review comes after you, from someone who did not write the code.
+- At each major milestone (a phase of the task done, or something only the user can settle) send one line with SendMessage to "main": \`j${job.id} <what now works>; next: <step>\` (load SendMessage with ToolSearch if it is deferred). Nothing else in between.
 `;
 }
 
@@ -117,6 +118,7 @@ ${job.agent === 'worker' ? workerRules(job, options) : ''}- Worth keeping if you
 - If some other command is refused, carry on with Read, Grep and Glob. \`mem\` commands are always allowed, so a refusal never stops you from noting, asking or finishing.
 - When finished you must close the job, or nobody knows it ended: ${closing}
 ${REPORT[job.agent]}
+- Every message and report: short lines, facts only. No prose, no preamble, no restating the task.
 - Your final message: the STATUS line, then one line per ${job.agent === 'reviewer' ? 'finding' : 'file changed'}. Nothing else — the report is already on disk.
 `;
 }

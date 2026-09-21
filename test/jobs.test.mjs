@@ -48,6 +48,8 @@ test('a brief carries the task, what memory knows about the project, and how to 
   assert.match(brief, /## Goal\nMigrate the project from npm to pnpm\./);
   assert.match(brief, /mem job finish 1 --status DONE/);
   assert.match(brief, /You never write it\./);
+  assert.match(brief, /each major milestone.*SendMessage to "main"/, 'a worker reports milestones without being asked');
+  assert.match(brief, /Every message and report: short lines, facts only\. No prose/, 'reports stay terse');
 });
 
 test('a scout is told plainly that it cannot edit, and a task without a check is called out', () => {
@@ -56,6 +58,7 @@ test('a scout is told plainly that it cannot edit, and a task without a check is
   const created = s.mem(['job', 'new', '--project', 'simba', '--title', 'where is the briefing generator', '--agent', 'scout'], { input: 'Find where briefings are rendered.' });
   assert.match(created.out, /note: the task names no check that proves the work/);
   assert.match(s.mem(['job', 'brief', '1']).out, /You are a scout.*You have no edit tools and none can be granted/s);
+  assert.match(s.mem(['job', 'brief', '1']).out, /Every message and report: short lines, facts only\. No prose/, 'a scout reports tersely too');
 
   assert.equal(s.mem(['job', 'new', '--project', 'simba', '--title', 'x', '--agent', 'architect'], { input: 'y' }).code, 2);
   assert.equal(s.mem(['job', 'new', '--project', 'simba', '--title', 'x'], { input: '' }).code, 2);
