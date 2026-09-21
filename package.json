@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "description": "One repo you talk to: a local memory engine and working process for coding agents.",
+  "license": "MIT",
   "bin": { "mem": "bin/mem.mjs" },
   "engines": { "node": ">=22.13" },
   "scripts": { "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.mjs\"" }
