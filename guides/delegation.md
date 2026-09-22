@@ -3,9 +3,10 @@
 A delegation costs a brief and a fresh context.
 
 **Who.** `scout` (Haiku, no edit tools): finding, tracing, auditing — cheapest; tracing, not judging → say
-"describe only". `worker` (Sonnet): building and fixing. `reviewer` (Opus, no edit tools): judging a change
-it did not write. A stronger model only when the user asks or a cheaper attempt failed its check twice;
-a stuck job is never resent unchanged. Routing preferences: `mem search "which model sub-agent"`.
+"describe only". `worker`: building and fixing. `reviewer` (no edit tools): judging a change it did not
+write. `mem job new` picks the route; `--model`/`--effort` only when named. A project rule:
+a decision shaped `worker model opus effort high`. Failed, or `important >= 3` → `mem job retry <id>`,
+one step up.
 
 **1. Write the brief** — a contract, not a wish:
 
@@ -17,7 +18,7 @@ a stuck job is never resent unchanged. Routing preferences: `mem search "which m
     ## Report          what you need back beyond the standard one
     EOF_TASK
 
-Rules, gotchas and commands come from memory. One job = the smallest piece with its own check.
+Rules and commands come from memory. One job = the smallest piece with its own check.
 Existing tests must change → `--tests-may-change`.
 
 **2. Start it** with the named sub-agent and exactly the `JOB:` line printed. Independent scouts go in

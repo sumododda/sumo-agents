@@ -6,6 +6,7 @@ import { tx } from './db.mjs';
 import { UsageError } from './memory.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
+import { chooseRoute, statsLines } from './route.mjs';
 import { runScribe } from './scribe.mjs';
 import { addCheckpoint, pendingTurns } from './sessions.mjs';
 import { clip } from './text.mjs';
@@ -16,6 +17,8 @@ const AGENTS = ['scout', 'worker', 'reviewer'];
 const GUIDES = ['fix', 'feature', 'review'];
 const BRIEF_CARD_BUDGET = 400;
 const MAX_LEARNED = 5;
+/** A failed job can always be retried; a done one only once review found enough wrong with it. */
+const RETRY_IMPORTANT_THRESHOLD = 3;
 
 export function parseJobId(raw) {
   const match = /^j?(\d+)$/.exec(String(raw ?? '').trim());
@@ -75,7 +78,7 @@ const REPORT = {
     ${LEARNED}`,
   reviewer: `    ## Summary             one line: does it do what was asked, and can it be trusted as it stands
     ## Asked vs built      missing · extra · misunderstood — or "matches"
-    ## Findings            worst first: <file:line> — how it fails, concretely — the smallest fix or test. No praise, no rewrites.
+    ## Findings            numbered, worst first: \`1. <file:line> — how it fails, concretely — the smallest fix or test\`. No praise, no rewrites.
     ## Minor               listed, never a reason to reopen the work
     ## Could not verify    what the change alone cannot show — it lives in code that did not change
     ${LEARNED}`,
@@ -167,12 +170,32 @@ function changeToJudge(db, { project, reviews }) {
   return { snap, lines };
 }
 
+/** The sub-agent a job's route names: `<role>-<effort>`, or the plain role where there is no effort — a scout, or haiku. */
+export function agentType(job) {
+  return job.agent === 'scout' || job.effort === 'none' ? job.agent : `${job.agent}-${job.effort}`;
+}
+
+const reviewsFile = (id) => fileOf(id, 'reviews.json');
+/** The job a reviewer job was created to judge — set once, at creation, from `--reviews`. */
+function recordReviewTarget(id, targetId) {
+  writeFileSync(reviewsFile(id), `${JSON.stringify({ reviews: targetId })}\n`, { mode: 0o600 });
+}
+function reviewTargetOf(id) {
+  try {
+    return JSON.parse(readFileSync(reviewsFile(id), 'utf8')).reviews;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Creates a job and its brief. The brief carries what memory knows about the
  * project, so the sub-agent starts with its context instead of spending turns
- * finding it — and the main agent's conversation never has to hold it.
+ * finding it — and the main agent's conversation never has to hold it. Its
+ * model and effort are chosen by `chooseRoute` (src/route.mjs) before the row
+ * is written, so every job that exists has a route.
  */
-export function newJob(db, { project: nameOrAlias, title, agent = 'worker', task, guide: guideName, reviews, testsMayChange = false, now = new Date().toISOString() }) {
+export async function newJob(db, { project: nameOrAlias, title, agent = 'worker', task, guide: guideName, reviews, testsMayChange = false, model, effort, retryOf, now = new Date().toISOString() }) {
   if (!AGENTS.includes(agent)) throw new UsageError(`--agent is one of: ${AGENTS.join(', ')}`);
   if (!title?.trim()) throw new UsageError('a job needs a --title');
   if (!task?.trim()) throw new UsageError('describe the task on stdin — see guides/delegation.md for the five headings');
@@ -185,16 +208,22 @@ export function newJob(db, { project: nameOrAlias, title, agent = 'worker', task
   // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory.
   if (pendingTurns(db, 1).length > 0) runScribe(db, { now });
 
+  const route = await chooseRoute(db, { agent, project, task, title: title.trim(), explicit: { model, effort }, retryOf });
+
   const session = db.prepare('SELECT id FROM sessions ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1').get();
   const job = tx(db, () => {
     const { lastInsertRowid } = db
-      .prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?, ?)`)
-      .run(project.slug, title.trim(), agent, session?.id ?? null, now, now);
+      .prepare(
+        `INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason, retry_of)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(project.slug, title.trim(), agent, session?.id ?? null, now, now, route.model, route.effort, route.reason, retryOf ?? null);
     return getJob(db, Number(lastInsertRowid));
   });
 
   const known = card(db, project.slug, { budget: BRIEF_CARD_BUDGET, now }).split('\n').slice(1, -1).join('\n') || 'Nothing yet.';
   mkdirSync(dirOf(job.id), { recursive: true, mode: 0o700 });
+  if (agent === 'reviewer' && reviews !== undefined) recordReviewTarget(job.id, reviews);
 
   let change = null;
   if (judged) {
@@ -214,6 +243,55 @@ export function newJob(db, { project: nameOrAlias, title, agent = 'worker', task
     if (other) warnings.push(`note: j${other.id} "${other.title}" is already a running worker in ${project.slug} — two workers in one working tree overwrite each other. Let it finish, or: mem job abandon ${other.id}`);
   }
   return { job, warnings };
+}
+
+/**
+ * Retries a job one rung up the ladder: same project, same title (marked as a
+ * retry), same task, with what the previous attempt found carried into the
+ * new brief. Only a failed job, or a done one a review found enough wrong
+ * with, is eligible — `chooseRoute` itself refuses once there is nowhere
+ * higher to go.
+ */
+export async function retry(db, id, { now = new Date().toISOString() } = {}) {
+  const old = getJob(db, id);
+  const eligible = old.status === 'failed' || (old.status === 'done' && (old.important ?? 0) >= RETRY_IMPORTANT_THRESHOLD);
+  if (!eligible) {
+    throw new UsageError(
+      `j${id} is ${old.status}${old.status === 'done' ? ` (important: ${old.important ?? 0})` : ''} — only a failed job, or a done one reviewed with important >= ${RETRY_IMPORTANT_THRESHOLD}, can be retried`,
+    );
+  }
+  const task = taskFromBrief(readOr(fileOf(id, 'brief.md')));
+  if (!task) throw new UsageError(`j${id}'s brief has no "## The task" section to retry from`);
+
+  // What the original was allowed and pointed at travels with the task: a retry of a review judges the same job,
+  // and a retry of a worker keeps the permission the first attempt was given.
+  const reviews = reviewTargetOf(id) ?? undefined;
+  const testsMayChange = Boolean(readState(id)?.testsMayChange);
+  const { job, warnings } = await newJob(db, { project: old.project, title: `${old.title} (retry of j${id})`, agent: old.agent, task, reviews, testsMayChange, retryOf: id, now });
+
+  const oldNotes = readOr(fileOf(id, 'notes.md')).trim();
+  const oldReport = readOr(fileOf(id, 'report.md')).trim();
+  const found = [oldNotes && `### Notes\n${oldNotes}`, oldReport && `### Report\n${oldReport}`].filter(Boolean).join('\n\n');
+  if (found) appendFileSync(fileOf(job.id, 'brief.md'), `\n## What the previous attempt found\n${found}\n`, { mode: 0o600 });
+
+  return { job, warnings };
+}
+
+/** The task text a brief was built from — everything between "## The task" and the next section renderBrief adds. */
+function taskFromBrief(brief) {
+  const marker = '## The task\n';
+  const start = brief.indexOf(marker);
+  if (start === -1) return null;
+  const from = start + marker.length;
+  const stops = ['\n## The change to judge\n', '\n## How this kind of work is done here\n', '\n## How to work\n']
+    .map((section) => brief.indexOf(section, from))
+    .filter((i) => i !== -1);
+  return brief.slice(from, stops.length > 0 ? Math.min(...stops) : brief.length).trim();
+}
+
+/** `jobs, done, failed, reviewed, avg important` — one line per model/effort this project has finished. */
+export function stats(db, { project } = {}) {
+  return statsLines(db, { project: project === undefined ? undefined : getProject(db, project).slug });
 }
 
 /** Everything a sub-agent needs to start — or to start again cold, in another session, after being interrupted. */
@@ -323,6 +401,17 @@ function learnedLines(report) {
 }
 
 /**
+ * The findings under "## Findings" in a review — the count that becomes the
+ * reviewed job's `important`. One per line that opens the way the template
+ * asks (`1. `) or the way reviewers here also write them (`<file:line> — `);
+ * a wrapped line is indented, so it is never counted twice.
+ */
+function findingsCount(report) {
+  const section = /^##\s*Findings\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(report)?.[1] ?? '';
+  return (section.match(/^(?:\d+\.\s|\S+\.\w+:\d+)/gm) ?? []).length;
+}
+
+/**
  * Closes a job. What the sub-agent learned is filed by code, not by trust: only
  * as gotchas, only in this project, marked as observed, through the same
  * validator as every other model-written memory.
@@ -355,6 +444,12 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
   writeFileSync(fileOf(id, 'report.md'), `${report.trim()}\n${observed}`, { mode: 0o600 });
   setStatus(db, id, status === 'DONE' ? 'done' : 'failed', now);
 
+  // A reviewer job created with --reviews <id> grades that job: the count of numbered Findings becomes its "important".
+  if (job.agent === 'reviewer' && status === 'DONE') {
+    const targetId = reviewTargetOf(id);
+    if (targetId !== null) db.prepare('UPDATE jobs SET important = ? WHERE id = ?').run(findingsCount(report), targetId);
+  }
+
   const ops = learnedLines(report).map((body) => ({ op: 'gotcha', scope: `project:${job.project}`, body: clip(body, 300) }));
   const learned = applyOps(db, ops, { source: 'worker', turns: new Map(), now });
 
@@ -386,6 +481,8 @@ export function jobLine(job) {
 export function show(db, id) {
   const job = getJob(db, id);
   const out = [jobLine(job), `files: ${dirOf(id)}`];
+  if (job.model && job.effort) out.push(`route: ${job.model}/${job.effort} — ${job.route_reason}`);
+  if (job.important !== null && job.important !== undefined) out.push(`important: ${job.important}`);
   const qa = readOr(fileOf(id, 'qa.md')).trim();
   if (job.status === 'needs_input' && qa) out.push('', 'waiting on this question:', qa.split(/^### /m).filter(Boolean).at(-1).replace(/^[^\n]*\n/, '').trim());
   const notes = readOr(fileOf(id, 'notes.md')).trim();

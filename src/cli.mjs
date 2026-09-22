@@ -13,7 +13,7 @@ import { prime } from './prime.mjs';
 import * as projects from './projects.mjs';
 import { detail, historyLine, line, scopeLabel } from './render.mjs';
 import { buildBundle, modelStats, runScribe, scribeStatus } from './scribe.mjs';
-import { searchTurns } from './sessions.mjs';
+import { searchTurns, taskEndedNudge } from './sessions.mjs';
 import { config, doctor, setup } from './setup.mjs';
 import { ftsQuery } from './text.mjs';
 import { verdictLines } from './verify.mjs';
@@ -29,9 +29,9 @@ const HELP = `mem — local memory for the sumo-agents process
   mem forget <id> [--purge]
   mem confirm <id>     mem reject <id>
   mem project add <path> [--slug S] [--alias A]...   show S · list · rescan S · alias S A · archive S
-  mem job new --project S --title T [--agent scout|worker|reviewer] [--guide fix|feature|review]
+  mem job new --project S --title T [--agent scout|worker|reviewer] [--model M] [--effort E]
         brief ID · note ID · ask ID · answer ID · baseline ID · verify ID · changes ID
-        finish ID --status DONE|FAILED · show ID · list [--all] · abandon ID      (text on stdin)
+        finish ID --status DONE|FAILED · show ID · list [--all] · abandon ID · retry ID · stats
   mem prime            the block a session starts with
   mem scribe run|show|status|stats  mem dream run|status       the cheap-model passes
   mem export [--json]  mem backup
@@ -72,12 +72,15 @@ mem project show <name> | list [--all] | rescan <name> | alias <name> <alias> | 
         [--guide fix|feature|review]     carry guides/<name>.md into the brief
         [--reviews <id>]                 reviewer: judge that job's change (default: what is uncommitted)
         [--tests-may-change]             worker: this task is allowed to edit tests that already exist
+        [--model haiku|sonnet|opus|fable] [--effort low|medium|high|xhigh|max]   override the chosen route
 mem job brief|show|abandon <id>
 mem job note|ask|answer <id>                                    (text on stdin)
 mem job baseline <id>        the project's checks, before the work
 mem job verify <id>          the same checks now, judged against the baseline
 mem job changes <id>         everything the job changed, as one file
 mem job finish <id> --status DONE|FAILED [--accept "<why>"]     (report on stdin)
+mem job retry <id>           a failed job, or a done one reviewed with important >= 3, one route step up
+mem job stats [--project S]  jobs, done, failed, reviewed, avg important — per model/effort
 mem job list [--all]`,
   prime: 'mem prime [--budget N]',
   scribe: 'mem scribe run|show|status|stats',
@@ -85,7 +88,7 @@ mem job list [--all]`,
   apply: 'mem apply <ops.json> [--source scribe|dream]',
   export: 'mem export [--json]',
   backup: 'mem backup',
-  setup: 'mem setup [--bin-dir DIR] [--no-link]',
+  setup: 'mem setup [--bin-dir DIR] [--no-link] [--model-source URL] [--no-model]',
   doctor: 'mem doctor',
   config: 'mem config [key [value]]',
 };
@@ -107,7 +110,7 @@ const COMMANDS = {
   confirm: { value: [], bool: [], run: (db, { args }) => [`confirmed ${line(memory.confirm(db, memory.parseId(args[0])))}`] },
   reject: { value: [], bool: [], run: (db, { args }) => [`rejected ${line(memory.reject(db, memory.parseId(args[0])))}`] },
   project: { value: ['slug'], multi: ['alias'], bool: ['all'], run: runProject },
-  job: { value: ['project', 'title', 'agent', 'status', 'from-file', 'guide', 'reviews', 'accept'], bool: ['all', 'tests-may-change'], run: runJob },
+  job: { value: ['project', 'title', 'agent', 'status', 'from-file', 'guide', 'reviews', 'accept', 'model', 'effort'], bool: ['all', 'tests-may-change'], run: runJob },
   prime: { value: ['budget'], bool: [], run: (db, { flags }) => [prime(db, { budget: flags.budget === undefined ? undefined : Number(flags.budget) })] },
   scribe: { value: [], bool: [], run: runScribeCommand },
   dream: { value: [], bool: [], run: runDreamCommand },
@@ -275,11 +278,22 @@ function stdinText(flags) {
   return process.stdin.isTTY ? '' : readFileSync(0, 'utf8');
 }
 
-function runJob(db, { args, flags }) {
+/** The lines `new` and `retry` both print: the job, its route, and exactly what to start it with. */
+function createdLines(job, warnings) {
+  return [
+    `created ${jobs.jobLine(job)}`,
+    ...warnings,
+    `route: ${job.model}/${job.effort} — ${job.route_reason}`,
+    `start it with the ${jobs.agentType(job)} sub-agent and exactly this prompt:`,
+    `JOB: run \`mem job brief ${job.id}\` and follow it exactly.`,
+  ];
+}
+
+async function runJob(db, { args, flags }) {
   const [sub, rawId] = args;
   if (sub === 'new') {
     if (!flags.project) throw new UsageError(`usage: ${USAGE.job}`);
-    const { job, warnings } = jobs.newJob(db, {
+    const { job, warnings } = await jobs.newJob(db, {
       project: flags.project,
       title: flags.title,
       agent: flags.agent,
@@ -287,17 +301,21 @@ function runJob(db, { args, flags }) {
       guide: flags.guide,
       reviews: flags.reviews === undefined ? undefined : jobs.parseJobId(flags.reviews),
       testsMayChange: Boolean(flags['tests-may-change']),
+      model: flags.model,
+      effort: flags.effort,
     });
-    return [
-      `created ${jobs.jobLine(job)}`,
-      ...warnings,
-      `start it with the ${job.agent} sub-agent and exactly this prompt:`,
-      `JOB: run \`mem job brief ${job.id}\` and follow it exactly.`,
-    ];
+    return createdLines(job, warnings);
   }
   if (sub === 'list') {
     const all = jobs.listJobs(db, { all: flags.all });
     return all.length > 0 ? all.map(jobs.jobLine) : ['no open jobs'];
+  }
+  if (sub === 'stats') {
+    return jobs.stats(db, { project: flags.project });
+  }
+  if (sub === 'retry') {
+    const { job, warnings } = await jobs.retry(db, jobs.parseJobId(rawId));
+    return createdLines(job, warnings);
   }
   if (!['brief', 'note', 'ask', 'answer', 'finish', 'show', 'abandon', 'baseline', 'verify', 'changes'].includes(sub)) {
     throw new UsageError(`usage: ${USAGE.job}`);
@@ -322,7 +340,8 @@ function runJob(db, { args, flags }) {
       ];
     case 'abandon':
       jobs.abandon(db, id);
-      return [`abandoned j${id}`];
+      // A task just ended: if the session is already big, this is the cheapest moment to start a fresh one.
+      return [`abandoned j${id}`, ...[taskEndedNudge(db)].filter(Boolean)];
     case 'baseline':
       return jobs.baseline(db, id);
     case 'verify': {
@@ -340,6 +359,7 @@ function runJob(db, { args, flags }) {
         `STATUS: ${job.status === 'done' ? 'DONE' : 'FAILED'}${unverified ? ' (UNVERIFIED — taken without running the checks)' : ''} — j${id}`,
         ...(verdict?.flags ?? []).map((f) => `  look at: ${f}`),
         ...learned.applied.map((l) => `  ${l}`),
+        ...[taskEndedNudge(db)].filter(Boolean),
       ];
     }
   }
@@ -402,7 +422,7 @@ function runDoctor() {
   return checks.some((c) => !c.ok && !c.warn) ? 1 : 0;
 }
 
-export function main(argv) {
+export async function main(argv) {
   const [command, ...rest] = argv;
   try {
     if (command === undefined || command === 'help' || command === '--help' || command === '-h') {
@@ -414,8 +434,9 @@ export function main(argv) {
       return 0;
     }
     if (command === 'setup') {
-      const { flags } = parse(rest, { value: ['bin-dir'], bool: ['no-link'] });
-      process.stdout.write(`${setup({ binDir: flags['bin-dir'], link: !flags['no-link'] }).join('\n')}\n`);
+      const { flags } = parse(rest, { value: ['bin-dir', 'model-source'], bool: ['no-link', 'no-model'] });
+      const lines = await setup({ binDir: flags['bin-dir'], link: !flags['no-link'], modelSource: flags['model-source'], noModel: !!flags['no-model'] });
+      process.stdout.write(`${lines.join('\n')}\n`);
       return 0;
     }
     if (command === 'hook') {
@@ -436,7 +457,8 @@ export function main(argv) {
     const parsed = parse(rest, spec);
     const db = openDb();
     try {
-      process.stdout.write(`${spec.run(db, parsed).join('\n')}\n`);
+      const lines = await spec.run(db, parsed);
+      process.stdout.write(`${lines.join('\n')}\n`);
     } finally {
       db.close();
     }

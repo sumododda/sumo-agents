@@ -11,4 +11,4 @@ process.emitWarning = (warning, ...rest) => {
 };
 
 const { main } = await import('../src/cli.mjs');
-process.exitCode = main(process.argv.slice(2));
+process.exitCode = await main(process.argv.slice(2));

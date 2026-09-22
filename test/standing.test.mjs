@@ -13,7 +13,8 @@ const read = (...parts) => readFileSync(join(REPO_ROOT, ...parts), 'utf8');
  * These limits are the point of the project: raising one is a decision, not an accident.
  */
 test('the standing prompt stays small', () => {
-  assert.ok(estimateTokens(read('AGENTS.md')) <= 600, `AGENTS.md is ${estimateTokens(read('AGENTS.md'))} tokens`);
+  // 650 rather than 600: the compact instructions have to live here, or a compaction never sees them.
+  assert.ok(estimateTokens(read('AGENTS.md')) <= 650, `AGENTS.md is ${estimateTokens(read('AGENTS.md'))} tokens`);
   assert.equal(read('CLAUDE.md').trim(), '@AGENTS.md', 'CLAUDE.md only points at AGENTS.md');
   for (const guide of readdirSync(join(REPO_ROOT, 'guides'))) {
     assert.ok(estimateTokens(read('guides', guide)) <= 550, `guides/${guide} is ${estimateTokens(read('guides', guide))} tokens`);
@@ -48,7 +49,7 @@ test('Claude Code is wired to the launcher for all five events, with its own mem
     assert.ok(command.includes(`"$m" hook ${name} --harness claude`), event);
     assert.ok(command.includes('$HOME/.sumo-agents/bin/mem'), `${event} must not depend on PATH`);
   }
-  assert.equal(settings.hooks.PreToolUse[0].matcher, 'Bash|AskUserQuestion|Read', 'shell commands for the guard and the workflow gate, questions for the memory gate, reads for secret files — no other tool pays for a hook');
+  assert.equal(settings.hooks.PreToolUse[0].matcher, 'Bash|AskUserQuestion|Read|Agent', 'shell commands for the guard and the workflow gate, questions for the memory gate, reads for secret files, agent starts for the route — no other tool pays for a hook');
   assert.match(settings.hooks.SessionStart[0].hooks[0].command, /launcher failed/, 'a broken launcher has to say so, not fail silently');
 });
 

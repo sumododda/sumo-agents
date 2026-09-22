@@ -198,7 +198,7 @@ test('a reviewer is handed the change as one file, what was asked, and the autho
 
   const created = s.mem(['job', 'new', '--project', 'gitproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'The thing must return 2.' });
   assert.equal(created.code, 0, created.err);
-  assert.match(created.out, /start it with the reviewer sub-agent/);
+  assert.match(created.out, /start it with the reviewer-\w+ sub-agent/);
   assert.doesNotMatch(created.out, /names no check/);
 
   const brief = s.mem(['job', 'brief', '2']).out;
@@ -242,7 +242,7 @@ test('jobs from before reviewers existed survive the upgrade, and no job id is e
         status TEXT NOT NULL CHECK (status IN ('running', 'needs_input', 'done', 'failed', 'abandoned')),
         session_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       ) STRICT;
-      INSERT INTO jobs_old SELECT * FROM jobs WHERE id = 1;
+      INSERT INTO jobs_old SELECT id, project, title, agent, status, session_id, created_at, updated_at FROM jobs WHERE id = 1;
       DROP TABLE jobs;
       ALTER TABLE jobs_old RENAME TO jobs;
       UPDATE sqlite_sequence SET seq = 2 WHERE name = 'jobs';
@@ -268,4 +268,20 @@ test('a recorded start that git has since collected is said out loud, never read
   const changes = s.mem(['job', 'changes', '1']);
   assert.equal(changes.code, 2);
   assert.match(changes.err, /is no longer in the repository/);
+});
+
+test('a retried worker keeps the original\'s permission to change tests that were already here', () => {
+  const s = sandbox();
+  const p = gitProject(s);
+  newWorker(s, ['--tests-may-change']);
+  assert.equal(s.mem(['job', 'finish', '1', '--status', 'FAILED'], { input: '## Summary\nRan out of road.\n' }).code, 0);
+
+  const retried = s.mem(['job', 'retry', '1']);
+  assert.equal(retried.code, 0, retried.err);
+  assert.match(s.mem(['job', 'brief', '2']).out, /This task may change them — say in the report which, and why\./);
+
+  p.write('src.js', 'export const thing = 2;\n');
+  p.write('test/thing.test.js', '// asserts the thing is 2\n');
+  const done = finish(s, '2');
+  assert.equal(done.code, 0, done.err);
 });

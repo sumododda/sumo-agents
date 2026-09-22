@@ -25,6 +25,10 @@ Small or sequential → do it yourself, absolute paths. Big, parallel, context-h
 half full → delegate: `scout` looks, `worker` builds, `reviewer` judges. None starts without a job from
 `mem job new` — read guides/delegation.md first.
 
+## Compact instructions
+Keep: open job ids/status · decisions made this session · current project · last failing command + error.
+Drop: tool output, file contents — a `mem job show` or file read away.
+
 ## Coding
 - Before changing code, trace how it works now: the smallest complete slice — signature, callers,
   callees, types, tests. One grep, not a fan-out.

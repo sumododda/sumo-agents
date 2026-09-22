@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { contextUse } from '../src/sessions.mjs';
 import { estimateTokens } from '../src/text.mjs';
 import { sandbox } from './helpers.mjs';
 
@@ -313,4 +314,98 @@ test('erasing a memory erases the sentence it came from', () => {
   s.mem(['forget', 'm1', '--purge']);
   assert.match(s.mem(['search', 'home address', '--turns']).out, /^the user never said anything like/);
   assert.equal(existsSync(join(s.home, 'memory.db')), true);
+});
+
+/** A Claude Code transcript whose last assistant turn reports what the window is carrying. */
+function grownTo(file, tokens) {
+  const lines = [
+    { type: 'user', message: { role: 'user', content: 'carry on' } },
+    {
+      type: 'assistant',
+      message: { role: 'assistant', model: 'claude-opus-5', usage: { input_tokens: 4, cache_creation_input_tokens: 2000, cache_read_input_tokens: tokens - 2004 }, content: [{ type: 'text', text: 'done' }] },
+    },
+    { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } },
+  ];
+  writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+  return file;
+}
+
+test('how much context a session is carrying is read from its transcript, and an unreadable one simply does not answer', () => {
+  const s = sandbox();
+  const file = join(s.root, 'ctx.jsonl');
+  assert.deepEqual(contextUse(grownTo(file, 90_000)), { tokens: 90_000, model: 'claude-opus-5' });
+
+  // A session is as big as its latest turn, not its first — and the tool traffic after it changes nothing.
+  const busy = join(s.root, 'busy.jsonl');
+  const turn = (usage) => JSON.stringify({ type: 'assistant', message: { role: 'assistant', model: 'claude-opus-5', usage } });
+  writeFileSync(busy, [
+    turn({ input_tokens: 10_000 }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'and now the hard part' } }),
+    turn({ input_tokens: 3, cache_read_input_tokens: 120_000 }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } }),
+  ].join('\n'));
+  assert.equal(contextUse(busy).tokens, 120_003);
+
+  writeFileSync(file, '{"type":"assistant", and then the write was cut off\n');
+  assert.equal(contextUse(file), null);
+  assert.equal(contextUse(join(s.root, 'no-such-file.jsonl')), null);
+  assert.equal(contextUse(null), null);
+});
+
+test('a session that has grown big says so once per band, with the compact hint ready to paste', () => {
+  const s = sandbox();
+  withSimba(s);
+  const file = join(s.root, 'growing.jsonl');
+  const session = { session_id: 'sess-big', cwd: '/Users/sumo/sumo-agents', transcript_path: file };
+  const hint = 'hint: focus on proj-simba; keep decisions and open job ids; drop tool output and file contents.';
+
+  grownTo(file, 40_000);
+  assert.match(say(s, 'fix the briefing bug in simba', session).out, /^<project proj-simba>/);
+  assert.equal(say(s, 'and the next bit', session).out, '', 'a small session is left alone');
+
+  grownTo(file, 90_000);
+  assert.equal(
+    say(s, 'keep going', session).out,
+    `context: 90k tokens — quality drops from here. Finish the piece in hand, then start fresh: /clear, and mem prime brings the thread back. Mid-task and it must continue: /compact <hint below>. ${hint}`,
+  );
+
+  grownTo(file, 100_000);
+  assert.equal(say(s, 'and this too', session).out, '', 'the same band is not said twice');
+
+  // Once a job is open, that is what a compaction has to keep — not the project it belongs to.
+  s.mem(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm'], { input: 'Move simba to pnpm.\n## Check\n`make test` exits 0.\n' });
+  grownTo(file, 155_000);
+  assert.equal(
+    say(s, 'one more thing', session).out,
+    'context: 155k tokens — start fresh now: note where you are (mem job note / the Stop hook records "Left off"), then /clear. ' +
+      'hint: focus on migrate to pnpm; keep decisions and open job ids; drop tool output and file contents.',
+  );
+});
+
+test('a transcript that cannot be read never adds a line to the turn', () => {
+  const s = sandbox();
+  const file = join(s.root, 'corrupt.jsonl');
+  writeFileSync(file, '{"type":"assistant" this line was never finished\n');
+  const run = say(s, 'carry on then', { session_id: 'sess-corrupt', cwd: '/x', transcript_path: file });
+  assert.deepEqual([run.code, run.out, run.err], [0, '', '']);
+});
+
+test('a task that ends in a big session ends with the nudge to start fresh', () => {
+  const s = sandbox();
+  withSimba(s);
+  const file = join(s.root, 'boundary.jsonl');
+  grownTo(file, 120_000);
+  say(s, 'start the pnpm migration in simba', { session_id: 'sess-boundary', cwd: '/x', transcript_path: file });
+  const boundary = 'this session is at 120k tokens and the task just ended — /clear now; mem prime brings the thread back.';
+
+  const task = 'Move simba to pnpm.\n## Check\n`make test` exits 0.\n';
+  assert.equal(s.mem(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm'], { input: task }).code, 0);
+  assert.equal(s.mem(['job', 'new', '--project', 'simba', '--title', 'drop the old lockfile'], { input: task }).code, 0);
+
+  assert.equal(s.mem(['job', 'abandon', '1']).out.trim(), `abandoned j1\n${boundary}`);
+  assert.equal(s.mem(['job', 'finish', '2', '--status', 'FAILED'], { input: '## Summary\npnpm broke the build.\n' }).out.trim(), `STATUS: FAILED — j2\n${boundary}`);
+
+  grownTo(file, 20_000);
+  assert.equal(s.mem(['job', 'new', '--project', 'simba', '--title', 'third go'], { input: task }).code, 0);
+  assert.equal(s.mem(['job', 'abandon', '3']).out.trim(), 'abandoned j3', 'a small session is not told to start over');
 });

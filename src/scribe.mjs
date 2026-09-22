@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeSync } from 'node:fs';
+import { appendFileSync, closeSync, openSync, readFileSync, rmSync, statSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
 import { getMeta, setMeta } from './db.mjs';
-import { callModel } from './model.mjs';
+import { callModel, logRun } from './model.mjs';
 import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
 import { aliasesOf, listProjects } from './projects.mjs';
 import { line } from './render.mjs';
@@ -164,17 +164,6 @@ export function buildBundle(db) {
   ].join('\n');
 
   return { prompt, turns: new Map(turns.map((t) => [t.id, t])) };
-}
-
-function logRun(db, { kind, model, result, note, now }) {
-  db.prepare('INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
-    now, kind, model, result.usage.inputTokens, result.usage.outputTokens, result.usage.costUsd, result.ok ? 1 : 0, note,
-  );
-  mkdirSync(paths().logs, { recursive: true, mode: 0o700 });
-  appendFileSync(
-    join(paths().logs, 'scribe.log'),
-    `${now} ${kind} ${model} ${result.ok ? 'ok' : 'FAILED'} in=${result.usage.inputTokens} out=${result.usage.outputTokens} $${result.usage.costUsd.toFixed(4)} ${note}\n`,
-  );
 }
 
 /** Shared by the writer and the consolidation pass: ask, validate, record what it cost. */

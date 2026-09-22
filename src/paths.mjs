@@ -19,5 +19,6 @@ export function paths() {
     logs: join(home, 'logs'),
     backups: join(home, 'backups'),
     jobs: join(home, 'jobs'),
+    models: join(home, 'models'),
   };
 }

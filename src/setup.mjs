@@ -1,10 +1,13 @@
 import { execFileSync } from 'node:child_process';
 import {
-  accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync,
-  realpathSync, statSync, symlinkSync, unlinkSync, writeFileSync,
+  accessSync, chmodSync, constants, createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync,
+  readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { basename, delimiter, join } from 'node:path';
+import { createInterface } from 'node:readline/promises';
+import { pipeline } from 'node:stream/promises';
+import { Readable, Transform } from 'node:stream';
 import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mjs';
 import { UsageError } from './memory.mjs';
 import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
@@ -16,6 +19,9 @@ export const CONFIG_DEFAULTS = {
   'prime.budget': '800',
   'scribe.model': 'haiku',
   'dream.model': 'haiku',
+  'model.source': 'https://huggingface.co',
+  'model.repo': 'Qwen/Qwen3-4B-GGUF',
+  'model.file': 'Qwen3-4B-Q4_K_M.gguf',
 };
 
 /**
@@ -67,9 +73,98 @@ function linkInto(binDir, launcher) {
   return { link, status: 'linked' };
 }
 
-export function setup({ binDir, link = true } = {}) {
+/** "2621440000" -> "2.4 GB". Decimal (1000-based), the way Hugging Face itself labels file sizes. */
+function formatBytes(n) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = n;
+  let i = 0;
+  while (value >= 1000 && i < units.length - 1) {
+    value /= 1000;
+    i++;
+  }
+  return `${value.toFixed(1)} ${units[i]}`;
+}
+
+/** This layout also works behind a JFrog Artifactory Hugging Face remote, whose base is its huggingfaceml URL. */
+function modelUrl({ source, repo, file }) {
+  return `${source}/${repo}/resolve/main/${file}`;
+}
+
+/**
+ * Downloads the router model unless it is already there at the size the server reports (HEAD first).
+ * Streams to `<file>.part` then renames, so a run that dies never leaves a file that looks finished.
+ * Never throws: a model that could not be fetched is not a reason for `mem setup` to fail.
+ */
+async function ensureModel(db, { modelSource } = {}) {
+  const file = getMeta(db, 'config.model.file') ?? CONFIG_DEFAULTS['model.file'];
+  const repo = getMeta(db, 'config.model.repo') ?? CONFIG_DEFAULTS['model.repo'];
+  const source = modelSource ?? getMeta(db, 'config.model.source') ?? CONFIG_DEFAULTS['model.source'];
+  // The file name decides where the bytes land; a separator in it would let `mem config` point outside models/.
+  if (file !== basename(file) || file === '..' || file === '.') {
+    return `model.file "${file}" is refused — a file name, with no path separator: mem config model.file <name>`;
+  }
+  const dest = join(paths().models, file);
+  const url = modelUrl({ source, repo, file });
+  const shown = redactUrl(url);
+  // Unique per run: two setups at once must not interleave into one file, and a dead run must not leave a
+  // part file that a later run mistakes for progress.
+  const partPath = `${dest}.${process.pid}.part`;
+  try {
+    const head = await fetch(url, { method: 'HEAD' });
+    if (!head.ok) throw new Error(`HEAD ${shown} → HTTP ${head.status}`);
+    const lengthHeader = head.headers.get('content-length');
+    const remoteSize = lengthHeader === null ? null : Number(lengthHeader);
+    const localSize = existsSync(dest) ? statSync(dest).size : null;
+    // No Content-Length (a JFrog remote that has not cached the artifact yet) → keep what is there rather than
+    // fetch gigabytes on every setup; a size mismatch is the only reason to download again.
+    if (localSize !== null && (remoteSize === null || localSize === remoteSize)) {
+      return `model     ${dest} (${formatBytes(localSize)}, present)`;
+    }
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`GET ${shown} → HTTP ${res.status}`);
+    await pipeline(Readable.fromWeb(res.body), cappedAt(MAX_MODEL_BYTES), createWriteStream(partPath));
+    renameSync(partPath, dest);
+    return `model     ${dest} (${formatBytes(statSync(dest).size)}, downloaded)`;
+  } catch (cause) {
+    rmSync(partPath, { force: true });
+    return `could not download the router model: ${redactUrl(cause.message)}`;
+  }
+}
+
+/** A source pasted with a token in it (`https://user:token@host/…`) must never reach stdout or a transcript. */
+function redactUrl(text) {
+  return String(text).replace(/(https?:\/\/)[^/\s@]+@/g, '$1');
+}
+
+// Larger than any model setup would fetch; a server that streams past its advertised size stops here, not at a full disk.
+const MAX_MODEL_BYTES = 8 * 1000 * 1000 * 1000;
+
+/** Passes bytes through until the cap, then fails the pipeline instead of filling the disk. */
+function cappedAt(limit) {
+  let seen = 0;
+  return new Transform({
+    transform(chunk, _encoding, done) {
+      seen += chunk.length;
+      if (seen > limit) done(new Error(`download exceeded ${formatBytes(limit)}`));
+      else done(null, chunk);
+    },
+  });
+}
+
+/** The one question `mem setup` ever asks, and only when nothing is stored yet and a person is there to answer it. */
+async function askModelSource(defaultSource) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(`Download the router model from [${defaultSource}]: `);
+    return answer.trim() || defaultSource;
+  } finally {
+    rl.close();
+  }
+}
+
+export async function setup({ binDir, link = true, modelSource, noModel = false } = {}) {
   const p = paths();
-  for (const dir of [p.home, p.bin, p.logs, p.backups, p.jobs]) {
+  for (const dir of [p.home, p.bin, p.logs, p.backups, p.jobs, p.models]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   chmodSync(p.home, 0o700);
@@ -82,12 +177,32 @@ export function setup({ binDir, link = true } = {}) {
   // the old version folder, so a resolved path stops existing at the next update.
   const claude = commandOnPath('claude');
   if (claude) setMeta(db, 'claude.path', claude);
+  const llama = commandOnPath('llama-server');
+  if (llama) setMeta(db, 'llama.path', llama);
+
+  let source = modelSource;
+  if (source === undefined && !noModel && !getMeta(db, 'config.model.source') && process.stdin.isTTY) {
+    source = await askModelSource(CONFIG_DEFAULTS['model.source']);
+  }
+  if (source !== undefined) setMeta(db, 'config.model.source', source);
+
+  // SUMO_AGENTS_MODEL_CMD marks a hermetic test/dev harness, the same way it tells callModel and
+  // callLocalModel never to run a real model — an explicit --model-source still means "go fetch it".
+  const harnessSkip = Boolean(process.env.SUMO_AGENTS_MODEL_CMD) && modelSource === undefined;
+  let modelLine = null;
+  if (!noModel) {
+    modelLine = harnessSkip
+      ? 'model     not downloaded — SUMO_AGENTS_MODEL_CMD is set (unset it, or pass --model-source, to fetch it)'
+      : await ensureModel(db, { modelSource: source });
+  }
   db.close();
 
   writeFileSync(p.launcher, launcherScript(), { mode: 0o755 });
   chmodSync(p.launcher, 0o755);
 
   const lines = [`home      ${p.home}`, `database  ${p.db}`, `launcher  ${p.launcher}`];
+  if (modelLine) lines.push(modelLine);
+  if (!llama) lines.push('llama-server not found — brew install llama.cpp');
   if (link) {
     const dir = binDir ?? pickBinDir();
     if (dir) {
@@ -155,6 +270,12 @@ export function doctor() {
   const claude = pinnedClaude();
   check(claude !== null && existsSync(claude), 'claude CLI found (runs the cheap-model passes)', 'install Claude Code, then: mem setup', true);
 
+  const model = modelFile();
+  check(existsSync(model), `router model (${basename(model)})`, 'run: mem setup', true);
+
+  const llama = pinnedLlama();
+  check(llama !== null && existsSync(llama), 'llama-server found (runs the router model)', 'brew install llama.cpp, then: mem setup', true);
+
   return checks;
 }
 
@@ -170,6 +291,24 @@ function pinnedClaude() {
   const db = openDb();
   try {
     return getMeta(db, 'claude.path') ?? commandOnPath('claude');
+  } finally {
+    db.close();
+  }
+}
+
+function modelFile() {
+  const db = openDb();
+  try {
+    return join(paths().models, getMeta(db, 'config.model.file') ?? CONFIG_DEFAULTS['model.file']);
+  } finally {
+    db.close();
+  }
+}
+
+function pinnedLlama() {
+  const db = openDb();
+  try {
+    return getMeta(db, 'llama.path') ?? commandOnPath('llama-server');
   } finally {
     db.close();
   }

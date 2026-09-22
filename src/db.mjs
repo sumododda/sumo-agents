@@ -208,6 +208,17 @@ const MIGRATIONS = [
   DROP TABLE jobs;
   ALTER TABLE jobs_next RENAME TO jobs;
   `,
+
+  // 6 — a job's chosen model and effort, why, whether it is a retry, and — once reviewed — how many
+  // Important findings it drew. The agent CHECK is unchanged; these are all nullable, so a job
+  // created before this migration keeps printing nothing for its route.
+  `
+  ALTER TABLE jobs ADD COLUMN model TEXT;
+  ALTER TABLE jobs ADD COLUMN effort TEXT;
+  ALTER TABLE jobs ADD COLUMN route_reason TEXT;
+  ALTER TABLE jobs ADD COLUMN important INTEGER;
+  ALTER TABLE jobs ADD COLUMN retry_of INTEGER REFERENCES jobs(id) ON DELETE SET NULL;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
