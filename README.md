@@ -90,8 +90,8 @@ a written brief (`mem job new`). All three refuse to start without a job:
 | Sub-agent | Model and effort | Can edit | For |
 |---|---|---|---|
 | `scout` | always Haiku | no | finding, tracing, auditing, summarizing — anything reading-heavy |
-| `worker` | chosen per job, Sonnet/medium by default | yes | building and fixing |
-| `reviewer` | chosen per job, never below Opus/high | no | judging a change it did not write |
+| `worker` | chosen per job by the router | yes | building and fixing |
+| `reviewer` | chosen per job by the router | no | judging a change it did not write |
 
 A blocked sub-agent asks; the main agent checks memory before it asks you. Briefs, notes, answers,
 reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today can be picked up
@@ -116,7 +116,8 @@ no project rules, no retry ladder and no floors.
 
 If the router is missing, fails, or answers something no sub-agent can run (a model outside the list, or
 no effort for a model that takes one), the command exits with the error and **no job is created**. The
-only changes made to an answer are mechanical: a scout exists only on Haiku, and Haiku takes no effort.
+answer schema pairs Haiku with no effort and every other model with one. The only change made to an
+answer: a scout exists only on Haiku. `mem doctor` fails while the router is missing.
 
 Effort is real, not advisory: `worker-low` … `worker-max` and `reviewer-low` … `reviewer-max` are agent
 files whose frontmatter carries the level. A hook on the Agent call rewrites its model and agent type to
@@ -133,11 +134,11 @@ and that is what the router's history and `mem job stats` report:
 ```sh
 mem job stats --project <slug>     # per model/effort: jobs, done, failed, reviewed, avg important
 mem job retry <id>                 # a failed job, or one reviewed with 3+ Important: same brief,
-                                   # previous notes and report attached, one rung up
+                                   # previous notes and report attached, routed afresh
 ```
 
-The ladder climbs effort before model — Sonnet/medium → Sonnet/high → Opus/high → Fable/high →
-Fable/xhigh — and `retry` refuses at the top and says to ask you.
+A retry is routed like any job, except that the router is also told what the previous attempt ran on
+and how it ended.
 
 ## How coding work gets done
 

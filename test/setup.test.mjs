@@ -70,6 +70,20 @@ test('doctor passes after setup and fails once the launcher is broken', () => {
   assert.match(broken.out, /FAIL {2}launcher/);
 });
 
+test('doctor fails without the router, since no job can be created without it', () => {
+  const s = sandbox();
+  const binDir = join(s.root, 'bin');
+  mkdirSync(binDir);
+  s.mem(['setup', '--bin-dir', binDir, '--no-model']);
+  const env = { PATH: `${binDir}:${process.env.PATH}` };
+
+  assert.match(s.mem(['doctor'], { extraEnv: env }).out, /^ok {4}router stand-in /m, 'a test harness answers for the router');
+
+  const real = s.mem(['doctor'], { extraEnv: { ...env, SUMO_AGENTS_MODEL_CMD: '' } });
+  assert.equal(real.code, 1);
+  assert.match(real.out, /^FAIL {2}router model \(Qwen3-4B-Q4_K_M\.gguf\)/m);
+});
+
 test('the schema is migrated once and recorded', () => {
   const s = sandbox();
   s.mem(['config']);

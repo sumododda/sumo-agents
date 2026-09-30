@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -89,16 +89,43 @@ test('a scout is still asked, then runs on haiku with no effort — the only sco
   });
 });
 
-test('haiku takes no effort, so an effort the router gives it is dropped', async () => {
-  await withRouter({ model: 'haiku', effort: 'low', reason: 'mechanical' }, async (db, project) => {
-    const route = await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
-    assert.deepEqual(route, { model: 'haiku', effort: 'none', reason: 'router: mechanical; haiku takes no effort' });
+test('an effort that does not fit the model is outside the schema: haiku takes none, the others need one', async () => {
+  await withRouter({ model: 'haiku', effort: 'low', reason: 'x' }, async (db, project) => {
+    await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /the router failed: the router answered outside its schema/);
+  });
+  // No effort would silently run the plain role sub-agent on whatever effort the session has.
+  await withRouter({ model: 'sonnet', effort: 'none', reason: 'x' }, async (db, project) => {
+    await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /the router failed: the router answered outside its schema/);
+  });
+  await withRouter({ model: 'haiku', effort: 'none', reason: 'mechanical' }, async (db, project) => {
+    assert.deepEqual(await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), { model: 'haiku', effort: 'none', reason: 'router: mechanical' });
   });
 });
 
-test('no effort on a model that takes one is refused: it would silently inherit the session\'s effort', async () => {
-  await withRouter({ model: 'sonnet', effort: 'none', reason: 'x' }, async (db, project) => {
-    await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /the router failed: it gave sonnet no effort/);
+test('the schema the router answers under pairs haiku with no effort, and every other model with a real one', async () => {
+  const capture = join(mkdtempSync(join(tmpdir(), 'sumo-agents-route-capture-')), 'saw.json');
+  await withRouter({ model: 'sonnet', effort: 'low', reason: 'x' }, async (db, project) => {
+    process.env.STUB_CAPTURE = capture;
+    try {
+      await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
+    } finally {
+      delete process.env.STUB_CAPTURE;
+    }
+  });
+  const { schema } = JSON.parse(readFileSync(capture, 'utf8'));
+  const pairs = schema.anyOf.map((branch) => [branch.properties.model.enum, branch.properties.effort.enum]);
+  assert.deepEqual(pairs, [
+    [['haiku'], ['none']],
+    [['sonnet', 'opus', 'fable'], ['low', 'medium', 'high', 'xhigh', 'max']],
+  ]);
+});
+
+test('a reason is one line of text: missing is outside the schema, a newline is folded', async () => {
+  await withRouter({ model: 'sonnet', effort: 'low' }, async (db, project) => {
+    await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /outside its schema/);
+  });
+  await withRouter({ model: 'sonnet', effort: 'low', reason: 'small\n  and precise' }, async (db, project) => {
+    assert.equal((await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' })).reason, 'router: small and precise');
   });
 });
 

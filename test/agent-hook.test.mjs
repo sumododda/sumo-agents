@@ -84,7 +84,7 @@ test('a non-Agent tool call is never rewritten, and the guard still runs first f
 test('a job whose effort is none routes to the plain role sub-agent, not "worker-none"', () => {
   const s = sandbox();
   withSimba(s);
-  s.routerWillSay('haiku', 'low');
+  s.routerWillSay('haiku', 'none');
   s.mem(['job', 'new', '--project', 'simba', '--title', 'fix it'], { input: TASK });
   const held = decision(agentCall(s, { prompt: 'JOB: run `mem job brief 1` and follow it exactly.', subagent_type: 'general-purpose' }));
   assert.equal(held.updatedInput.model, 'haiku');

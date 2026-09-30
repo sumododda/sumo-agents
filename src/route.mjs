@@ -12,16 +12,18 @@ const ROUTER_SYSTEM =
   'pass with no Important review findings, then the lowest effort that fits. Raise effort before raising the model. Security, credentials, ' +
   'money, migrations or concurrency raise both. A precise check and a small surface lower both. Use the project\'s history.';
 
-const ROUTER_SCHEMA = {
+/** One answer shape per pairing, so the grammar itself cannot give haiku an effort or another model none. */
+const answerShape = (models, efforts) => ({
   type: 'object',
   properties: {
-    model: { type: 'string', enum: MODELS },
-    effort: { type: 'string', enum: ['none', ...EFFORTS] },
+    model: { type: 'string', enum: models },
+    effort: { type: 'string', enum: efforts },
     reason: { type: 'string', maxLength: 200 },
   },
   required: ['model', 'effort', 'reason'],
   additionalProperties: false,
-};
+});
+const ROUTER_SCHEMA = { anyOf: [answerShape(['haiku'], ['none']), answerShape(MODELS.filter((m) => m !== 'haiku'), EFFORTS)] };
 
 const TASK_CUT = 3500;
 
@@ -53,7 +55,7 @@ function historyText(db, projectSlug) {
   return rows
     .map(
       (r) =>
-        `${r.model}/${r.effort}: ${r.jobs} job${r.jobs === 1 ? '' : 's'}, ${r.reviewed} reviewed${
+        `${r.model}/${r.effort}: ${r.jobs} job${r.jobs === 1 ? '' : 's'}, ${r.done} done, ${r.failed} failed, ${r.reviewed} reviewed${
           r.reviewed > 0 ? `, avg ${r.avgImportant.toFixed(1)} Important findings` : ''
         }`,
     )
@@ -74,11 +76,20 @@ function stackOf(db, projectSlug) {
   return row ? row.body.replace(/^stack:\s*/, '') : null;
 }
 
-function routerPrompt(db, { agent, project, task, title }) {
+/** What the job being retried ran on and how it ended — without it, a retry is routed exactly like the attempt that failed. */
+function retryLine(db, retryOf) {
+  const prev = db.prepare('SELECT model, effort, status, important FROM jobs WHERE id = ?').get(retryOf);
+  if (!prev) return null;
+  const outcome = prev.status === 'failed' ? 'failed' : `was reviewed with ${prev.important ?? 0} Important findings`;
+  return `retry of j${retryOf}: it ran on ${prev.model ?? 'no recorded route'}${prev.effort ? `/${prev.effort}` : ''} and ${outcome}`;
+}
+
+function routerPrompt(db, { agent, project, task, title, retryOf }) {
   const stack = stackOf(db, project.slug);
   return [
     `role: ${agent}`,
     `project: ${project.slug}${stack ? ` (${stack})` : ''}`,
+    ...(retryOf === undefined ? [] : [retryLine(db, retryOf)].filter(Boolean)),
     'history:',
     historyText(db, project.slug),
     `title: ${title ?? ''}`,
@@ -87,34 +98,26 @@ function routerPrompt(db, { agent, project, task, title }) {
   ].join('\n');
 }
 
-async function askRouter(db, { agent, project, task, title }) {
-  const result = await callLocalModel(db, { system: ROUTER_SYSTEM, prompt: routerPrompt(db, { agent, project, task, title }), schema: ROUTER_SCHEMA });
+async function askRouter(db, { agent, project, task, title, retryOf }) {
+  const result = await callLocalModel(db, { system: ROUTER_SYSTEM, prompt: routerPrompt(db, { agent, project, task, title, retryOf }), schema: ROUTER_SCHEMA });
   if (!result.ok) return { ok: false, error: result.error };
-  const { model, effort } = result.data ?? {};
-  if (!MODELS.includes(model) || !['none', ...EFFORTS].includes(effort)) return { ok: false, error: `the router answered outside its schema: ${JSON.stringify(result.data)}` };
-  return { ok: true, model, effort, reason: result.data.reason };
+  const { model, effort, reason } = result.data ?? {};
+  // The same pairing the schema enforces, checked again: a backend without grammar support can still answer anything.
+  const fits = model === 'haiku' ? effort === 'none' : MODELS.includes(model) && EFFORTS.includes(effort);
+  if (!fits || typeof reason !== 'string' || !reason.trim()) return { ok: false, error: `the router answered outside its schema: ${JSON.stringify(result.data)}` };
+  return { ok: true, model, effort, reason: reason.replace(/\s+/g, ' ').trim() };
 }
 
 /**
  * Chooses a job's model and effort by asking the local router — every job, every retry, no exceptions.
- * Its answer is the route. A router that cannot answer, or answers something no sub-agent can run,
- * refuses the job: there is no default to fall back to. The only change made to an answer is
- * mechanical: a scout exists only on haiku, and haiku takes no effort.
+ * Its answer is the route; a router that cannot answer refuses the job, with no default to fall back
+ * to. A retry tells the router what the previous attempt ran on and how it ended. The one change made
+ * to an answer: a scout exists only on haiku.
  */
-export async function chooseRoute(db, { agent, project, task, title }) {
-  const routed = await askRouter(db, { agent, project, task, title });
+export async function chooseRoute(db, { agent, project, task, title, retryOf }) {
+  const routed = await askRouter(db, { agent, project, task, title, retryOf });
   if (!routed.ok) throw new UsageError(`the router failed: ${routed.error} — no job was created`);
-  let { model, effort } = routed;
-  let reason = `router: ${routed.reason}`;
-  if (agent === 'scout') {
-    if (model !== 'haiku' || effort !== 'none') reason += '; scout runs on haiku';
-    return { model: 'haiku', effort: 'none', reason };
-  }
-  if (model === 'haiku') {
-    if (effort !== 'none') reason += '; haiku takes no effort';
-    return { model, effort: 'none', reason };
-  }
-  // With no effort, the plain role sub-agent would run on whatever effort the session happens to have.
-  if (effort === 'none') throw new UsageError(`the router failed: it gave ${model} no effort — no job was created`);
-  return { model, effort, reason };
+  const reason = `router: ${routed.reason}`;
+  if (agent === 'scout' && routed.model !== 'haiku') return { model: 'haiku', effort: 'none', reason: `${reason}; scout runs on haiku` };
+  return { model: routed.model, effort: routed.effort, reason };
 }

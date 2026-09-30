@@ -208,7 +208,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
   // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory.
   if (pendingTurns(db, 1).length > 0) runScribe(db, { now });
 
-  const route = await chooseRoute(db, { agent, project, task, title: title.trim() });
+  const route = await chooseRoute(db, { agent, project, task, title: title.trim(), retryOf });
 
   const session = db.prepare('SELECT id FROM sessions ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1').get();
   const job = tx(db, () => {

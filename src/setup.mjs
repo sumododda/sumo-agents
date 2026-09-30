@@ -270,11 +270,17 @@ export function doctor() {
   const claude = pinnedClaude();
   check(claude !== null && existsSync(claude), 'claude CLI found (runs the cheap-model passes)', 'install Claude Code, then: mem setup', true);
 
-  const model = modelFile();
-  check(existsSync(model), `router model (${basename(model)})`, 'run: mem setup', true);
+  // Not a warning: every job is routed by it, and without an answer no job can be created.
+  const standIn = process.env.SUMO_AGENTS_MODEL_CMD;
+  if (standIn) {
+    check(true, `router stand-in (SUMO_AGENTS_MODEL_CMD=${standIn})`, '');
+  } else {
+    const model = modelFile();
+    check(existsSync(model), `router model (${basename(model)})`, 'run: mem setup');
 
-  const llama = pinnedLlama();
-  check(llama !== null && existsSync(llama), 'llama-server found (runs the router model)', 'brew install llama.cpp, then: mem setup', true);
+    const llama = pinnedLlama();
+    check(llama !== null && existsSync(llama), 'llama-server found (runs the router model)', 'brew install llama.cpp, then: mem setup');
+  }
 
   return checks;
 }

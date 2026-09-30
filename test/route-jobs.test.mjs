@@ -103,6 +103,10 @@ test('retry asks the router again — no ladder — and carries the old attempt 
   assert.match(retried.out, /start it with the worker-medium sub-agent and exactly this prompt:/);
   assert.match(retried.out, /JOB: run `mem job brief 2` and follow it exactly\./);
   assert.equal(s.sql((db) => db.prepare('SELECT retry_of FROM jobs WHERE id = 2').get().retry_of), 1);
+  // The router is told what it is retrying, or it would hand back the route that just failed.
+  const shown = s.modelWasShown().prompt;
+  assert.match(shown, /^retry of j1: it ran on sonnet\/low and failed$/m);
+  assert.match(shown, /^sonnet\/low: 1 job, 0 done, 1 failed, 0 reviewed$/m);
 
   const brief = s.mem(['job', 'brief', '2']).out;
   assert.match(brief, /^## Goal\nMake the thing return 2\./m);
@@ -200,6 +204,7 @@ test('a retried reviewer still reviews the job the original was pointed at', () 
 
   const retried = s.mem(['job', 'retry', '2']);
   assert.equal(retried.code, 0, retried.err);
+  assert.match(s.modelWasShown().prompt, /^retry of j2: it ran on opus\/high and failed$/m);
   assert.deepEqual(JSON.parse(readFileSync(join(s.home, 'jobs', '3', 'reviews.json'), 'utf8')), { reviews: 1 });
   assert.match(s.mem(['job', 'brief', '3']).out, /What was asked: .*jobs\/1\/brief\.md/);
 });
@@ -207,7 +212,7 @@ test('a retried reviewer still reviews the job the original was pointed at', () 
 test('an effort of none names the plain role sub-agent, never worker-none', () => {
   const s = sandbox();
   gitProject(s);
-  s.routerWillSay('haiku', 'medium');
+  s.routerWillSay('haiku', 'none');
   const created = s.mem(['job', 'new', '--project', 'routeproj', '--title', 'return 2'], { input: TASK });
   assert.equal(created.code, 0, created.err);
   assert.match(created.out, /^route: haiku\/none/m);
