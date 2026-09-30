@@ -230,10 +230,13 @@ export function scribeStatus(db) {
 export function modelStats(db) {
   const rows = db
     .prepare(
-      `SELECT kind, COUNT(*) AS runs, SUM(ok) AS ok, SUM(input_tokens) AS input, SUM(output_tokens) AS output, SUM(cost_usd) AS cost
+      `SELECT kind, COUNT(*) AS runs, SUM(ok) AS ok, SUM(input_tokens) AS input, SUM(output_tokens) AS output, SUM(cost_usd) AS cost,
+              SUM(cache_read_tokens) AS cache_read, SUM(cache_creation_tokens) AS cache_write
        FROM model_runs GROUP BY kind ORDER BY kind`,
     )
     .all();
   if (rows.length === 0) return ['no cheap-model runs yet'];
-  return rows.map((r) => `${r.kind}: ${r.runs} runs (${r.ok} ok) · ${r.input} tokens in · ${r.output} out · $${(r.cost ?? 0).toFixed(4)}`);
+  return rows.map(
+    (r) => `${r.kind}: ${r.runs} runs (${r.ok} ok) · ${r.input} tokens in · ${r.output} out · $${(r.cost ?? 0).toFixed(4)} · cache ${r.cache_read ?? 0} read · ${r.cache_write ?? 0} written`,
+  );
 }

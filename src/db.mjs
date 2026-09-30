@@ -6,7 +6,8 @@ import { paths } from './paths.mjs';
 /**
  * One entry per schema version, applied in order and never edited once shipped.
  * Each phase of the plan adds its own tables here rather than the first one
- * guessing at all of them.
+ * guessing at all of them. An entry is SQL, or a function of the database for a
+ * step plain SQL cannot make re-runnable (see addColumnsIfMissing).
  */
 const MIGRATIONS = [
   `
@@ -219,7 +220,30 @@ const MIGRATIONS = [
   ALTER TABLE jobs ADD COLUMN important INTEGER;
   ALTER TABLE jobs ADD COLUMN retry_of INTEGER REFERENCES jobs(id) ON DELETE SET NULL;
   `,
+
+  // 7 — the ledger splits cached input from fresh and names the job and session a call belonged to.
+  // All nullable: a row from before this migration, or a backend that reports no cache, reads as NULL.
+  // job_id has no REFERENCES on purpose: the ledger outlives the jobs it counts.
+  (db) => addColumnsIfMissing(db, 'model_runs', [
+    'cache_read_tokens INTEGER',
+    'cache_creation_tokens INTEGER',
+    'job_id INTEGER',
+    'session_id TEXT',
+  ]),
 ];
+
+/**
+ * ALTER TABLE … ADD COLUMN for each definition whose column the table does not have yet, so a
+ * migration that only adds columns can be re-run against any shape of the table — a half-applied
+ * upgrade, or a database whose user_version was lowered without undoing what came after it.
+ * Every ADD COLUMN migration goes through here.
+ */
+function addColumnsIfMissing(db, table, defs) {
+  const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+  for (const def of defs) {
+    if (!have.has(def.split(/\s+/)[0])) db.exec(`ALTER TABLE ${table} ADD COLUMN ${def}`);
+  }
+}
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -240,7 +264,8 @@ export function schemaVersion(db) {
 function migrate(db) {
   for (let v = schemaVersion(db); v < MIGRATIONS.length; v++) {
     tx(db, () => {
-      db.exec(MIGRATIONS[v]);
+      if (typeof MIGRATIONS[v] === 'function') MIGRATIONS[v](db);
+      else db.exec(MIGRATIONS[v]);
       db.exec(`PRAGMA user_version = ${v + 1}`);
     });
   }

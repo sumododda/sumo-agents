@@ -37,10 +37,15 @@ function envelopeToResult(run, command) {
     return failure(`unreadable answer (exit ${run.status}): ${(run.stderr || run.stdout).slice(0, 300)}`);
   }
 
+  // inputTokens stays the total; the cache split rides beside it, null when the envelope does not report it.
+  const cacheReadTokens = envelope.usage?.cache_read_input_tokens ?? null;
+  const cacheCreationTokens = envelope.usage?.cache_creation_input_tokens ?? null;
   const usage = {
-    inputTokens: (envelope.usage?.input_tokens ?? 0) + (envelope.usage?.cache_read_input_tokens ?? 0) + (envelope.usage?.cache_creation_input_tokens ?? 0),
+    inputTokens: (envelope.usage?.input_tokens ?? 0) + (cacheReadTokens ?? 0) + (cacheCreationTokens ?? 0),
     outputTokens: envelope.usage?.output_tokens ?? 0,
     costUsd: envelope.total_cost_usd ?? 0,
+    cacheReadTokens,
+    cacheCreationTokens,
   };
   if (envelope.is_error) return { ...failure(`model call failed: ${String(envelope.result ?? envelope.subtype).slice(0, 300)}`), usage };
 
@@ -211,6 +216,8 @@ export async function callLocalModel(db, { system, prompt, schema }) {
       inputTokens: body.usage?.prompt_tokens ?? 0,
       outputTokens: body.usage?.completion_tokens ?? 0,
       costUsd: 0,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
     };
     const result = { ok: true, data, usage, error: null };
     log(result);
@@ -225,13 +232,21 @@ export async function callLocalModel(db, { system, prompt, schema }) {
 }
 
 function failure(error) {
-  return { ok: false, data: null, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 }, error };
+  return { ok: false, data: null, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0, cacheReadTokens: null, cacheCreationTokens: null }, error };
 }
 
-/** The one `model_runs` row every cheap-model call leaves behind, whichever backend answered it. */
-export function logRun(db, { kind, model, result, note, now }) {
-  db.prepare('INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+/**
+ * The one `model_runs` row every cheap-model call leaves behind, whichever backend answered it.
+ * The cache split comes from result.usage and the job and session from the options; any of them
+ * missing is written as NULL.
+ */
+export function logRun(db, { kind, model, result, note, now, jobId = null, sessionId = null }) {
+  db.prepare(
+    `INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, note, cache_read_tokens, cache_creation_tokens, job_id, session_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
     now, kind, model, result.usage.inputTokens, result.usage.outputTokens, result.usage.costUsd, result.ok ? 1 : 0, note,
+    result.usage.cacheReadTokens ?? null, result.usage.cacheCreationTokens ?? null, jobId, sessionId,
   );
   mkdirSync(paths().logs, { recursive: true, mode: 0o700 });
   appendFileSync(
