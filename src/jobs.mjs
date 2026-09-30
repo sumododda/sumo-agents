@@ -206,7 +206,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
   const judged = agent === 'reviewer' ? changeToJudge(db, { project, reviews }) : null;
 
   // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory.
-  if (pendingTurns(db, 1).length > 0) runScribe(db, { now });
+  if (pendingTurns(db, 1).length > 0) await runScribe(db, { now });
 
   const route = await chooseRoute(db, { agent, project, task, title: title.trim(), retryOf });
 

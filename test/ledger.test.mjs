@@ -82,7 +82,7 @@ test('logRun writes the cache split, job and session, and NULL for whichever is 
   });
 });
 
-test('the Claude Code envelope keeps inputTokens as the total and carries the cache split beside it', async () => {
+test('the stand-in envelope keeps inputTokens as the total and carries the cache split beside it', async () => {
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-model-cache-'));
   const answerFile = join(root, 'answer.json');
   const answer = (u) => writeFileSync(answerFile, JSON.stringify({ is_error: false, result: '', structured_output: { ok: 1 }, usage: u, total_cost_usd: 0.002 }));
@@ -93,13 +93,13 @@ test('the Claude Code envelope keeps inputTokens as the total and carries the ca
       const ask = () => callModel(db, { system: 's', prompt: 'p', schema: { type: 'object' }, model: 'haiku' });
 
       answer({ input_tokens: 10, cache_read_input_tokens: 3000, cache_creation_input_tokens: 200, output_tokens: 5 });
-      const cached = ask();
+      const cached = await ask();
       assert.equal(cached.ok, true, cached.error ?? '');
       assert.deepEqual(Object.keys(cached).sort(), ['data', 'error', 'ok', 'usage']);
       assert.deepEqual(cached.usage, { inputTokens: 3210, outputTokens: 5, costUsd: 0.002, cacheReadTokens: 3000, cacheCreationTokens: 200 });
 
       answer({ input_tokens: 10, output_tokens: 5 });
-      assert.deepEqual(ask().usage, { inputTokens: 10, outputTokens: 5, costUsd: 0.002, cacheReadTokens: null, cacheCreationTokens: null });
+      assert.deepEqual((await ask()).usage, { inputTokens: 10, outputTokens: 5, costUsd: 0.002, cacheReadTokens: null, cacheCreationTokens: null });
     } finally {
       db.close();
     }

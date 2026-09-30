@@ -24,7 +24,6 @@ export function sandbox() {
     STUB_CAPTURE: modelSaw,
     STUB_ROUTER_ANSWER: routerAnswer,
   };
-  delete env.SUMO_AGENTS_SCRIBE;
 
   /** Runs `mem` exactly as a user would. Never throws: exit code and streams come back for asserting on. */
   const mem = (args, { input, extraEnv } = {}) => {

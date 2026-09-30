@@ -9,10 +9,12 @@ never committed — a work laptop and a personal one learn separately.
 
 ## Set up a machine
 
-Needs Node 22.13+, Claude Code, and llama.cpp (`brew install llama.cpp`) for the local router model.
+Needs Node 22.13+, Claude Code, an `ANTHROPIC_API_KEY` in the environment (the background memory passes call the
+API directly), and llama.cpp (`brew install llama.cpp`) for the local router model.
 
 ```sh
 git clone <this repo> ~/sumo-agents && cd ~/sumo-agents
+npm install                # the one dependency: the Anthropic SDK
 node bin/mem.mjs setup     # creates ~/.sumo-agents, links `mem` into a directory on your PATH
 mem doctor                 # every line should say ok
 claude                     # open it here. Approve the project hooks once when asked.
@@ -264,7 +266,8 @@ running something are checked by running something.
 
 ## What it costs
 
-Measured on this machine, Claude Code 2.1, Haiku 4.5, subscription login:
+Measured on this machine while the passes still ran through Claude Code 2.1 (Haiku 4.5, subscription login);
+they now call the API directly, and `mem scribe stats` shows what that costs:
 
 - One scribe call: about 4,300 tokens in, 300–600 out, **$0.011–0.013**, 4–8 s, in the background.
 - 30 labelled turns over six conversations: **$0.07**. It remembered 16 of 16 things it should, put
@@ -289,7 +292,7 @@ node probes/scope-accuracy.mjs        # live: real model, about 7 cents
 AGENTS.md            the only always-loaded instructions (CLAUDE.md just imports it)
 guides/              read on demand: memory · projects · workflows · delegation · fix · feature · review
 prompts/             system prompts for the scribe and dream passes
-bin/mem.mjs  src/    the `mem` CLI — Node, zero dependencies, SQLite full-text search
+bin/mem.mjs  src/    the `mem` CLI — Node, one dependency (the Anthropic SDK), SQLite full-text search
 .claude/             hooks, the `mem` permission, the agents (scout · worker and reviewer at each effort), /dream /fix /feature /review
 src/route.mjs        how a job's model and effort are chosen: the router, and the stats
 test/  probes/       the suite, and the live measurement

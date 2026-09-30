@@ -43,15 +43,15 @@ function buildBundle(db, sessions) {
   return { prompt, turns: new Map(turns.map((t) => [t.id, t])) };
 }
 
-export function runDream(db, { now = new Date().toISOString(), force = false } = {}) {
+export async function runDream(db, { now = new Date().toISOString(), force = false } = {}) {
   // Anything still unfiled belongs to the writer first; consolidation reads its results.
-  runScribe(db, { now });
+  await runScribe(db, { now });
 
-  return withLock('dream', () => {
+  return withLock('dream', async () => {
     const sessions = sessionsAwaitingDream(db, now, MAX_SESSIONS, { includeOpen: force });
     if (sessions.length === 0) return { skipped: 'no finished sessions are waiting' };
 
-    const outcome = askAndApply(db, {
+    const outcome = await askAndApply(db, {
       kind: 'dream', promptFile: 'dream.md', bundle: buildBundle(db, sessions),
       ops: ['add', 'supersede', 'gotcha', 'checkpoint', 'contradiction', 'procedure'], sessionId: null, now,
     });

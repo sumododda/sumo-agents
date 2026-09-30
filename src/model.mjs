@@ -1,3 +1,5 @@
+import Anthropic from '@anthropic-ai/sdk';
+import { jsonSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/json-schema';
 import { spawn, spawnSync } from 'node:child_process';
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
 import { createServer } from 'node:net';
@@ -7,27 +9,68 @@ import { paths } from './paths.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 
 const TIMEOUT_MS = 180_000;
-const MAX_SPEND_USD = '0.25';
 const HEALTH_TIMEOUT_MS = 60_000;
 const HEALTH_POLL_MS = 250;
 // Room for a schema'd answer with a sentence of reasoning; a small model cut off mid-string is unparseable JSON.
 const MAX_ANSWER_TOKENS = 400;
+// A scribe pass answers with a list of operations; a longer one than this is the model rambling, not remembering.
+const MAX_API_ANSWER_TOKENS = 4096;
 
-/** The path setup pinned, unless it has since vanished — then whatever PATH offers, which may still be nothing. */
-function pinnedOrOnPath(db) {
-  const pinned = getMeta(db, 'claude.path');
-  if (pinned) {
-    try {
-      accessSync(pinned, constants.X_OK);
-      return pinned;
-    } catch {
-      // Pinned before a reinstall or a move; fall through.
-    }
-  }
-  return 'claude';
+/** The short names the router and `mem config` use, and the API model each one means. */
+export const MODEL_IDS = {
+  haiku: 'claude-haiku-4-5',
+  sonnet: 'claude-sonnet-5-5',
+  opus: 'claude-opus-5-5',
+  fable: 'claude-fable-5-1',
+};
+
+/** US dollars per million tokens: input, output, and what a cache read costs relative to input. */
+const PRICES = {
+  'claude-haiku-4-5': { input: 1, output: 5, cacheRead: 0.1 },
+  'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.1 },
+  'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.05 },
+  'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.025 },
+};
+const CACHE_WRITE = 1.25;
+
+export const modelId = (model) => MODEL_IDS[model] ?? model;
+
+/** What one response cost, from its usage and the price list; 0 for a model the list does not know. */
+export function costOf(model, usage) {
+  const price = PRICES[modelId(model)];
+  if (!price) return 0;
+  const plain = usage.input_tokens ?? 0;
+  const read = usage.cache_read_input_tokens ?? 0;
+  const written = usage.cache_creation_input_tokens ?? 0;
+  const out = usage.output_tokens ?? 0;
+  return (plain * price.input + read * price.input * price.cacheRead + written * price.input * CACHE_WRITE + out * price.output) / 1_000_000;
 }
 
-/** Claude Code's own JSON envelope, whichever binary produced it, turned into the shape every caller gets back. */
+/** The request one cheap-model call sends: a frozen system prompt, the bundle as the one user turn, the answer shape enforced by the API. */
+export function requestFor({ system, prompt, schema, model }) {
+  return {
+    model: modelId(model),
+    max_tokens: MAX_API_ANSWER_TOKENS,
+    system,
+    messages: [{ role: 'user', content: prompt }],
+    output_config: { format: jsonSchemaOutputFormat(schema) },
+  };
+}
+
+/** The usage of an API response in the shape every caller gets back: inputTokens is the total, the cache split rides beside it. */
+function usageOf(model, usage) {
+  const cacheReadTokens = usage?.cache_read_input_tokens ?? null;
+  const cacheCreationTokens = usage?.cache_creation_input_tokens ?? null;
+  return {
+    inputTokens: (usage?.input_tokens ?? 0) + (cacheReadTokens ?? 0) + (cacheCreationTokens ?? 0),
+    outputTokens: usage?.output_tokens ?? 0,
+    costUsd: costOf(model, usage ?? {}),
+    cacheReadTokens,
+    cacheCreationTokens,
+  };
+}
+
+/** The stand-in's JSON envelope (the shape Claude Code printed, kept so recorded answers still replay), turned into a result. */
 function envelopeToResult(run, command) {
   if (run.error) return failure(`could not run ${command}: ${run.error.message}`);
   let envelope;
@@ -37,16 +80,7 @@ function envelopeToResult(run, command) {
     return failure(`unreadable answer (exit ${run.status}): ${(run.stderr || run.stdout).slice(0, 300)}`);
   }
 
-  // inputTokens stays the total; the cache split rides beside it, null when the envelope does not report it.
-  const cacheReadTokens = envelope.usage?.cache_read_input_tokens ?? null;
-  const cacheCreationTokens = envelope.usage?.cache_creation_input_tokens ?? null;
-  const usage = {
-    inputTokens: (envelope.usage?.input_tokens ?? 0) + (cacheReadTokens ?? 0) + (cacheCreationTokens ?? 0),
-    outputTokens: envelope.usage?.output_tokens ?? 0,
-    costUsd: envelope.total_cost_usd ?? 0,
-    cacheReadTokens,
-    cacheCreationTokens,
-  };
+  const usage = { ...usageOf(null, envelope.usage), costUsd: envelope.total_cost_usd ?? 0 };
   if (envelope.is_error) return { ...failure(`model call failed: ${String(envelope.result ?? envelope.subtype).slice(0, 300)}`), usage };
 
   let data = envelope.structured_output;
@@ -60,49 +94,50 @@ function envelopeToResult(run, command) {
   return { ok: true, data, usage, error: null };
 }
 
+/** What went wrong with an API call, in one line a person can act on. */
+function describe(cause) {
+  if (cause instanceof Anthropic.AuthenticationError) return 'ANTHROPIC_API_KEY is missing or invalid — export it in the shell that runs mem';
+  if (cause instanceof Anthropic.RateLimitError) return 'the API is rate-limiting this key — try again in a minute';
+  if (cause instanceof Anthropic.APIError) return `the API answered ${cause.status ?? 'an error'}: ${String(cause.message).slice(0, 300)}`;
+  return String(cause?.message ?? cause).slice(0, 300);
+}
+
 /**
  * One call to the cheap model, outside any conversation.
  *
- * It runs Claude Code headless with its tools off, its system prompt replaced
- * and the user's own hooks skipped, from an empty directory — so it loads no
- * project instructions, cannot touch anything, and costs a few thousand tokens
- * instead of a session's worth. SUMO_AGENTS_SCRIBE marks the process so this
- * repo's hooks ignore it: the call must never be recorded as something the
- * user said, or trigger another call.
+ * It goes straight to the Messages API with the key in ANTHROPIC_API_KEY: a
+ * system prompt, one user turn, and a JSON schema the API itself enforces on
+ * the answer. No tools, no thinking, nothing loaded from disk — so it costs the
+ * prompt and the answer, and nothing else.
  *
- * SUMO_AGENTS_MODEL_CMD swaps the binary for a stand-in that reads the same
- * request and prints the same envelope; the tests use it to replay recorded
- * answers without spending anything.
+ * SUMO_AGENTS_MODEL_CMD swaps the call for a stand-in that reads the same
+ * request and prints a recorded envelope; the tests use it to replay answers
+ * without spending anything.
  */
-export function callModel(db, { system, prompt, schema, model }) {
-  const cwd = join(paths().home, 'scribe');
-  mkdirSync(cwd, { recursive: true, mode: 0o700 });
-
+export async function callModel(db, { system, prompt, schema, model }) {
   const standIn = process.env.SUMO_AGENTS_MODEL_CMD;
-  const command = standIn ?? pinnedOrOnPath(db);
-  const args = standIn
-    ? []
-    : [
-        '-p', '--model', model, '--tools', '', '--setting-sources', 'project', '--no-session-persistence',
-        '--output-format', 'json', '--max-budget-usd', MAX_SPEND_USD,
-        '--system-prompt', system, '--json-schema', JSON.stringify(schema),
-      ];
-  const input = standIn ? JSON.stringify({ system, prompt, schema, model }) : prompt;
+  if (standIn) {
+    const run = spawnSync(standIn, [], {
+      input: JSON.stringify({ system, prompt, schema, model }),
+      encoding: 'utf8',
+      timeout: TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return envelopeToResult(run, standIn);
+  }
 
-  const run = spawnSync(command, args, {
-    cwd,
-    input,
-    encoding: 'utf8',
-    timeout: TIMEOUT_MS,
-    maxBuffer: 16 * 1024 * 1024,
-    // Extended thinking is off on purpose. Measured on the same input it took 6,426 output tokens and 65 s
-    // to find 2 memories; without it, 479 tokens and 4 s to find 5. Labelling text is not a reasoning task.
-    env: { ...process.env, SUMO_AGENTS_SCRIBE: '1', MAX_THINKING_TOKENS: '0' },
-  });
-
-  return envelopeToResult(run, command);
+  try {
+    const client = new Anthropic({ timeout: TIMEOUT_MS });
+    const response = await client.messages.parse(requestFor({ system, prompt, schema, model }));
+    const usage = usageOf(model, response.usage);
+    if (response.stop_reason === 'refusal') return { ...failure(`the model declined to answer (${response.stop_details?.category ?? 'no category'})`), usage };
+    if (response.stop_reason === 'max_tokens') return { ...failure(`the answer was cut off at ${MAX_API_ANSWER_TOKENS} tokens`), usage };
+    if (response.parsed_output === null || response.parsed_output === undefined) return { ...failure('the answer was not the JSON that was asked for'), usage };
+    return { ok: true, data: response.parsed_output, usage, error: null };
+  } catch (cause) {
+    return failure(describe(cause));
+  }
 }
-
 /** A TCP port nothing is listening on yet, for llama-server to bind to. */
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -136,7 +171,7 @@ async function waitForHealth(port, dead, deadlineMs = HEALTH_TIMEOUT_MS) {
 }
 
 /**
- * One call to the router model, run locally through llama-server instead of Claude Code.
+ * One call to the router model, run locally through llama-server instead of the API.
  * Same envelope as callModel ({ ok, data, usage, error }), so a caller cannot tell which
  * backend answered. Async, because there is no synchronous way to poll a health endpoint
  * or stream a chat completion without blocking the event loop; the stand-in path below

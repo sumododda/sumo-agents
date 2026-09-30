@@ -374,8 +374,8 @@ function outcomeLines(outcome) {
   ];
 }
 
-function runScribeCommand(db, { args }) {
-  if (args[0] === 'run') return outcomeLines(runScribe(db));
+async function runScribeCommand(db, { args }) {
+  if (args[0] === 'run') return outcomeLines(await runScribe(db));
   if (args[0] === 'status') return scribeStatus(db);
   if (args[0] === 'stats') return modelStats(db);
   // Exactly what the cheap model would be sent right now — nothing about the writer is hidden from the user.
@@ -383,8 +383,8 @@ function runScribeCommand(db, { args }) {
   throw new UsageError(`usage: ${USAGE.scribe}`);
 }
 
-function runDreamCommand(db, { args }) {
-  if (args[0] === 'run') return outcomeLines(runDream(db, { force: true }));
+async function runDreamCommand(db, { args }) {
+  if (args[0] === 'run') return outcomeLines(await runDream(db, { force: true }));
   if (args[0] === 'status') return dreamStatus(db);
   throw new UsageError(`usage: ${USAGE.dream}`);
 }

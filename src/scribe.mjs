@@ -56,7 +56,7 @@ export function spawnDetached(args) {
 }
 
 /** One writer at a time. A lock older than five minutes belongs to a run that died. */
-export function withLock(name, fn) {
+export async function withLock(name, fn) {
   const file = join(paths().home, `${name}.lock`);
   try {
     if (Date.now() - statSync(file).mtimeMs > LOCK_STALE_MS) rmSync(file);
@@ -71,7 +71,7 @@ export function withLock(name, fn) {
   }
   try {
     writeSync(fd, String(process.pid));
-    return fn();
+    return await fn();
   } finally {
     closeSync(fd);
     rmSync(file, { force: true });
@@ -92,9 +92,9 @@ export function knownProjectsLine(db) {
 export function opsSchema(db, ops) {
   const slugs = projectEnum(db);
   const properties = {
-    op: { enum: ops },
-    type: { enum: ['preference', 'fact', 'decision'] },
-    scope: { enum: ['global', ...slugs.map((s) => `project:${s}`)] },
+    op: { type: 'string', enum: ops },
+    type: { type: 'string', enum: ['preference', 'fact', 'decision'] },
+    scope: { type: 'string', enum: ['global', ...slugs.map((s) => `project:${s}`)] },
     topic: { type: 'string', description: 'one lowercase word: git, testing, style, writing, tooling, deploy…' },
     body: { type: 'string', description: 'one plain sentence, written as a standing fact or rule' },
     turn: { type: 'integer', description: 'the number from the [tN] tag of the user turn this came from' },
@@ -107,7 +107,7 @@ export function opsSchema(db, ops) {
     title: { type: 'string' },
     cue: { type: 'string' },
   };
-  if (slugs.length > 0) properties.project = { enum: slugs };
+  if (slugs.length > 0) properties.project = { type: 'string', enum: slugs };
   return { type: 'object', properties: { ops: { type: 'array', items: { type: 'object', properties, required: ['op'] } } }, required: ['ops'] };
 }
 
@@ -167,10 +167,10 @@ export function buildBundle(db) {
 }
 
 /** Shared by the writer and the consolidation pass: ask, validate, record what it cost. */
-export function askAndApply(db, { kind, promptFile, bundle, ops, sessionId, now }) {
+export async function askAndApply(db, { kind, promptFile, bundle, ops, sessionId, now }) {
   const model = getMeta(db, `config.${kind}.model`) ?? CONFIG_DEFAULTS[`${kind}.model`];
   const system = readFileSync(join(REPO_ROOT, 'prompts', promptFile), 'utf8').trim();
-  const result = callModel(db, { system, prompt: bundle.prompt, schema: opsSchema(db, ops), model });
+  const result = await callModel(db, { system, prompt: bundle.prompt, schema: opsSchema(db, ops), model });
 
   if (!result.ok) {
     logRun(db, { kind, model, result, note: result.error, now });
@@ -192,15 +192,15 @@ export function askAndApply(db, { kind, promptFile, bundle, ops, sessionId, now 
  * Files what was said since the last run. Turns are marked done only after the
  * answer was applied, so a failed call costs nothing but a retry.
  */
-export function runScribe(db, { now = new Date().toISOString() } = {}) {
+export async function runScribe(db, { now = new Date().toISOString() } = {}) {
   if ((getMeta(db, 'config.scribe.model') ?? CONFIG_DEFAULTS['scribe.model']) === 'off') return { skipped: 'scribe.model is off' };
 
-  return withLock('scribe', () => {
+  return withLock('scribe', async () => {
     const bundle = buildBundle(db);
     if (!bundle) return { skipped: 'nothing new was said' };
 
     const sessions = new Set([...bundle.turns.values()].map((t) => t.session_id));
-    const outcome = askAndApply(db, {
+    const outcome = await askAndApply(db, {
       kind: 'scribe', promptFile: 'scribe.md', bundle, ops: ['add', 'supersede', 'gotcha', 'checkpoint'],
       sessionId: sessions.size === 1 ? [...sessions][0] : null, now,
     });

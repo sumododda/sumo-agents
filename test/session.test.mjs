@@ -89,18 +89,6 @@ test('the writer is woken at once by a standing instruction, and otherwise only 
   assert.notEqual(s.sql((db) => db.prepare('SELECT ended_at FROM sessions').get().ended_at), null);
 });
 
-test('the cheap-model run is invisible to the hooks, so it can never record itself or wake itself', () => {
-  const s = sandbox();
-  const quiet = { SUMO_AGENTS_SCRIBE: '1' };
-  assert.equal(s.hook('session-start', SESSION, quiet).out, '');
-  s.hook('prompt', { ...SESSION, prompt: 'always remember this extraction prompt' }, quiet);
-  s.hook('stop', SESSION, quiet);
-
-  s.mem(['config']);
-  assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM user_turns').get().n), 0);
-  assert.deepEqual(s.spawned(), []);
-});
-
 test('a broken memory never breaks the session: hooks exit 0, print nothing, and leave a log', () => {
   const s = sandbox();
   mkdirSync(s.home, { recursive: true });

@@ -217,9 +217,6 @@ const HANDLERS = {
  * without this hook's contribution.
  */
 export function runHook(event, harness, stdin) {
-  // The cheap-model call is itself a Claude Code run; without this its prompt
-  // would be recorded as something the user said and would trigger another call.
-  if (process.env.SUMO_AGENTS_SCRIBE === '1') return '';
   let db = null;
   try {
     const handler = HANDLERS[event];

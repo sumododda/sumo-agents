@@ -172,11 +172,7 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
   const db = openDb();
   chmodSync(p.db, 0o600);
   if (!getMeta(db, 'machine')) setMeta(db, 'machine', hostname().replace(/\.local$/, ''));
-  // Pinned for the same reason the launcher pins node: the background passes run where PATH cannot be trusted.
-  // The PATH entry itself, not what it resolves to: Claude Code's updater repoints that symlink and deletes
-  // the old version folder, so a resolved path stops existing at the next update.
-  const claude = commandOnPath('claude');
-  if (claude) setMeta(db, 'claude.path', claude);
+  // Pinned for the same reason the launcher pins node: the router runs where PATH cannot be trusted.
   const llama = commandOnPath('llama-server');
   if (llama) setMeta(db, 'llama.path', llama);
 
@@ -267,8 +263,9 @@ export function doctor() {
   const ours = found !== null && existsSync(p.launcher) && realpathSync(found) === realpathSync(p.launcher);
   check(ours, '`mem` on PATH is this one', found ? `PATH finds ${found} instead` : 'run: mem setup');
 
-  const claude = pinnedClaude();
-  check(claude !== null && existsSync(claude), 'claude CLI found (runs the cheap-model passes)', 'install Claude Code, then: mem setup', true);
+  // The cheap-model passes (scribe, dream) go straight to the API; without a key they fail quietly in the background.
+  const standInKey = Boolean(process.env.SUMO_AGENTS_MODEL_CMD);
+  check(standInKey || Boolean(process.env.ANTHROPIC_API_KEY), 'ANTHROPIC_API_KEY is set (runs the cheap-model passes)', 'export ANTHROPIC_API_KEY in the shell that starts sessions and hooks');
 
   // Not a warning: every job is routed by it, and without an answer no job can be created.
   const standIn = process.env.SUMO_AGENTS_MODEL_CMD;
@@ -290,15 +287,6 @@ function codeVersion() {
     return execFileSync('git', ['-C', REPO_ROOT, 'log', '-1', '--format=%h · %cs · %s'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
   } catch {
     return null;
-  }
-}
-
-function pinnedClaude() {
-  const db = openDb();
-  try {
-    return getMeta(db, 'claude.path') ?? commandOnPath('claude');
-  } finally {
-    db.close();
   }
 }
 
