@@ -95,6 +95,11 @@ a written brief (`mem job new`). All three refuse to start without a job:
 | `worker` | chosen per job by the router | yes | building and fixing |
 | `reviewer` | chosen per job by the router | no | judging a change it did not write |
 
+A job can also run outside Claude Code: `mem job run <id>` runs it in Sumo's own loop against the
+Anthropic API on the route the router chose, with two tools (a shell and a file editor), the same
+guard, a path jail around the project, capped tool output, secrets kept out of the tool environment,
+and one ledger row per model response (`mem scribe stats`). The job closes itself the way its brief says.
+
 A blocked sub-agent asks; the main agent checks memory before it asks you. Briefs, notes, answers,
 reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today can be picked up
 tomorrow. One worker per project at a time — they share a working tree, and `mem job new` says so when

@@ -6,6 +6,7 @@ import { openDb } from './db.mjs';
 import { dreamStatus, runDream } from './dream.mjs';
 import { backup, exportJson, exportMarkdown } from './export.mjs';
 import { runHook } from './hooks.mjs';
+import { runJob as runJobLoop, runLines } from './loop.mjs';
 import * as jobs from './jobs.mjs';
 import * as memory from './memory.mjs';
 import { UsageError } from './memory.mjs';
@@ -73,6 +74,7 @@ mem project show <name> | list [--all] | rescan <name> | alias <name> <alias> | 
         [--reviews <id>]                 reviewer: judge that job's change (default: what is uncommitted)
         [--tests-may-change]             worker: this task is allowed to edit tests that already exist
 mem job brief|show|abandon <id>
+mem job run <id>             runs the job here, in Sumo's own loop, on its route; it closes itself as its brief says
 mem job note|ask|answer <id>                                    (text on stdin)
 mem job baseline <id>        the project's checks, before the work
 mem job verify <id>          the same checks now, judged against the baseline
@@ -314,13 +316,16 @@ async function runJob(db, { args, flags }) {
     const { job, warnings } = await jobs.retry(db, jobs.parseJobId(rawId));
     return createdLines(job, warnings);
   }
-  if (!['brief', 'note', 'ask', 'answer', 'finish', 'show', 'abandon', 'baseline', 'verify', 'changes'].includes(sub)) {
+  if (!['brief', 'note', 'ask', 'answer', 'finish', 'show', 'abandon', 'baseline', 'verify', 'changes', 'run'].includes(sub)) {
     throw new UsageError(`usage: ${USAGE.job}`);
   }
   const id = jobs.parseJobId(rawId);
   switch (sub) {
     case 'brief':
       return [jobs.brief(db, id)];
+    case 'run':
+      // The job runs here, in Sumo's own loop, on the route the router chose; it closes itself the way its brief says.
+      return runLines(await runJobLoop(db, id));
     case 'show':
       return [jobs.show(db, id)];
     case 'note':

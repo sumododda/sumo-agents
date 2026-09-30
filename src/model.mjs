@@ -18,7 +18,7 @@ const MAX_API_ANSWER_TOKENS = 4096;
 
 /** The short names the router and `mem config` use, and the API model each one means. */
 export const MODEL_IDS = {
-  haiku: 'claude-haiku-4-5',
+  haiku: 'claude-haiku-4-5-20251001',
   sonnet: 'claude-sonnet-5-5',
   opus: 'claude-opus-5-5',
   fable: 'claude-fable-5-1',
@@ -26,7 +26,7 @@ export const MODEL_IDS = {
 
 /** US dollars per million tokens: input, output, and what a cache read costs relative to input. */
 const PRICES = {
-  'claude-haiku-4-5': { input: 1, output: 5, cacheRead: 0.1 },
+  'claude-haiku-4-5-20251001': { input: 1, output: 5, cacheRead: 0.1 },
   'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.1 },
   'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.05 },
   'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.025 },
@@ -58,7 +58,7 @@ export function requestFor({ system, prompt, schema, model }) {
 }
 
 /** The usage of an API response in the shape every caller gets back: inputTokens is the total, the cache split rides beside it. */
-function usageOf(model, usage) {
+export function usageOf(model, usage) {
   const cacheReadTokens = usage?.cache_read_input_tokens ?? null;
   const cacheCreationTokens = usage?.cache_creation_input_tokens ?? null;
   return {
