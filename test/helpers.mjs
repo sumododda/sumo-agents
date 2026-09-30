@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -13,6 +13,7 @@ export function sandbox() {
   const spawnLog = join(root, 'spawned.log');
   const modelAnswer = join(root, 'model-answer.json');
   const modelSaw = join(root, 'model-saw.json');
+  const routerAnswer = join(root, 'router-answer.json');
   const env = {
     ...process.env,
     SUMO_AGENTS_HOME: home,
@@ -21,6 +22,7 @@ export function sandbox() {
     SUMO_AGENTS_MODEL_CMD: join(REPO_ROOT, 'test', 'fixtures', 'model-stub.mjs'),
     STUB_ANSWER: modelAnswer,
     STUB_CAPTURE: modelSaw,
+    STUB_ROUTER_ANSWER: routerAnswer,
   };
   delete env.SUMO_AGENTS_SCRIBE;
 
@@ -67,8 +69,12 @@ export function sandbox() {
       JSON.stringify({ is_error: isError, result: isError ? 'rate limited' : '', structured_output: isError ? null : { ops }, usage: { input_tokens: 3400, output_tokens: 120 }, total_cost_usd: 0.004 }),
     );
 
+  /** What the local router will answer for every `mem job new` and `mem job retry` from here on; null makes it fail. */
+  const routerWillSay = (model, effort, reason = 'stand-in route') =>
+    model === null ? rmSync(routerAnswer, { force: true }) : writeFileSync(routerAnswer, JSON.stringify({ is_error: false, result: '', structured_output: { model, effort, reason }, usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 }));
+
   const modelWasShown = () => JSON.parse(readFileSync(modelSaw, 'utf8'));
   const spawned = () => (existsSync(spawnLog) ? readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean) : []);
 
-  return { root, home, claudeLocalSettings, mem, sql, addProject, hook, modelWillSay, modelWasShown, spawned };
+  return { root, home, claudeLocalSettings, mem, sql, addProject, hook, modelWillSay, routerWillSay, modelWasShown, spawned };
 }

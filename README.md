@@ -104,25 +104,21 @@ The model you chat with never decides this. `mem job new` does, in plain code, a
 
 ```
 created j27 [worker·sumo-agents·running] Session hygiene: context gauge …
-route: opus/xhigh — router: a new feature across hooks and sessions with tests; floor: security
+route: opus/xhigh — router: a new feature across hooks and sessions with tests
 start it with the worker-xhigh sub-agent and exactly this prompt: JOB: run `mem job brief 27` …
 ```
 
-The route is settled in this order, first match wins:
+The route is the router's answer, and nothing else's. On every `mem job new` and every `mem job retry`, a
+4B open model (Qwen3, through llama.cpp) reads the role, project, task text and the project's history —
+how each model/effort scored in past reviews — and answers with a model, an effort and one sentence. It
+runs locally, costs nothing, and takes about 1.5 s including startup. There are no flags to override it,
+no project rules, no retry ladder and no floors.
 
-1. **You named it**: `--model opus --effort high` on `mem job new`.
-2. **It is a retry**: one rung above the job it retries.
-3. **A project rule** you stated: a decision shaped `worker model opus effort high` for that project.
-4. **The router**: a 4B open model (Qwen3, through llama.cpp) reads the role, project, task text and the
-   project's history — how each model/effort scored in past reviews — and answers with a model, an
-   effort and one sentence. It runs locally, costs nothing, and takes about 1.5 s including startup.
-5. **The role default** when the router is unavailable or answers badly: Haiku, Sonnet/medium, Opus/high.
+If the router is missing, fails, or answers something no sub-agent can run (a model outside the list, or
+no effort for a model that takes one), the command exits with the error and **no job is created**. The
+only changes made to an answer are mechanical: a scout exists only on Haiku, and Haiku takes no effort.
 
-Then floors the router cannot cross, each named in the printed reason: a scout is Haiku; a reviewer is
-at least Opus/high; work that mentions credentials, payments, migrations or concurrency is at least
-Opus/xhigh; each axis is raised on its own, so a strong model never excuses low effort.
-
-Effort is real, not advisory: `worker-low` … `worker-max` and `reviewer-high` … `reviewer-max` are agent
+Effort is real, not advisory: `worker-low` … `worker-max` and `reviewer-low` … `reviewer-max` are agent
 files whose frontmatter carries the level. A hook on the Agent call rewrites its model and agent type to
 the job's route, and logs requested vs applied in the job folder, so what was chosen is what runs.
 
@@ -294,7 +290,7 @@ guides/              read on demand: memory · projects · workflows · delegati
 prompts/             system prompts for the scribe and dream passes
 bin/mem.mjs  src/    the `mem` CLI — Node, zero dependencies, SQLite full-text search
 .claude/             hooks, the `mem` permission, the agents (scout · worker and reviewer at each effort), /dream /fix /feature /review
-src/route.mjs        how a job's model and effort are chosen: precedence, floors, the ladder, the stats
+src/route.mjs        how a job's model and effort are chosen: the router, and the stats
 test/  probes/       the suite, and the live measurement
 docs/PLAN.md         the design, the evidence behind it, and what was measured while building it
 ```

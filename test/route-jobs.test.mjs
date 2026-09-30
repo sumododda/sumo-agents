@@ -25,7 +25,10 @@ function gitProject(s) {
   return { dir, write: (file, text) => writeFileSync(join(dir, file), text) };
 }
 
-const newWorker = (s, extra = []) => s.mem(['job', 'new', '--project', 'routeproj', '--title', 'return 2', '--model', 'sonnet', '--effort', 'low', ...extra], { input: TASK });
+const newWorker = (s, extra = [], route = ['sonnet', 'low']) => {
+  s.routerWillSay(...route);
+  return s.mem(['job', 'new', '--project', 'routeproj', '--title', 'return 2', ...extra], { input: TASK });
+};
 
 test('a review\'s numbered Findings become the reviewed job\'s "important", visible on show', () => {
   const s = sandbox();
@@ -34,6 +37,7 @@ test('a review\'s numbered Findings become the reviewed job\'s "important", visi
   p.write('src.js', 'export const thing = 2;\n');
   assert.equal(s.mem(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
 
+  s.routerWillSay('opus', 'high');
   s.mem(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'The thing must return 2.' });
   // A numbered decoy outside "## Findings" (here, and in "## Minor" below) must not be counted — only what is under the heading itself.
   const reviewReport = `## Summary
@@ -52,7 +56,7 @@ Nothing.
   assert.equal(s.mem(['job', 'finish', '2', '--status', 'DONE'], { input: reviewReport }).code, 0);
 
   assert.match(s.mem(['job', 'show', '1']).out, /^important: 3$/m);
-  assert.match(s.mem(['job', 'show', '1']).out, /^route: sonnet\/low — explicit sonnet\/low$/m);
+  assert.match(s.mem(['job', 'show', '1']).out, /^route: sonnet\/low — router: stand-in route$/m);
 });
 
 test('a review that finds nothing under "## Findings" stores important: 0', () => {
@@ -61,6 +65,7 @@ test('a review that finds nothing under "## Findings" stores important: 0', () =
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
   assert.equal(s.mem(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  s.routerWillSay('opus', 'high');
   s.mem(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'x' });
   const clean = '## Summary\nMatches.\n## Asked vs built\nMatches.\n## Findings\nNone.\n## Minor\nNone.\n## Could not verify\nNothing.\n';
   assert.equal(s.mem(['job', 'finish', '2', '--status', 'DONE'], { input: clean }).code, 0);
@@ -83,31 +88,55 @@ test('retry refuses a job that is still running, and one that is done without en
   assert.match(notEnough.err, /j1 is done \(important: 0\) — only a failed job/);
 });
 
-test('retry steps a failed job\'s route up the ladder, carries the old attempt forward, and refuses once there is nowhere left to go', () => {
+test('retry asks the router again — no ladder — and carries the old attempt forward', () => {
   const s = sandbox();
   gitProject(s);
   newWorker(s);
   s.mem(['job', 'note', '1'], { input: 'Tried returning 2 directly; the linter complained about an unused import.' });
   assert.equal(s.mem(['job', 'finish', '1', '--status', 'FAILED'], { input: '## Summary\nThe check never passed.\n' }).code, 0);
 
+  s.routerWillSay('opus', 'medium', 'the first attempt failed on lint');
   const retried = s.mem(['job', 'retry', '1']);
   assert.equal(retried.code, 0, retried.err);
   assert.match(retried.out, /^created j2 \[worker·proj-route·running\] return 2 \(retry of j1\)/);
-  assert.match(retried.out, /^route: sonnet\/medium — retry: stepped up from j1 sonnet\/low$/m);
+  assert.match(retried.out, /^route: opus\/medium — router: the first attempt failed on lint$/m);
   assert.match(retried.out, /start it with the worker-medium sub-agent and exactly this prompt:/);
   assert.match(retried.out, /JOB: run `mem job brief 2` and follow it exactly\./);
+  assert.equal(s.sql((db) => db.prepare('SELECT retry_of FROM jobs WHERE id = 2').get().retry_of), 1);
 
   const brief = s.mem(['job', 'brief', '2']).out;
   assert.match(brief, /^## Goal\nMake the thing return 2\./m);
   assert.match(brief, /## What the previous attempt found\n### Notes\n[\s\S]*Tried returning 2 directly/);
   assert.match(brief, /### Report\n## Summary\nThe check never passed\./);
+});
 
-  // Fail it again from the top of the ladder — nowhere left to step up to.
-  s.sql((db) => db.prepare("UPDATE jobs SET model = 'fable', effort = 'xhigh' WHERE id = 2").run());
-  assert.equal(s.mem(['job', 'finish', '2', '--status', 'FAILED'], { input: '## Summary\nStill fails.\n' }).code, 0);
-  const stuck = s.mem(['job', 'retry', '2']);
-  assert.equal(stuck.code, 2, stuck.err);
-  assert.match(stuck.err, /j2 already ran on fable\/xhigh — ask the user/);
+test('a router that fails stops job new and retry cold: exit non-zero, no job created', () => {
+  const s = sandbox();
+  gitProject(s);
+  const refused = s.mem(['job', 'new', '--project', 'routeproj', '--title', 'return 2'], { input: TASK });
+  assert.notEqual(refused.code, 0);
+  assert.match(refused.err, /the router failed: /);
+  assert.equal(refused.out, '');
+  assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM jobs').get().n), 0);
+
+  newWorker(s);
+  assert.equal(s.mem(['job', 'finish', '1', '--status', 'FAILED'], { input: '## Summary\nno.\n' }).code, 0);
+  s.routerWillSay(null);
+  const noRetry = s.mem(['job', 'retry', '1']);
+  assert.notEqual(noRetry.code, 0);
+  assert.match(noRetry.err, /the router failed: /);
+  assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM jobs').get().n), 1);
+});
+
+test('--model and --effort are gone: the router is the only one who picks', () => {
+  const s = sandbox();
+  gitProject(s);
+  s.routerWillSay('sonnet', 'low');
+  for (const flag of [['--model', 'opus'], ['--effort', 'high']]) {
+    const run = s.mem(['job', 'new', '--project', 'routeproj', '--title', 'return 2', ...flag], { input: TASK });
+    assert.equal(run.code, 2);
+    assert.match(run.err, new RegExp(`unknown option ${flag[0]}`));
+  }
 });
 
 test('mem job stats groups finished jobs by model and effort', () => {
@@ -115,7 +144,7 @@ test('mem job stats groups finished jobs by model and effort', () => {
   gitProject(s);
   newWorker(s, ['--title', 'a']);
   assert.equal(s.mem(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
-  newWorker(s, ['--title', 'b', '--model', 'opus', '--effort', 'high']);
+  newWorker(s, ['--title', 'b'], ['opus', 'high']);
   assert.equal(s.mem(['job', 'finish', '2', '--status', 'FAILED'], { input: '## Summary\nno.\n' }).code, 0);
 
   const lines = s.mem(['job', 'stats', '--project', 'routeproj']).out.trim().split('\n');
@@ -137,10 +166,12 @@ test("reviews written in this project's own format are counted: j23 scores 3 and
   assert.equal(s.mem(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
 
   // j23's findings are unnumbered paragraphs that open with <file:line>; j26's are a numbered list.
+  s.routerWillSay('opus', 'high');
   s.mem(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'x' });
   assert.equal(s.mem(['job', 'finish', '2', '--status', 'DONE'], { input: realReview('review-j23.md') }).code, 0);
   assert.match(s.mem(['job', 'show', '1']).out, /^important: 3$/m);
 
+  s.routerWillSay('opus', 'high');
   s.mem(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1 again'], { input: 'x' });
   assert.equal(s.mem(['job', 'finish', '3', '--status', 'DONE'], { input: realReview('review-j26.md') }).code, 0);
   assert.match(s.mem(['job', 'show', '1']).out, /^important: 4$/m);
@@ -152,6 +183,7 @@ test('the reviewer brief asks for findings as a numbered list', () => {
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
   assert.equal(s.mem(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  s.routerWillSay('opus', 'high');
   s.mem(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'x' });
   assert.match(s.mem(['job', 'brief', '2']).out, /## Findings\s+numbered, worst first: `1\. <file:line> —/);
 });
@@ -162,6 +194,7 @@ test('a retried reviewer still reviews the job the original was pointed at', () 
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
   assert.equal(s.mem(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  s.routerWillSay('opus', 'high');
   assert.equal(s.mem(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'x' }).code, 0);
   assert.equal(s.mem(['job', 'finish', '2', '--status', 'FAILED'], { input: '## Summary\nRan out of context.\n' }).code, 0);
 
@@ -174,7 +207,8 @@ test('a retried reviewer still reviews the job the original was pointed at', () 
 test('an effort of none names the plain role sub-agent, never worker-none', () => {
   const s = sandbox();
   gitProject(s);
-  const created = s.mem(['job', 'new', '--project', 'routeproj', '--title', 'return 2', '--model', 'haiku'], { input: TASK });
+  s.routerWillSay('haiku', 'medium');
+  const created = s.mem(['job', 'new', '--project', 'routeproj', '--title', 'return 2'], { input: TASK });
   assert.equal(created.code, 0, created.err);
   assert.match(created.out, /^route: haiku\/none/m);
   assert.match(created.out, /start it with the worker sub-agent/);

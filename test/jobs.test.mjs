@@ -30,6 +30,7 @@ function withSimba(s) {
 
 test('a brief carries the task, what memory knows about the project, and how to report — so the worker starts with its context', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const dir = withSimba(s);
 
   const created = s.mem(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm', '--agent', 'worker'], { input: TASK });
@@ -54,6 +55,7 @@ test('a brief carries the task, what memory knows about the project, and how to 
 
 test('a scout is told plainly that it cannot edit, and a task without a check is called out', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   const created = s.mem(['job', 'new', '--project', 'simba', '--title', 'where is the briefing generator', '--agent', 'scout'], { input: 'Find where briefings are rendered.' });
   assert.match(created.out, /note: the task names no check that proves the work/);
@@ -67,6 +69,7 @@ test('a scout is told plainly that it cannot edit, and a task without a check is
 
 test('a blocked worker asks, the answer is recorded, and a fresh worker in another session picks up where the first stopped', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   s.mem(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm'], { input: TASK });
 
@@ -84,6 +87,7 @@ test('a blocked worker asks, the answer is recorded, and a fresh worker in anoth
 
 test('cold restart: the brief replays the answers and the progress notes', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   s.mem(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm'], { input: TASK });
   s.mem(['job', 'note', '1'], { input: 'Converted the lockfile. CI config still references npm ci.' });
@@ -103,6 +107,7 @@ test('cold restart: the brief replays the answers and the progress notes', () =>
 
 test('finishing files the traps the worker hit — as observed gotchas in that project only — and leaves a checkpoint', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   s.mem(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm'], { input: TASK });
 
@@ -136,6 +141,7 @@ package-lock.json — removed
 
 test('a rule stated a minute ago is filed before the brief is built, so the worker gets it', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   s.hook('prompt', { session_id: 'now', prompt: 'in simba, never touch the vendored ios directory' });
   s.modelWillSay([{ op: 'add', type: 'preference', scope: 'project:proj-simba', body: 'Never touch the vendored ios directory', turn: 1, quote: 'never touch the vendored ios directory' }]);
@@ -146,6 +152,7 @@ test('a rule stated a minute ago is filed before the brief is built, so the work
 
 test('an abandoned or failed job stops being announced', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   s.mem(['job', 'new', '--project', 'simba', '--title', 'one'], { input: TASK });
   s.mem(['job', 'new', '--project', 'simba', '--title', 'two'], { input: TASK });

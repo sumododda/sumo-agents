@@ -192,10 +192,10 @@ function reviewTargetOf(id) {
  * Creates a job and its brief. The brief carries what memory knows about the
  * project, so the sub-agent starts with its context instead of spending turns
  * finding it — and the main agent's conversation never has to hold it. Its
- * model and effort are chosen by `chooseRoute` (src/route.mjs) before the row
- * is written, so every job that exists has a route.
+ * model and effort are the local router's answer (`chooseRoute`, src/route.mjs),
+ * asked before the row is written: no answer, no job.
  */
-export async function newJob(db, { project: nameOrAlias, title, agent = 'worker', task, guide: guideName, reviews, testsMayChange = false, model, effort, retryOf, now = new Date().toISOString() }) {
+export async function newJob(db, { project: nameOrAlias, title, agent = 'worker', task, guide: guideName, reviews, testsMayChange = false, retryOf, now = new Date().toISOString() }) {
   if (!AGENTS.includes(agent)) throw new UsageError(`--agent is one of: ${AGENTS.join(', ')}`);
   if (!title?.trim()) throw new UsageError('a job needs a --title');
   if (!task?.trim()) throw new UsageError('describe the task on stdin — see guides/delegation.md for the five headings');
@@ -208,7 +208,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
   // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory.
   if (pendingTurns(db, 1).length > 0) runScribe(db, { now });
 
-  const route = await chooseRoute(db, { agent, project, task, title: title.trim(), explicit: { model, effort }, retryOf });
+  const route = await chooseRoute(db, { agent, project, task, title: title.trim() });
 
   const session = db.prepare('SELECT id FROM sessions ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1').get();
   const job = tx(db, () => {
@@ -246,11 +246,10 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
 }
 
 /**
- * Retries a job one rung up the ladder: same project, same title (marked as a
- * retry), same task, with what the previous attempt found carried into the
- * new brief. Only a failed job, or a done one a review found enough wrong
- * with, is eligible — `chooseRoute` itself refuses once there is nowhere
- * higher to go.
+ * Retries a job: same project, same title (marked as a retry), same task, with
+ * what the previous attempt found carried into the new brief. The router is
+ * asked again for its route, like any new job. Only a failed job, or a done
+ * one a review found enough wrong with, is eligible.
  */
 export async function retry(db, id, { now = new Date().toISOString() } = {}) {
   const old = getJob(db, id);

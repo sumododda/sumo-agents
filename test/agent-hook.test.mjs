@@ -22,7 +22,8 @@ const decision = (run) => (run.out ? JSON.parse(run.out).hookSpecificOutput : nu
 test('an Agent call that names a job is rewritten to that job\'s route, and the call is logged', () => {
   const s = sandbox();
   withSimba(s);
-  const created = s.mem(['job', 'new', '--project', 'simba', '--title', 'fix it', '--model', 'opus', '--effort', 'xhigh'], { input: TASK });
+  s.routerWillSay('opus', 'xhigh');
+  const created = s.mem(['job', 'new', '--project', 'simba', '--title', 'fix it'], { input: TASK });
   assert.match(created.out, /^created j1 /);
 
   const run = agentCall(s, { description: 'run the job', prompt: 'JOB: run `mem job brief 1` and follow it exactly.', subagent_type: 'general-purpose', model: 'sonnet' });
@@ -41,6 +42,7 @@ test('an Agent call that names a job is rewritten to that job\'s route, and the 
 test('a scout job routes to the plain "scout" sub-agent, not "scout-none"', () => {
   const s = sandbox();
   withSimba(s);
+  s.routerWillSay('sonnet', 'high');
   s.mem(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
   const held = decision(agentCall(s, { prompt: 'JOB: run `mem job brief 1` and follow it exactly.', subagent_type: 'general-purpose' }));
   assert.equal(held.updatedInput.model, 'haiku');
@@ -50,6 +52,7 @@ test('a scout job routes to the plain "scout" sub-agent, not "scout-none"', () =
 test('an Agent call naming no job, or an unknown one, is left untouched', () => {
   const s = sandbox();
   withSimba(s);
+  s.routerWillSay('sonnet', 'medium');
   s.mem(['job', 'new', '--project', 'simba', '--title', 'fix it'], { input: TASK });
 
   assert.equal(agentCall(s, { prompt: 'Please go read the README and summarize it.', subagent_type: 'general-purpose' }).out, '');
@@ -59,6 +62,7 @@ test('an Agent call naming no job, or an unknown one, is left untouched', () => 
 test('a job with no recorded route (from before this migration) is left untouched', () => {
   const s = sandbox();
   withSimba(s);
+  s.routerWillSay('sonnet', 'medium');
   s.mem(['job', 'new', '--project', 'simba', '--title', 'fix it'], { input: TASK });
   s.sql((db) => db.prepare('UPDATE jobs SET model = NULL, effort = NULL WHERE id = 1').run());
 
@@ -68,6 +72,7 @@ test('a job with no recorded route (from before this migration) is left untouche
 test('a non-Agent tool call is never rewritten, and the guard still runs first for Bash and Read', () => {
   const s = sandbox();
   withSimba(s);
+  s.routerWillSay('sonnet', 'medium');
   s.mem(['job', 'new', '--project', 'simba', '--title', 'fix it'], { input: TASK });
 
   assert.equal(s.hook('pre-tool', { ...SESSION, tool_name: 'Write', tool_input: { file_path: '/x/y.md', prompt: 'mem job brief 1' } }).out, '');
@@ -79,9 +84,20 @@ test('a non-Agent tool call is never rewritten, and the guard still runs first f
 test('a job whose effort is none routes to the plain role sub-agent, not "worker-none"', () => {
   const s = sandbox();
   withSimba(s);
-  s.mem(['job', 'new', '--project', 'simba', '--title', 'fix it', '--model', 'haiku'], { input: TASK });
+  s.routerWillSay('haiku', 'low');
+  s.mem(['job', 'new', '--project', 'simba', '--title', 'fix it'], { input: TASK });
   const held = decision(agentCall(s, { prompt: 'JOB: run `mem job brief 1` and follow it exactly.', subagent_type: 'general-purpose' }));
   assert.equal(held.updatedInput.model, 'haiku');
   assert.equal(held.updatedInput.subagent_type, 'worker');
   assert.ok(existsSync(join(REPO_ROOT, '.claude', 'agents', `${held.updatedInput.subagent_type}.md`)), 'the sub-agent it names exists');
+});
+
+test('every route the router can give names a sub-agent that exists, for workers and reviewers alike', () => {
+  for (const role of ['worker', 'reviewer']) {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      const file = join(REPO_ROOT, '.claude', 'agents', `${role}-${effort}.md`);
+      assert.ok(existsSync(file), `${role}-${effort}.md exists`);
+      assert.match(readFileSync(file, 'utf8'), new RegExp(`^effort: ${effort}$`, 'm'), `${role}-${effort}.md carries its effort`);
+    }
+  }
 });

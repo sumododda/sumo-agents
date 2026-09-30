@@ -354,6 +354,7 @@ test('how much context a session is carrying is read from its transcript, and an
 
 test('a session that has grown big says so once per band, with the compact hint ready to paste', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   const file = join(s.root, 'growing.jsonl');
   const session = { session_id: 'sess-big', cwd: '/Users/sumo/sumo-agents', transcript_path: file };
@@ -392,6 +393,7 @@ test('a transcript that cannot be read never adds a line to the turn', () => {
 
 test('a task that ends in a big session ends with the nudge to start fresh', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   const file = join(s.root, 'boundary.jsonl');
   grownTo(file, 120_000);

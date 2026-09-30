@@ -29,7 +29,7 @@ const HELP = `mem — local memory for the sumo-agents process
   mem forget <id> [--purge]
   mem confirm <id>     mem reject <id>
   mem project add <path> [--slug S] [--alias A]...   show S · list · rescan S · alias S A · archive S
-  mem job new --project S --title T [--agent scout|worker|reviewer] [--model M] [--effort E]
+  mem job new --project S --title T [--agent scout|worker|reviewer]
         brief ID · note ID · ask ID · answer ID · baseline ID · verify ID · changes ID
         finish ID --status DONE|FAILED · show ID · list [--all] · abandon ID · retry ID · stats
   mem prime            the block a session starts with
@@ -72,14 +72,13 @@ mem project show <name> | list [--all] | rescan <name> | alias <name> <alias> | 
         [--guide fix|feature|review]     carry guides/<name>.md into the brief
         [--reviews <id>]                 reviewer: judge that job's change (default: what is uncommitted)
         [--tests-may-change]             worker: this task is allowed to edit tests that already exist
-        [--model haiku|sonnet|opus|fable] [--effort low|medium|high|xhigh|max]   override the chosen route
 mem job brief|show|abandon <id>
 mem job note|ask|answer <id>                                    (text on stdin)
 mem job baseline <id>        the project's checks, before the work
 mem job verify <id>          the same checks now, judged against the baseline
 mem job changes <id>         everything the job changed, as one file
 mem job finish <id> --status DONE|FAILED [--accept "<why>"]     (report on stdin)
-mem job retry <id>           a failed job, or a done one reviewed with important >= 3, one route step up
+mem job retry <id>           a failed job, or a done one reviewed with important >= 3, routed afresh
 mem job stats [--project S]  jobs, done, failed, reviewed, avg important — per model/effort
 mem job list [--all]`,
   prime: 'mem prime [--budget N]',
@@ -110,7 +109,7 @@ const COMMANDS = {
   confirm: { value: [], bool: [], run: (db, { args }) => [`confirmed ${line(memory.confirm(db, memory.parseId(args[0])))}`] },
   reject: { value: [], bool: [], run: (db, { args }) => [`rejected ${line(memory.reject(db, memory.parseId(args[0])))}`] },
   project: { value: ['slug'], multi: ['alias'], bool: ['all'], run: runProject },
-  job: { value: ['project', 'title', 'agent', 'status', 'from-file', 'guide', 'reviews', 'accept', 'model', 'effort'], bool: ['all', 'tests-may-change'], run: runJob },
+  job: { value: ['project', 'title', 'agent', 'status', 'from-file', 'guide', 'reviews', 'accept'], bool: ['all', 'tests-may-change'], run: runJob },
   prime: { value: ['budget'], bool: [], run: (db, { flags }) => [prime(db, { budget: flags.budget === undefined ? undefined : Number(flags.budget) })] },
   scribe: { value: [], bool: [], run: runScribeCommand },
   dream: { value: [], bool: [], run: runDreamCommand },
@@ -301,8 +300,6 @@ async function runJob(db, { args, flags }) {
       guide: flags.guide,
       reviews: flags.reviews === undefined ? undefined : jobs.parseJobId(flags.reviews),
       testsMayChange: Boolean(flags['tests-may-change']),
-      model: flags.model,
-      effort: flags.effort,
     });
     return createdLines(job, warnings);
   }

@@ -4,9 +4,9 @@ A delegation costs a brief and a fresh context.
 
 **Who.** `scout` (Haiku, no edit tools): finding, tracing, auditing — cheapest; tracing, not judging → say
 "describe only". `worker`: building and fixing. `reviewer` (no edit tools): judging a change it did not
-write. `mem job new` picks the route; `--model`/`--effort` only when named. A project rule:
-a decision shaped `worker model opus effort high`. Failed, or `important >= 3` → `mem job retry <id>`,
-one step up.
+write. `mem job new` asks the local router for the route — every time; it fails, the command fails and
+no job exists: tell the user, never start a sub-agent without a job. Failed, or `important >= 3` →
+`mem job retry <id>`, routed afresh.
 
 **1. Write the brief** — a contract, not a wish:
 

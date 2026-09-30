@@ -4,22 +4,6 @@ import { UsageError } from './memory.mjs';
 export const MODELS = ['haiku', 'sonnet', 'opus', 'fable'];
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-/** Total order for the floors below: a model dimension, then an effort dimension within it. */
-const MODEL_RANK = ['haiku', 'sonnet', 'opus', 'fable'];
-const EFFORT_RANK = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
-/** The ladder `stepUp` climbs: haiku is a step of its own, so it is handled first. */
-const MODEL_LADDER = ['sonnet', 'opus', 'fable'];
-const EFFORT_LADDER = ['low', 'medium', 'high', 'xhigh', 'max'];
-
-const ROLE_DEFAULT = {
-  scout: { model: 'haiku', effort: 'none' },
-  worker: { model: 'sonnet', effort: 'medium' },
-  reviewer: { model: 'opus', effort: 'high' },
-};
-
-/** Security, credentials, money, migrations or concurrency: never trusted to a cheap pass. */
-const SECURITY_RE = /credential|password|secret|api[ -]?key|bearer|access token|auth(entication|orization|\b)|payment|billing|migration|concurren|\brace\b/i;
-
 const ROUTER_SYSTEM =
   'You assign a coding job to a model and an effort level. Answer with JSON only. Models, cheapest first: haiku (fast, mechanical work; no ' +
   'effort setting), sonnet (routine coding), opus (design, hard bugs, review), fable (only when opus would plausibly fail: novel algorithms, ' +
@@ -40,88 +24,6 @@ const ROUTER_SCHEMA = {
 };
 
 const TASK_CUT = 3500;
-
-/**
- * One rung up the ladder: effort climbs to high before the model does, a model
- * step keeps whatever effort it arrived with, and fable/high is the last rung
- * before the top. Returns null once nothing is left to raise.
- */
-export function stepUp({ model, effort }) {
-  if (model === 'haiku') return { model: 'sonnet', effort: 'medium' };
-  if (model === 'fable') {
-    if (effort === 'high') return { model, effort: 'xhigh' };
-    return null; // already at xhigh or max — there is nowhere left to go
-  }
-  if (effort === 'low' || effort === 'medium') {
-    return { model, effort: EFFORT_LADDER[EFFORT_LADDER.indexOf(effort) + 1] };
-  }
-  // effort is high, xhigh or max and the model is not yet fable: the model steps up, effort unchanged.
-  return { model: MODEL_LADDER[MODEL_LADDER.indexOf(model) + 1], effort };
-}
-
-/**
- * Each axis on its own: the model is raised to the floor's model if it is
- * below it, and the effort to the floor's effort if it is below it. A higher
- * model never excuses a lower effort, and the other way round.
- */
-function raiseToFloor(route, floor) {
-  const higher = (rank, a, b) => (rank.indexOf(a) < rank.indexOf(b) ? b : a);
-  return { model: higher(MODEL_RANK, route.model, floor.model), effort: higher(EFFORT_RANK, route.effort, floor.effort) };
-}
-
-/**
- * The floors, applied after every precedence step: scout is pinned to
- * haiku/none outright; a reviewer never judges below opus/high; haiku never
- * carries an effort; and security-shaped work never runs below opus/xhigh for
- * a worker or a reviewer. Each one applied is named in the reason.
- */
-function applyFloors({ model, effort, reason }, { agent, title, task }) {
-  const applied = [];
-  if (agent === 'scout') {
-    if (model !== 'haiku' || effort !== 'none') applied.push('scout');
-    model = 'haiku';
-    effort = 'none';
-  } else {
-    if (agent === 'reviewer') {
-      const raised = raiseToFloor({ model, effort }, { model: 'opus', effort: 'high' });
-      if (raised.model !== model || raised.effort !== effort) {
-        applied.push('reviewer');
-        ({ model, effort } = raised);
-      }
-    }
-    if (SECURITY_RE.test(`${title ?? ''}\n${task ?? ''}`)) {
-      const raised = raiseToFloor({ model, effort }, { model: 'opus', effort: 'xhigh' });
-      if (raised.model !== model || raised.effort !== effort) {
-        applied.push('security');
-        ({ model, effort } = raised);
-      }
-    }
-    if (model === 'haiku' && effort !== 'none') {
-      applied.push('haiku effort');
-      effort = 'none';
-    }
-  }
-  return { model, effort, reason: applied.length > 0 ? `${reason}; floor: ${applied.join(', ')}` : reason };
-}
-
-/** A memory of type decision whose text pins a role to a model, and optionally an effort. Latest wins. */
-export function projectRule(db, projectSlug, agent) {
-  const re = /^(scout|worker|reviewer) model (haiku|sonnet|opus|fable)(?: effort (low|medium|high|xhigh|max))?$/i;
-  const rows = db
-    .prepare(`SELECT * FROM memories WHERE scope = ? AND type = 'decision' AND state = 'active' ORDER BY id DESC`)
-    .all(`project:${projectSlug}`);
-  for (const m of rows) {
-    const match = re.exec(m.body.trim());
-    if (match && match[1].toLowerCase() === agent) {
-      return {
-        model: match[2].toLowerCase(),
-        effort: match[3]?.toLowerCase() ?? ROLE_DEFAULT[agent].effort,
-        reason: `project rule m${m.id}: ${m.body}`,
-      };
-    }
-  }
-  return null;
-}
 
 /** Per model/effort, over this project's finished jobs: how many, how many reviewed, and how they scored. */
 export function routeStats(db, { project } = {}) {
@@ -193,55 +95,26 @@ async function askRouter(db, { agent, project, task, title }) {
   return { ok: true, model, effort, reason: result.data.reason };
 }
 
-function roleDefault(agent) {
-  const d = ROLE_DEFAULT[agent];
-  return { model: d.model, effort: d.effort, reason: `default: ${agent} ${d.model}/${d.effort}` };
-}
-
-/** The previous job's route, one rung up the ladder — or a refusal when there is nowhere left to go. */
-function decideRetry(db, retryOf) {
-  const prev = db.prepare('SELECT model, effort FROM jobs WHERE id = ?').get(retryOf);
-  if (!prev?.model || !prev?.effort) throw new UsageError(`j${retryOf} has no recorded route to step up from`);
-  const next = stepUp({ model: prev.model, effort: prev.effort });
-  if (!next) throw new UsageError(`j${retryOf} already ran on ${prev.model}/${prev.effort} — ask the user`);
-  return { ...next, reason: `retry: stepped up from j${retryOf} ${prev.model}/${prev.effort}` };
-}
-
-/** Precedence b–e: retryOf, then a project rule, then the router, then the role's default. */
-async function decide(db, { agent, project, task, title, retryOf }) {
-  if (retryOf !== undefined) return decideRetry(db, retryOf);
-  const rule = projectRule(db, project.slug, agent);
-  if (rule) return rule;
-  const routed = await askRouter(db, { agent, project, task, title });
-  if (routed.ok) return { model: routed.model, effort: routed.effort, reason: `router: ${routed.reason}` };
-  const fallback = roleDefault(agent);
-  return { ...fallback, reason: `router failed: ${routed.error}; ${fallback.reason}` };
-}
-
-function validateExplicit({ model, effort }) {
-  if (model !== undefined && !MODELS.includes(model)) throw new UsageError(`--model is one of: ${MODELS.join(', ')}`);
-  if (effort !== undefined && !EFFORTS.includes(effort)) throw new UsageError(`--effort is one of: ${EFFORTS.join(', ')}`);
-}
-
 /**
- * Chooses a job's model and effort. First match wins: an explicit flag (each
- * half filled from the steps below when only one is given), a retry's step
- * up, a project rule, the router, then the role's default — and always the
- * floors on top. Async because the router is a real (if local) model call.
+ * Chooses a job's model and effort by asking the local router — every job, every retry, no exceptions.
+ * Its answer is the route. A router that cannot answer, or answers something no sub-agent can run,
+ * refuses the job: there is no default to fall back to. The only change made to an answer is
+ * mechanical: a scout exists only on haiku, and haiku takes no effort.
  */
-export async function chooseRoute(db, { agent, project, task, title, explicit = {}, retryOf } = {}) {
-  validateExplicit(explicit);
-  let model = explicit.model;
-  let effort = explicit.effort;
-  let reason;
-  if (model === undefined || effort === undefined) {
-    const decided = await decide(db, { agent, project, task, title, retryOf });
-    model = model ?? decided.model;
-    effort = effort ?? decided.effort;
-    const named = [explicit.model !== undefined && `model ${explicit.model}`, explicit.effort !== undefined && `effort ${explicit.effort}`].filter(Boolean);
-    reason = named.length > 0 ? `explicit ${named.join(', ')}; ${decided.reason}` : decided.reason;
-  } else {
-    reason = `explicit ${model}/${effort}`;
+export async function chooseRoute(db, { agent, project, task, title }) {
+  const routed = await askRouter(db, { agent, project, task, title });
+  if (!routed.ok) throw new UsageError(`the router failed: ${routed.error} — no job was created`);
+  let { model, effort } = routed;
+  let reason = `router: ${routed.reason}`;
+  if (agent === 'scout') {
+    if (model !== 'haiku' || effort !== 'none') reason += '; scout runs on haiku';
+    return { model: 'haiku', effort: 'none', reason };
   }
-  return applyFloors({ model, effort, reason }, { agent, title, task });
+  if (model === 'haiku') {
+    if (effort !== 'none') reason += '; haiku takes no effort';
+    return { model, effort: 'none', reason };
+  }
+  // With no effort, the plain role sub-agent would run on whatever effort the session happens to have.
+  if (effort === 'none') throw new UsageError(`the router failed: it gave ${model} no effort — no job was created`);
+  return { model, effort, reason };
 }

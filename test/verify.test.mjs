@@ -40,6 +40,7 @@ const finish = (s, id = '1', extra = []) => s.mem(['job', 'finish', id, '--statu
 
 test("a worker's DONE rests on what the project's checks say, not on what its report says", () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s);
   assert.match(s.mem(['job', 'brief', '1']).out, /Before you edit anything: `mem job baseline 1`/);
@@ -65,6 +66,7 @@ test("a worker's DONE rests on what the project's checks say, not on what its re
 
 test('what already failed is not blamed on the job — and without a baseline, nothing can hide behind "it was already broken"', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   gitProject(s, { status: 'broken' });
   newWorker(s);
   assert.match(s.mem(['job', 'baseline', '1']).out, /^`make test` ALREADY FAILS — not yours to fix/);
@@ -82,6 +84,7 @@ test('what already failed is not blamed on the job — and without a baseline, n
 
 test('a baseline taken after the first edit is refused, because it would call the job\'s own breakage "already there"', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s);
   p.write('status', 'broken\n');
@@ -91,6 +94,7 @@ test('a baseline taken after the first edit is refused, because it would call th
 
 test('tests that were already here judge the change and are not part of it; new tests are welcome', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s);
   p.write('test/new.test.js', '// asserts the thing is 2\n');
@@ -109,6 +113,7 @@ test('tests that were already here judge the change and are not part of it; new 
 
 test('a line that tells a checker to look away is put in front of a person, not silently accepted', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n// eslint-disable-next-line no-undef\nthing2 = 3;\n');
@@ -120,6 +125,7 @@ test('a line that tells a checker to look away is put in front of a person, not 
 
 test('a key or token in the change blocks DONE; a credential-looking assignment is put in front of a person', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\nconst gh = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";\n');
@@ -145,6 +151,7 @@ test('a key or token in the change blocks DONE; a credential-looking assignment 
 
 test('work can be taken without verification, but never quietly', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s);
   p.write('status', 'broken\n');
@@ -157,6 +164,7 @@ test('work can be taken without verification, but never quietly', () => {
 
 test("what the user had already changed is not counted as the job's", () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   p.write('src.js', 'export const thing = 1; // the user was here\n');
   p.write('scratch.txt', 'the user left this lying around\n');
@@ -173,6 +181,7 @@ test("what the user had already changed is not counted as the job's", () => {
 
 test('--guide carries the written way of doing that work into the brief', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   gitProject(s);
   newWorker(s, ['--guide', 'fix']);
   const brief = s.mem(['job', 'brief', '1']).out;
@@ -189,6 +198,7 @@ test('--guide carries the written way of doing that work into the brief', () => 
 
 test('a reviewer is handed the change as one file, what was asked, and the author\'s report as claims', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   assert.equal(s.mem(['job', 'new', '--project', 'gitproj', '--agent', 'reviewer', '--title', 'review'], { input: 'x' }).code, 2, 'nothing changed, nothing to review');
 
@@ -221,6 +231,7 @@ test('a reviewer is handed the change as one file, what was asked, and the autho
 
 test('a second worker in the same working tree is called out when it is created', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   gitProject(s);
   assert.doesNotMatch(newWorker(s).out, /already a running worker/);
   assert.match(newWorker(s).out, /note: j1 "return 2" is already a running worker in proj-git — two workers in one working tree overwrite each other/);
@@ -230,6 +241,7 @@ test('a second worker in the same working tree is called out when it is created'
 
 test('jobs from before reviewers existed survive the upgrade, and no job id is ever handed out twice', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   gitProject(s);
   newWorker(s);
   newWorker(s);
@@ -257,6 +269,7 @@ test('jobs from before reviewers existed survive the upgrade, and no job id is e
 
 test('a recorded start that git has since collected is said out loud, never read as "nothing changed"', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s);
   p.write('test/thing.test.js', '// asserts nothing\n');
@@ -272,6 +285,7 @@ test('a recorded start that git has since collected is said out loud, never read
 
 test('a retried worker keeps the original\'s permission to change tests that were already here', () => {
   const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s, ['--tests-may-change']);
   assert.equal(s.mem(['job', 'finish', '1', '--status', 'FAILED'], { input: '## Summary\nRan out of road.\n' }).code, 0);
