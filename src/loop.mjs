@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { anthropicClientOptions, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
 import { brief, getJob } from './jobs.mjs';
 import { UsageError } from './memory.mjs';
 import { costOf, logRun, modelId, usageOf } from './model.mjs';
@@ -63,8 +64,9 @@ export const textOf = (content) => content.filter((b) => b.type === 'text').map(
 
 /** The default transport: streamed, so a long turn never trips the HTTP timeout. */
 export async function sendToApi(params, { onText } = {}) {
-  const client = new Anthropic({ timeout: REQUEST_TIMEOUT_MS });
-  const stream = client.beta.messages.stream(params);
+  const credential = resolveAnthropicCredential();
+  const client = new Anthropic(anthropicClientOptions(REQUEST_TIMEOUT_MS, credential));
+  const stream = client.beta.messages.stream(authenticatedRequest(params, credential));
   if (onText) stream.on('text', onText);
   return stream.finalMessage();
 }

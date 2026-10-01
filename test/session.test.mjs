@@ -156,7 +156,8 @@ test('the writer is shown the user and the assistant — never tool output, thin
   assert.match(prompt, /Known projects: proj-simba \/ simba/);
   assert.doesNotMatch(prompt, /hunter2|evil@example\.com|sub-agent chatter|private reasoning/);
   assert.match(system, /^You label text\./);
-  assert.deepEqual(schema.properties.ops.items.properties.scope.enum, ['global', 'project:proj-simba'], 'the model can only choose a scope that exists');
+  const add = schema.properties.ops.items.anyOf.find((branch) => branch.properties.op.enum[0] === 'add');
+  assert.deepEqual(add.properties.scope.enum, ['global', 'project:proj-simba'], 'the model can only choose a scope that exists');
 });
 
 test('a replacement only takes effect when the user demonstrably said it', () => {

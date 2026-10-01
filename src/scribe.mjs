@@ -88,27 +88,40 @@ export function knownProjectsLine(db) {
   return `Known projects: ${all.map((p) => [p.slug, ...aliasesOf(db, p.slug)].join(' / ')).join(' · ')}`;
 }
 
-/** The JSON shape the model must answer in. Scopes are an enum of real projects, so it cannot invent one. */
+/** The JSON shape the model must answer in. Each operation is a closed branch, avoiding an exponential set of optional fields. */
 export function opsSchema(db, ops) {
   const slugs = projectEnum(db);
-  const properties = {
-    op: { type: 'string', enum: ops },
+  const field = {
     type: { type: 'string', enum: ['preference', 'fact', 'decision'] },
     scope: { type: 'string', enum: ['global', ...slugs.map((s) => `project:${s}`)] },
     topic: { type: 'string', description: 'one lowercase word: git, testing, style, writing, tooling, deploy…' },
     body: { type: 'string', description: 'one plain sentence, written as a standing fact or rule' },
-    turn: { type: 'integer', description: 'the number from the [tN] tag of the user turn this came from' },
-    quote: { type: 'string', description: 'an exact, contiguous run of words copied from that user turn' },
-    old: { type: 'integer', description: 'for supersede: the id of the existing memory this replaces' },
-    done: { type: 'string' },
-    next: { type: 'string' },
-    ids: { type: 'array', items: { type: 'integer' } },
-    note: { type: 'string' },
-    title: { type: 'string' },
-    cue: { type: 'string' },
+    turn: { type: ['integer', 'null'], description: 'the number from the [tN] tag, or null when this is an inferred pattern' },
+    quote: { type: ['string', 'null'], description: 'an exact run of words from that user turn, or null when this is an inferred pattern' },
   };
-  if (slugs.length > 0) properties.project = { type: 'string', enum: slugs };
-  return { type: 'object', properties: { ops: { type: 'array', items: { type: 'object', properties, required: ['op'] } } }, required: ['ops'] };
+  const branch = (op, properties) => {
+    const all = { op: { type: 'string', enum: [op] }, ...properties };
+    return { type: 'object', properties: all, required: Object.keys(all), additionalProperties: false };
+  };
+  const branches = {
+    add: branch('add', { type: field.type, scope: field.scope, topic: field.topic, body: field.body, turn: field.turn, quote: field.quote }),
+    supersede: branch('supersede', {
+      old: { type: 'integer', description: 'the id of the existing memory this replaces' },
+      type: field.type, scope: field.scope, topic: field.topic, body: field.body, turn: field.turn, quote: field.quote,
+    }),
+    gotcha: branch('gotcha', { scope: field.scope, body: field.body }),
+    checkpoint: slugs.length > 0
+      ? branch('checkpoint', { project: { type: 'string', enum: slugs }, done: { type: 'string' }, next: { type: ['string', 'null'] } })
+      : null,
+    contradiction: branch('contradiction', { ids: { type: 'array', items: { type: 'integer' } }, note: { type: 'string' } }),
+    procedure: branch('procedure', { scope: field.scope, title: { type: 'string' }, cue: { type: 'string' }, body: field.body }),
+  };
+  return {
+    type: 'object',
+    properties: { ops: { type: 'array', items: { anyOf: ops.map((op) => branches[op]).filter(Boolean) } } },
+    required: ['ops'],
+    additionalProperties: false,
+  };
 }
 
 export function relatedMemories(db, texts, scopes) {

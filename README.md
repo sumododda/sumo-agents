@@ -10,8 +10,8 @@ never committed — a work laptop and a personal one learn separately.
 
 ## Set up a machine
 
-Needs Node 22.13+, an `ANTHROPIC_API_KEY` in the environment, and llama.cpp (`brew install llama.cpp`)
-for the local router model.
+Needs Node 22.13+, either `ANTHROPIC_API_KEY` or a `CLAUDE_CODE_OAUTH_TOKEN` from
+`claude setup-token` in the environment, and llama.cpp (`brew install llama.cpp`) for the local router model.
 
 ```sh
 git clone <this repo> ~/sumo-agents && cd ~/sumo-agents
@@ -64,7 +64,7 @@ History is never rewritten on the client.
 | Session starts | The first user turn is the core block: your global preferences, workflows, projects, where you left off, open jobs, things to confirm. Hard cap 800 tokens. | ≤ 800 tokens, once |
 | You send a message | It is stored word for word (secrets redacted). First mention of a project adds its card — path, stack, commands, your rules for it, gotchas — as an operator message after the cached prefix. | 0, or ≤ 200 once per project |
 | The agent is about to run a command that would wipe a tree (`rm -rf ~`, `git reset --hard`, `git clean -f`, `DROP TABLE` …), or to print, open or write a secret file (`.env`, a private key, `~/.aws/credentials`) | Refused in plain code before it runs, and the refusal says why. No memory is consulted. The way through is you: `! <command>` runs it yourself. A force-push is not on the list — it is an accepted way of cleaning up history here. | 0 |
-| The agent reaches for a path outside the project | Refused: the shell runs in the project directory and the editor is jailed to it (symlinks followed). The child environment carries no key, token or password variable, so `env` cannot print your API key. | 0 |
+| The agent reaches for a path outside the project | Refused: the shell runs in the project directory and the editor is jailed to it (symlinks followed). The child environment carries no key, token or password variable, so `env` cannot print your credential. | 0 |
 | The agent is about to run a shell command a taught workflow gates (`gh pr create`, for a workflow taught with `--gate 'gh(-axi)? pr create'`) | The command is held back once and the agent is handed the workflow's steps. It follows them, then runs the command. The same steps ride in with your message when you ask for the thing yourself. | 0 until it fires |
 | The agent ends a turn on a question | Memory is searched with the question's own words, in plain code. If something close is there, the agent is handed it once and carries on instead of waiting for you; if nothing is, the question reaches you untouched. | 0 unless memory answers |
 | A turn ends | The **scribe** wakes — a detached Haiku call straight to the API that reads the new turns and proposes memories. Code checks every proposal against what you actually typed before saving it. | 0 |
@@ -104,7 +104,7 @@ the brief as its only user turn, a short frozen system prompt, and tools by role
 | `worker` | chosen per job by the router | shell + editor | building and fixing |
 | `reviewer` | chosen per job by the router | shell | judging a change it did not write |
 
-A `mem job run` typed by the chat agent runs inside the chat process, so the API key never enters a
+A `mem job run` typed by the chat agent runs inside the chat process, so the Anthropic credential never enters a
 shell. A blocked job asks (`mem job ask`); the main agent checks memory before it asks you. Briefs,
 notes, answers, reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today
 can be picked up tomorrow with the same command. One worker per project at a time — they share a

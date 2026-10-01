@@ -8,6 +8,7 @@ import { basename, delimiter, join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
+import { resolveAnthropicCredential } from './auth.mjs';
 import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mjs';
 import { UsageError } from './memory.mjs';
 import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
@@ -265,9 +266,13 @@ export function doctor() {
   const ours = found !== null && existsSync(p.launcher) && realpathSync(found) === realpathSync(p.launcher);
   check(ours, '`mem` on PATH is this one', found ? `PATH finds ${found} instead` : 'run: mem setup');
 
-  // The cheap-model passes (scribe, dream) go straight to the API; without a key they fail quietly in the background.
+  // The cheap-model passes (scribe, dream) go straight to the API; without a credential they fail quietly in the background.
   const standInKey = Boolean(process.env.SUMO_AGENTS_MODEL_CMD);
-  check(standInKey || Boolean(process.env.ANTHROPIC_API_KEY), 'ANTHROPIC_API_KEY is set (runs the cheap-model passes)', 'export ANTHROPIC_API_KEY in the shell that starts sessions and hooks');
+  check(
+    standInKey || Boolean(resolveAnthropicCredential()),
+    'ANTHROPIC_API_KEY is set or CLAUDE_CODE_OAUTH_TOKEN is set (runs model calls)',
+    'export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that starts sessions and hooks',
+  );
 
   // Not a warning: every job is routed by it, and without an answer no job can be created.
   const standIn = process.env.SUMO_AGENTS_MODEL_CMD;

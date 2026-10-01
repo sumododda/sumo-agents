@@ -52,7 +52,7 @@ test('reading sessions side by side: a pattern becomes a question, a clash is ra
   assert.match(shown.system, /^You label text\. You are shown several finished conversations/);
   assert.match(shown.prompt, /What is already remembered:\n[\s\S]*use tabs for indentation/);
   assert.match(shown.prompt, /\[t\d+\] user: again: shorter PR description/);
-  assert.deepEqual(shown.schema.properties.ops.items.properties.op.enum, ['add', 'supersede', 'gotcha', 'checkpoint', 'contradiction', 'procedure']);
+  assert.deepEqual(shown.schema.properties.ops.items.anyOf.map((branch) => branch.properties.op.enum[0]), ['add', 'supersede', 'gotcha', 'contradiction', 'procedure'], 'a checkpoint is omitted when there is no known project it could name');
 
   // Everything waits for the user; the two real memories are untouched.
   const block = s.mem(['prime']).out;

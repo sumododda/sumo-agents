@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
+import { anthropicClientOptions, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
 import { getMeta } from './db.mjs';
 import { paths } from './paths.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
@@ -96,7 +97,7 @@ function envelopeToResult(run, command) {
 
 /** What went wrong with an API call, in one line a person can act on. */
 function describe(cause) {
-  if (cause instanceof Anthropic.AuthenticationError) return 'ANTHROPIC_API_KEY is missing or invalid — export it in the shell that runs mem';
+  if (cause instanceof Anthropic.AuthenticationError) return 'the Anthropic credential is missing or invalid — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that runs mem';
   if (cause instanceof Anthropic.RateLimitError) return 'the API is rate-limiting this key — try again in a minute';
   if (cause instanceof Anthropic.APIError) return `the API answered ${cause.status ?? 'an error'}: ${String(cause.message).slice(0, 300)}`;
   return String(cause?.message ?? cause).slice(0, 300);
@@ -105,7 +106,7 @@ function describe(cause) {
 /**
  * One call to the cheap model, outside any conversation.
  *
- * It goes straight to the Messages API with the key in ANTHROPIC_API_KEY: a
+ * It goes straight to the Messages API with an API key or Claude Code OAuth token: a
  * system prompt, one user turn, and a JSON schema the API itself enforces on
  * the answer. No tools, no thinking, nothing loaded from disk — so it costs the
  * prompt and the answer, and nothing else.
@@ -127,8 +128,12 @@ export async function callModel(db, { system, prompt, schema, model }) {
   }
 
   try {
-    const client = new Anthropic({ timeout: TIMEOUT_MS });
-    const response = await client.messages.parse(requestFor({ system, prompt, schema, model }));
+    const credential = resolveAnthropicCredential();
+    const client = new Anthropic(anthropicClientOptions(TIMEOUT_MS, credential));
+    const request = authenticatedRequest(requestFor({ system, prompt, schema, model }), credential);
+    const response = credential?.type === 'oauth'
+      ? await client.beta.messages.parse(request)
+      : await client.messages.parse(request);
     const usage = usageOf(model, response.usage);
     if (response.stop_reason === 'refusal') return { ...failure(`the model declined to answer (${response.stop_details?.category ?? 'no category'})`), usage };
     if (response.stop_reason === 'max_tokens') return { ...failure(`the answer was cut off at ${MAX_API_ANSWER_TOKENS} tokens`), usage };

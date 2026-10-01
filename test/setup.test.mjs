@@ -118,3 +118,17 @@ test('doctor wants ANTHROPIC_API_KEY for the cheap-model passes, unless a stand-
   const keyed = s.mem(['doctor'], { extraEnv: { ...env, SUMO_AGENTS_MODEL_CMD: '', ANTHROPIC_API_KEY: 'sk-ant-test' } });
   assert.match(keyed.out, /^ok {4}ANTHROPIC_API_KEY/m, keyed.out);
 });
+
+test('doctor accepts a Claude Code OAuth token, including one mistakenly exported as an API key', () => {
+  const s = sandbox();
+  const binDir = join(s.root, 'bin');
+  mkdirSync(binDir);
+  s.mem(['setup', '--bin-dir', binDir, '--no-model']);
+  const env = { PATH: `${binDir}:${process.env.PATH}`, SUMO_AGENTS_MODEL_CMD: '', ANTHROPIC_API_KEY: '' };
+
+  const named = s.mem(['doctor'], { extraEnv: { ...env, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat-named' } });
+  assert.match(named.out, /^ok {4}ANTHROPIC_API_KEY.*CLAUDE_CODE_OAUTH_TOKEN/m, named.out);
+
+  const misplaced = s.mem(['doctor'], { extraEnv: { ...env, ANTHROPIC_API_KEY: 'sk-ant-oat-misplaced', CLAUDE_CODE_OAUTH_TOKEN: '' } });
+  assert.match(misplaced.out, /^ok {4}ANTHROPIC_API_KEY.*CLAUDE_CODE_OAUTH_TOKEN/m, misplaced.out);
+});
