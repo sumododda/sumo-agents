@@ -38,6 +38,13 @@ export function injection(text, model) {
   return SYSTEM_MESSAGES.has(model) ? { role: 'system', content: text } : { role: 'user', content: [{ type: 'text', text: `<sumo>\n${text}\n</sumo>` }] };
 }
 
+/** One line per tool call, so the user can watch the work: the command, or the edit and its file. */
+export function describeCall(call) {
+  if (call.name === BASH_TOOL.name) return `$ ${String(call.input?.command ?? '').split('\n')[0].slice(0, 120)}`;
+  if (call.name === EDITOR_TOOL.name) return `${call.input?.command ?? 'edit'} ${call.input?.path ?? ''}${Array.isArray(call.input?.view_range) ? `:${call.input.view_range.join('-')}` : ''}`;
+  return call.name;
+}
+
 /** The session log, one JSON line per message, the shape the scribe reads assistant replies from and the gauge reads usage from. */
 function logLine(file, entry) {
   appendFileSync(file, `${JSON.stringify({ timestamp: new Date().toISOString(), ...entry })}\n`, { mode: 0o600 });
@@ -51,7 +58,7 @@ function configured(db, key) {
  * One chat session's state and policy, apart from the terminal, so it can be
  * driven by tests with canned responses. `say(text)` is one user turn.
  */
-export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, now = () => new Date().toISOString() } = {}) {
+export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, now = () => new Date().toISOString() } = {}) {
   model ??= configured(db, 'chat.model');
   effort ??= configured(db, 'chat.effort');
   const system = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim();
@@ -116,6 +123,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         ledger,
         beforeTool,
         onText: emit,
+        onTool: (call) => activity(describeCall(call)),
         onTurn: (response, totals) => {
           lastContext = totals.contextTokens;
           logLine(transcript, { type: 'assistant', message: { role: 'assistant', model: response.model ?? params.model, usage: response.usage, content: response.content } });
@@ -176,7 +184,7 @@ export async function chat(db, { model, effort } = {}) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   // A closed stdin never answers a question; the close event is the answer.
   const closed = new Promise((resolve) => rl.once('close', () => resolve(null)));
-  const session = createChat(db, { model, effort, out: (t) => process.stdout.write(t) });
+  const session = createChat(db, { model, effort, out: (t) => process.stdout.write(t), activity: (line) => process.stdout.write(`\n  › ${line}\n`) });
   const block = session.start('startup');
   process.stdout.write(`${block}\n\n`);
   try {

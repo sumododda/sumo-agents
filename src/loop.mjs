@@ -76,7 +76,7 @@ export async function sendToApi(params, { onText } = {}) {
  * in-process `mem job run` work. Totals and the stop reason come back; the
  * messages are mutated in place, so a chat can keep going from them.
  */
-export async function converse(db, params, { send = sendToApi, ctx, ledger, beforeTool = null, onText = null, onTurn = null, now = () => new Date().toISOString() }) {
+export async function converse(db, params, { send = sendToApi, ctx, ledger, beforeTool = null, onText = null, onTool = null, onTurn = null, now = () => new Date().toISOString() }) {
   const totals = { inputTokens: 0, outputTokens: 0, costUsd: 0, toolCalls: 0, contextTokens: 0 };
   let turns = 0;
   let stop = 'max_turns';
@@ -110,6 +110,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     totals.toolCalls += calls.length;
     const results = [];
     for (const call of calls) {
+      onTool?.(call);
       const out = (await beforeTool?.(call)) ?? runTool(call, ctx);
       results.push({ type: 'tool_result', tool_use_id: call.id, content: out.content, is_error: Boolean(out.isError) });
     }

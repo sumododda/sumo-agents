@@ -40,12 +40,13 @@ test('a session: the memory block opens it, a project card rides in once, a gate
       add(db, { type: 'preference', body: 'Always squash before merging', now: NOW });
 
       const printed = [];
+      const activity = [];
       const { send, seen } = canned([
         reply('tool_use', [{ type: 'text', text: 'on it' }, call('t1', 'bash', { command: 'pwd' })]),
         reply('end_turn', [{ type: 'text', text: 'done' }], { input_tokens: 90_000, output_tokens: 10 }),
         reply('end_turn', [{ type: 'text', text: 'ok' }]),
       ]);
-      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, out: (t) => printed.push(t), now: () => NOW });
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, out: (t) => printed.push(t), activity: (l) => activity.push(l), now: () => NOW });
 
       const block = session.start('startup');
       assert.match(block, /^<sumo-memory/);
@@ -56,6 +57,7 @@ test('a session: the memory block opens it, a project card rides in once, a gate
 
       await session.say('fix the briefing bug in simba');
       assert.deepEqual(printed.join(''), 'on itdone', 'the reply streams out as it comes');
+      assert.deepEqual(activity, ['$ pwd'], 'each tool call is shown as one line');
       const first = seen[0].messages;
       assert.equal(first[1].content[0].text, 'fix the briefing bug in simba');
       assert.equal(first[2].role, 'system', 'the project card arrives as an operator message, after the cached prefix');
