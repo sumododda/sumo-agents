@@ -1,6 +1,6 @@
 # ADR: a Sumo-owned runtime on the Anthropic API, replacing the Claude Code harness
 
-Status: accepted 2026-09-30 · implementation starts with Phase 0.
+Status: accepted 2026-09-30 · phases 0–4 implemented 2026-10-01; the benchmark in §7 is the open item.
 
 ## 1. Recommendation
 
