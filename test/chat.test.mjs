@@ -26,7 +26,11 @@ const canned = (responses) => {
 };
 
 test('operator text goes in as a system message where the model takes one, and as tagged text otherwise', () => {
-  assert.deepEqual(injection('card', 'claude-opus-5-5'), { role: 'system', content: 'card' });
+  const afterUser = [{ role: 'user', content: 'hi' }];
+  const afterAssistant = [{ role: 'user', content: 'hi' }, { role: 'assistant', content: [{ type: 'text', text: 'done?' }] }];
+  assert.deepEqual(injection('card', 'claude-opus-5-5', afterUser), { role: 'system', content: 'card' });
+  // The API rejects a system message after an assistant turn, so a stop-hook continuation goes as text.
+  assert.deepEqual(injection('card', 'claude-opus-5-5', afterAssistant), { role: 'user', content: [{ type: 'text', text: '<sumo>\ncard\n</sumo>' }] });
   assert.deepEqual(injection('card', 'claude-haiku-4-5-20251001'), { role: 'user', content: [{ type: 'text', text: '<sumo>\ncard\n</sumo>' }] });
 });
 
@@ -115,8 +119,8 @@ test('a job run typed by the model runs in this process, and a question memory c
       assert.match(seen[2].messages.at(-1).content[0].content, /STATUS: never closed — j\d+[\s\S]*scout report/, 'the chat sees the run the way mem job run prints it');
       assert.equal(outcome.text, 'Atlas it is.');
       const held = seen[3].messages.at(-1);
-      assert.equal(held.role, 'system');
-      assert.match(held.content, /memory already holds[\s\S]*tracker board Atlas/);
+      assert.equal(held.role, 'user', 'after the assistant turn the memory goes as text; the API refuses a system message there');
+      assert.match(held.content[0].text, /memory already holds[\s\S]*tracker board Atlas/);
       assert.equal(seen.length, 4);
       assert.equal(existsSync(join(paths().jobs, String(id), 'run.log')), false);
     } finally {

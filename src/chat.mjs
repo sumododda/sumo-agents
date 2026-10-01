@@ -33,9 +33,15 @@ const COMMANDS = {
 
 const JOB_RUN = /^\s*mem\s+job\s+run\s+j?(\d+)\s*(&?)\s*$/;
 
-/** Operator text for the model, placed so the cached prefix is untouched: a system message where the model takes one, a text block otherwise. */
-export function injection(text, model) {
-  return SYSTEM_MESSAGES.has(model) ? { role: 'system', content: text } : { role: 'user', content: [{ type: 'text', text: `<sumo>\n${text}\n</sumo>` }] };
+/**
+ * Operator text for the model, placed so the cached prefix is untouched: a
+ * system message where the model takes one, a text block otherwise. The API
+ * accepts a mid-conversation system message only right after a user message,
+ * so one that would follow the assistant's own turn goes as text too.
+ */
+export function injection(text, model, messages = []) {
+  const afterUser = messages.at(-1)?.role === 'user';
+  return SYSTEM_MESSAGES.has(model) && afterUser ? { role: 'system', content: text } : { role: 'user', content: [{ type: 'text', text: `<sumo>\n${text}\n</sumo>` }] };
 }
 
 /** One line per tool call, so the user can watch the work: the command, or the edit and its file. */
@@ -112,7 +118,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   async function say(text) {
     const injected = event('prompt', { prompt: text, context_tokens: lastContext });
     params.messages.push({ role: 'user', content: [{ type: 'text', text }] });
-    if (injected) params.messages.push(injection(injected, params.model));
+    if (injected) params.messages.push(injection(injected, params.model, params.messages));
     logLine(transcript, { type: 'user', message: { role: 'user', content: text } });
 
     let continued = false;
@@ -133,7 +139,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       // Memory before the user: a turn ending on a question memory can answer is given the answer and continued, once.
       const held = continued ? '' : event('stop', { last_assistant_message: outcome.text, stop_hook_active: false });
       if (!held) return outcome;
-      params.messages.push(injection(JSON.parse(held).context, params.model));
+      params.messages.push(injection(JSON.parse(held).context, params.model, params.messages));
       continued = true;
     }
   }
