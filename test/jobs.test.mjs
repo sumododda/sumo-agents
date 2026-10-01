@@ -36,7 +36,7 @@ test('a brief carries the task, what memory knows about the project, and how to 
   const created = s.mem(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm', '--agent', 'worker'], { input: TASK });
   assert.equal(created.code, 0, created.err);
   assert.match(created.out, /^created j1 \[worker·proj-simba·running\] migrate to pnpm/);
-  assert.match(created.out, /JOB: run `mem job brief 1` and follow it exactly\./);
+  assert.match(created.out, /run it: mem job run 1/);
   assert.doesNotMatch(created.out, /names no check/);
 
   const brief = s.mem(['job', 'brief', '1']).out;
@@ -49,7 +49,7 @@ test('a brief carries the task, what memory knows about the project, and how to 
   assert.match(brief, /## Goal\nMigrate the project from npm to pnpm\./);
   assert.match(brief, /mem job finish 1 --status DONE/);
   assert.match(brief, /You never write it\./);
-  assert.match(brief, /each major milestone.*SendMessage to "main"/, 'a worker reports milestones without being asked');
+  assert.match(brief, /each major milestone.*mem job note/, 'a worker notes milestones without being asked');
   assert.match(brief, /Every message and report: short lines, facts only\. No prose/, 'reports stay terse');
 });
 
@@ -95,8 +95,8 @@ test('cold restart: the brief replays the answers and the progress notes', () =>
 
   assert.equal(s.mem(['job', 'answer', '1'], { input: '' }).code, 2);
   const answered = s.mem(['job', 'answer', '1'], { input: 'Pin pnpm 9.' });
-  assert.match(answered.out, /Resume the same sub-agent \(SendMessage\)/);
-  assert.match(answered.out, /If that sub-agent is gone, start a new one with: JOB: run `mem job brief 1`/);
+  assert.match(answered.out, /mem job run \d+/);
+  assert.match(answered.out, /Continue it: mem job run 1/);
   assert.match(s.mem(['job', 'list']).out, /^j1 \[worker·proj-simba·running\]/);
 
   const brief = s.mem(['job', 'brief', '1']).out;

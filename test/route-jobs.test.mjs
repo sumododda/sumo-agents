@@ -100,8 +100,8 @@ test('retry asks the router again — no ladder — and carries the old attempt 
   assert.equal(retried.code, 0, retried.err);
   assert.match(retried.out, /^created j2 \[worker·proj-route·running\] return 2 \(retry of j1\)/);
   assert.match(retried.out, /^route: opus\/medium — router: the first attempt failed on lint$/m);
-  assert.match(retried.out, /start it with the worker-medium sub-agent and exactly this prompt:/);
-  assert.match(retried.out, /JOB: run `mem job brief 2` and follow it exactly\./);
+  assert.match(retried.out, /run it: mem job run \d+/);
+  assert.match(retried.out, /run it: mem job run 2/);
   assert.equal(s.sql((db) => db.prepare('SELECT retry_of FROM jobs WHERE id = 2').get().retry_of), 1);
   // The router is told what it is retrying, or it would hand back the route that just failed.
   const shown = s.modelWasShown().prompt;
@@ -216,5 +216,5 @@ test('an effort of none names the plain role sub-agent, never worker-none', () =
   const created = s.mem(['job', 'new', '--project', 'routeproj', '--title', 'return 2'], { input: TASK });
   assert.equal(created.code, 0, created.err);
   assert.match(created.out, /^route: haiku\/none/m);
-  assert.match(created.out, /start it with the worker sub-agent/);
+  assert.match(created.out, /run it: mem job run \d+/);
 });

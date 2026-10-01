@@ -6,7 +6,7 @@ import { sandbox } from './helpers.mjs';
 const SESSION = { session_id: 'sess-r', cwd: '/work/home' };
 const say = (s, prompt) => s.hook('prompt', { ...SESSION, prompt });
 const stop = (s, reply, more = {}) => s.hook('stop', { ...SESSION, last_assistant_message: reply, stop_hook_active: false, ...more });
-const feedback = (run) => (run.out ? JSON.parse(run.out).hookSpecificOutput : null);
+const feedback = (run) => (run.out ? JSON.parse(run.out) : null);
 
 const ASKED = 'Need a board name — which tracker board are your tickets on?';
 
@@ -17,9 +17,8 @@ test('a turn that ends by asking what memory already holds is held back and hand
   // The real failure: a request was answered with a question, memory unread.
   say(s, 'list my open tickets');
   const held = feedback(stop(s, ASKED));
-  assert.equal(held.hookEventName, 'Stop');
-  assert.match(held.additionalContext, /^Before the user answers that: memory already holds/);
-  assert.match(held.additionalContext, /m1 \[fact·global·stated\] My tickets are on the tracker board Atlas/);
+  assert.match(held.context, /^Before the user answers that: memory already holds/);
+  assert.match(held.context, /m1 \[fact·global·stated\] My tickets are on the tracker board Atlas/);
 
   // Claude Code is now continuing because of us; whatever it ends on this time goes to the user.
   assert.equal(stop(s, ASKED, { stop_hook_active: true }).out, '');
@@ -57,43 +56,6 @@ test('a project\'s memory answers only in a session where that project has come 
   assert.equal(stop(s, asking).out, '');
 
   say(s, 'ship the simba release');
-  assert.match(feedback(stop(s, asking)).additionalContext, /m1 \[fact·simba·stated\] deploys go to the staging cluster first/);
+  assert.match(feedback(stop(s, asking)).context, /m1 \[fact·simba·stated\] deploys go to the staging cluster first/);
   assert.equal(s.sql((db) => currentProject(db, SESSION.session_id)), 'simba', 'what was recalled is not mistaken for the project in hand');
-});
-
-const ask = (s, question, more = {}) =>
-  s.hook('pre-tool', {
-    ...SESSION,
-    tool_name: 'AskUserQuestion',
-    tool_input: { questions: [{ question, header: 'Board', multiSelect: false, options: [{ label: 'Pick from a list', description: 'List every board' }, { label: 'Type it', description: 'Enter the name' }] }] },
-    ...more,
-  });
-const decision = (run) => (run.out ? JSON.parse(run.out).hookSpecificOutput : null);
-
-test('a question put through the question tool is held back the same way — once', () => {
-  const s = sandbox();
-  s.mem(['add', 'fact', 'My tickets are on the tracker board Atlas']);
-
-  const held = decision(ask(s, 'Which tracker board are your tickets on?'));
-  assert.equal(held.hookEventName, 'PreToolUse');
-  assert.equal(held.permissionDecision, 'deny');
-  assert.match(held.permissionDecisionReason, /^Not yet: memory already holds\nm1 \[fact·global·stated\] My tickets are on the tracker board Atlas\n/);
-  assert.match(held.permissionDecisionReason, /If none does, ask again\.$/);
-
-  // The memory is in front of it now; asking anyway is its call, and ending the turn on the same question is too.
-  assert.equal(ask(s, 'Which tracker board are your tickets on?').out, '');
-  assert.equal(stop(s, ASKED).out, '');
-
-  // A sub-agent has its own context: what the main agent was handed, it never saw.
-  assert.equal(decision(ask(s, 'Which tracker board are your tickets on?', { agent_id: 'agent-7' })).permissionDecision, 'deny');
-  assert.equal(ask(s, 'Which tracker board are your tickets on?', { agent_id: 'agent-7' }).out, '');
-});
-
-test('the question tool is left alone when memory has nothing close, or the payload is not what was expected', () => {
-  const s = sandbox();
-  s.mem(['add', 'fact', 'The kanban board colours are set in theme.css']);
-
-  assert.equal(ask(s, 'Which tracker board are your tickets on?').out, '');
-  assert.equal(s.hook('pre-tool', { ...SESSION, tool_name: 'AskUserQuestion', tool_input: {} }).out, '');
-  assert.equal(s.hook('pre-tool', { ...SESSION, tool_name: 'AskUserQuestion', tool_input: { questions: 'which project?' } }).out, '');
 });

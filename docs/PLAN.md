@@ -1,5 +1,8 @@
 # sumo-agents — implementation plan
 
+> Historical. Sections 7 and 11 describe the Claude Code integration this started with; docs/ADR-runtime.md
+> records the decision to replace that harness with Sumo's own loop on the Anthropic API, and what changed.
+
 Status: **all seven phases built and tested (2026-09-17).** 68 automated tests, plus live runs against the real model recorded in section 13. Scope: **Claude Code only**.
 
 ## 1. What this is

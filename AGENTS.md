@@ -1,12 +1,8 @@
 # sumo-agents
 You are the user's single point of contact for all their work on this machine. Their projects live
 elsewhere on disk; this repo holds only the process. Memory is a local database behind one command,
-`mem`; a background process files what the user says, so you don't.
-
-Prompt starts with `JOB:` → you are a worker: follow it; only ## Coding applies to you.
-
-## Start
-No `<sumo-memory>` block in context → run `mem prime` (if `mem` is missing: `node bin/mem.mjs setup`).
+`mem`; a background process files what the user says, so you don't. The first message of every session
+is the memory block: preferences, projects, where things were left, open jobs, things to confirm.
 
 ## Memory
 - Before asking the user how they like something done, or about a project: `mem search`. Ask only if it
@@ -18,16 +14,16 @@ No `<sumo-memory>` block in context → run `mem prime` (if `mem` is missing: `n
 
 ## Projects
 Unknown project → find it on disk, confirm the path once, `mem project add` (guides/projects.md).
-No card in context for a known project → `mem project show <slug>`.
+A project's card arrives when it first comes up; for one that has not, `mem project show <slug>`.
 
 ## Work
-Small or sequential → do it yourself, absolute paths. Big, parallel, context-heavy, or your context past
-half full → delegate: `scout` looks, `worker` builds, `reviewer` judges. None starts without a job from
-`mem job new` — read guides/delegation.md first.
+Small or sequential → do it yourself, absolute paths. Big, parallel, context-heavy, or the context
+nudge has fired → delegate: `scout` looks, `worker` builds, `reviewer` judges. A job is a written brief
+(`mem job new`) run with `mem job run <id>` — read guides/delegation.md first.
 
-## Compact instructions
-Keep: open job ids/status · decisions made this session · current project · last failing command + error.
-Drop: tool output, file contents — a `mem job show` or file read away.
+## Context
+A line saying how big the context is means: finish the piece in hand, note where you are, and ask the
+user to type /new. The memory block brings the thread back; open jobs resume from their briefs.
 
 ## Coding
 - Before changing code, trace how it works now: the smallest complete slice — signature, callers,

@@ -9,7 +9,6 @@ import { ENTRY, REPO_ROOT } from '../src/paths.mjs';
 export function sandbox() {
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-test-'));
   const home = join(root, 'home');
-  const claudeLocalSettings = join(root, 'claude-settings.local.json');
   const spawnLog = join(root, 'spawned.log');
   const modelAnswer = join(root, 'model-answer.json');
   const modelSaw = join(root, 'model-saw.json');
@@ -17,7 +16,6 @@ export function sandbox() {
   const env = {
     ...process.env,
     SUMO_AGENTS_HOME: home,
-    SUMO_AGENTS_CLAUDE_LOCAL_SETTINGS: claudeLocalSettings,
     SUMO_AGENTS_SPAWN_LOG: spawnLog,
     SUMO_AGENTS_MODEL_CMD: join(REPO_ROOT, 'test', 'fixtures', 'model-stub.mjs'),
     STUB_ANSWER: modelAnswer,
@@ -58,8 +56,8 @@ export function sandbox() {
     });
   };
 
-  /** Fires a Claude Code hook the way the harness does: JSON on stdin. */
-  const hook = (event, payload, extraEnv) => mem(['hook', event, '--harness', 'claude'], { input: JSON.stringify(payload), extraEnv });
+  /** Raises one session event from outside the process: JSON on stdin. */
+  const hook = (event, payload, extraEnv) => mem(['hook', event], { input: JSON.stringify(payload), extraEnv });
 
   /** What the cheap model will answer next, in Claude Code's own envelope. */
   const modelWillSay = (ops, { isError = false } = {}) =>
@@ -75,5 +73,5 @@ export function sandbox() {
   const modelWasShown = () => JSON.parse(readFileSync(modelSaw, 'utf8'));
   const spawned = () => (existsSync(spawnLog) ? readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean) : []);
 
-  return { root, home, claudeLocalSettings, mem, sql, addProject, hook, modelWillSay, routerWillSay, modelWasShown, spawned };
+  return { root, home, mem, sql, addProject, hook, modelWillSay, routerWillSay, modelWasShown, spawned };
 }

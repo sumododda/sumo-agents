@@ -24,7 +24,7 @@ function fixtureRepo(s, name = 'proj-simba') {
   return dir;
 }
 
-test('adding a project scans it, shows its card, and opens the directory to Claude Code', () => {
+test('adding a project scans it and shows its card', () => {
   const s = sandbox();
   const dir = fixtureRepo(s);
 
@@ -37,29 +37,19 @@ test('adding a project scans it, shows its card, and opens the directory to Clau
   // An index the agent is told to prefer costs more than the grep it replaces, so the card never names one.
   assert.doesNotMatch(added.out, /CodeGraph|codegraph/);
   assert.match(added.out, /about: Simba writes a daily briefing from your calendar and inbox\./);
-  assert.match(added.out, /\/add-dir /);
-
-  const settings = JSON.parse(readFileSync(s.claudeLocalSettings, 'utf8'));
-  assert.equal(settings.permissions.additionalDirectories.length, 1);
-  assert.match(settings.permissions.additionalDirectories[0], /proj-simba$/);
 
   // Scanned facts are ordinary memories: searchable, scoped, marked as scanned.
   assert.match(s.mem(['search', 'package manager stack', '--project', 'simba']).out, /\[fact·proj-simba·scanned\] stack: TypeScript/);
   assert.match(s.mem(['project', 'list']).out, /^proj-simba {2}.*\(also: simba\)/);
 });
 
-test('adding the same directory again rescans instead of failing, and keeps existing settings intact', () => {
+test('adding the same directory again rescans instead of failing', () => {
   const s = sandbox();
   const dir = fixtureRepo(s);
-  writeFileSync(s.claudeLocalSettings, JSON.stringify({ permissions: { allow: ['Bash(ls *)'], additionalDirectories: ['/elsewhere'] } }));
   s.mem(['project', 'add', dir]);
 
   const again = s.mem(['project', 'add', dir]);
   assert.match(again.out, /^proj-simba was already registered — rescanned \(0 new, 0 changed, 0 gone\)/);
-
-  const settings = JSON.parse(readFileSync(s.claudeLocalSettings, 'utf8'));
-  assert.deepEqual(settings.permissions.allow, ['Bash(ls *)']);
-  assert.equal(settings.permissions.additionalDirectories.length, 2);
 });
 
 test('a rescan replaces exactly the facts that changed and retires the ones that are gone', () => {

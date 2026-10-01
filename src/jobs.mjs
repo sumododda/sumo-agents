@@ -93,8 +93,8 @@ function workerRules(job, { testsMayChange }) {
       : `Do not edit, skip or delete one. A test that is genuinely wrong, or that contradicts the task: stop and say why with \`mem job ask ${job.id}\`.`
   } Never loosen a lint or type setting, add an ignore, or special-case a test's input to get green.
 - A question you can settle yourself: decide, carry on, and list it under Decisions. Stop and ask only for something destructive or irreversible, security-sensitive, outside this project, or a task so unclear that every path is a guess.
-- You do not start sub-agents. Review comes after you, from someone who did not write the code.
-- At each major milestone (a phase of the task done, or something only the user can settle) send one line with SendMessage to "main": \`j${job.id} <what now works>; next: <step>\` (load SendMessage with ToolSearch if it is deferred). Nothing else in between.
+- You do not start other jobs. Review comes after you, from someone who did not write the code.
+- At each major milestone (a phase of the task done) note one line: \`mem job note ${job.id}\` — \`<what now works>; next: <step>\`. Nothing else in between.
 `;
 }
 
@@ -118,7 +118,7 @@ ${change ? `\n## The change to judge\n${change}\n` : ''}${guide ? `\n## How this
 ${job.agent === 'worker' ? workerRules(job, options) : ''}- Worth keeping if you are interrupted — what you found, what you tried, what is left: \`mem job note ${job.id}\` (text on stdin).
 - Blocked on something only the user can decide: \`mem job ask ${job.id}\` (one question on stdin), then stop. You will be resumed with the answer.
 - You may read memory: \`mem search "<words>" --project ${project.slug}\`. You never write it.
-- If some other command is refused, carry on with Read, Grep and Glob. \`mem\` commands are always allowed, so a refusal never stops you from noting, asking or finishing.
+- If a command is refused, carry on another way (grep, a view of a line range). \`mem\` commands are always allowed, so a refusal never stops you from noting, asking or finishing.
 - When finished you must close the job, or nobody knows it ended: ${closing}
 ${REPORT[job.agent]}
 - Every message and report: short lines, facts only. No prose, no preamble, no restating the task.
@@ -168,11 +168,6 @@ function changeToJudge(db, { project, reviews }) {
   const { tracked, created } = changesSince(project.path, snap);
   if (tracked.length + created.length === 0) throw new UsageError('nothing has changed — there is nothing to review');
   return { snap, lines };
-}
-
-/** The sub-agent a job's route names: `<role>-<effort>`, or the plain role where there is no effort — a scout, or haiku. */
-export function agentType(job) {
-  return job.agent === 'scout' || job.effort === 'none' ? job.agent : `${job.agent}-${job.effort}`;
 }
 
 const reviewsFile = (id) => fileOf(id, 'reviews.json');

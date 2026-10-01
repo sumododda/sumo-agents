@@ -4,7 +4,7 @@ import { guardCommand, guardPath, isSecretPath } from '../src/guard.mjs';
 import { sandbox } from './helpers.mjs';
 
 const SESSION = { session_id: 'sess-g', cwd: '/work/proj' };
-const decision = (run) => (run.out ? JSON.parse(run.out).hookSpecificOutput : null);
+const decision = (run) => (run.out ? JSON.parse(run.out) : null);
 
 test('a command that would wipe a tree, throw away history or empty a database is refused, and the refusal says why', () => {
   for (const command of [
@@ -116,13 +116,12 @@ test('the same secret paths are known by name, for the file tool and for a chang
 test('the hook refuses before anything else runs — for a shell command and for the file tool alike', () => {
   const s = sandbox();
   const held = decision(s.hook('pre-tool', { ...SESSION, tool_name: 'Bash', tool_input: { command: 'git reset --hard' } }));
-  assert.equal(held.hookEventName, 'PreToolUse');
-  assert.equal(held.permissionDecision, 'deny');
-  assert.match(held.permissionDecisionReason, /^Refused: `git reset --hard` throws away/);
+  assert.ok(held.deny);
+  assert.match(held.deny, /^Refused: `git reset --hard` throws away/);
 
   const read = decision(s.hook('pre-tool', { ...SESSION, tool_name: 'Read', tool_input: { file_path: '/work/proj/.env' } }));
-  assert.equal(read.permissionDecision, 'deny');
-  assert.match(read.permissionDecisionReason, /^Refused: .*secret/i);
+  assert.ok(read.deny);
+  assert.match(read.deny, /^Refused: .*secret/i);
 
   assert.equal(s.hook('pre-tool', { ...SESSION, tool_name: 'Read', tool_input: { file_path: '/work/proj/src/index.js' } }).out, '', 'an ordinary read costs nothing');
   assert.equal(s.hook('pre-tool', { ...SESSION, tool_name: 'Bash', tool_input: { command: 'npm test' } }).out, '');

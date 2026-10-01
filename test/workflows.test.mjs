@@ -10,7 +10,7 @@ const PR_STEPS = '1. run every CI check locally and make sure it passes\n2. crea
 
 const teachPr = (s, extra = []) => s.mem(['learn', 'Creating a PR', '--cue', 'create a PR', ...extra], { input: PR_STEPS });
 const bash = (s, command, more = {}) => s.hook('pre-tool', { ...SESSION, tool_name: 'Bash', tool_input: { command }, ...more });
-const decision = (run) => (run.out ? JSON.parse(run.out).hookSpecificOutput : null);
+const decision = (run) => (run.out ? JSON.parse(run.out) : null);
 
 test('an agent about to do what a workflow covers is stopped and handed the steps — once', () => {
   const s = sandbox();
@@ -21,11 +21,10 @@ test('an agent about to do what a workflow covers is stopped and handed the step
   assert.equal(bash(s, 'git push -u origin fix/login-form-validation').out, '');
 
   const held = decision(bash(s, 'gh-axi pr create --title "fix(auth): rework login form"'));
-  assert.equal(held.hookEventName, 'PreToolUse');
-  assert.equal(held.permissionDecision, 'deny');
-  assert.match(held.permissionDecisionReason, /^Not yet\. The user taught a workflow for exactly this/);
-  assert.match(held.permissionDecisionReason, /<workflow m1 "Creating a PR">\n1\. run every CI check locally[\s\S]*3\. only then open the PR/);
-  assert.match(held.permissionDecisionReason, /then run the command again\.$/);
+  assert.ok(held.deny);
+  assert.match(held.deny, /^Not yet\. The user taught a workflow for exactly this/);
+  assert.match(held.deny, /<workflow m1 "Creating a PR">\n1\. run every CI check locally[\s\S]*3\. only then open the PR/);
+  assert.match(held.deny, /then run the command again\.$/);
 
   // The steps are now in front of it, so the retry goes through. The gate informs; it does not argue.
   assert.equal(bash(s, 'gh-axi pr create --title "fix(auth): rework login form"').out, '');
@@ -69,11 +68,11 @@ test('the gate never blocks mem itself, other tools, or a command that only shar
 test('a sub-agent has its own context, so it is given the steps even if the main agent already was', () => {
   const s = sandbox();
   teachPr(s);
-  assert.equal(decision(bash(s, 'gh pr create --fill')).permissionDecision, 'deny');
+  assert.ok(decision(bash(s, 'gh pr create --fill')).deny);
   assert.equal(bash(s, 'gh pr create --fill').out, '');
 
   const worker = { agent_id: 'agent-7', agent_type: 'worker' };
-  assert.equal(decision(bash(s, 'gh pr create --fill', worker)).permissionDecision, 'deny');
+  assert.ok(decision(bash(s, 'gh pr create --fill', worker)).deny);
   assert.equal(bash(s, 'gh pr create --fill', worker).out, '');
 });
 
@@ -87,12 +86,12 @@ test('a project\'s workflow applies only once that project has come up; after a 
 
   assert.equal(bash(s, 'gh pr create --fill').out, '', 'nothing in this session is about simba yet');
   s.hook('prompt', { ...SESSION, prompt: 'let us work on simba' });
-  assert.equal(decision(bash(s, 'gh pr create --fill')).permissionDecision, 'deny');
+  assert.ok(decision(bash(s, 'gh pr create --fill')).deny);
   assert.equal(bash(s, 'gh pr create --fill').out, '');
 
   s.hook('session-start', { ...SESSION, source: 'compact' });
   s.hook('prompt', { ...SESSION, prompt: 'back to simba' });
-  assert.equal(decision(bash(s, 'gh pr create --fill')).permissionDecision, 'deny', 'the steps left the context with the compaction');
+  assert.ok(decision(bash(s, 'gh pr create --fill')).deny, 'the steps left the context with the compaction');
 });
 
 test('a stated gate decides exactly which commands wait — no accidental matches, no near-misses', () => {
@@ -109,9 +108,9 @@ test('a stated gate decides exactly which commands wait — no accidental matche
   // And it catches a command the cue's words would have missed entirely.
   const other = sandbox();
   other.mem(['learn', 'Creating a PR', '--cue', 'open a pull request', '--gate', 'gh(-axi)? pr create|glab mr create'], { input: PR_STEPS });
-  assert.equal(decision(bash(other, 'glab mr create --title x')).permissionDecision, 'deny');
+  assert.ok(decision(bash(other, 'glab mr create --title x')).deny);
 
-  assert.equal(decision(bash(s, 'gh-axi pr create --title "fix: login form"')).permissionDecision, 'deny');
+  assert.ok(decision(bash(s, 'gh-axi pr create --title "fix: login form"')).deny);
   assert.equal(bash(s, 'GH-AXI PR CREATE --fill').out, '', 'shown once; and matching ignores case');
 
   // The user asking for it is still matched by the cue — a gate is about commands only.
@@ -121,15 +120,15 @@ test('a stated gate decides exactly which commands wait — no accidental matche
 test('a gate can be put on a workflow that already exists, and taken off again', () => {
   const s = sandbox();
   teachPr(s);
-  assert.equal(decision(bash(s, 'grep "create pr" notes.md', { session_id: 'a' })).permissionDecision, 'deny', 'with no gate, the cue words are the guess');
+  assert.ok(decision(bash(s, 'grep "create pr" notes.md', { session_id: 'a' })).deny, 'with no gate, the cue words are the guess');
 
   const set = s.mem(['gate', 'm1', 'gh(-axi)? pr create']);
   assert.match(set.out, /^m1 \[proc·global·stated\] "Creating a PR" — when: create a PR\ngates shell commands matching: gh\(-axi\)\? pr create/);
   assert.equal(bash(s, 'grep "create pr" notes.md', { session_id: 'b' }).out, '');
-  assert.equal(decision(bash(s, 'gh pr create --fill', { session_id: 'b' })).permissionDecision, 'deny');
+  assert.ok(decision(bash(s, 'gh pr create --fill', { session_id: 'b' })).deny);
 
   assert.match(s.mem(['gate', 'm1', 'off']).out, /no gate — its cue words are matched instead/);
-  assert.equal(decision(bash(s, 'grep "create pr" notes.md', { session_id: 'c' })).permissionDecision, 'deny');
+  assert.ok(decision(bash(s, 'grep "create pr" notes.md', { session_id: 'c' })).deny);
 });
 
 test('a gate that is broken or would hold back everything is refused when it is written, not discovered later', () => {
@@ -162,7 +161,7 @@ test('a memory from before gates existed upgrades in place and keeps working', (
 
   assert.match(s.mem(['search', 'concise']).out, /m2 .*be concise/, 'opening it migrates it; nothing is lost');
   assert.equal(s.sql((db) => db.prepare('PRAGMA user_version').get().user_version), SCHEMA_VERSION);
-  assert.equal(decision(bash(s, 'gh pr create --fill')).permissionDecision, 'deny', 'the old workflow still triggers by its cue');
+  assert.ok(decision(bash(s, 'gh pr create --fill')).deny, 'the old workflow still triggers by its cue');
   assert.match(s.mem(['gate', 'm1', 'gh pr create']).out, /gates shell commands matching/);
 });
 

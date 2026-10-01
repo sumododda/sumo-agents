@@ -1,10 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
-import { allowDirectory } from './claude.mjs';
 import { openDb } from './db.mjs';
 import { dreamStatus, runDream } from './dream.mjs';
 import { backup, exportJson, exportMarkdown } from './export.mjs';
+import { chat } from './chat.mjs';
 import { runHook } from './hooks.mjs';
 import { runJob as runJobLoop, runLines } from './loop.mjs';
 import * as jobs from './jobs.mjs';
@@ -240,9 +240,8 @@ function runProject(db, { args, flags }) {
     case 'add': {
       need(rest, 1, 'project');
       const { project, created, changes } = projects.addProject(db, rest[0], { slug: flags.slug, aliases: flags.alias });
-      const note = allowDirectory(project.path);
       const summary = created ? `registered ${project.slug}` : `${project.slug} was already registered — rescanned (${changes.added} new, ${changes.updated} changed, ${changes.removed} gone)`;
-      return [summary, card(db, project.slug), ...(note ? [note] : [])];
+      return [summary, card(db, project.slug)];
     }
     case 'show':
       need(rest, 1, 'project');
@@ -285,8 +284,7 @@ function createdLines(job, warnings) {
     `created ${jobs.jobLine(job)}`,
     ...warnings,
     `route: ${job.model}/${job.effort} — ${job.route_reason}`,
-    `start it with the ${jobs.agentType(job)} sub-agent and exactly this prompt:`,
-    `JOB: run \`mem job brief ${job.id}\` and follow it exactly.`,
+    `run it: mem job run ${job.id}   (append & to run it in the background)`,
   ];
 }
 
@@ -336,10 +334,7 @@ async function runJob(db, { args, flags }) {
       return [`STATUS: NEEDS_INPUT — j${id}. Stop now; you will be resumed with the answer.`];
     case 'answer':
       jobs.answer(db, id, stdinText(flags));
-      return [
-        `answered j${id}. Resume the same sub-agent (SendMessage) with: "Your question is answered — run \`mem job brief ${id}\` and continue."`,
-        `If that sub-agent is gone, start a new one with: JOB: run \`mem job brief ${id}\` and follow it exactly.`,
-      ];
+      return [`answered j${id}. Continue it: mem job run ${id}   (the brief now carries the answer)`];
     case 'abandon':
       jobs.abandon(db, id);
       // A task just ended: if the session is already big, this is the cheapest moment to start a fresh one.
@@ -442,10 +437,18 @@ export async function main(argv) {
       return 0;
     }
     if (command === 'hook') {
-      // No usage errors, no exit codes, no stderr: a hook that complains breaks the session it is attached to.
-      const harness = rest[rest.indexOf('--harness') + 1] ?? 'claude';
-      process.stdout.write(runHook(rest[0], harness, process.stdin.isTTY ? '' : readFileSync(0, 'utf8')));
+      // No usage errors, no exit codes, no stderr: an event that complains breaks the session it serves.
+      process.stdout.write(runHook(rest[0], process.stdin.isTTY ? '' : readFileSync(0, 'utf8')));
       return 0;
+    }
+    if (command === 'chat') {
+      const { flags } = parse(rest, { value: ['model', 'effort'], bool: [] });
+      const db = openDb();
+      try {
+        return await chat(db, { model: flags.model, effort: flags.effort });
+      } finally {
+        db.close();
+      }
     }
     if (command === 'doctor') return runDoctor();
     if (command === 'config') {

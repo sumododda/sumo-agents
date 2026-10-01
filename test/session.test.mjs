@@ -99,7 +99,7 @@ test('a broken memory never breaks the session: hooks exit 0, print nothing, and
     assert.deepEqual([run.code, run.out, run.err], [0, '', ''], event);
   }
   assert.equal(s.mem(['hook', 'prompt', '--harness', 'claude'], { input: 'not json at all' }).code, 0);
-  assert.match(readFileSync(join(s.home, 'logs', 'hook.log'), 'utf8'), /claude session-start: /);
+  assert.match(readFileSync(join(s.home, 'logs', 'hook.log'), 'utf8'), / session-start: /);
 });
 
 test('the writer files what the user really said, holds back what it cannot prove, and ignores one-off requests', () => {
@@ -346,7 +346,7 @@ test('a session that has grown big says so once per band, with the compact hint 
   withSimba(s);
   const file = join(s.root, 'growing.jsonl');
   const session = { session_id: 'sess-big', cwd: '/Users/sumo/sumo-agents', transcript_path: file };
-  const hint = 'hint: focus on proj-simba; keep decisions and open job ids; drop tool output and file contents.';
+  const hint = 'hint: focus on proj-simba; keep decisions and open job ids in a note; drop tool output and file contents.';
 
   grownTo(file, 40_000);
   assert.match(say(s, 'fix the briefing bug in simba', session).out, /^<project proj-simba>/);
@@ -355,7 +355,7 @@ test('a session that has grown big says so once per band, with the compact hint 
   grownTo(file, 90_000);
   assert.equal(
     say(s, 'keep going', session).out,
-    `context: 90k tokens — quality drops from here. Finish the piece in hand, then start fresh: /clear, and mem prime brings the thread back. Mid-task and it must continue: /compact <hint below>. ${hint}`,
+    `context: 90k tokens — quality drops from here. Finish the piece in hand, then tell the user to type /new: the memory block brings the thread back. ${hint}`,
   );
 
   grownTo(file, 100_000);
@@ -366,8 +366,8 @@ test('a session that has grown big says so once per band, with the compact hint 
   grownTo(file, 155_000);
   assert.equal(
     say(s, 'one more thing', session).out,
-    'context: 155k tokens — start fresh now: note where you are (mem job note / the Stop hook records "Left off"), then /clear. ' +
-      'hint: focus on migrate to pnpm; keep decisions and open job ids; drop tool output and file contents.',
+    'context: 155k tokens — start fresh now: note where you are (mem job note; the end of the turn records "Left off"), then tell the user to type /new. ' +
+      'hint: focus on migrate to pnpm; keep decisions and open job ids in a note; drop tool output and file contents.',
   );
 });
 
@@ -386,7 +386,7 @@ test('a task that ends in a big session ends with the nudge to start fresh', () 
   const file = join(s.root, 'boundary.jsonl');
   grownTo(file, 120_000);
   say(s, 'start the pnpm migration in simba', { session_id: 'sess-boundary', cwd: '/x', transcript_path: file });
-  const boundary = 'this session is at 120k tokens and the task just ended — /clear now; mem prime brings the thread back.';
+  const boundary = 'this session is at 120k tokens and the task just ended — a good moment for /new; the memory block brings the thread back.';
 
   const task = 'Move simba to pnpm.\n## Check\n`make test` exits 0.\n';
   assert.equal(s.mem(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm'], { input: task }).code, 0);

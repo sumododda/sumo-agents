@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { openDb } from '../src/db.mjs';
-import { paramsFor, runJob, runLines } from '../src/loop.mjs';
+import { jobParams, runJob, runLines } from '../src/loop.mjs';
 import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { cap, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
@@ -41,7 +41,7 @@ const canned = (responses) => {
 };
 
 test('the request: frozen system with a cache breakpoint, the brief as the one user turn, tools by role, effort by route', () => {
-  const worker = paramsFor({ job: { agent: 'worker', model: 'sonnet', effort: 'medium' }, text: 'the brief', system: 'rules' });
+  const worker = jobParams({ job: { agent: 'worker', model: 'sonnet', effort: 'medium' }, text: 'the brief', system: 'rules' });
   assert.equal(worker.model, 'claude-sonnet-5-5');
   assert.deepEqual(worker.system, [{ type: 'text', text: 'rules', cache_control: { type: 'ephemeral' } }]);
   assert.deepEqual(worker.messages, [{ role: 'user', content: [{ type: 'text', text: 'the brief' }] }]);
@@ -49,10 +49,10 @@ test('the request: frozen system with a cache breakpoint, the brief as the one u
   assert.deepEqual(worker.output_config, { effort: 'medium' });
   assert.equal(worker.context_management.edits[0].type, 'clear_tool_uses_20250919');
 
-  const scout = paramsFor({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' });
+  const scout = jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' });
   assert.deepEqual(scout.tools.map((t) => t.name), ['bash'], 'a scout cannot edit');
   assert.equal('output_config' in scout, false, 'haiku takes no effort');
-  const reviewer = paramsFor({ job: { agent: 'reviewer', model: 'opus', effort: 'high' }, text: 'judge', system: 'rules' });
+  const reviewer = jobParams({ job: { agent: 'reviewer', model: 'opus', effort: 'high' }, text: 'judge', system: 'rules' });
   assert.deepEqual(reviewer.tools.map((t) => t.name), ['bash'], 'a reviewer cannot edit');
 });
 

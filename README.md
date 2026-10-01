@@ -2,22 +2,23 @@
 
 One repo you open and talk to. It works across every other project on the machine, remembers what you
 tell it so you never explain twice, learns each project as you go, and hands big work to cheaper
-sub-agents. Built for Claude Code; the core is harness-neutral.
+jobs that run in its own loop against the Anthropic API. No harness: Sumo owns its prompt, its tools,
+its context and its cost.
 
 The repo holds only the process. Everything learned lives in `~/.sumo-agents/` on each machine and is
 never committed — a work laptop and a personal one learn separately.
 
 ## Set up a machine
 
-Needs Node 22.13+, Claude Code, an `ANTHROPIC_API_KEY` in the environment (the background memory passes call the
-API directly), and llama.cpp (`brew install llama.cpp`) for the local router model.
+Needs Node 22.13+, an `ANTHROPIC_API_KEY` in the environment, and llama.cpp (`brew install llama.cpp`)
+for the local router model.
 
 ```sh
 git clone <this repo> ~/sumo-agents && cd ~/sumo-agents
 npm install                # the one dependency: the Anthropic SDK
 node bin/mem.mjs setup     # creates ~/.sumo-agents, links `mem` into a directory on your PATH
 mem doctor                 # every line should say ok
-claude                     # open it here. Approve the project hooks once when asked.
+mem chat                   # talk
 ```
 
 Setup asks one question, once: where to download the router model from. Enter keeps the default,
@@ -30,13 +31,13 @@ instead (`https://<host>/artifactory/api/huggingfaceml/<repo-key>`); the same
 mem setup --model-source https://<host>/artifactory/api/huggingfaceml/hf-remote   # non-interactive
 mem setup --no-model                                                               # skip the download
 mem config model.source <url>                                                      # change it later
+mem config chat.model opus · chat.effort high                                      # what `mem chat` runs on
 ```
 
-Without llama.cpp or the model, everything still works: jobs fall back to a fixed route per role and
-`mem doctor` says what is missing.
-
 Then just talk. Mention a project the way you normally would; the first time, the agent finds it on
-disk, confirms the path with you, and registers it.
+disk, confirms the path with you, and registers it. In the chat: `/fix`, `/feature`, `/review`, `/dream`
+load the matching guide; `/new` starts a fresh session with the memory block; `! <command>` runs a
+command yourself, where the agent would be refused; `/quit` ends it.
 
 ## Update a machine
 
@@ -48,20 +49,27 @@ mem doctor                 # first line shows the commit now running — compare
 That is all: `mem` runs straight from the repo, so new code is live the moment it is pulled, and the
 database upgrades itself the next time it is opened. Your memory is not touched — it lives in
 `~/.sumo-agents/`, outside the repo. Run `mem setup` again only if `mem doctor` tells you to (you moved
-the repo, or changed Node versions). Start a new Claude Code session afterwards, so it loads the new
-`AGENTS.md` and hooks.
+the repo, or changed Node versions). Start a new `mem chat` afterwards, so it loads the new
+`AGENTS.md`.
 
 ## What happens while you talk
 
+Every session runs in Sumo's own loop: one request per turn to the Anthropic Messages API, two tools
+(a shell and a file editor, both Anthropic-defined so no schema is sent), a frozen system prompt that
+caches across turns, and old tool results cleared server-side once the context passes 60k tokens.
+History is never rewritten on the client.
+
 | When | What runs | Cost to the model you chat with |
 |---|---|---|
-| Session starts | A hook prints the core block: your global preferences, workflows, projects, where you left off, open jobs, things to confirm. Hard cap 800 tokens. | ≤ 800 tokens, once |
-| You send a message | A hook stores it word for word (secrets redacted). First mention of a project adds its card: path, stack, commands, your rules for it, gotchas. | 0, or ≤ 200 once per project |
-| The agent is about to run a command that would wipe a tree (`rm -rf ~`, `git reset --hard`, `git clean -f`, `DROP TABLE` …), or to print or open a secret file (`.env`, a private key, `~/.aws/credentials`) | A hook refuses it before it runs, in plain code, and says why. No memory is consulted. The way through is you: `! <command>` runs it yourself. A force-push is not on the list — it is an accepted way of cleaning up history here. | 0 |
-| The agent is about to run a shell command a taught workflow gates (`gh pr create`, for a workflow taught with `--gate 'gh(-axi)? pr create'`) | A hook holds the command back once and hands the agent the workflow's steps. It follows them, then runs the command. The same steps ride in with your message when you ask for the thing yourself. | 0 until it fires |
-| The agent is about to ask you something — a turn ending on a question, or the question tool | A hook searches memory with the question's own words, in plain code. If something close is there, the agent is handed it once and carries on instead of waiting for you; if nothing is, the question reaches you untouched. | 0 unless memory answers |
-| The assistant finishes a turn | A hook wakes the **scribe** — a detached, headless Haiku call that reads the new turns and proposes memories. Code checks every proposal against what you actually typed before saving it. | 0 |
+| Session starts | The first user turn is the core block: your global preferences, workflows, projects, where you left off, open jobs, things to confirm. Hard cap 800 tokens. | ≤ 800 tokens, once |
+| You send a message | It is stored word for word (secrets redacted). First mention of a project adds its card — path, stack, commands, your rules for it, gotchas — as an operator message after the cached prefix. | 0, or ≤ 200 once per project |
+| The agent is about to run a command that would wipe a tree (`rm -rf ~`, `git reset --hard`, `git clean -f`, `DROP TABLE` …), or to print, open or write a secret file (`.env`, a private key, `~/.aws/credentials`) | Refused in plain code before it runs, and the refusal says why. No memory is consulted. The way through is you: `! <command>` runs it yourself. A force-push is not on the list — it is an accepted way of cleaning up history here. | 0 |
+| The agent reaches for a path outside the project | Refused: the shell runs in the project directory and the editor is jailed to it (symlinks followed). The child environment carries no key, token or password variable, so `env` cannot print your API key. | 0 |
+| The agent is about to run a shell command a taught workflow gates (`gh pr create`, for a workflow taught with `--gate 'gh(-axi)? pr create'`) | The command is held back once and the agent is handed the workflow's steps. It follows them, then runs the command. The same steps ride in with your message when you ask for the thing yourself. | 0 until it fires |
+| The agent ends a turn on a question | Memory is searched with the question's own words, in plain code. If something close is there, the agent is handed it once and carries on instead of waiting for you; if nothing is, the question reaches you untouched. | 0 unless memory answers |
+| A turn ends | The **scribe** wakes — a detached Haiku call straight to the API that reads the new turns and proposes memories. Code checks every proposal against what you actually typed before saving it. | 0 |
 | 3 finished sessions pile up | The **dream** pass reads them side by side: contradictions, repeated corrections, routines worth naming. | 0 |
+| Every model response | One ledger row: tokens in, cached, written, out, cost, the job or session it served. `mem scribe stats` sums them. | 0 |
 
 What you state is saved silently. What the model could not tie to your exact words is held and put
 to you as a one-line question at the next session start. Nothing from web pages, files or tool output
@@ -86,24 +94,21 @@ mem forget <id>                    # stop it being true (history kept);  --purge
 
 ## Delegation
 
-The main agent does small things itself. Big, parallel or reading-heavy work goes to a sub-agent through
-a written brief (`mem job new`). All three refuse to start without a job:
+The main agent does small things itself. Big, parallel or reading-heavy work goes to a job: a written
+brief (`mem job new`) run in its own loop (`mem job run <id>`, or `… &` for the background). The job gets
+the brief as its only user turn, a short frozen system prompt, and tools by role:
 
-| Sub-agent | Model and effort | Can edit | For |
+| Role | Model and effort | Tools | For |
 |---|---|---|---|
-| `scout` | always Haiku | no | finding, tracing, auditing, summarizing — anything reading-heavy |
-| `worker` | chosen per job by the router | yes | building and fixing |
-| `reviewer` | chosen per job by the router | no | judging a change it did not write |
+| `scout` | always Haiku | shell | finding, tracing, auditing, summarizing — anything reading-heavy |
+| `worker` | chosen per job by the router | shell + editor | building and fixing |
+| `reviewer` | chosen per job by the router | shell | judging a change it did not write |
 
-A job can also run outside Claude Code: `mem job run <id>` runs it in Sumo's own loop against the
-Anthropic API on the route the router chose, with two tools (a shell and a file editor), the same
-guard, a path jail around the project, capped tool output, secrets kept out of the tool environment,
-and one ledger row per model response (`mem scribe stats`). The job closes itself the way its brief says.
-
-A blocked sub-agent asks; the main agent checks memory before it asks you. Briefs, notes, answers,
-reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today can be picked up
-tomorrow. One worker per project at a time — they share a working tree, and `mem job new` says so when
-a second one is created.
+A `mem job run` typed by the chat agent runs inside the chat process, so the API key never enters a
+shell. A blocked job asks (`mem job ask`); the main agent checks memory before it asks you. Briefs,
+notes, answers, reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today
+can be picked up tomorrow with the same command. One worker per project at a time — they share a
+working tree, and `mem job new` says so when a second one is created.
 
 ## Which model and effort a job gets
 
@@ -112,7 +117,7 @@ The model you chat with never decides this. `mem job new` does, in plain code, a
 ```
 created j27 [worker·sumo-agents·running] Session hygiene: context gauge …
 route: opus/xhigh — router: a new feature across hooks and sessions with tests
-start it with the worker-xhigh sub-agent and exactly this prompt: JOB: run `mem job brief 27` …
+run it: mem job run 27   (append & to run it in the background)
 ```
 
 The route is the router's answer, and nothing else's. On every `mem job new` and every `mem job retry`, a
@@ -121,16 +126,15 @@ how each model/effort scored in past reviews — and answers with a model, an ef
 runs locally, costs nothing, and takes about 1.5 s including startup. There are no flags to override it,
 no project rules, no retry ladder and no floors.
 
-If the router is missing, fails, or answers something no sub-agent can run (a model outside the list, or
+If the router is missing, fails, or answers something no job can run on (a model outside the list, or
 no effort for a model that takes one), the command exits with the error and **no job is created**. The
 answer schema pairs Haiku with no effort and every other model with one. The only change made to an
 answer: a scout exists only on Haiku. `mem doctor` fails while the router is missing.
 
-Effort is real, not advisory: `worker-low` … `worker-max` and `reviewer-low` … `reviewer-max` are agent
-files whose frontmatter carries the level. A hook on the Agent call rewrites its model and agent type to
-the job's route, and logs requested vs applied in the job folder, so what was chosen is what runs.
+Effort is real, not advisory: the route's effort goes on the request as `output_config.effort`, its model as the
+model id, and the run's ledger rows say what ran — so what was chosen is what runs.
 
-Models available to sub-agents: `haiku`, `sonnet`, `opus`, `fable`. Effort levels: `low`, `medium`,
+Models available to jobs: `haiku`, `sonnet`, `opus`, `fable`. Effort levels: `low`, `medium`,
 `high`, `xhigh`, `max`; Haiku takes none.
 
 **The label that grades a route is a review, not a green check.** A worker's DONE only proves the
@@ -160,7 +164,7 @@ only when that work comes up:
 
 You do not have to type the command: `AGENTS.md` tells the agent to read the matching guide first.
 
-**`--guide`** is how the same steps reach a sub-agent. `mem job new --guide fix` pastes `guides/fix.md`
+**`--guide`** is how the same steps reach a job. `mem job new --guide fix` pastes `guides/fix.md`
 into the worker's brief, so a delegated fix is done the same way as one done in the conversation. A
 reviewer job always carries `guides/review.md`.
 
@@ -231,20 +235,18 @@ rather than better. Findings are still claims — `guides/review.md` ends with h
 
 Model quality falls with the absolute size of the context, not with the share of the window that is
 full: degradation is measurable from tens of thousands of tokens, and a coding-agent study passed 8 of
-10 runs clean and 3 of 10 with about 75k tokens of extra context, relevant or not. Anthropic's own rule
-is that a new task gets a new session, and that a compaction is only good when the model is told what
-to keep. So:
+10 runs clean and 3 of 10 with about 75k tokens of extra context, relevant or not. A new task gets a
+new session. So:
 
-- **A gauge, not a guess.** Every prompt, a hook reads the exact context size from the session
-  transcript. At 80k tokens it says so once — finish the piece in hand, then `/clear`; mid-task and it
-  must continue, `/compact` with the hint it prints. At 150k it says start fresh now.
-- **A boundary nudge.** `mem job finish` and `mem job abandon` end with a clear-now line when the session
+- **A gauge, not a guess.** The exact context size comes back with every response and shows in the
+  prompt (`sumo 92k>`). At 80k tokens the agent is told once — finish the piece in hand, then ask for
+  `/new`. At 150k it is told to stop and note where it is.
+- **A boundary nudge.** `mem job finish` and `mem job abandon` end with a `/new` line when the session
   is already heavy, because a task boundary is the cheapest place to start over.
-- **Nothing is lost.** The Stop hook records where you left off, and `mem prime` brings it back in the
-  next session's first block. Open jobs resume from their briefs.
-- **Compaction knows what to keep.** `AGENTS.md` carries a three-line compact instruction: open job ids
-  and status, decisions made this session, the current project, the last failing command; drop tool
-  output and file contents.
+- **Nothing is lost.** The end of a turn records where you left off, and the next session's first
+  block brings it back. Open jobs resume from their briefs.
+- **Old tool output goes first.** Past 60k tokens the API clears the oldest tool results from what
+  the model reads, keeping the last five; the conversation itself stays intact.
 
 ## What a project card tells you about hygiene
 
@@ -259,19 +261,20 @@ in for test and lint. `mem project rescan <slug>` after setting one up.
 |---|---|
 | a worker's DONE against the project's checks and a baseline | the steps in `guides/fix.md`, `feature.md`, `review.md` |
 | existing tests untouched by a worker | the rules in `AGENTS.md` for work done in the conversation itself |
-| no reviewer or scout can edit (no edit tools) | a worker running `mem job baseline` first — though skipping it only hurts the worker |
-| a taught workflow's steps before a gated shell command | |
-| no job, no sub-agent | |
-| a destructive command, or a read of a secret file, refused before it runs | |
+| no reviewer or scout can edit (no editor tool) | a worker running `mem job baseline` first — though skipping it only hurts the worker |
+| a taught workflow's steps before a gated shell command | the nudge to start a new session |
+| no job, no run | |
+| a destructive command, a secret file, or a path outside the project, refused before it runs | |
+| no secret in a tool's environment or in what a tool prints | |
 | a key or token in a worker's change blocks DONE | |
-| a job's model and effort, rewritten onto the Agent call by a hook | the compact instructions, and the nudge to start a new session |
+| a job's model and effort, set on the request from its route | |
 
 The split is deliberate: a line in a prompt is a request, and the things that are cheap to check by
 running something are checked by running something.
 
 ## What it costs
 
-Measured on this machine while the passes still ran through Claude Code 2.1 (Haiku 4.5, subscription login);
+Measured on this machine before the passes called the API directly (Haiku 4.5 through a harness, subscription login);
 they now call the API directly, and `mem scribe stats` shows what that costs:
 
 - One scribe call: about 4,300 tokens in, 300–600 out, **$0.011–0.013**, 4–8 s, in the background.
@@ -294,12 +297,13 @@ node probes/scope-accuracy.mjs        # live: real model, about 7 cents
 ## Layout
 
 ```
-AGENTS.md            the only always-loaded instructions (CLAUDE.md just imports it)
+AGENTS.md            the system prompt of the chat, and the only always-loaded instructions
+prompts/             agent.md — the system prompt of a job; scribe.md, dream.md — the memory passes
 guides/              read on demand: memory · projects · workflows · delegation · fix · feature · review
-prompts/             system prompts for the scribe and dream passes
 bin/mem.mjs  src/    the `mem` CLI — Node, one dependency (the Anthropic SDK), SQLite full-text search
-.claude/             hooks, the `mem` permission, the agents (scout · worker and reviewer at each effort), /dream /fix /feature /review
+src/loop.mjs         the loop every conversation runs in; src/tools.mjs the shell and editor with their policy
+src/chat.mjs         the chat; src/hooks.mjs the session policy as events
 src/route.mjs        how a job's model and effort are chosen: the router, and the stats
 test/  probes/       the suite, and the live measurement
-docs/PLAN.md         the design, the evidence behind it, and what was measured while building it
+docs/ADR-runtime.md  the decision to own the runtime, and the plan it followed; docs/PLAN.md the original design
 ```

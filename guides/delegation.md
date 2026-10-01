@@ -20,8 +20,8 @@ write. The local router picks every route; if it fails, no job exists — tell t
 Rules and commands come from memory. One job = the smallest piece with its own check.
 Existing tests must change → `--tests-may-change`.
 
-**2. Start it** with the named sub-agent and exactly the `JOB:` line printed. Independent scouts go in
-the same turn; one worker per project at a time — they share a working tree.
+**2. Run it:** `mem job run <id>` (the chat waits) or `mem job run <id> &` (background; `mem job show <id>`
+says where it is). One worker per project at a time — they share a working tree.
 
 **3. Read the result:** a STATUS line, one line per file; the report: `mem job show <id>`. A worker's DONE means code ran the project's checks against a baseline;
 `UNVERIFIED` or `look at:` → open the report. Relay its Concerns and Decisions. Work that matters →
@@ -32,5 +32,5 @@ No STATUS line → never closed: `mem job finish <id> --status DONE|FAILED`.
 `mem job answer <id>` (answer on stdin), resume as it says.
 
 **A job from an earlier session** (listed at session start): `mem job show <id>`. Worth finishing → a fresh
-sub-agent with the same `JOB:` line continues from its brief; not worth it → `mem job abandon <id>`.
+`mem job run <id>` continues it from its brief; not worth it → `mem job abandon <id>`.
 A brief in phases → the worker notes each pass (`mem job note <id>`), so a resumed job starts at the first without one.

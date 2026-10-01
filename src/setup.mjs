@@ -19,6 +19,8 @@ export const CONFIG_DEFAULTS = {
   'prime.budget': '800',
   'scribe.model': 'haiku',
   'dream.model': 'haiku',
+  'chat.model': 'opus',
+  'chat.effort': 'high',
   'model.source': 'https://huggingface.co',
   'model.repo': 'Qwen/Qwen3-4B-GGUF',
   'model.file': 'Qwen3-4B-Q4_K_M.gguf',

@@ -187,7 +187,7 @@ test('--guide carries the written way of doing that work into the brief', () => 
   const brief = s.mem(['job', 'brief', '1']).out;
   assert.match(brief, /## How this kind of work is done here\n1\. What changed recently\?/);
   assert.doesNotMatch(brief, /^# Fix$/m, 'the guide comes without its own title');
-  assert.match(brief, /You do not start sub-agents\./);
+  assert.match(brief, /You do not start other jobs\./);
   assert.match(brief, /## Concerns[\s\S]*## Decisions/);
 
   const bad = newWorker(s, ['--guide', 'vibes']);
@@ -208,7 +208,7 @@ test('a reviewer is handed the change as one file, what was asked, and the autho
 
   const created = s.mem(['job', 'new', '--project', 'gitproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'The thing must return 2.' });
   assert.equal(created.code, 0, created.err);
-  assert.match(created.out, /start it with the reviewer-\w+ sub-agent/);
+  assert.match(created.out, /run it: mem job run \d+/);
   assert.doesNotMatch(created.out, /names no check/);
 
   const brief = s.mem(['job', 'brief', '2']).out;

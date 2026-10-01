@@ -144,9 +144,9 @@ const inK = (tokens) => `${Math.round(tokens / 1000)}k`;
  * hint, so a `/compact` can be pasted exactly as it stands.
  */
 export function contextNudge(band, tokens, focus) {
-  const hint = `hint: focus on ${focus}; keep decisions and open job ids; drop tool output and file contents.`;
-  if (band === 'act') return `context: ${inK(tokens)} tokens — start fresh now: note where you are (mem job note / the Stop hook records "Left off"), then /clear. ${hint}`;
-  return `context: ${inK(tokens)} tokens — quality drops from here. Finish the piece in hand, then start fresh: /clear, and mem prime brings the thread back. Mid-task and it must continue: /compact <hint below>. ${hint}`;
+  const hint = `hint: focus on ${focus}; keep decisions and open job ids in a note; drop tool output and file contents.`;
+  if (band === 'act') return `context: ${inK(tokens)} tokens — start fresh now: note where you are (mem job note; the end of the turn records "Left off"), then tell the user to type /new. ${hint}`;
+  return `context: ${inK(tokens)} tokens — quality drops from here. Finish the piece in hand, then tell the user to type /new: the memory block brings the thread back. ${hint}`;
 }
 
 /**
@@ -158,5 +158,5 @@ export function taskEndedNudge(db) {
   const path = db.prepare('SELECT transcript_path FROM sessions ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1').get()?.transcript_path ?? null;
   const use = contextUse(path);
   if (!use || !contextBand(use.tokens)) return null;
-  return `this session is at ${inK(use.tokens)} tokens and the task just ended — /clear now; mem prime brings the thread back.`;
+  return `this session is at ${inK(use.tokens)} tokens and the task just ended — a good moment for /new; the memory block brings the thread back.`;
 }
