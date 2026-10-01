@@ -11,7 +11,7 @@ import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
 import { BASH_TOOL, cap, EDITOR_TOOL } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
-import { colourEnabled, createRenderer, renderBlock, styles } from './tty.mjs';
+import { colourEnabled, createRenderer, header, prompt, renderBlock, styles, widthOf } from './tty.mjs';
 
 /**
  * The conversation the user has with Sumo: the same loop a job runs in, with
@@ -176,6 +176,12 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     get sessionId() {
       return sessionId;
     },
+    get model() {
+      return model;
+    },
+    get effort() {
+      return effort;
+    },
     get params() {
       return params;
     },
@@ -185,12 +191,13 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   };
 }
 
-/** The terminal: a prompt, the reply rendered as it streams, tool lines dim, errors red, the size of the context in the prompt once it matters. */
+/** The terminal: a header, the prompt with the model in it, the reply rendered as it streams, tool lines dim, errors red, a rule between turns. */
 export async function chat(db, { model, effort } = {}) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const s = styles(colourEnabled());
+  const width = widthOf();
   const write = (t) => process.stdout.write(t);
-  const reply = createRenderer(write, s);
+  const reply = createRenderer(write, s, { width });
   // A closed stdin never answers a question; the close event is the answer.
   const closed = new Promise((resolve) => rl.once('close', () => resolve(null)));
   const session = createChat(db, {
@@ -202,17 +209,21 @@ export async function chat(db, { model, effort } = {}) {
       write(`\n${s.dim(`  › ${line}`)}\n`);
     },
   });
-  const show = (block) => write(`${renderBlock(block, s)}\n\n`);
+  const rule = () => write(`\n${s.dim('─'.repeat(width))}\n\n`);
+  const show = (block) => {
+    write(`${header({ model: session.model, effort: session.effort, cwd: process.cwd() }, s)}\n\n${renderBlock(block, s, { width })}\n`);
+    rule();
+  };
   show(session.start('startup'));
   try {
     for (;;) {
-      const k = session.contextTokens >= 1000 ? s.dim(` ${Math.round(session.contextTokens / 1000)}k`) : '';
-      const answer = await Promise.race([rl.question(`${s.bold(s.green('sumo'))}${k}${s.bold('>')} `).catch(() => null), closed]);
+      const answer = await Promise.race([rl.question(prompt({ model: session.model, effort: session.effort, contextTokens: session.contextTokens }, s)).catch(() => null), closed]);
       if (answer === null) break;
       const line = answer.trim();
       if (!line) continue;
       if (line.startsWith('!')) {
         write(`${s.dim(session.shell(line.slice(1).trim()))}\n`);
+        rule();
         continue;
       }
       const { text, control, error } = session.expand(line);
@@ -223,6 +234,7 @@ export async function chat(db, { model, effort } = {}) {
       if (control === 'quit') break;
       if (control === 'new') {
         session.end();
+        write('\n');
         show(session.start('new'));
         continue;
       }
@@ -230,7 +242,7 @@ export async function chat(db, { model, effort } = {}) {
       const outcome = await session.say(text);
       reply.flush();
       if (outcome.stop === 'error') write(`\n${s.red(`error: ${outcome.error}`)}\n`);
-      write('\n\n');
+      rule();
     }
   } finally {
     session.end();
