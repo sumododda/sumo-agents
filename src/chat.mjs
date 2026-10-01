@@ -11,6 +11,7 @@ import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
 import { BASH_TOOL, cap, EDITOR_TOOL } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
+import { colourEnabled, createRenderer, renderBlock, styles } from './tty.mjs';
 
 /**
  * The conversation the user has with Sumo: the same loop a job runs in, with
@@ -111,7 +112,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       child.unref();
       return { content: `started j${id} in the background — mem job show ${id} for progress; it reports when it closes` };
     }
-    emit(`\n[running j${id}…]\n`);
+    activity(`running j${id}…`);
     return { content: runLines(await runJob(db, id, { send: (p) => send(p, {}) })).join('\n') };
   }
 
@@ -135,7 +136,6 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           logLine(transcript, { type: 'assistant', message: { role: 'assistant', model: response.model ?? params.model, usage: response.usage, content: response.content } });
         },
       });
-      if (outcome.stop === 'error') emit(`\n[${outcome.error}]\n`);
       // Memory before the user: a turn ending on a question memory can answer is given the answer and continued, once.
       const held = continued ? '' : event('stop', { last_assistant_message: outcome.text, stop_hook_active: false });
       if (!held) return outcome;
@@ -185,38 +185,52 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   };
 }
 
-/** The terminal: a prompt, the reply streamed as it comes, the size of the context in the prompt once it matters. */
+/** The terminal: a prompt, the reply rendered as it streams, tool lines dim, errors red, the size of the context in the prompt once it matters. */
 export async function chat(db, { model, effort } = {}) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const s = styles(colourEnabled());
+  const write = (t) => process.stdout.write(t);
+  const reply = createRenderer(write, s);
   // A closed stdin never answers a question; the close event is the answer.
   const closed = new Promise((resolve) => rl.once('close', () => resolve(null)));
-  const session = createChat(db, { model, effort, out: (t) => process.stdout.write(t), activity: (line) => process.stdout.write(`\n  › ${line}\n`) });
-  const block = session.start('startup');
-  process.stdout.write(`${block}\n\n`);
+  const session = createChat(db, {
+    model,
+    effort,
+    out: (t) => reply.write(t),
+    activity: (line) => {
+      reply.flush();
+      write(`\n${s.dim(`  › ${line}`)}\n`);
+    },
+  });
+  const show = (block) => write(`${renderBlock(block, s)}\n\n`);
+  show(session.start('startup'));
   try {
     for (;;) {
-      const k = session.contextTokens >= 1000 ? ` ${Math.round(session.contextTokens / 1000)}k` : '';
-      const answer = await Promise.race([rl.question(`sumo${k}> `).catch(() => null), closed]);
+      const k = session.contextTokens >= 1000 ? s.dim(` ${Math.round(session.contextTokens / 1000)}k`) : '';
+      const answer = await Promise.race([rl.question(`${s.bold(s.green('sumo'))}${k}${s.bold('>')} `).catch(() => null), closed]);
       if (answer === null) break;
       const line = answer.trim();
       if (!line) continue;
       if (line.startsWith('!')) {
-        process.stdout.write(`${session.shell(line.slice(1).trim())}\n`);
+        write(`${s.dim(session.shell(line.slice(1).trim()))}\n`);
         continue;
       }
       const { text, control, error } = session.expand(line);
       if (error) {
-        process.stdout.write(`${error}\n`);
+        write(`${s.red(error)}\n`);
         continue;
       }
       if (control === 'quit') break;
       if (control === 'new') {
         session.end();
-        process.stdout.write(`${session.start('new')}\n\n`);
+        show(session.start('new'));
         continue;
       }
-      await session.say(text);
-      process.stdout.write('\n\n');
+      write('\n');
+      const outcome = await session.say(text);
+      reply.flush();
+      if (outcome.stop === 'error') write(`\n${s.red(`error: ${outcome.error}`)}\n`);
+      write('\n\n');
     }
   } finally {
     session.end();
