@@ -120,6 +120,23 @@ test('the schema the router answers under pairs haiku with no effort, and every 
   ]);
 });
 
+test('the router describes the job before it picks: kind, surface and risky come ahead of the model in every answer', async () => {
+  const capture = join(mkdtempSync(join(tmpdir(), 'sumo-agents-route-capture-')), 'saw.json');
+  await withRouter({ model: 'sonnet', effort: 'low', reason: 'x' }, async (db, project) => {
+    process.env.STUB_CAPTURE = capture;
+    try {
+      await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
+    } finally {
+      delete process.env.STUB_CAPTURE;
+    }
+  });
+  const { schema } = JSON.parse(readFileSync(capture, 'utf8'));
+  for (const branch of schema.anyOf) {
+    assert.deepEqual(Object.keys(branch.properties), ['kind', 'surface', 'risky', 'model', 'effort', 'reason']);
+    assert.deepEqual(branch.required, Object.keys(branch.properties));
+  }
+});
+
 test('a reason is one line of text: missing is outside the schema, a newline is folded', async () => {
   await withRouter({ model: 'sonnet', effort: 'low' }, async (db, project) => {
     await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /outside its schema/);
@@ -156,6 +173,38 @@ test('routeStats and statsLines group finished jobs by model and effort', async 
       ]);
 
       assert.deepEqual(statsLines(db, { project: 'no-such-project' }), ['no finished jobs yet']);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('the router is shown only evidence against a route: a clean record never, a failure or Important findings always', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sumo-agents-route-'));
+  const answerFile = join(dir, 'answer.json');
+  const capture = join(dir, 'shown.json');
+  writeAnswer(answerFile, { model: 'sonnet', effort: 'medium', reason: 'routine' });
+  await withHome(freshHome(), { SUMO_AGENTS_MODEL_CMD: STAND_IN, STUB_ANSWER: answerFile, STUB_CAPTURE: capture }, async () => {
+    const db = openDb();
+    try {
+      const project = makeProject(db, 'evidence');
+      const shown = async () => {
+        await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
+        return JSON.parse(readFileSync(capture, 'utf8')).prompt;
+      };
+
+      // Five clean jobs on the dearest route say nothing about what a cheaper one would have done.
+      for (let i = 0; i < 5; i++) insertJob(db, { project: project.slug, status: 'done', model: 'opus', effort: 'xhigh', important: i === 0 ? 0 : null });
+      insertJob(db, { project: project.slug, status: 'done', model: 'haiku', effort: 'none', important: null });
+      const clean = await shown();
+      assert.doesNotMatch(clean, /opus\/xhigh|haiku\/none/);
+      assert.match(clean, /^history:\nno history yet$/m);
+
+      insertJob(db, { project: project.slug, status: 'failed', model: 'sonnet', effort: 'medium' });
+      insertJob(db, { project: project.slug, status: 'done', model: 'sonnet', effort: 'medium', important: 2 });
+      const against = await shown();
+      assert.match(against, /^history:\nsonnet\/medium: 2 jobs, 1 done, 1 failed, 1 reviewed, avg 2\.0 Important findings$/m);
+      assert.doesNotMatch(against, /opus\/xhigh|haiku\/none/);
     } finally {
       db.close();
     }

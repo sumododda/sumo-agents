@@ -4,23 +4,34 @@ import { UsageError } from './memory.mjs';
 export const MODELS = ['haiku', 'sonnet', 'opus', 'fable'];
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-const ROUTER_SYSTEM =
-  'You assign a coding job to a model and an effort level. Answer with JSON only. Models, cheapest first: haiku (fast, mechanical work; no ' +
-  'effort setting), sonnet (routine coding), opus (design, hard bugs, review), fable (only when opus would plausibly fail: novel algorithms, ' +
-  'subtle concurrency, deep security review). Effort, cheapest first: low (short scoped edits), medium (routine implementation), high (judgment ' +
-  'needed), xhigh (many interacting parts), max (rare; only for the hardest reasoning). Rules: pick the cheapest model that would finish in one ' +
-  'pass with no Important review findings, then the lowest effort that fits. Raise effort before raising the model. Security, credentials, ' +
-  'money, migrations or concurrency raise both. A precise check and a small surface lower both. Use the project\'s history.';
+const KINDS = ['mechanical', 'routine', 'hard', 'novel'];
+const SURFACES = ['one spot', 'a few files', 'many interacting parts'];
 
-/** One answer shape per pairing, so the grammar itself cannot give haiku an effort or another model none. */
+const ROUTER_SYSTEM =
+  'You assign a coding job to a model and an effort level. Answer with JSON only. First classify the job, then choose. kind: mechanical (typos, ' +
+  'renames, comments, constants, tests for a pure function), routine (an ordinary feature or fix with a clear spec), hard (design, a bug whose ' +
+  'cause is unknown, or reviewing risky code), novel (new algorithms, subtle concurrency, deep security review). surface: how much code the job ' +
+  'touches. risky: true when it touches security, credentials, money, migrations or concurrency. Model follows kind: haiku for mechanical (it ' +
+  'takes no effort setting), sonnet for routine, opus for hard, fable for novel. Effort follows surface: low for one spot, medium for a few ' +
+  'files, high for many interacting parts. risky raises the effort one step (low, medium, high, xhigh, max) and makes a routine job hard. ' +
+  'History lists only the routes that failed or drew Important review findings on this project: for work like that, go above them.';
+
+/**
+ * One answer shape per pairing, so the grammar itself cannot give haiku an effort or another model none.
+ * The classification comes first: a small model that names the route first just repeats a route it was
+ * shown, and one that has described the job first chooses from the description.
+ */
 const answerShape = (models, efforts) => ({
   type: 'object',
   properties: {
+    kind: { type: 'string', enum: KINDS },
+    surface: { type: 'string', enum: SURFACES },
+    risky: { type: 'boolean' },
     model: { type: 'string', enum: models },
     effort: { type: 'string', enum: efforts },
     reason: { type: 'string', maxLength: 200 },
   },
-  required: ['model', 'effort', 'reason'],
+  required: ['kind', 'surface', 'risky', 'model', 'effort', 'reason'],
   additionalProperties: false,
 });
 const ROUTER_SCHEMA = { anyOf: [answerShape(['haiku'], ['none']), answerShape(MODELS.filter((m) => m !== 'haiku'), EFFORTS)] };
@@ -49,8 +60,13 @@ export function routeStats(db, { project } = {}) {
     .map((r) => ({ model: r.model, effort: r.effort, jobs: r.jobs, done: r.done, failed: r.failed, reviewed: r.reviewed, avgImportant: r.avg_important }));
 }
 
+/**
+ * Only evidence against a route is shown. A clean record says nothing about what a cheaper route
+ * would have done, and the router repeats whatever route it sees praised — so a project that
+ * started on the dearest one would never leave it.
+ */
 function historyText(db, projectSlug) {
-  const rows = routeStats(db, { project: projectSlug });
+  const rows = routeStats(db, { project: projectSlug }).filter((r) => r.failed > 0 || r.avgImportant > 0);
   if (rows.length === 0) return 'no history yet';
   return rows
     .map(

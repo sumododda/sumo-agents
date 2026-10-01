@@ -121,10 +121,14 @@ run it: mem job run 27   (append & to run it in the background)
 ```
 
 The route is the router's answer, and nothing else's. On every `mem job new` and every `mem job retry`, a
-4B open model (Qwen3, through llama.cpp) reads the role, project, task text and the project's history —
-how each model/effort scored in past reviews — and answers with a model, an effort and one sentence. It
-runs locally, costs nothing, and takes about 1.5 s including startup. There are no flags to override it,
-no project rules, no retry ladder and no floors.
+4B open model (Qwen3, through llama.cpp) reads the role, project, task text and the project's history,
+describes the job — its kind, how much code it touches, whether it is risky — and then answers with a
+model, an effort and one sentence. It runs locally, costs nothing, and takes about 1.5 s including
+startup. There are no flags to override it, no project rules, no retry ladder and no floors.
+
+The history it reads is only the evidence against a route: a model/effort that failed here, or that a
+review found Important issues in. A clean record is left out — it says nothing about what a cheaper
+route would have done, and a router shown one keeps choosing it.
 
 If the router is missing, fails, or answers something no job can run on (a model outside the list, or
 no effort for a model that takes one), the command exits with the error and **no job is created**. The
@@ -146,6 +150,14 @@ and that is what the router's history and `mem job stats` report:
 mem job stats --project <slug>     # per model/effort: jobs, done, failed, reviewed, avg important
 mem job retry <id>                 # a failed job, or one reviewed with 3+ Important: same brief,
                                    # previous notes and report attached, routed afresh
+```
+
+The router itself is graded by a set of labelled tasks, each with the cheapest and the dearest route that
+would be right for it. Run it after changing the router's prompt, its history or its model; it asks the
+real router in a throwaway home and prints how many tasks were routed too high and too low:
+
+```sh
+node --disable-warning=ExperimentalWarning test/router-probes.mjs
 ```
 
 A retry is routed like any job, except that the router is also told what the previous attempt ran on
