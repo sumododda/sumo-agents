@@ -1,5 +1,6 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -9,7 +10,7 @@ import { contextFor, converse, paramsFor, runJob, runLines, sendToApi } from './
 import { MODEL_IDS } from './model.mjs';
 import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
-import { BASH_TOOL, cap, EDITOR_TOOL } from './tools.mjs';
+import { BASH_TOOL, cap, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { colourEnabled, createRenderer, header, prompt, renderBlock, styles, widthOf } from './tty.mjs';
 
@@ -32,6 +33,16 @@ const COMMANDS = {
   dream: () => 'Run `mem dream run` and tell me, in a few lines, what it changed and what it wants me to confirm.',
 };
 
+/** What the command menu shows, in the order it shows it. */
+export const COMMAND_LIST = [
+  { name: 'fix', hint: 'fix a bug, by guides/fix.md' },
+  { name: 'feature', hint: 'build something, by guides/feature.md' },
+  { name: 'review', hint: 'have a reviewer job judge something' },
+  { name: 'dream', hint: 'tidy the memory and say what changed' },
+  { name: 'new', hint: 'start a fresh session' },
+  { name: 'quit', hint: 'leave' },
+];
+
 const JOB_RUN = /^\s*mem\s+job\s+run\s+j?(\d+)\s*(&?)\s*$/;
 
 /**
@@ -42,8 +53,10 @@ const JOB_RUN = /^\s*mem\s+job\s+run\s+j?(\d+)\s*(&?)\s*$/;
  */
 export function injection(text, model, messages = []) {
   const afterUser = messages.at(-1)?.role === 'user';
-  return SYSTEM_MESSAGES.has(model) && afterUser ? { role: 'system', content: text } : { role: 'user', content: [{ type: 'text', text: `<sumo>\n${text}\n</sumo>` }] };
+  return SYSTEM_MESSAGES.has(model) && afterUser ? { role: 'system', content: text } : asText(text);
 }
+
+const asText = (text) => ({ role: 'user', content: [{ type: 'text', text: `<sumo>\n${text}\n</sumo>` }] });
 
 /** One line per tool call, so the user can watch the work: the command, or the edit and its file. */
 export function describeCall(call) {
@@ -63,9 +76,11 @@ function configured(db, key) {
 
 /**
  * One chat session's state and policy, apart from the terminal, so it can be
- * driven by tests with canned responses. `say(text)` is one user turn.
+ * driven by tests with canned responses. `say(text)` is one user turn;
+ * `interrupt()` stops the one in progress. `watch` is told each tool call, its
+ * result, and the running totals, for a screen that shows the work.
  */
-export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, now = () => new Date().toISOString() } = {}) {
+export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, now = () => new Date().toISOString() } = {}) {
   model ??= configured(db, 'chat.model');
   effort ??= configured(db, 'chat.effort');
   const system = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim();
@@ -75,6 +90,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   let transcript;
   let lastContext = 0;
   let project = null;
+  let stopper = null;
   const ledger = { kind: 'chat', sessionId: null };
 
   const emit = (text) => out(text);
@@ -113,15 +129,19 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       return { content: `started j${id} in the background — mem job show ${id} for progress; it reports when it closes` };
     }
     activity(`running j${id}…`);
-    return { content: runLines(await runJob(db, id, { send: (p) => send(p, {}) })).join('\n') };
+    return { content: runLines(await runJob(db, id, { send: (p) => send(p, { signal: stopper.signal }), signal: stopper.signal })).join('\n') };
   }
 
   async function say(text) {
+    // A turn that ended before the model answered left its operator message at the tail; the API takes one only where the model answers next, so it becomes text.
+    const tail = params.messages.at(-1);
+    if (tail?.role === 'system') params.messages[params.messages.length - 1] = asText(tail.content);
     const injected = event('prompt', { prompt: text, context_tokens: lastContext });
     params.messages.push({ role: 'user', content: [{ type: 'text', text }] });
     if (injected) params.messages.push(injection(injected, params.model, params.messages));
     logLine(transcript, { type: 'user', message: { role: 'user', content: text } });
 
+    stopper = new AbortController();
     let continued = false;
     for (;;) {
       const outcome = await converse(db, params, {
@@ -129,13 +149,24 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         ctx: workspace(),
         ledger,
         beforeTool,
+        signal: stopper.signal,
         onText: emit,
-        onTool: (call) => activity(describeCall(call)),
+        onTool: (call) => {
+          activity(describeCall(call));
+          watch({ type: 'tool', call });
+        },
+        onResult: (call, result) => watch({ type: 'result', call, result }),
         onTurn: (response, totals) => {
           lastContext = totals.contextTokens;
           logLine(transcript, { type: 'assistant', message: { role: 'assistant', model: response.model ?? params.model, usage: response.usage, content: response.content } });
+          watch({ type: 'usage', totals });
         },
       });
+      // Stopped by the user: the turn still ended, so the scribe is woken, but nothing is asked of memory and nothing continues.
+      if (outcome.stop === 'interrupted') {
+        event('stop', { stop_hook_active: true });
+        return outcome;
+      }
       // Memory before the user: a turn ending on a question memory can answer is given the answer and continued, once.
       const held = continued ? '' : event('stop', { last_assistant_message: outcome.text, stop_hook_active: false });
       if (!held) return outcome;
@@ -145,10 +176,10 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   }
 
   /** `! <command>`: the user runs it themselves, where the model would be refused; the model sees what it printed. */
-  function shell(command) {
-    const ctx = workspace();
-    const run = spawnSync(command, { cwd: ctx.cwd, shell: true, encoding: 'utf8', env: process.env, maxBuffer: 64 * 1024 * 1024 });
-    const output = cap(`${run.stdout ?? ''}${run.stderr ?? ''}`.trimEnd());
+  async function shell(command) {
+    stopper = new AbortController();
+    const run = await runCommand(command, { cwd: workspace().cwd, env: process.env, signal: stopper.signal });
+    const output = cap(`${run.stdout}${run.stderr}`.trimEnd()) + (run.stopped === 'interrupted' ? `\n(${INTERRUPTED})` : '');
     params.messages.push({ role: 'user', content: [{ type: 'text', text: `I ran \`${command}\` myself:\n${output || '(no output)'}` }] });
     return output;
   }
@@ -170,6 +201,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   return {
     start,
     say,
+    interrupt: () => stopper?.abort(),
     shell,
     expand,
     end,
@@ -191,8 +223,26 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   };
 }
 
-/** The terminal: a header, the prompt with the model in it, the reply rendered as it streams, tool lines dim, errors red, a rule between turns. */
+/** The chat on a real terminal: the screen in ui.mjs, loaded only here so no other `mem` command pays for it. */
+async function screen(db, { model, effort }) {
+  const { runUi } = await import('./ui.mjs');
+  const events = new EventEmitter();
+  const session = createChat(db, { model, effort, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e) });
+  try {
+    await runUi({ session, events }).waitUntilExit();
+  } finally {
+    session.end();
+  }
+  return 0;
+}
+
+/**
+ * The terminal. With a keyboard and a screen it is the full-screen chat; piped,
+ * it is plain lines: a header, the prompt with the model in it, the reply
+ * rendered as it streams, tool lines dim, errors red, a rule between turns.
+ */
 export async function chat(db, { model, effort } = {}) {
+  if (process.stdin.isTTY && process.stdout.isTTY) return screen(db, { model, effort });
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const s = styles(colourEnabled());
   const width = widthOf();
@@ -222,7 +272,7 @@ export async function chat(db, { model, effort } = {}) {
       const line = answer.trim();
       if (!line) continue;
       if (line.startsWith('!')) {
-        write(`${s.dim(session.shell(line.slice(1).trim()))}\n`);
+        write(`${s.dim(await session.shell(line.slice(1).trim()))}\n`);
         rule();
         continue;
       }

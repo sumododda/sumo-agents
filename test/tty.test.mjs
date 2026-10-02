@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { createRenderer, header, prompt, renderBlock, renderLine, styles, wrap } from '../src/tty.mjs';
+import { createRenderer, header, pickMessage, prompt, renderBlock, renderLine, spinnerMessages, styles, toolView, wrap } from '../src/tty.mjs';
 
 const on = styles(true);
 const off = styles(false);
@@ -45,5 +48,96 @@ describe('the chat terminal rendering', () => {
     assert.equal(header({ model: 'opus', effort: 'high', cwd: '/w' }, off), 'sumo  model opus  effort high  /w');
     assert.equal(prompt({ model: 'opus', effort: 'high', contextTokens: 0 }, off), 'sumo opus·high> ');
     assert.equal(prompt({ model: 'opus', effort: 'high', contextTokens: 12_400 }, off), 'sumo opus·high 12k> ');
+  });
+
+  it('lets the screen see the line still being written', () => {
+    const r = createRenderer(() => {}, off);
+    r.write('done\nhalf a li');
+    assert.equal(r.tail, 'half a li');
+    r.flush();
+    assert.equal(r.tail, '');
+  });
+
+  it('reads the working messages from a file the user edits: one a line, comments and blanks skipped', () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'sumo-agents-spinner-')), 'spinner.txt');
+    writeFileSync(file, '# mine\nWrestling\n\n  Salting the ring  \n');
+    assert.deepEqual(spinnerMessages(file), ['Wrestling', 'Salting the ring']);
+    assert.deepEqual(spinnerMessages(join(tmpdir(), 'no-such-spinner.txt')), ['Working'], 'no file is not an error');
+    writeFileSync(file, '# nothing yet\n');
+    assert.deepEqual(spinnerMessages(file), ['Working']);
+    assert.equal(pickMessage(['a', 'b', 'c'], () => 0.5), 'b');
+    assert.equal(pickMessage(['a', 'b', 'c'], () => 0.999), 'c');
+  });
+
+  it('shows a tool call the way the work reads: what ran, and the top of what came back', () => {
+    const bash = { name: 'bash', input: { command: 'npm test\necho more' } };
+    assert.deepEqual(toolView(bash), { title: 'Bash', detail: 'npm test …', lines: [] }, 'before the result there is only the call');
+    assert.deepEqual(toolView(bash, { content: 'a\nb\nc\nd\ne', isError: false }).lines, [
+      { text: 'a', tone: 'plain' },
+      { text: 'b', tone: 'plain' },
+      { text: 'c', tone: 'plain' },
+      { text: '… +2 lines', tone: 'dim' },
+    ]);
+    assert.deepEqual(toolView(bash, { content: '', isError: false }).lines, [{ text: '(no output)', tone: 'dim' }]);
+    assert.deepEqual(toolView(bash, { content: 'boom\n(exit 1)', isError: true }).lines.map((l) => l.tone), ['error', 'error']);
+  });
+
+  it('shows an edit as the lines that went and the lines that came', () => {
+    const edit = { name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: '/p/a.mjs', old_str: 'const a = 1;', new_str: 'const a = 2;\nconst b = 3;' } };
+    assert.deepEqual(toolView(edit, { content: 'edited /p/a.mjs', isError: false }), {
+      title: 'Update',
+      detail: '/p/a.mjs',
+      lines: [
+        { text: '- const a = 1;', tone: 'del' },
+        { text: '+ const a = 2;', tone: 'add' },
+        { text: '+ const b = 3;', tone: 'add' },
+      ],
+    });
+    assert.deepEqual(toolView(edit, { content: 'old_str was not found in /p/a.mjs', isError: true }).lines, [{ text: 'old_str was not found in /p/a.mjs', tone: 'error' }], 'a refused edit shows the refusal, not the diff');
+
+    const view = { name: 'str_replace_based_edit_tool', input: { command: 'view', path: '/p/a.mjs', view_range: [1, 40] } };
+    assert.deepEqual(toolView(view, { content: '1\ta\n2\tb', isError: false }), { title: 'Read', detail: '/p/a.mjs:1-40', lines: [{ text: '2 lines', tone: 'dim' }] });
+    const create = { name: 'str_replace_based_edit_tool', input: { command: 'create', path: '/p/new.mjs', file_text: 'x\ny\n' } };
+    assert.deepEqual(toolView(create, { content: 'created /p/new.mjs', isError: false }), { title: 'Write', detail: '/p/new.mjs', lines: [{ text: '2 lines', tone: 'dim' }] });
+  });
+
+  it('holds a table until it is whole, then draws it with its columns lined up', () => {
+    const out = [];
+    const r = createRenderer((t) => out.push(t), off, { width: 60 });
+    r.write('before\n| Name | Count |\n|:--|--:|\n| **alpha** | 1 |\n');
+    assert.deepEqual(out, ['before\n'], 'rows wait for the rest of the table');
+    assert.match(r.tail, /│ alpha │/, 'the screen can show the table as far as it has got');
+    r.write('| b | 200 |\nafter\n');
+    assert.equal(out.join(''), 'before\n┌───────┬───────┐\n│ Name  │ Count │\n├───────┼───────┤\n│ alpha │     1 │\n│ b     │   200 │\n└───────┴───────┘\nafter\n');
+
+    const last = [];
+    const end = createRenderer((t) => last.push(t), off, { width: 60 });
+    end.write('| a | b |\n|---|---|\n| 1 | 2 |');
+    end.flush();
+    assert.equal(last.join(''), '┌───┬───┐\n│ a │ b │\n├───┼───┤\n│ 1 │ 2 │\n└───┴───┘', 'a table the text ends on is drawn when the text ends');
+  });
+
+  it('leaves pipes alone where they are not a table, and folds a wide table into the window', () => {
+    const out = [];
+    const r = createRenderer((t) => out.push(t), off, { width: 60 });
+    r.write('| just | pipes |\nnext\n```\n| a | b |\n|---|---|\n```\n');
+    assert.equal(out.join(''), '| just | pipes |\nnext\n    ┌─\n    | a | b |\n    |---|---|\n    └─\n');
+
+    const narrow = [];
+    const n = createRenderer((t) => narrow.push(t), off, { width: 30 });
+    n.write('| Key | What it does |\n|---|---|\n| esc | stops the turn that is running now |\n\n');
+    const lines = narrow.join('').trimEnd().split('\n');
+    assert.ok(lines.every((l) => l.length <= 30), `no line is wider than the window:\n${lines.join('\n')}`);
+    assert.equal(new Set(lines.filter((l) => /^[│┌├└]/.test(l)).map((l) => l.length)).size, 1, 'the box keeps its shape');
+    for (const word of ['stops', 'the', 'turn', 'that', 'is', 'running', 'now']) assert.ok(lines.some((l) => l.includes(word)), word);
+  });
+
+  it('shows a tool call in full when asked: every line that came back, the file that was read or written', () => {
+    const bash = { name: 'bash', input: { command: 'seq 5' } };
+    assert.deepEqual(toolView(bash, { content: 'a\nb\nc\nd\ne', isError: false }, { full: true }).lines.map((l) => l.text), ['a', 'b', 'c', 'd', 'e']);
+    const view = { name: 'str_replace_based_edit_tool', input: { command: 'view', path: '/p/a.mjs' } };
+    assert.deepEqual(toolView(view, { content: '1\ta\n2\tb', isError: false }, { full: true }).lines, [{ text: '1\ta', tone: 'plain' }, { text: '2\tb', tone: 'plain' }]);
+    const create = { name: 'str_replace_based_edit_tool', input: { command: 'create', path: '/p/new.mjs', file_text: 'x\ny\n' } };
+    assert.deepEqual(toolView(create, { content: 'created /p/new.mjs', isError: false }, { full: true }).lines, [{ text: '+ x', tone: 'add' }, { text: '+ y', tone: 'add' }]);
   });
 });

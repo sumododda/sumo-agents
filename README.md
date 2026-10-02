@@ -15,7 +15,7 @@ Needs Node 22.13+, either `ANTHROPIC_API_KEY` or a `CLAUDE_CODE_OAUTH_TOKEN` fro
 
 ```sh
 git clone <this repo> ~/sumo-agents && cd ~/sumo-agents
-npm install                # the one dependency: the Anthropic SDK
+npm install                # the Anthropic SDK, and Ink for the chat's screen
 node bin/mem.mjs setup     # creates ~/.sumo-agents, links `mem` into a directory on your PATH
 mem doctor                 # every line should say ok
 mem chat                   # talk
@@ -38,6 +38,13 @@ Then just talk. Mention a project the way you normally would; the first time, th
 disk, confirms the path with you, and registers it. In the chat: `/fix`, `/feature`, `/review`, `/dream`
 load the matching guide; `/new` starts a fresh session with the memory block; `! <command>` runs a
 command yourself, where the agent would be refused; `/quit` ends it.
+
+The chat is a screen, not a scroll of lines: a box to type in (`\`+Enter, Shift-Enter or Option-Enter
+for a new line, Up for what you sent before, `/` for the command menu), each tool call with the top
+of its result (Ctrl-O for all of it, and again to fold it back), tables drawn as tables, and a working
+line while the model is busy. Esc stops the turn; a message sent while it works is queued and goes
+next; Ctrl-C twice leaves. A resized window is redrawn to fit. The words on the working line are yours:
+`spinner.txt`, one a line, picked at random each turn. Piped (`echo … | mem chat`), it prints plain lines.
 
 ## Update a machine
 
@@ -312,9 +319,11 @@ node probes/scope-accuracy.mjs        # live: real model, about 7 cents
 AGENTS.md            the system prompt of the chat, and the only always-loaded instructions
 prompts/             agent.md — the system prompt of a job; scribe.md, dream.md — the memory passes
 guides/              read on demand: memory · projects · workflows · delegation · fix · feature · review
-bin/mem.mjs  src/    the `mem` CLI — Node, one dependency (the Anthropic SDK), SQLite full-text search
+bin/mem.mjs  src/    the `mem` CLI — Node, the Anthropic SDK, SQLite full-text search
 src/loop.mjs         the loop every conversation runs in; src/tools.mjs the shell and editor with their policy
 src/chat.mjs         the chat; src/hooks.mjs the session policy as events
+src/ui.mjs           the chat's screen (Ink, loaded only by `mem chat`); src/editor.mjs the box you type in
+spinner.txt          the words the chat shows while it works — edit them
 src/route.mjs        how a job's model and effort are chosen: the router, and the stats
 test/  probes/       the suite, and the live measurement
 docs/ADR-runtime.md  the decision to own the runtime, and the plan it followed; docs/PLAN.md the original design

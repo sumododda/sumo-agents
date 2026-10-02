@@ -1,3 +1,8 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { REPO_ROOT } from './paths.mjs';
+import { BASH_TOOL } from './tools.mjs';
+
 /**
  * What the chat terminal looks like: the reply's markdown turned into bold,
  * dim and colour as it streams, wrapped to a readable width; the memory block
@@ -63,13 +68,60 @@ export function renderLine(line, s, { fence = false, width = MAX_WIDTH } = {}) {
   return wrap(inline(line, s), width);
 }
 
+const TABLE_ROW = /^\s*\|.*\|\s*$/;
+const TABLE_RULE = /^\s*\|(\s*:?-+:?\s*\|)+\s*$/;
+const MIN_COLUMN = 3;
+const NO_STYLE = styles(false);
+
+const cellsOf = (row) => row.trim().slice(1, -1).split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, '|'));
+
+/** A cell's text folded to its column; a word wider than the column is cut, so the box keeps its shape. */
+function fold(text, width) {
+  return wrap(text, width)
+    .split('\n')
+    .flatMap((line) => (line.length <= width ? [line] : line.match(new RegExp(`.{1,${width}}`, 'g'))));
+}
+
+function pad(text, width, align) {
+  const space = Math.max(0, width - visible(text));
+  if (align === 'right') return ' '.repeat(space) + text;
+  if (align === 'center') return ' '.repeat(Math.floor(space / 2)) + text + ' '.repeat(Math.ceil(space / 2));
+  return text + ' '.repeat(space);
+}
+
+/**
+ * A markdown table as a box with its columns lined up. When the window is too
+ * narrow for it, the widest columns give way and their cells fold; a folded
+ * cell is plain text, so no style runs across a border.
+ */
+export function renderTable(rows, s, width) {
+  const [head, rule, ...body] = rows.map(cellsOf);
+  const columns = head.length;
+  const aligns = Array.from({ length: columns }, (_, i) => (/^:-+:$/.test(rule[i] ?? '') ? 'center' : /-:$/.test(rule[i] ?? '') ? 'right' : 'left'));
+  const table = [head, ...body].map((row) => Array.from({ length: columns }, (_, i) => row[i] ?? ''));
+  const widths = Array.from({ length: columns }, (_, i) => Math.max(1, ...table.map((row) => visible(inline(row[i], s)))));
+  const room = width - (3 * columns + 1);
+  while (widths.reduce((a, b) => a + b, 0) > room && Math.max(...widths) > MIN_COLUMN) widths[widths.indexOf(Math.max(...widths))]--;
+
+  const edge = (left, mid, right) => s.dim(`${left}${widths.map((w) => '─'.repeat(w + 2)).join(mid)}${right}`);
+  const bar = s.dim('│');
+  const draw = (row, style) => {
+    const cells = row.map((cell, i) => (visible(inline(cell, s)) <= widths[i] ? [inline(cell, s)] : fold(inline(cell, NO_STYLE), widths[i])));
+    const height = Math.max(...cells.map((c) => c.length));
+    return Array.from({ length: height }, (_, n) => `${bar} ${cells.map((c, i) => style(pad(c[n] ?? '', widths[i], aligns[i]))).join(` ${bar} `)} ${bar}`);
+  };
+  return [edge('┌', '┬', '┐'), ...draw(table[0], s.bold), edge('├', '┼', '┤'), ...table.slice(1).flatMap((row) => draw(row, (t) => t)), edge('└', '┴', '┘')].join('\n');
+}
+
 /**
  * A line-buffered renderer for streamed text: each complete line is written
  * rendered as soon as it arrives; the tail is kept until it ends or `flush`.
+ * The rows of a table are kept too, until the line after it shows it is whole.
  */
 export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
   let tail = '';
   let fence = false;
+  let rows = [];
   const line = (raw) => {
     if (/^\s*```/.test(raw)) {
       fence = !fence;
@@ -77,21 +129,96 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
     }
     return renderLine(raw, s, { fence, width });
   };
+  /** The rows held so far: a table once its rule has come, the lines they were otherwise. */
+  const held = () => (rows.length >= 2 && TABLE_RULE.test(rows[1]) ? renderTable(rows, s, width) : rows.map((r) => renderLine(r, s, { width })).join('\n'));
   return {
     write(chunk) {
       tail += chunk;
       let at;
       while ((at = tail.indexOf('\n')) !== -1) {
-        write(`${line(tail.slice(0, at))}\n`);
+        const raw = tail.slice(0, at);
         tail = tail.slice(at + 1);
+        if (!fence && TABLE_ROW.test(raw)) {
+          rows.push(raw);
+          continue;
+        }
+        if (rows.length > 0) write(`${held()}\n`);
+        rows = [];
+        write(`${line(raw)}\n`);
       }
     },
     flush() {
+      if (!fence && TABLE_ROW.test(tail)) {
+        rows.push(tail);
+        tail = '';
+      }
+      if (rows.length > 0) write(`${held()}${tail ? '\n' : ''}`);
       if (tail) write(line(tail));
       tail = '';
+      rows = [];
       fence = false;
     },
+    /** What has not been written yet, rendered as far as it has got: the rows of a table, and the line still arriving. */
+    get tail() {
+      return [rows.length > 0 ? held() : '', tail && !/^\s*```/.test(tail) ? renderLine(tail, s, { fence, width }) : ''].filter(Boolean).join('\n');
+    },
   };
+}
+
+/** The words shown while the model works: yours, one a line, in spinner.txt at the top of the repo. */
+export const SPINNER_FILE = join(REPO_ROOT, 'spinner.txt');
+const SPINNER_FALLBACK = ['Working'];
+
+/** The working messages: every line of the file that is not blank and not a `#` comment. */
+export function spinnerMessages(file = SPINNER_FILE) {
+  let text;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch {
+    return SPINNER_FALLBACK;
+  }
+  const messages = text.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+  return messages.length > 0 ? messages : SPINNER_FALLBACK;
+}
+
+export const pickMessage = (messages, random = Math.random) => messages[Math.floor(random() * messages.length)];
+
+const SHOWN_OUTPUT_LINES = 3;
+const SHOWN_DIFF_LINES = 12;
+
+/** The top of a list of lines, and how many more there were. */
+function top(lines, max) {
+  return lines.length > max ? [...lines.slice(0, max), { text: `… +${lines.length - max} lines`, tone: 'dim' }] : lines;
+}
+
+const toned = (text, tone) => String(text).split('\n').map((t) => ({ text: t, tone }));
+const count = (text) => [{ text: `${text === '' ? 0 : text.replace(/\n$/, '').split('\n').length} lines`, tone: 'dim' }];
+
+/**
+ * A tool call for the screen: what ran, and under it the part of the result
+ * worth a glance — the top of a command's output, an edit as the lines that
+ * went and came, a read or a write as its size. Without a result it is the
+ * call alone; `full` is every line, and the file itself for a read or a write.
+ */
+export function toolView(call, result = null, { full = false } = {}) {
+  const input = call.input ?? {};
+  if (call.name === BASH_TOOL.name) {
+    const [first, ...rest] = String(input.command ?? '').split('\n');
+    const detail = `${first.slice(0, 120)}${rest.length > 0 || first.length > 120 ? ' …' : ''}`;
+    if (!result) return { title: 'Bash', detail, lines: [] };
+    if (result.content === '') return { title: 'Bash', detail, lines: [{ text: '(no output)', tone: 'dim' }] };
+    return { title: 'Bash', detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+  }
+  const range = Array.isArray(input.view_range) ? `:${input.view_range.join('-')}` : '';
+  const title = input.command === 'view' ? 'Read' : input.command === 'create' ? 'Write' : input.command === 'str_replace' || input.command === 'insert' ? 'Update' : call.name;
+  const detail = `${input.path ?? ''}${range}`;
+  if (!result) return { title, detail, lines: [] };
+  if (result.isError) return { title, detail, lines: top(toned(result.content, 'error'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+  const added = (text) => toned(text, 'add').map((l) => ({ ...l, text: `+ ${l.text}` }));
+  if (input.command === 'view') return { title, detail, lines: full ? toned(result.content, 'plain') : count(result.content) };
+  if (input.command === 'create') return { title, detail, lines: full ? added(String(input.file_text ?? '').replace(/\n$/, '')) : count(String(input.file_text ?? '')) };
+  const went = input.command === 'str_replace' ? toned(input.old_str ?? '', 'del').map((l) => ({ ...l, text: `- ${l.text}` })) : [];
+  return { title, detail, lines: top([...went, ...added(input.new_str ?? '')], full ? Infinity : SHOWN_DIFF_LINES) };
 }
 
 const kindOf = (raw) => (/^Ask the user/.test(raw) ? 'ask' : /^Warning/.test(raw) ? 'warning' : /^Left off/.test(raw) ? 'left' : /^- m\d+ /.test(raw) ? 'item' : raw);

@@ -1,6 +1,6 @@
 // The job loop: the request it builds, the policy every tool call passes through, and the ledger it leaves.
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -128,7 +128,7 @@ test('a transport error ends the run with the reason, logged, and the job left o
   });
 });
 
-test('the tools on their own: cap keeps both ends, the jail follows symlinks, secrets stay out of the environment and the output', () => {
+test('the tools on their own: cap keeps both ends, the jail follows symlinks, secrets stay out of the environment and the output', async () => {
   const capped = cap('a'.repeat(50) + 'MIDDLE' + 'b'.repeat(50), 40);
   assert.ok(capped.startsWith('a'.repeat(20)) && capped.endsWith('b'.repeat(20)) && /cut 66 characters/.test(capped), capped);
 
@@ -145,8 +145,70 @@ test('the tools on their own: cap keeps both ends, the jail follows symlinks, se
   assert.match(runEditor({ command: 'create', path: 'id_rsa', file_text: 'x' }, ctx).content, /Refused/);
   assert.match(runEditor({ command: 'str_replace', path: 'src/x.mjs', old_str: 'nope', new_str: 'x' }, ctx).content, /not found/);
 
-  const leaked = runBash({ command: 'echo token ghp_abcdefghijklmnopqrstuvwxyz0123456789' }, ctx);
+  const leaked = await runBash({ command: 'echo token ghp_abcdefghijklmnopqrstuvwxyz0123456789' }, ctx);
   assert.doesNotMatch(leaked.content, /ghp_abcdefghij/, 'a credential printed by a command is redacted before the model sees it');
-  assert.match(runBash({ command: 'git reset --hard' }, ctx).content, /Refused/);
-  assert.match(runBash({ command: 'exit 3' }, ctx).content, /\(exit 3\)/);
+  assert.match((await runBash({ command: 'git reset --hard' }, ctx)).content, /Refused/);
+  assert.match((await runBash({ command: 'exit 3' }, ctx)).content, /\(exit 3\)/);
+  assert.deepEqual(await runBash({ command: 'echo out; echo err >&2' }, ctx), { content: 'out\nerr', isError: false }, 'both streams come back, output first');
+});
+
+test('a command leaves the process free while it runs, and stops when the user says stop', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-stop-'));
+  const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }) };
+  const stop = new AbortController();
+  let ticks = 0;
+  const ticking = setInterval(() => ticks++, 10);
+  const started = Date.now();
+  const running = runBash({ command: 'echo begun; sleep 20' }, ctx, { signal: stop.signal });
+  setTimeout(() => stop.abort(), 500);
+  const out = await running;
+  clearInterval(ticking);
+  assert.ok(ticks >= 5, `timers ran while the command did (${ticks})`);
+  assert.ok(Date.now() - started < 5000, 'it did not wait for the sleep');
+  assert.equal(out.isError, true);
+  assert.match(out.content, /^begun\n\(stopped: interrupted by the user\)$/);
+});
+
+/** Whether a process is still there. */
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const settled = async (test) => {
+  for (let i = 0; i < 100 && !test(); i++) await new Promise((r) => setTimeout(r, 20));
+  return test();
+};
+
+test('stopping a command stops what it started, and a child left in the background cannot hold the run open', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-tree-'));
+  const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }) };
+
+  // The shell is still there, waiting on a child: both go.
+  const stop = new AbortController();
+  const waiting = runBash({ command: 'sleep 30 & echo $! > child.pid; wait' }, ctx, { signal: stop.signal });
+  assert.equal(await settled(() => existsSync(join(root, 'child.pid')) && readFileSync(join(root, 'child.pid'), 'utf8').trim() !== ''), true);
+  const child = Number(readFileSync(join(root, 'child.pid'), 'utf8'));
+  stop.abort();
+  assert.match((await waiting).content, /interrupted by the user/);
+  assert.equal(await settled(() => !alive(child)), true, 'the sleep the shell started is gone too');
+
+  // The shell has already gone and only its background child holds the output open.
+  const again = new AbortController();
+  let began = Date.now();
+  const orphaned = runBash({ command: 'sleep 30 & echo started' }, ctx, { signal: again.signal });
+  setTimeout(() => again.abort(), 300);
+  const out = await orphaned;
+  assert.ok(Date.now() - began < 5000, 'the stop was heard');
+  assert.match(out.content, /^started\n\(stopped: interrupted by the user\)$/);
+
+  // The same, with nobody to say stop: the time limit ends it.
+  began = Date.now();
+  const late = await runBash({ command: 'sleep 4 & echo started' }, ctx, { timeoutMs: 300 });
+  assert.ok(Date.now() - began < 3000, 'the limit was kept');
+  assert.equal(late.isError, true);
+  assert.match(late.content, /^started\n\(stopped: it ran past /);
 });

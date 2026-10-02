@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { guardCommand, guardPath, isSecretPath } from './guard.mjs';
@@ -17,6 +17,10 @@ export const EDITOR_TOOL = { type: 'text_editor_20250728', name: 'str_replace_ba
 const OUTPUT_CAP_CHARS = 16_000;
 const VIEW_CAP_LINES = 400;
 const COMMAND_TIMEOUT_MS = 540_000; // the same nine minutes a check gets
+const MAX_BUFFER_CHARS = 64 * 1024 * 1024;
+
+/** What a command's output ends with when the user stopped it. */
+export const INTERRUPTED = 'stopped: interrupted by the user';
 
 /** Environment names whose values are secrets. The tool's child processes never see them, so `env` cannot print them. */
 const SECRET_ENV = /KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL/i;
@@ -60,16 +64,74 @@ export function jailed(path, { cwd, roots }) {
 
 const result = (content, isError = false) => ({ content: redact(String(content)).text, isError });
 
+/**
+ * Runs a shell command beside the process, not in front of it, so the screen
+ * keeps drawing while it runs. It ends when the command does, when `signal`
+ * says stop, or when `timeoutMs` is up — whichever is first. With a `signal`
+ * the command gets a process group of its own, so the stop reaches everything
+ * it started; without one it stays in the terminal's group, where Ctrl-C finds it.
+ */
+export function runCommand(command, { cwd, env, signal = null, timeoutMs = null }) {
+  return new Promise((resolve) => {
+    const grouped = signal !== null;
+    const child = spawn(command, { cwd, shell: true, env, stdio: ['ignore', 'pipe', 'pipe'], detached: grouped });
+    const streams = { stdout: '', stderr: '' };
+    let size = 0;
+    let stopped = null;
+    let settled = false;
+    const interrupt = () => kill('interrupted');
+    const timer = timeoutMs === null ? null : setTimeout(() => kill('timeout'), timeoutMs);
+    const settle = (status, killedBy) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', interrupt);
+      resolve({ ...streams, status, signal: killedBy, stopped });
+    };
+    // What was stopped is not waited for: a child left in the background can hold the pipes open long after the shell is gone.
+    const release = (status, killedBy) => {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      settle(status, killedBy);
+    };
+    function kill(why) {
+      stopped ??= why;
+      try {
+        if (grouped) process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch {
+        // Nothing left to kill.
+      }
+      if (child.exitCode !== null || child.signalCode !== null) release(child.exitCode, child.signalCode);
+    }
+    for (const name of ['stdout', 'stderr']) {
+      child[name].setEncoding('utf8');
+      child[name].on('data', (chunk) => {
+        size += chunk.length;
+        if (size > MAX_BUFFER_CHARS) kill('overflow');
+        else streams[name] += chunk;
+      });
+    }
+    child.on('error', () => settle(null, null));
+    child.on('close', settle);
+    child.on('exit', (status, killedBy) => {
+      if (stopped) release(status, killedBy);
+    });
+    if (signal?.aborted) interrupt();
+    else signal?.addEventListener('abort', interrupt, { once: true });
+  });
+}
+
 /** A shell command, in the project directory, without the secrets, refused when the guard says so. */
-export function runBash({ command }, ctx) {
+export async function runBash({ command }, ctx, { signal = null, timeoutMs = COMMAND_TIMEOUT_MS } = {}) {
   if (typeof command !== 'string' || !command.trim()) return result('bash needs a command', true);
   const refused = guardCommand(command);
   if (refused) return result(refused, true);
-  const run = spawnSync(command, { cwd: ctx.cwd, shell: true, encoding: 'utf8', env: ctx.env ?? childEnv(), timeout: COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
-  const timedOut = run.error?.code === 'ETIMEDOUT';
-  const output = `${run.stdout ?? ''}${run.stderr ?? ''}`.trimEnd();
-  const tail = timedOut ? `\n(stopped: it ran past ${COMMAND_TIMEOUT_MS / 60_000} minutes)` : run.status !== 0 ? `\n(exit ${run.status ?? run.signal})` : '';
-  return result(cap(output) + tail, timedOut || run.status !== 0);
+  const run = await runCommand(command, { cwd: ctx.cwd, env: ctx.env ?? childEnv(), signal, timeoutMs });
+  const failed = run.stopped !== null || run.status !== 0;
+  const output = `${run.stdout}${run.stderr}`.trimEnd();
+  const tail = run.stopped === 'timeout' ? `\n(stopped: it ran past ${timeoutMs / 60_000} minutes)` : run.stopped === 'interrupted' ? `\n(${INTERRUPTED})` : failed ? `\n(exit ${run.status ?? run.signal})` : '';
+  return result(cap(output) + tail, failed);
 }
 
 function view(path, range) {
@@ -130,8 +192,8 @@ export function runEditor(input, ctx) {
 }
 
 /** One tool call, whichever tool it names; a name nothing answers to is an error the model can read. */
-export function runTool(block, ctx) {
-  if (block.name === BASH_TOOL.name) return runBash(block.input ?? {}, ctx);
+export function runTool(block, ctx, { signal = null } = {}) {
+  if (block.name === BASH_TOOL.name) return runBash(block.input ?? {}, ctx, { signal });
   if (block.name === EDITOR_TOOL.name) return runEditor(block.input ?? {}, ctx);
   return result(`no tool called ${block.name}`, true);
 }

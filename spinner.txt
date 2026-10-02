@@ -1,0 +1,7 @@
+# The words `mem chat` shows while it works — one a line, picked at random each turn.
+# Edit freely: add, remove, rewrite. Lines starting with # are skipped.
+Working
+Thinking
+On it
+Wrestling with it
+Digging in

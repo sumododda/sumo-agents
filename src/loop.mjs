@@ -7,7 +7,7 @@ import { UsageError } from './memory.mjs';
 import { costOf, logRun, modelId, usageOf } from './model.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
-import { BASH_TOOL, childEnv, EDITOR_TOOL, runTool } from './tools.mjs';
+import { BASH_TOOL, childEnv, EDITOR_TOOL, INTERRUPTED, runTool } from './tools.mjs';
 
 /**
  * The loop every conversation runs in: one request, the policy pipeline over
@@ -63,10 +63,10 @@ export function markTail(messages) {
 export const textOf = (content) => content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
 
 /** The default transport: streamed, so a long turn never trips the HTTP timeout. */
-export async function sendToApi(params, { onText } = {}) {
+export async function sendToApi(params, { onText, signal } = {}) {
   const credential = resolveAnthropicCredential();
   const client = new Anthropic(anthropicClientOptions(REQUEST_TIMEOUT_MS, credential));
-  const stream = client.beta.messages.stream(authenticatedRequest(params, credential));
+  const stream = client.beta.messages.stream(authenticatedRequest(params, credential), signal ? { signal } : undefined);
   if (onText) stream.on('text', onText);
   return stream.finalMessage();
 }
@@ -76,9 +76,12 @@ export async function sendToApi(params, { onText } = {}) {
  * calling tools. `send` is the transport (canned in tests); `beforeTool` may
  * refuse a call or answer it itself, which is how the workflow gate and the
  * in-process `mem job run` work. Totals and the stop reason come back; the
- * messages are mutated in place, so a chat can keep going from them.
+ * messages are mutated in place, so a chat can keep going from them. `signal`
+ * is the user saying stop: the request is dropped, a running command is
+ * killed, and every tool call still gets a result, so the history stays one
+ * the API takes.
  */
-export async function converse(db, params, { send = sendToApi, ctx, ledger, beforeTool = null, onText = null, onTool = null, onTurn = null, now = () => new Date().toISOString() }) {
+export async function converse(db, params, { send = sendToApi, ctx, ledger, beforeTool = null, onText = null, onTool = null, onResult = null, onTurn = null, signal = null, now = () => new Date().toISOString() }) {
   const totals = { inputTokens: 0, outputTokens: 0, costUsd: 0, toolCalls: 0, contextTokens: 0 };
   let turns = 0;
   let stop = 'max_turns';
@@ -90,8 +93,12 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     markTail(params.messages);
     let response;
     try {
-      response = await send(params, { onText });
+      response = await send(params, { onText, signal });
     } catch (cause) {
+      if (signal?.aborted) {
+        log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns}: interrupted`);
+        return { turns, stop: 'interrupted', error: null, text, totals };
+      }
       log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns}: ${String(cause.message).slice(0, 200)}`);
       return { turns, stop: 'error', error: String(cause.message).slice(0, 300), text, totals };
     }
@@ -112,11 +119,26 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     totals.toolCalls += calls.length;
     const results = [];
     for (const call of calls) {
+      if (signal?.aborted) {
+        results.push({ type: 'tool_result', tool_use_id: call.id, content: 'not run: interrupted by the user', is_error: true });
+        continue;
+      }
       onTool?.(call);
-      const out = (await beforeTool?.(call)) ?? runTool(call, ctx);
+      let out;
+      try {
+        out = (await beforeTool?.(call)) ?? (await runTool(call, ctx, { signal }));
+      } catch (cause) {
+        // A call that is not answered makes the next request invalid; a failure is an answer.
+        out = { content: `the tool failed: ${cause.message}`, isError: true };
+      }
+      onResult?.(call, out);
       results.push({ type: 'tool_result', tool_use_id: call.id, content: out.content, is_error: Boolean(out.isError) });
     }
     params.messages.push({ role: 'user', content: results });
+    if (signal?.aborted) {
+      stop = 'interrupted';
+      break;
+    }
   }
 
   return { turns, stop, error: null, text, totals };
@@ -132,13 +154,13 @@ export function contextFor(project, { jobId = null } = {}) {
  * throws for anything the model did; a job that is not open is refused up front.
  * The job closes itself through `mem job finish` in bash, as its brief says.
  */
-export async function runJob(db, id, { send = sendToApi, now } = {}) {
+export async function runJob(db, id, { send = sendToApi, now, signal = null } = {}) {
   const job = getJob(db, id);
   if (job.status !== 'running' && job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — only a running job can be run`);
   if (!job.model) throw new UsageError(`j${id} has no route — it was created before routing existed; create it again`);
   const project = getProject(db, job.project);
   const params = jobParams({ job, text: brief(db, id) });
-  const outcome = await converse(db, params, { send, now, ctx: contextFor(project, { jobId: id }), ledger: { kind: job.agent, jobId: id, sessionId: job.session_id } });
+  const outcome = await converse(db, params, { send, now, signal, ctx: contextFor(project, { jobId: id }), ledger: { kind: job.agent, jobId: id, sessionId: job.session_id } });
   return { ...outcome, job: getJob(db, id) };
 }
 
@@ -151,6 +173,7 @@ export function runLines(outcome) {
     `${turns} turn${turns === 1 ? '' : 's'}, ${totals.toolCalls} tool calls, ${totals.inputTokens} tokens in, ${totals.outputTokens} out, $${totals.costUsd.toFixed(4)} on ${job.model}/${job.effort}`,
   ];
   if (stop === 'error') lines.push(`stopped: ${outcome.error}`);
+  if (stop === 'interrupted') lines.push(INTERRUPTED);
   if (stop === 'refusal') lines.push('stopped: the model declined to continue');
   if (stop === 'max_tokens') lines.push('stopped: a reply hit the output limit');
   if (stop === 'max_turns') lines.push(`stopped: ${MAX_TURNS} turns without closing the job`);
