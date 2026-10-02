@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { openDb } from '../src/db.mjs';
-import { jobParams, runJob, runLines } from '../src/loop.mjs';
+import { jobParams, markTail, runJob, runLines } from '../src/loop.mjs';
 import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { cap, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
@@ -211,4 +211,17 @@ test('stopping a command stops what it started, and a child left in the backgrou
   assert.ok(Date.now() - began < 3000, 'the limit was kept');
   assert.equal(late.isError, true);
   assert.match(late.content, /^started\n\(stopped: it ran past /);
+});
+
+test('the cache breakpoint lands on the last message that can carry one, so a turn ending on an operator message still reads its history from the cache', () => {
+  const text = (t) => ({ type: 'text', text: t });
+  const messages = [{ role: 'user', content: [text('the memory block')] }, { role: 'assistant', content: [text('hello')] }, { role: 'user', content: [text('fix simba')] }, { role: 'system', content: '<project simba> card' }];
+  markTail(messages);
+  assert.deepEqual(messages[2].content[0].cache_control, { type: 'ephemeral' }, 'the turn before the operator message carries it');
+  assert.equal(messages[3].content, '<project simba> card', 'the operator message is sent as it was');
+
+  messages.push({ role: 'assistant', content: [text('on it')] }, { role: 'user', content: [text('thanks')] });
+  markTail(messages);
+  assert.deepEqual(messages.at(-1).content[0].cache_control, { type: 'ephemeral' });
+  assert.equal(messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => b.cache_control).length, 1, 'and there is only ever the one');
 });

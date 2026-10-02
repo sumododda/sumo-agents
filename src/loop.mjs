@@ -50,14 +50,18 @@ export function jobParams({ job, text, system = systemPrompt() }) {
   return paramsFor({ model: job.model, effort: job.effort, tools: job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL], text, system });
 }
 
-/** One cache breakpoint rides on the last block of the last message, so each turn reads everything before it. */
+/**
+ * One cache breakpoint rides on the last block of the last message that can
+ * carry one, so each turn reads everything before it. An operator message at
+ * the tail is plain text with nowhere to put it; the turn before it is marked.
+ */
 export function markTail(messages) {
   for (const m of messages) {
     if (!Array.isArray(m.content)) continue;
     for (const block of m.content) delete block.cache_control;
   }
-  const last = messages.at(-1);
-  if (Array.isArray(last?.content) && last.content.length > 0) last.content.at(-1).cache_control = { type: 'ephemeral' };
+  const last = messages.findLast((m) => Array.isArray(m.content) && m.content.length > 0);
+  if (last) last.content.at(-1).cache_control = { type: 'ephemeral' };
 }
 
 export const textOf = (content) => content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
