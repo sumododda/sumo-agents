@@ -1,0 +1,21 @@
+{
+  "name": "sumo-agents",
+  "private": true,
+  "type": "module",
+  "description": "One repo you talk to: a local memory engine and working process for coding agents.",
+  "license": "MIT",
+  "bin": {
+    "sumo": "bin/sumo.mjs"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.6.0"
+  },
+  "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "ink": "^7.1.1",
+    "react": "^19.3.0"
+  }
+}

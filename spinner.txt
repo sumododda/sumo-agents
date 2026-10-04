@@ -1,0 +1,90 @@
+# The words `sumo chat` shows while it works — one a line, picked at random each turn.
+# Edit freely: add, remove, rewrite. Lines starting with # are skipped.
+# Lines starting with # are skipped
+Wrestling with it
+Digging in
+Convincing the electrons
+Asking the rubber duck
+Consulting the ancient scrolls
+Turning coffee into progress
+Summoning a smaller model
+Negotiating with reality
+Searching for the missing semicolon
+Politely arguing with the compiler
+Making the pixels nervous
+Running on vibes and stack traces
+Feeding the goblins
+Taming the spaghetti
+Checking behind the couch cushions
+Attempting a controlled miracle
+Staring respectfully at the error
+Teaching rocks to think
+Interrogating the logs
+Manifesting a green checkmark
+Performing software archaeology
+Pretending this was the plan
+Befriending the weird edge case
+Applying artisanal duct tape
+Threat-modeling the vibes
+Replacing panic with YAML
+Computing, allegedly
+Loading the thinking hamster
+The hamster has lawyered up
+Deploying emotional support regex
+Summoning the commit that fixes everything
+Giving the code a stern talking-to
+Performing interpretive debugging
+Bribing the tests with good intentions
+Actively avoiding production incidents
+Doing crimes against whitespace
+Turning “hmm” into “done”
+Bribing the compiler with fresh syntax
+Explaining the requirements to the requirements
+Interviewing the bug’s alibi
+Asking the logs to stop being mysterious
+Trying the obvious thing, professionally
+Reconstructing the crime scene
+Making a deal with the type system
+Performing emergency vibes-based engineering
+Translating machine disappointment
+Following a suspiciously confident TODO
+Applying highly targeted keyboard violence
+Reenacting the issue in a controlled environment
+Making the error message regret its choices
+Asking production to please stay calm
+Filing a missing-person report for the data
+Persuading two APIs to acknowledge each other
+Trying to reproduce the magic
+Telling the cache it can let go now
+Inspecting the little guy
+Teaching the happy path about consequences
+Waiting for the tests to finish their novel
+Building a tiny bridge over a large swamp
+Checking whether it’s a feature in disguise
+Following the bytes into the woods
+Calling in a specialist: `console.log`
+Making a map of the haunted codebase
+Converting confusion into a numbered list
+Putting on my debugging monocle
+Finding out what “should be impossible” means
+Looking for the bug’s emotional support branch
+Performing surgery with a keyboard
+Asking Git what it remembers
+Creating a perfectly normal amount of temporary files
+Trying not to awaken the legacy service
+Questioning the assumptions under a bright lamp
+Making the robots do their paperwork
+Untying a knot made of callbacks
+Validating the vibes against reality
+Reading documentation written by a time traveler
+Checking if the fix fixed the fix
+Adding one small change with enormous confidence
+Searching for the variable that became `undefined`
+Discovering a new and exciting failure mode
+Making peace with the edge case
+Replacing “quick fix” with “less alarming fix”
+Assembling a solution from reputable spare parts
+Testing the theory before it escapes
+Persuading the app to behave in public
+Finding the exact moment it got weird
+Attempting to leave no trace except a commit
