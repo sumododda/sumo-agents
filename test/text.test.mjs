@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { redact, secretShape } from '../src/redact.mjs';
 import { clip } from '../src/text.mjs';
 import { cap, runEditor } from '../src/tools.mjs';
+import { abridge } from '../src/transcript.mjs';
 import { renderWorkflow } from '../src/workflows.mjs';
 
 test('a cut never lands inside a character: an emoji at the edge goes whole, so what is sent stays well-formed', () => {
@@ -18,6 +19,21 @@ test('a cut never lands inside a character: an emoji at the edge goes whole, so 
   const long = renderWorkflow({ id: 7, title: 'Long', body: `${'y'.repeat(2999)}😀${'z'.repeat(50)}` });
   assert.equal(long.isWellFormed(), true);
   assert.match(long, /y\n… \(the rest: sumo show m7\)/);
+});
+
+test('a reply kept by both ends is well-formed, though either cut fell inside an emoji', () => {
+  // Odd and even offsets: whichever way the text is aligned, one of the two cuts lands between the halves of an emoji.
+  for (const text of ['😀'.repeat(1000), `a${'😀'.repeat(1000)}`]) {
+    const kept = abridge(text);
+    assert.equal(kept.isWellFormed(), true, JSON.stringify([kept.slice(0, 2), kept.slice(-2)]));
+    assert.match(kept, / \[…\] /);
+  }
+});
+
+test('a secret is counted once, though more than one shape caught it', () => {
+  assert.deepEqual(redact('OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456'), { text: 'OPENAI_API_KEY=[redacted]', count: 1 });
+  assert.deepEqual(redact('{ "token": "ghp_abcdefghijklmnopqrstuvwxyz0123456789" }'), { text: '{ "token": [redacted] }', count: 1 });
+  assert.equal(redact('DB_PASSWORD=hunter2hunter2 and GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789').count, 2);
 });
 
 test('the first line of a private key is a key on its own: a scan that reads one line at a time still sees it', () => {

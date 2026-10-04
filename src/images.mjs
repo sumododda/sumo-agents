@@ -25,9 +25,14 @@ const KINDS = [
 function imageOf(bytes) {
   const mediaType = KINDS.find(([, is]) => is(bytes))?.[0];
   if (!mediaType) return null;
-  const data = bytes.toString('base64');
-  if (data.length > MAX_IMAGE_BYTES) throw new Error(`that image is too big — ${(data.length / 1e6).toFixed(1)} MB encoded, and the API takes ${MAX_IMAGE_BYTES / 1e6} MB`);
-  return { mediaType, data };
+  tooBig(bytes.length);
+  return { mediaType, data: bytes.toString('base64') };
+}
+
+/** Said from the raw size, so a file too big to send is never read whole or encoded. */
+function tooBig(size) {
+  const encoded = Math.ceil(size / 3) * 4;
+  if (encoded > MAX_IMAGE_BYTES) throw new Error(`that image is too big — ${(encoded / 1e6).toFixed(1)} MB encoded, and the API takes ${MAX_IMAGE_BYTES / 1e6} MB`);
 }
 
 /** What osascript prints for the clipboard as PNG: `«data PNGf89504E47…»`. It fails when there is no image on it. */
@@ -56,7 +61,9 @@ const wordsOf = (text) => (text.trim().match(/'[^']*'|"[^"]*"|(?:\\.|[^ \t\r\n\\
 /** The images a paste is, when every word of it is the path of an image file; null when it is text. */
 export function droppedImages(text) {
   const paths = wordsOf(text);
-  if (paths.length === 0 || !paths.every((p) => isAbsolute(p) && NAMES.test(p) && statSync(p, { throwIfNoEntry: false })?.isFile())) return null;
+  const stats = paths.map((p) => (isAbsolute(p) && NAMES.test(p) ? statSync(p, { throwIfNoEntry: false }) : undefined));
+  if (paths.length === 0 || !stats.every((s) => s?.isFile())) return null;
+  for (const s of stats) tooBig(s.size);
   const images = paths.map((p) => imageOf(readFileSync(p)));
   return images.every(Boolean) ? images : null;
 }

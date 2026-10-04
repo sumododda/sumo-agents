@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { getMeta, openDb, setMeta } from '../src/db.mjs';
+import { stopLocalServer } from '../src/local-server.mjs';
 import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { chooseRoute, EFFORTS, MODELS } from '../src/route.mjs';
@@ -97,6 +98,7 @@ for (const [name, jobs] of Object.entries(HISTORIES)) {
       }
       console.log(`  ${PROBES.length} probes: ${tally.ok} ok, ${tally.over} routed too high, ${tally.under} routed too low`);
     } finally {
+      stopLocalServer(db); // the throwaway home's server would otherwise outlive the probe
       db.close();
     }
   });

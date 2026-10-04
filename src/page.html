@@ -282,7 +282,8 @@
     $('main').replaceChildren(...out);
 
     const area = document.querySelector('textarea');
-    if (area && document.activeElement !== area) {
+    // Typing in the filter redraws too; the edit box takes focus only when the filter does not hold it.
+    if (area && document.activeElement !== area && document.activeElement !== $('filter')) {
       area.focus();
       area.setSelectionRange(area.value.length, area.value.length);
     }

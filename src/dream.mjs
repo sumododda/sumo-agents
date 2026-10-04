@@ -18,7 +18,7 @@ function buildBundle(db, sessions) {
   const marks = ids.map(() => '?').join(', ');
   const turns = db.prepare(`SELECT * FROM user_turns WHERE session_id IN (${marks}) ORDER BY id`).all(...ids);
   const checkpoints = db.prepare(`SELECT * FROM checkpoints WHERE session_id IN (${marks}) ORDER BY id`).all(...ids);
-  const projects = db.prepare(`SELECT DISTINCT slug FROM session_injections WHERE session_id IN (${marks})`).all(...ids).map((r) => r.slug);
+  const projects = db.prepare(`SELECT DISTINCT slug FROM session_injections WHERE session_id IN (${marks}) AND slug NOT LIKE '%:%'`).all(...ids).map((r) => r.slug);
 
   const scopes = ['global', ...projects.map((p) => `project:${p}`)];
   const memories = db

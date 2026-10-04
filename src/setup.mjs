@@ -10,6 +10,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
 import { resolveAnthropicCredential } from './auth.mjs';
 import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mjs';
+import { stopLocalServer } from './local-server.mjs';
 import { UsageError } from './memory.mjs';
 import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
 
@@ -18,8 +19,8 @@ const NODE_REQUIREMENT = '22.19+ or 24.6+';
 /** The settings `sumo config` accepts, with the value used when none is stored. */
 export const CONFIG_DEFAULTS = {
   'prime.budget': '800',
-  'scribe.model': 'haiku',
-  'dream.model': 'haiku',
+  'scribe.model': 'local',
+  'dream.model': 'local',
   'chat.model': 'opus',
   'chat.effort': 'high',
   'model.source': 'https://huggingface.co',
@@ -33,7 +34,9 @@ export const CONFIG_DEFAULTS = {
  * both as absolute paths, so `sumo` means the same thing everywhere.
  */
 function launcherScript() {
-  return `#!/bin/sh\nexport NODE_USE_SYSTEM_CA=1\nexec "${process.execPath}" --disable-warning=ExperimentalWarning "${ENTRY}" "$@"\n`;
+  // Single quotes keep a `$`, backtick or `"` in either path literal; a `'` is closed, escaped and reopened.
+  const quote = (s) => `'${s.replaceAll("'", `'\\''`)}'`;
+  return `#!/bin/sh\nexport NODE_USE_SYSTEM_CA=1\nexec ${quote(process.execPath)} --disable-warning=ExperimentalWarning ${quote(ENTRY)} "$@"\n`;
 }
 
 /** A directory already on PATH, inside the home folder, that a command can be linked into without sudo. */
@@ -175,6 +178,8 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
   const db = openDb();
   chmodSync(p.db, 0o600);
   if (!getMeta(db, 'machine')) setMeta(db, 'machine', hostname().replace(/\.local$/, ''));
+  // The model or the binary may be about to change; the next local call starts a server for what is current.
+  stopLocalServer(db);
   // Pinned for the same reason the launcher pins node: the router runs where PATH cannot be trusted.
   const llama = commandOnPath('llama-server');
   if (llama) setMeta(db, 'llama.path', llama);
@@ -196,8 +201,11 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
   }
   db.close();
 
-  writeFileSync(p.launcher, launcherScript(), { mode: 0o755 });
-  chmodSync(p.launcher, 0o755);
+  // Written aside and renamed in, so a hook running the launcher mid-setup never reads half a script.
+  const staged = `${p.launcher}.${process.pid}.tmp`;
+  writeFileSync(staged, launcherScript(), { mode: 0o755 });
+  chmodSync(staged, 0o755);
+  renameSync(staged, p.launcher);
 
   const lines = [`home      ${p.home}`, `database  ${p.db}`, `launcher  ${p.launcher}`];
   if (modelLine) lines.push(modelLine);
@@ -218,8 +226,9 @@ function commandOnPath(name) {
   for (const dir of (process.env.PATH ?? '').split(delimiter).filter(Boolean)) {
     const candidate = join(dir, name);
     try {
+      // A directory passes the X_OK check too (it means "searchable"), so it is ruled out the way `which` rules it out.
       accessSync(candidate, constants.X_OK);
-      return candidate;
+      if (statSync(candidate).isFile()) return candidate;
     } catch {
       // Not in this directory.
     }
@@ -271,11 +280,11 @@ export function doctor() {
   const ours = found !== null && existsSync(p.launcher) && realpathSync(found) === realpathSync(p.launcher);
   check(ours, '`sumo` on PATH is this one', found ? `PATH finds ${found} instead` : 'run: sumo setup');
 
-  // The cheap-model passes (scribe, dream) go straight to the API; without a credential they fail quietly in the background.
+  // The chat and every job go to the API; the memory passes run locally and only fall back to it.
   const standInKey = Boolean(process.env.SUMO_AGENTS_MODEL_CMD);
   check(
     standInKey || Boolean(resolveAnthropicCredential()),
-    'ANTHROPIC_API_KEY is set or CLAUDE_CODE_OAUTH_TOKEN is set (runs model calls)',
+    'ANTHROPIC_API_KEY is set or CLAUDE_CODE_OAUTH_TOKEN is set (chat, jobs, and the passes\' fallback)',
     'export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that starts sessions and hooks',
   );
 

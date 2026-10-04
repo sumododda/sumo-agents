@@ -417,6 +417,12 @@ test('a command that cannot start says why, and an insert at a line that is not 
   assert.equal(empty.isError, true);
   assert.match(empty.content, /insert_text/);
   assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'one\nX\ntwo\n', 'and no blank line is written in its place');
+  // Past the last line is the end of the file: the newline it ended on is not a line of its own.
+  assert.equal(runEditor({ command: 'insert', path: 'a.txt', insert_line: 99, insert_text: 'end\n' }, ctx).isError, false);
+  assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'one\nX\ntwo\nend\n');
+  const noOld = runEditor({ command: 'str_replace', path: 'a.txt', new_str: 'Y' }, ctx);
+  assert.equal(noOld.isError, true);
+  assert.match(noOld.content, /needs old_str/);
 });
 
 test('a job\'s commands meet the workflow gate as the chat\'s do: held once with the steps, and the job\'s own project counts', async () => {

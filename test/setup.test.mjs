@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { lstatSync, mkdirSync, readlinkSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readlinkSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { SCHEMA_VERSION } from '../src/db.mjs';
+import { ENTRY } from '../src/paths.mjs';
 import { sandbox } from './helpers.mjs';
 
 const mode = (file) => statSync(file).mode & 0o777;
@@ -127,7 +128,7 @@ test('the schema is migrated once and recorded', () => {
 
 test('config reads defaults, stores changes and rejects names it does not know', () => {
   const s = sandbox();
-  assert.match(s.sumo(['config', 'scribe.model']).out, /scribe\.model = haiku/);
+  assert.match(s.sumo(['config', 'scribe.model']).out, /scribe\.model = local/);
   assert.match(s.sumo(['config', 'scribe.model', 'sonnet']).out, /scribe\.model = sonnet/);
   assert.match(s.sumo(['config']).out, /scribe\.model = sonnet/);
 
@@ -165,4 +166,27 @@ test('doctor accepts a Claude Code OAuth token, including one mistakenly exporte
 
   const misplaced = s.sumo(['doctor'], { extraEnv: { ...env, ANTHROPIC_API_KEY: 'sk-ant-oat-misplaced', CLAUDE_CODE_OAUTH_TOKEN: '' } });
   assert.match(misplaced.out, /^ok {4}ANTHROPIC_API_KEY.*CLAUDE_CODE_OAUTH_TOKEN/m, misplaced.out);
+});
+
+test('a home given as a relative path is pinned as an absolute one, so the linked command works from anywhere', () => {
+  const s = sandbox();
+  const binDir = join(s.root, 'bin');
+  mkdirSync(binDir);
+  const run = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', ENTRY, 'setup', '--bin-dir', binDir, '--no-model'], {
+    cwd: s.root,
+    env: { ...process.env, SUMO_AGENTS_HOME: 'home' },
+    encoding: 'utf8',
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(realpathSync(join(binDir, 'sumo')), realpathSync(join(s.home, 'bin', 'sumo')), 'the link must not dangle');
+});
+
+test('a directory that shares a command name on PATH is not that command', () => {
+  const s = sandbox();
+  const fakeBin = join(s.root, 'fake-bin');
+  mkdirSync(join(fakeBin, 'llama-server'), { recursive: true });
+  const run = s.sumo(['setup', '--no-link', '--no-model'], { extraEnv: { PATH: `${fakeBin}:/usr/bin:/bin` } });
+  assert.equal(run.code, 0, run.err);
+  assert.match(run.out, /llama-server not found/);
+  assert.equal(s.sql((db) => db.prepare(`SELECT value FROM meta WHERE key = 'llama.path'`).get()), undefined);
 });

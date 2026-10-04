@@ -17,8 +17,8 @@ const SECRET_FILE =
 /** Anything that would put a file's contents in front of the model. `source .env` is not on it: that sets variables without showing them. */
 const PRINTS = /(^|[\s;&|($`])(cat|head|tail|less|more|bat|grep|rg|egrep|fgrep|sed|awk|cut|strings|xxd|hexdump|od|base64|nl|tac|view|vim?|nano|code|open|pbcopy|jq|yq)\s/;
 
-/** `rm`, its flags, and its targets. Only a recursive spelling of the flags is looked at further. */
-const RM = /(^|[\s;&|(`"'])(?:sudo\s+)?rm((?:\s+-{1,2}[\w-]+)+)\s+([^;&|)`]+)/g;
+/** `rm`, its flags, and its targets — up to the end of its command, which a new line is too. Only a recursive spelling of the flags is looked at further. */
+const RM = /(^|[\s;&|(`"'])(?:sudo\s+)?rm((?:\s+-{1,2}[\w-]+)+)\s+([^;&|)`\n]+)/g;
 const RECURSIVE = /(^|\s)(?:-[a-zA-Z]*[rR]|--recursive)/;
 
 /** A target that is the whole machine, the home, the working directory, or one level below any of them. */
@@ -29,7 +29,8 @@ const unquote = (word) => word.replace(/^["']|["']$/g, '');
 const RULES = [
   {
     test: (c) => {
-      for (const m of c.matchAll(RM)) {
+      // A line ending in a backslash goes on: its targets are still rm's.
+      for (const m of c.replace(/\\\n/g, ' ').matchAll(RM)) {
         if (!RECURSIVE.test(m[2])) continue;
         const targets = m[3].trim().split(/\s+/).map(unquote);
         if (targets.some((t) => ROOT_OR_HOME_OR_HERE.test(t))) return true;
