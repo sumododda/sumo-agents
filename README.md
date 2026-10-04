@@ -10,8 +10,9 @@ never committed — a work laptop and a personal one learn separately.
 
 ## Set up a machine
 
-Needs Node 22.19+ on the 22.x line or Node 24.6+, either `ANTHROPIC_API_KEY` or a `CLAUDE_CODE_OAUTH_TOKEN` from
-`claude setup-token` in the environment, and llama.cpp (`brew install llama.cpp`) for the local router model.
+Needs Node 22.19+ on the 22.x line or Node 24.6+, llama.cpp (`brew install llama.cpp`) for the local model that
+routes jobs and writes memory, and, for the chat and jobs, either `ANTHROPIC_API_KEY` or a `CLAUDE_CODE_OAUTH_TOKEN`
+from `claude setup-token` in the environment.
 
 ```sh
 git clone https://github.com/sumododda/sumo-agents.git ~/sumo-agents && cd ~/sumo-agents
@@ -91,7 +92,7 @@ History is never rewritten on the client.
 | The editor reaches for a path outside the project | Refused: the editor is jailed to the project (symlinks followed). Shell commands start in the project directory but can access other paths. The child environment omits variables whose names indicate credentials. | 0 |
 | The agent is about to run a shell command a taught workflow gates (`gh pr create`, for a workflow taught with `--gate 'gh(-axi)? pr create'`) | The command is held back once and the agent is handed the workflow's steps. It follows them, then runs the command. The same steps ride in with your message when you ask for the thing yourself. | 0 until it fires |
 | The agent ends a turn on a question | Memory is searched with the question's own words, in plain code. If something close is there, the agent is handed it once and carries on instead of waiting for you; if nothing is, the question reaches you untouched. | 0 unless memory answers |
-| A turn ends | The **scribe** is scheduled when a pending turn contains a standing instruction, three turns are waiting, or its last run was at least five minutes ago (or it has never run). Session start and end also sweep up pending turns. A detached Haiku call proposes memories; code checks each against what you actually typed. | 0 |
+| A turn ends | The **scribe** is scheduled when a pending turn contains a standing instruction, three turns are waiting, or its last run was at least five minutes ago (or it has never run). Session start and end also sweep up pending turns. A detached call to the local model proposes memories; code checks each against what you actually typed. | 0 |
 | 3 finished sessions pile up | The **dream** pass reads them side by side: contradictions, repeated corrections, routines worth naming. | 0 |
 | Every model response | One ledger row: tokens in, cached, written, out, cost, the job or session it served. `sumo scribe stats` sums them. | 0 |
 
@@ -162,10 +163,13 @@ run it: sumo job run 27   (append & to run it in the background)
 ```
 
 The route is the router's answer, and nothing else's. On every `sumo job new` and every `sumo job retry`, a
-4B open model (Qwen3, through llama.cpp) reads the role, project, task text and the project's history,
+4B open model (Qwen3-4B, through llama.cpp) reads the role, project, task text and the project's history,
 describes the job — its kind, how much code it touches, whether it is risky — and then answers with a
-model, an effort and one sentence. It runs locally, costs nothing, and takes about 1.5 s including
-startup. There are no flags to override it, no project rules, no retry ladder and no floors.
+model, an effort and one sentence. It runs locally, costs nothing, and takes about a second once the
+model is loaded. There are no flags to override it, no project rules, no retry ladder and no floors.
+
+The same model, through the same server, writes memory; see *The local model* below for what it is, how it
+is run and how it was measured.
 
 The history it reads is only the evidence against a route: a model/effort that failed here, or that a
 review found Important issues in. A clean record is left out — it says nothing about what a cheaper
@@ -328,26 +332,82 @@ in for test and lint. `sumo project rescan <slug>` after setting one up.
 The split is deliberate: a line in a prompt is a request, and the things that are cheap to check by
 running something are checked by running something.
 
+## The local model
+
+One open model does the machine's bookkeeping: it routes every job and every `auto` chat turn, and it
+writes memory — the scribe after your turns, the dream pass over finished sessions. It is Qwen3-4B at
+Q4_K_M (a 2.5 GB file), run by llama.cpp's `llama-server`, downloaded once by `sumo setup` from
+`model.source`, `model.repo` and `model.file`. The router asks it without thinking and has an answer in
+about a second; the passes ask it with thinking on, capped at 1,024 tokens of thought by the server's
+reasoning budget, and have one in 8–15 s. Every answer is held to a JSON schema by the server's grammar,
+then checked by code against what you actually typed before anything is filed.
+
+It is one server, started by the first call that needs it and left running, detached, in router mode over
+`~/.sumo-agents/models/` with a 32k-token context. It sleeps after ten idle minutes (under 0.5 GB resident)
+and wakes in under a second; the first load after it starts takes up to about 15 s; it holds about 7 GB
+while it answers. `sumo scribe status` shows its pid, port and whether the model is loaded. `sumo setup`
+stops it, so a changed model file or binary takes effect. Its output goes to `~/.sumo-agents/logs/llama-server.log`.
+
+```sh
+sumo config model.repo <org>/<repo>     # another GGUF repository on the model source
+sumo config model.file <name>.gguf      # the file within it — then: sumo setup
+sumo config scribe.model haiku          # send the writer to the API instead (also sonnet, or off); dream.model likewise
+```
+
+### How it was chosen
+
+Measured on this machine (M5 Pro, 48 GB) on 2026-10-04 with the repo's own probes. The scope probe is
+30 labelled turns over six conversations, 16 of them worth remembering: it asks whether the writer keeps
+what it should, puts each memory in the right project, proves it with a quote from what was typed, and
+leaves the 14 throwaway turns alone. Haiku 4.5 ran the same day for the baseline.
+
+| Writer | Remembered | Right scope | Quoted | Noise filed | Per call | Resident |
+|---|---|---|---|---|---|---|
+| **Qwen3-4B, thinking capped at 1,024 — the default** | 16/16 | 16/16 | 16/16 | 0 | 8–15 s | ~7 GB awake |
+| Haiku 4.5, through the API | 16/16 | 16/16 | 16/16 | 0 | 8–22 s, $0.088 for six | — |
+| Qwen3.5-4B, thinking capped | 16/16 | 15/16 | 16/16 | 0 | 8–13 s | 3.7 GB |
+| Qwen3.5-9B, thinking capped | 15/16 | 14/15 | 15/15 | 0 | 26–29 s | 6.4 GB |
+| Qwen3.5-9B, thinking uncapped | every call hit the token limit with no answer | | | | 137 s | |
+| Qwen3-4B, no thinking | 14/16 | 12/14 | 14/14 | 4 | 1–5 s | |
+| Qwen3.5-4B, no thinking | 14/16 | 11/14 | 14/14 | 2 | 1–4 s | |
+| Qwen3.5-9B, no thinking | 14/16 | 10/14 | 14/14 | 0 | 2–7 s | |
+| Gemma 4 E4B, no thinking | 14/16 | 13/14 | 14/14 | 0 | 2–5 s | 5.3 GB |
+
+Two things decided it. Thinking is what closes the gap to Haiku, and the cap is what makes thinking safe:
+uncapped, the 9B thought until the token limit on every call, and the 4B did once on a trivial prompt. And
+the model already here is the best of them: on the router's own grading set — 12 labelled tasks, each with
+the cheapest and dearest acceptable route, over three project histories — Qwen3-4B routes 11 of 12 right on
+each history, where Qwen3.5-4B fell to 9, 9 and 11. The larger candidates (Qwen3.6-35B-A3B, Nemotron 3 Nano
+30B) are 22–25 GB files, too much to keep resident on a laptop that is also being worked on.
+
+Caveats: the probe's bundles are about 750 tokens, while real scribe bundles are 4,800 tokens at the median
+and 9,400 at the 90th percentile and carry the assistant's replies and related memories, so real accuracy
+may be lower. Every number is one run at temperature 0 of a set written by the author.
+
+```sh
+node probes/scope-accuracy.mjs                                    # the configured writer: local, $0, about 90 s
+node probes/scope-accuracy.mjs haiku                              # the same turns on the API model, about 9 cents
+node --disable-warning=ExperimentalWarning test/router-probes.mjs  # the router's grading set
+```
+
 ## What it costs
 
-Measured on this machine before the passes called the API directly (Haiku 4.5 through a harness, subscription login);
-they now call the API directly, and `sumo scribe stats` shows what that costs:
-
-- One scribe call: about 4,300 tokens in, 300–600 out, **$0.011–0.013**, 4–8 s, in the background.
-- 30 labelled turns over six conversations: **$0.07**. It remembered 16 of 16 things it should, put
-  16 of 16 in the right project, proved all 16 with a real quote, and remembered 0 of 14 throwaway turns.
+- A scribe or dream pass: $0, 8–15 s in the background, no credential needed. On this machine the 224 Haiku
+  scribe calls before the switch cost $1.86 in all, and dream's 18 cost $0.17.
+- The router: one local call per job, about a second once the model is loaded, $0.
+- The server: about 7 GB while it answers, under 0.5 GB asleep.
 - The always-loaded prompt (`AGENTS.md`) is about 650 tokens, and a test keeps it there.
-- The router: one local call per job, about 1.5 s, $0. llama-server holds about 3.6 GB while it answers
-  and is stopped right after, so nothing stays resident between jobs. The 21 briefs on this machine all
-  came back as valid answers, 0.7–2.2 s each.
 
-`sumo config scribe.model sonnet` switches the writer's model; `off` makes the chat model save directly.
+When a local call fails (server down, a bundle past the 32k context, an answer cut off) and a credential is in
+the environment, the pass is retried once on Haiku; both calls are in the ledger, and `sumo scribe stats` sums
+it per kind. `sumo config scribe.model haiku` (or `sonnet`) sends the writer straight to the API; `off` makes
+the chat model save directly. `dream.model` is the same.
 
 ## Tests
 
 ```sh
 npm test                              # offline suite, no real model calls (recorded answers)
-node probes/scope-accuracy.mjs        # live: real model, about 7 cents
+node probes/scope-accuracy.mjs        # live: the local writer on 30 labelled turns, $0 (`haiku` to compare, about 9 cents)
 ```
 
 ## Layout
@@ -362,6 +422,7 @@ src/chat.mjs         the chat; src/hooks.mjs the session policy as events
 src/ui.mjs           the chat's screen (Ink, loaded only by `sumo chat`); src/editor.mjs the box you type in
 spinner.txt          the words the chat shows while it works — edit them; logo.txt the lion behind the screen
 src/route.mjs        how a job's model and effort are chosen: the router, and the stats
-test/  probes/       the suite, and the live measurement
+src/local-server.mjs the one llama-server behind the router and the memory passes; src/model.mjs the calls to it and to the API
+test/  probes/       the suite, and the live measurements
 docs/ADR-runtime.md  the decision to own the runtime, and the plan it followed; docs/PLAN.md the original design
 ```

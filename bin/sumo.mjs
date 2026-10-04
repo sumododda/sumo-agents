@@ -20,5 +20,12 @@ process.emitWarning = (warning, ...rest) => {
   emitWarning.call(process, warning, ...rest);
 };
 
+// A reader that stops early (`sumo export | head`) closes the pipe: that is the
+// end of the output, not a crash with a stack trace.
+process.stdout.on('error', (error) => {
+  if (error.code !== 'EPIPE') throw error;
+  process.exit(0);
+});
+
 const { main } = await import('../src/cli.mjs');
 process.exitCode = await main(process.argv.slice(2));

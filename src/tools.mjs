@@ -29,7 +29,9 @@ const OWN_LIMITS = /^\s*sumo\s+job\s+(baseline|verify|finish)\b/;
 /** The process groups of the commands still running: when this process is told to go, they go first. */
 const live = new Set();
 let watching = false;
-const killGroup = (pid) => {
+export const killGroup = (pid) => {
+  // A spawn that failed reports pid 0, and -0 is 0: the caller's own group.
+  if (!(pid > 0)) return;
   try {
     process.kill(-pid, 'SIGKILL');
   } catch {
@@ -250,9 +252,9 @@ export function runEditor(input, ctx) {
         return result(`created ${path}`);
       case 'str_replace': {
         if (secret) return result(secret, true);
-        const text = readFileSync(path, 'utf8');
-        const hits = text.split(input.old_str ?? '').length - 1;
         if (!input.old_str) return result('str_replace needs old_str', true);
+        const text = readFileSync(path, 'utf8');
+        const hits = text.split(input.old_str).length - 1;
         if (hits !== 1) return result(hits === 0 ? `old_str was not found in ${path}` : `old_str appears ${hits} times in ${path} — include more context so it is unique`, true);
         writeFileSync(path, text.replace(input.old_str, () => String(input.new_str ?? '')));
         return result(`edited ${path}`);
@@ -265,7 +267,8 @@ export function runEditor(input, ctx) {
         // The tool sends the text as insert_text, a line with its newline; new_str is what an earlier version of the tool sent.
         const text = input.insert_text ?? input.new_str;
         if (typeof text !== 'string') return result('insert needs insert_text: the text to insert', true);
-        const at = Math.max(0, Math.min(lines.length, line));
+        // A file ending in a newline splits to a last empty piece, which is not a line to insert after.
+        const at = Math.max(0, Math.min(lines.at(-1) === '' ? lines.length - 1 : lines.length, line));
         lines.splice(at, 0, text.replace(/\n$/, ''));
         writeFileSync(path, lines.join('\n'));
         return result(`inserted into ${path} after line ${at}`);

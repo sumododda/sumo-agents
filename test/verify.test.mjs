@@ -584,3 +584,57 @@ test('an untracked repository inside the project does not make git hash every un
   assert.deepEqual(hashing.filter((l) => !l.includes('--stdin-paths')), [], 'all of them in one call');
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(s.home, 'jobs', '1', 'verify.json'), 'utf8')).snap.hashes).sort(), ['data.csv', 'notes.txt']);
 });
+
+test('a check that is over is not waited on for what it left running: the time limit is for checks, not for their leftovers', async () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const p = gitProject(s, { recipe: '@(sleep 30; echo late) & echo $$! > leftover.pid; echo checked' });
+  newWorker(s);
+  const started = Date.now();
+  const run = s.sumo(['job', 'verify', '1'], { extraEnv: { SUMO_AGENTS_CHECK_TIMEOUT_MS: '6000' } });
+  const took = Date.now() - started;
+  const left = Number(readFileSync(join(p.dir, 'leftover.pid'), 'utf8'));
+  const gone = await until(() => !alive(left), 3000);
+  if (!gone) process.kill(left, 'SIGKILL');
+  assert.ok(took < 5000, `verify took ${took} ms`);
+  assert.match(run.out, /`make test` passed/, run.out);
+  assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test.txt'), 'utf8'), /^\$ make test\nchecked\n$/);
+  assert.ok(gone, 'what the check left running does not outlive it');
+});
+
+test('a baseline taken after an early verdict is what DONE is judged against: the verdict from before it is not reused', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  gitProject(s, { status: 'broken' });
+  newWorker(s);
+  // Looked before the baseline: with nothing to compare against, the failure counts as the job's.
+  assert.match(s.sumo(['job', 'verify', '1']).out, /no baseline was taken before the work/);
+  assert.match(s.sumo(['job', 'baseline', '1']).out, /^`make test` ALREADY FAILS/);
+
+  const done = finish(s);
+  assert.equal(done.code, 0, done.err);
+  assert.match(done.out, /look at: `make test` was already failing when this job began/);
+});
+
+test('a make recipe goes on past a blank or comment line inside it, so a change to its later lines is a change to the check', () => {
+  const s = sandbox();
+  const dir = join(s.root, 'proj-make');
+  mkdirSync(dir);
+  writeFileSync(join(dir, 'Makefile'), '.PHONY: test\ntest:\n\t@echo one\n\n# then the real run\n\t@node --test\n\nlint:\n\t@eslint .\n');
+  const test = verifyCommands(dir).find((c) => c.command === 'make test');
+  assert.equal(test.definition, 'test:\n\t@echo one\n\n# then the real run\n\t@node --test');
+});
+
+test('a check that prints more than is kept is read from its end: the log holds its last lines, whole', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  // About 3 MB of numbered lines, so the end is read from well inside the file.
+  gitProject(s, { recipe: '@seq 1 400000 | sed "s/^/line /"' });
+  newWorker(s);
+  s.sumo(['job', 'verify', '1']);
+  const lines = readFileSync(join(s.home, 'jobs', '1', 'verify-test.txt'), 'utf8').trimEnd().split('\n');
+  assert.equal(lines[0], '$ make test');
+  assert.equal(lines.length, 201);
+  assert.equal(lines[1], 'line 399801');
+  assert.equal(lines.at(-1), 'line 400000');
+});

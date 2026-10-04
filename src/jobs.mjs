@@ -343,7 +343,8 @@ export function baseline(db, id) {
   if (!state.baseline) {
     const taken = takeBaseline(project.path, state.snap, dirOf(id));
     if (taken.refused) return [`no baseline taken: ${taken.refused}.`, 'Every check that fails at the end will count as this job\'s.'];
-    writeState(id, { ...state, baseline: taken.checks });
+    // A verdict given before there was a baseline judged against none: it no longer says what DONE would.
+    writeState(id, { ...state, baseline: taken.checks, verdict: null });
     state.baseline = taken.checks;
   }
   if (state.baseline.length === 0) return ['this project declares no check, test, lint or typecheck command — there is nothing to take a baseline of'];
@@ -524,10 +525,12 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
       : '';
 
   // The checks can take minutes: a job abandoned or closed while they ran is left as it now is.
-  requireOpen(getJob(db, id), 'finished');
-  writeFileSync(fileOf(id, 'report.md'), `${report.trim()}\n${observed}`, { mode: 0o600 });
-  const closed = db.prepare(`UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND status IN ('running', 'needs_input')`).run(status === 'DONE' ? 'done' : 'failed', now, id);
-  if (closed.changes === 0) requireOpen(getJob(db, id), 'finished');
+  // Closed before the report is written, so one closed elsewhere meanwhile keeps the report it had; a report that cannot be written undoes the close.
+  tx(db, () => {
+    const closed = db.prepare(`UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND status IN ('running', 'needs_input')`).run(status === 'DONE' ? 'done' : 'failed', now, id);
+    if (closed.changes === 0) requireOpen(getJob(db, id), 'finished');
+    writeFileSync(fileOf(id, 'report.md'), `${report.trim()}\n${observed}`, { mode: 0o600 });
+  });
 
   // A reviewer job created with --reviews <id> grades that job: the count of numbered Findings becomes its "important".
   if (job.agent === 'reviewer' && status === 'DONE') {

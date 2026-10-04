@@ -38,6 +38,8 @@ test('a command that would wipe a tree, throw away history or empty a database i
     'git branch -D feature/x',
     'git stash drop',
     'git stash clear',
+    'rm -rf build\nrm -rf ~',
+    'rm -rf \\\n  ~',
     'psql -c "DROP TABLE users"',
     "mysql -e 'TRUNCATE TABLE orders'",
     'sqlite3 app.db "DROP DATABASE main"',
@@ -57,6 +59,9 @@ test('ordinary deletes, soft resets, single-file restores and force-pushes go th
     'rm -f file.txt',
     'rm -f ~/.zcompdump',
     'rm -rf build/*',
+    // A new line starts a new command: what comes after it is not something rm deletes.
+    'rm -rf build\ncd ..',
+    'rm -rf dist\nmkdir -p ~/out',
     'git push --force origin main',
     'git push -f',
     'git reset --soft HEAD~1',

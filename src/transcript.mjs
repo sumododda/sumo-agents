@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { redact } from './redact.mjs';
+import { head } from './text.mjs';
 
 /**
  * Generous on purpose: the closing reply of a piece of work is where the traps it hit are mentioned,
@@ -15,7 +16,9 @@ export function abridge(text, max = REPLY_MAX) {
   const flat = text.replace(/\s+/g, ' ').trim();
   if (flat.length <= max) return flat;
   const half = Math.floor((max - 5) / 2);
-  return `${flat.slice(0, half)} […] ${flat.slice(-half)}`;
+  // Either cut can fall inside an emoji; a lone half of one makes the whole request one the API refuses.
+  const tail = flat.slice(-half);
+  return `${head(flat, half)} […] ${/^[\uDC00-\uDFFF]/.test(tail) ? tail.slice(1) : tail}`;
 }
 
 /**
