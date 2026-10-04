@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Sumo memory</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%A6%81%3C/text%3E%3C/svg%3E">
+<style nonce="__NONCE__">
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f6f3; --surface: #ffffff; --text: #1f1d1a; --muted: #6b665f; --line: #e5e1da;
+    --accent: #9a4a0c; --on-accent: #ffffff; --accent-soft: #fbf1e6; --danger: #b42318; --focus: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131211; --surface: #1c1b19; --text: #ece9e4; --muted: #a39d95; --line: #2e2c29;
+      --accent: #f0a35e; --on-accent: #1a1209; --accent-soft: #261e16; --danger: #f97066; --focus: #7aa2ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+  header { position: sticky; top: 0; z-index: 2; background: color-mix(in srgb, var(--bg) 90%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  header .wrap { padding-top: 18px; padding-bottom: 12px; display: grid; gap: 10px; }
+  .title { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .summary { color: var(--muted); font-size: 13px; }
+  #filter { width: 100%; font: inherit; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-size: 13px; padding: 3px 10px; border-radius: 999px; background: var(--surface); }
+  .chip[aria-pressed="true"] { background: var(--text); color: var(--bg); border-color: var(--text); }
+  .chip .n { opacity: 0.6; margin-left: 4px; }
+  main { padding-top: 20px; padding-bottom: 96px; }
+  section { margin-bottom: 30px; }
+  h2 { font-size: 16px; margin: 0 0 2px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  h2 .path { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); font-weight: normal; overflow-wrap: anywhere; }
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 16px 0 6px; font-weight: 600; }
+  .n { font-weight: normal; }
+  .list { list-style: none; margin: 0; padding: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+  .waiting .list { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+  .waiting h2::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); align-self: center; }
+  .item { padding: 11px 14px; border-top: 1px solid var(--line); display: grid; grid-template-columns: 1fr auto; gap: 3px 12px; }
+  .item:first-child { border-top: 0; }
+  .item > .content, .item > .meta { grid-column: 1; }
+  .text, .steps { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+  .steps { font-size: 14px; margin-top: 4px; }
+  .ptitle { font-weight: 600; }
+  .cue { font-size: 13px; color: var(--muted); }
+  blockquote { margin: 4px 0 0; padding-left: 10px; border-left: 2px solid color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--muted); font-size: 13px; }
+  .meta { font-size: 12px; color: var(--muted); }
+  .actions { grid-column: 2; grid-row: 1 / span 2; display: flex; gap: 6px; align-items: flex-start; flex-wrap: wrap; justify-content: flex-end; opacity: 0; transition: opacity 0.12s; }
+  .item:hover .actions, .item:focus-within .actions, .waiting .actions, .item.open .actions { opacity: 1; }
+  .ask { font-size: 13px; color: var(--muted); align-self: center; }
+  .item.open { grid-template-columns: 1fr; }
+  .item.open .actions { grid-column: 1; grid-row: auto; justify-content: flex-start; align-items: center; }
+  button { font: inherit; font-size: 13px; padding: 3px 10px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  textarea { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--focus); background: var(--bg); color: var(--text); resize: vertical; }
+  .hint { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .empty { color: var(--muted); text-align: center; padding: 48px 0; }
+  .toast { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 16px); opacity: 0; background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 10px; font-size: 14px; transition: opacity 0.18s, transform 0.18s; pointer-events: none; max-width: calc(100% - 32px); }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .toast.error { background: var(--danger); color: #fff; }
+  @media (hover: none) { .actions { opacity: 1; } }
+  @media (max-width: 600px) {
+    .item { grid-template-columns: 1fr; }
+    .actions { grid-column: 1; grid-row: auto; justify-content: flex-start; opacity: 1; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="title"><h1>Memory</h1><span class="summary" id="summary"></span></div>
+    <input id="filter" type="search" placeholder="Filter — press / to jump here" aria-label="Filter memories" autocomplete="off">
+    <nav class="chips" id="scopes" aria-label="Show"></nav>
+  </div>
+</header>
+<main class="wrap" id="main"></main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script nonce="__NONCE__">
+  const BASE = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
+  const SAID = { stated: 'you said it', observed: 'observed', scanned: 'scanned from the repo', inferred: 'a guess' };
+  const ui = { data: null, scope: 'all', query: '', editing: null, drafts: new Map(), forgetting: null, busy: false };
+  const $ = (id) => document.getElementById(id);
+
+  /** Every piece of text goes in as text: what is remembered is never read as markup. */
+  function h(tag, props, ...kids) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === 'class') node.className = v;
+      else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v === true ? '' : String(v));
+    }
+    for (const kid of kids.flat(Infinity)) if (kid !== undefined && kid !== null && kid !== false) node.append(kid);
+    return node;
+  }
+
+  let toastTimer;
+  function toast(text, error) {
+    const t = $('toast');
+    t.textContent = text;
+    t.className = 'toast show' + (error ? ' error' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (t.className = 'toast' + (error ? ' error' : '')), error ? 6000 : 3500);
+  }
+
+  const gone = 'The page has lost Sumo — run `sumo memory`, or /memory in the chat, and use the new address.';
+
+  async function load() {
+    if (ui.editing !== null || ui.busy) return;
+    try {
+      const res = await fetch(BASE + 'memories', { cache: 'no-store' });
+      if (!res.ok) throw new Error('the memory could not be read (' + res.status + ')');
+      ui.data = await res.json();
+      render();
+    } catch (e) {
+      toast(e instanceof TypeError ? gone : e.message, true);
+    }
+  }
+
+  async function act(id, action, payload) {
+    ui.busy = true;
+    render();
+    try {
+      const res = await fetch(BASE + 'memories/' + id + '/' + action, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload || {}),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out.error || 'that did not work (' + res.status + ')');
+      return out;
+    } catch (e) {
+      throw e instanceof TypeError ? new Error(gone) : e;
+    } finally {
+      ui.busy = false;
+    }
+  }
+
+  async function run(id, action, payload, said) {
+    try {
+      const out = await act(id, action, payload);
+      if (action === 'edit') ui.drafts.delete(id);
+      ui.editing = null;
+      ui.forgetting = null;
+      toast(said(out));
+    } catch (e) {
+      toast(e.message, true);
+      render();
+      return;
+    }
+    await load();
+  }
+
+  const scopeName = (scope) => {
+    if (scope === 'global') return 'Global';
+    const slug = scope.slice('project:'.length);
+    const p = ui.data.projects.find((x) => x.slug === slug);
+    return p ? p.name : slug;
+  };
+  const scopePath = (scope) => {
+    const p = ui.data.projects.find((x) => 'project:' + x.slug === scope);
+    return p ? p.path : '';
+  };
+
+  function meta(m, withScope) {
+    const parts = ['m' + m.id, SAID[m.provenance] || m.provenance, 'since ' + m.valid_from.slice(0, 10)];
+    if (withScope) parts.unshift(scopeName(m.scope));
+    if (m.topic) parts.push(m.topic);
+    if (m.pinned) parts.push('pinned');
+    return h('div', { class: 'meta' }, parts.join(' · '));
+  }
+
+  function content(m) {
+    if (m.type !== 'procedure') return h('div', { class: 'content' }, h('p', { class: 'text' }, m.body));
+    return h('div', { class: 'content' },
+      h('div', { class: 'ptitle' }, m.title),
+      m.cue && h('div', { class: 'cue' }, 'when: ' + m.cue),
+      h('pre', { class: 'steps' }, m.body));
+  }
+
+  function editor(m) {
+    const area = h('textarea', { 'aria-label': 'Edit m' + m.id, disabled: ui.busy, rows: Math.min(14, Math.max(2, m.body.split('\n').length + Math.floor(m.body.length / 90))) });
+    area.value = ui.drafts.get(m.id) ?? m.body;
+    area.addEventListener('input', () => ui.drafts.set(m.id, area.value));
+    const cancel = () => { ui.drafts.delete(m.id); ui.editing = null; render(); };
+    const save = () => {
+      const body = area.value.trim();
+      if (!body || body === m.body.trim()) return body ? cancel() : toast('A memory cannot be empty — use Forget instead.', true);
+      run(m.id, 'edit', { body }, (out) => 'Saved as m' + out.memory.id + ' — m' + m.id + ' stays in its history' + (out.redacted ? '; a secret-looking value was taken out' : ''));
+    };
+    area.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') cancel();
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) save();
+    });
+    return {
+      area,
+      actions: [
+        h('button', { class: 'primary', onclick: save, disabled: ui.busy }, 'Save'),
+        h('button', { onclick: cancel }, 'Cancel'),
+        h('span', { class: 'hint' }, '⌘/Ctrl ↵ saves · Esc cancels'),
+      ],
+    };
+  }
+
+  function item(m) {
+    if (ui.editing === m.id) {
+      const { area, actions } = editor(m);
+      return h('li', { class: 'item open', id: 'm' + m.id },
+        m.type === 'procedure' && h('div', { class: 'ptitle' }, m.title),
+        area, h('div', { class: 'actions' }, actions));
+    }
+    const forgetting = ui.forgetting === m.id;
+    const actions = forgetting
+      ? [
+          h('span', { class: 'ask' }, 'Stop remembering this? Its history is kept.'),
+          h('button', { class: 'danger', disabled: ui.busy, onclick: () => run(m.id, 'forget', {}, () => 'Forgot m' + m.id) }, 'Forget'),
+          h('button', { onclick: () => { ui.forgetting = null; render(); } }, 'Keep'),
+        ]
+      : [
+          h('button', { disabled: ui.busy, onclick: () => { ui.editing = m.id; ui.forgetting = null; render(); } }, 'Edit'),
+          h('button', { class: 'danger', disabled: ui.busy, onclick: () => { ui.forgetting = m.id; render(); } }, 'Forget'),
+        ];
+    return h('li', { class: 'item' + (forgetting ? ' open' : ''), id: 'm' + m.id }, content(m), meta(m, false), h('div', { class: 'actions' }, actions));
+  }
+
+  function guess(m) {
+    const kind = (ui.data.sections.find(([t]) => t === m.type) || [m.type, m.type])[1].replace(/s$/, '').toLowerCase();
+    return h('li', { class: 'item', id: 'm' + m.id },
+      h('div', { class: 'content' },
+        content(m),
+        m.source_quote && h('blockquote', {}, m.source_quote)),
+      h('div', { class: 'meta' }, scopeName(m.scope) + ' · ' + kind + ' · m' + m.id + ' · since ' + m.valid_from.slice(0, 10)),
+      h('div', { class: 'actions' },
+        h('button', { class: 'primary', disabled: ui.busy, onclick: () => run(m.id, 'confirm', {}, () => 'Kept m' + m.id + ' as something you said') }, 'Yes, keep it'),
+        h('button', { disabled: ui.busy, onclick: () => run(m.id, 'reject', {}, () => 'Dropped m' + m.id) }, 'No')));
+  }
+
+  function render() {
+    if (!ui.data) return;
+    const { memories, sections, machine } = ui.data;
+    const q = ui.query.trim().toLowerCase();
+    const matches = (m) => !q || [m.body, m.title, m.cue, m.topic, 'm' + m.id].some((t) => t && t.toLowerCase().includes(q));
+    const shown = (m) => (ui.scope === 'all' || m.scope === ui.scope) && matches(m);
+    const active = memories.filter((m) => m.state === 'active');
+    const waiting = memories.filter((m) => m.state === 'unconfirmed');
+    const scopes = ['global', ...[...new Set(memories.map((m) => m.scope))].filter((s) => s !== 'global').sort()];
+
+    $('summary').textContent = [machine, active.length + ' remembered', waiting.length ? waiting.length + ' waiting for you' : null].filter(Boolean).join(' · ');
+    $('scopes').replaceChildren(
+      ...['all', ...scopes].map((s) => {
+        const n = s === 'all' ? memories.length : memories.filter((m) => m.scope === s).length;
+        return h('button', { class: 'chip', 'aria-pressed': ui.scope === s ? 'true' : 'false', onclick: () => { ui.scope = s; render(); } },
+          s === 'all' ? 'All' : scopeName(s), h('span', { class: 'n' }, String(n)));
+      }));
+
+    const out = [];
+    const ask = waiting.filter(shown);
+    if (ask.length) {
+      out.push(h('section', { class: 'waiting' },
+        h('h2', {}, 'Waiting for your yes or no', h('span', { class: 'n summary' }, String(ask.length))),
+        h('h3', {}, 'Guesses from what you said — kept only if you say yes'),
+        h('ul', { class: 'list' }, ask.map(guess))));
+    }
+    for (const scope of scopes) {
+      const mine = active.filter((m) => m.scope === scope && shown(m));
+      if (!mine.length) continue;
+      const groups = sections
+        .map(([type, heading]) => [heading, mine.filter((m) => m.type === type)])
+        .filter(([, list]) => list.length)
+        .map(([heading, list]) => [h('h3', {}, heading, ' ', h('span', { class: 'n' }, String(list.length))), h('ul', { class: 'list' }, list.map(item))]);
+      out.push(h('section', {}, h('h2', {}, scopeName(scope), scopePath(scope) && h('span', { class: 'path' }, scopePath(scope))), groups));
+    }
+    if (!out.length) out.push(h('p', { class: 'empty' }, memories.length ? 'Nothing matches “' + ui.query.trim() + '”.' : 'Nothing remembered yet.'));
+    $('main').replaceChildren(...out);
+
+    const area = document.querySelector('textarea');
+    if (area && document.activeElement !== area) {
+      area.focus();
+      area.setSelectionRange(area.value.length, area.value.length);
+    }
+  }
+
+  $('filter').addEventListener('input', (e) => { ui.query = e.target.value; render(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === '/' && !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) {
+      e.preventDefault();
+      $('filter').focus();
+    }
+  });
+  // What the background writer filed while the page sat in another tab shows up on coming back to it.
+  window.addEventListener('focus', load);
+  load();
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# The lion `sumo chat` draws faint in the empty room above the box you type in — Simba's, in braille dots.
+# Replace freely: any text art, one row a line. Lines starting with # are skipped; an empty file draws nothing.
+        ⢠⣤⣤⣠⣤⣄⣀  ⠳⢶⣤⣀⡀
+         ⠉⠉⠉⠙⠛⠛⠿⢷⣄⡀⠙⢿⣿⣿⡦⡀
+   ⢀⣀⣤⣶⣶⡶⠛⠉  ⢀⣀⣤⣄⠈⠙⠂ ⠹⡟⣷⡄
+  ⢀⣤⣾⣿⠟⠉⢀⣠⠄  ⣿⢛⣩⡙⢦⢀⣴⣿⣷⣤⣘⢇⡀
+ ⣠⣾⠟⠋ ⣠⣾⡿⠁  ⠈⠻⣿⣿⣿⣶⣿⣿⣿⣿⣿⣿⣿⣷⡀
+⠠⠟⠁ ⢀⣾⣿⠏⢀⡴    ⢈⣿⣿⣿⣿⣷⣤⡲⢦⡌⢿⣿⣿⣗⠾
+  ⢀⣴⡿⠋⣡⣴⡟ ⢀⣠⠖⠁⠋⢁⣾⣿⣿⣿⣿⣿⣿⣿⣷⣿⣿⣿⣿⣷⣦⣄
+ ⣠⠞⠋⢠⣾⣿⠏⣠⣴⡿⠁  ⢠⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⣀⣉⢉⣹
+⢸⠏ ⢠⣿⠋ ⣼⣿⠟   ⠰⢛⣿⣿⣿⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣼⡏
+⠘  ⣿⠁ ⣼⡿⠃  ⢀⢀⣴⣿⡇⣿⣿⡀⣿⣿⣿⣿⣿⣿⠿⢟⣫⣥⣶⣽⡇
+   ⢸ ⢼⣿⠁⡼ ⢰⡏⢸⣿⣿ ⠿⢹⣿⣌⢿⠈⠛⠛⠛⢿⣿⣿⣿⣿⣿
+     ⢻⣿⢠⣿⡀⢸⠃⢸⣿⣿⡄ ⠘⣿⣿⣷⣴   ⠈⠙⠁⣼⢛⠟
+      ⣿⡈⣿⣷⡘⡄⠘⣿⠻⣿⡄ ⠙⢿⡻⣿⣆     ⠁
+      ⠘⢇⠈⠻⣷⡄ ⠘⠆⠙⢷⡀⠘⣦⡁⠹⣿⣿⡆
+          ⠈⠻⢦    ⠑ ⠙⢷⡀⢹⣿⣇
+             ⠁       ⠳ ⣿⠋
+                      ⠐⠋

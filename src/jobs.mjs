@@ -1,0 +1,578 @@
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { applyOps } from './apply.mjs';
+import { card } from './card.mjs';
+import { tx } from './db.mjs';
+import { UsageError } from './memory.mjs';
+import { paths, REPO_ROOT } from './paths.mjs';
+import { getProject } from './projects.mjs';
+import { chooseRoute, statsLines } from './route.mjs';
+import { verifyCommands } from './scan.mjs';
+import { runScribe } from './scribe.mjs';
+import { addCheckpoint, pendingTurns } from './sessions.mjs';
+import { clip } from './text.mjs';
+import { changesSince, hasCommit, snapshot, stillThere, takeBaseline, verdictLines, verify, writeChanges } from './verify.mjs';
+
+const AGENTS = ['scout', 'worker', 'reviewer'];
+/** Work with a written way of doing it: guides/<name>.md, carried into the brief on request. */
+const GUIDES = ['fix', 'feature', 'review'];
+const BRIEF_CARD_BUDGET = 400;
+const MAX_LEARNED = 5;
+/** A failed job can always be retried; a done one only once review found enough wrong with it. */
+const RETRY_IMPORTANT_THRESHOLD = 3;
+
+export function parseJobId(raw) {
+  const match = /^j?(\d+)$/.exec(String(raw ?? '').trim());
+  if (!match) throw new UsageError(`"${raw}" is not a job id — ids look like j17`);
+  return Number(match[1]);
+}
+
+export function getJob(db, id) {
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(id);
+  if (!job) throw new UsageError(`no job j${id}`);
+  return job;
+}
+
+const dirOf = (id) => join(paths().jobs, String(id));
+const fileOf = (id, name) => join(dirOf(id), name);
+const readOr = (file) => {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return '';
+  }
+};
+
+function setStatus(db, id, status, now) {
+  db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(status, now, id);
+}
+
+function requireOpen(job, verb) {
+  if (job.status !== 'running' && job.status !== 'needs_input') throw new UsageError(`j${job.id} is ${job.status} — it cannot be ${verb}`);
+}
+
+const ROLE = {
+  worker: 'You are a worker: you build, fix and change things in the project below.',
+  scout:
+    'You are a scout: you investigate the project below and report what you found. You have no edit tools and none can be granted — ' +
+    'that is by design, so do not look for one. If something should change, say exactly what and in which file.',
+  reviewer:
+    'You are a reviewer: you judge a change somebody else made in the project below. You did not write it and you owe it nothing. ' +
+    'You have no edit tools and none can be granted — that is by design. If something should change, say exactly what and in which file.',
+};
+
+const LEARNED = `## Learned             usually "none". Only a trap that cost you time and would cost the next person time —
+                           a required env var, a misleading error, a command that silently does the wrong thing.
+                           What you found out belongs in Summary, not here.`;
+
+/** What each kind of sub-agent sends back. The headings are read by code and by the main agent, so they are fixed. */
+const REPORT = {
+  scout: `    ## Summary
+    ## Files changed        one line each: <path> — <what changed>
+    ## Check               the command you ran and what it printed; or why there is none
+    ${LEARNED}`,
+  worker: `    ## Summary
+    ## Files changed        one line each: <path> — <what changed>
+    ## Check               the command you ran and what it printed; or why there is none
+    ## Concerns            "none", or what you finished but are not sure of. Never hand over doubt silently.
+    ## Decisions           "none", or each call you made for the user: what — why — what it costs if wrong
+    ${LEARNED}`,
+  reviewer: `    ## Summary             one line: does it do what was asked, and can it be trusted as it stands
+    ## Asked vs built      missing · extra · misunderstood — or "matches"
+    ## Findings            numbered, worst first: \`1. <file:line> — how it fails, concretely — the smallest fix or test\`. No praise, no rewrites.
+    ## Minor               listed, never a reason to reopen the work
+    ## Could not verify    what the change alone cannot show — it lives in code that did not change
+    ${LEARNED}`,
+};
+
+/** How a worker's result gets judged. Said up front, because a rule met only at the end reads as a trap. */
+function workerRules(job, { testsMayChange }) {
+  return `- Before you edit anything: \`sumo job baseline ${job.id}\` (allow it ten minutes). It runs the project's checks and records what already fails, so none of that is blamed on you — and nothing you break can hide behind it.
+- Tests that are already here judge your change; they are not part of it. ${
+    testsMayChange
+      ? 'This task may change them — say in the report which, and why.'
+      : `Do not edit, skip or delete one. A test that is genuinely wrong, or that contradicts the task: stop and say why with \`sumo job ask ${job.id}\`.`
+  } Never loosen a lint or type setting, add an ignore, or special-case a test's input to get green.
+- A question you can settle yourself: decide, carry on, and list it under Decisions. Stop and ask only for something destructive or irreversible, security-sensitive, outside this project, or a task so unclear that every path is a guess.
+- You do not start other jobs. Review comes after you, from someone who did not write the code.
+- At each major milestone (a phase of the task done) note one line: \`sumo job note ${job.id}\` — \`<what now works>; next: <step>\`. Nothing else in between.
+`;
+}
+
+function renderBrief({ job, project, known, task, guide, change, options = {} }) {
+  const closing =
+    job.agent === 'worker'
+      ? `\`sumo job finish ${job.id} --status DONE\` (or \`FAILED\`). DONE is not taken on your word: the project's checks are run and compared with the baseline, and it is refused while something new fails. See the verdict first with \`sumo job verify ${job.id}\` (allow it ten minutes). Report on stdin:`
+      : `\`sumo job finish ${job.id} --status DONE\` (or \`FAILED\`), with this report on stdin:`;
+  return `# Job j${job.id} — ${job.title}
+
+${ROLE[job.agent]}
+Work only inside: ${project.path}   (always use absolute paths — your shell does not start there)
+
+## What is already known about this project
+${known}
+
+## The task
+${task.trim()}
+${change ? `\n## The change to judge\n${change}\n` : ''}${guide ? `\n## How this kind of work is done here\n${guide}\n` : ''}
+## How to work
+${job.agent === 'worker' ? workerRules(job, options) : ''}- Worth keeping if you are interrupted — what you found, what you tried, what is left: \`sumo job note ${job.id}\` (text on stdin).
+- Blocked on something only the user can decide: \`sumo job ask ${job.id}\` (one question on stdin), then stop. You will be resumed with the answer.
+- You may read memory: \`sumo search "<words>" --project ${project.slug}\`. You never write it.
+- If a command is refused, carry on another way (grep, a view of a line range). \`sumo\` commands are always allowed, so a refusal never stops you from noting, asking or finishing.
+- When finished you must close the job, or nobody knows it ended: ${closing}
+${REPORT[job.agent]}
+- Every message and report: short lines, facts only. No prose, no preamble, no restating the task.
+- Your final message: the STATUS line, then one line per ${job.agent === 'reviewer' ? 'finding' : 'file changed'}. Nothing else — the report is already on disk.
+`;
+}
+
+/** What code has recorded about a job's work: where it began, what already failed, and the last verdict. */
+const readState = (id) => {
+  try {
+    return JSON.parse(readFileSync(fileOf(id, 'verify.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+};
+/** Written whole and then put in place: a run that dies half-way must not leave a record that reads as none. */
+const writeState = (id, state) => {
+  const whole = fileOf(id, 'verify.json.part');
+  writeFileSync(whole, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  renameSync(whole, fileOf(id, 'verify.json'));
+};
+
+/** The written way of doing one kind of work, without its title — the brief has its own heading for it. */
+export function guideFor(name) {
+  if (!GUIDES.includes(name)) throw new UsageError(`--guide is one of: ${GUIDES.join(', ')}`);
+  const text = readOr(join(REPO_ROOT, 'guides', `${name}.md`));
+  if (!text.trim()) throw new UsageError(`guides/${name}.md is missing or empty`);
+  return text.replace(/^#[^\n]*\n+/, '').trim();
+}
+
+/**
+ * The change a reviewer is pointed at: another job's work, or whatever is
+ * uncommitted right now. Settled before the job exists, so a review of nothing
+ * is refused instead of created.
+ */
+function changeToJudge(db, { project, reviews }) {
+  const lines = [];
+  let snap;
+  if (reviews !== undefined) {
+    const target = getJob(db, reviews);
+    if (target.project !== project.slug) throw new UsageError(`j${target.id} belongs to ${target.project}, not ${project.slug}`);
+    snap = readState(target.id)?.snap;
+    if (!snap) throw new UsageError(`j${target.id} recorded no starting point (not a worker job, or not a git repository) — there is no change to hand over`);
+    lines.push(`What was asked: ${fileOf(target.id, 'brief.md')}   (read "## The task")`);
+    if (existsSync(fileOf(target.id, 'report.md'))) {
+      lines.push(`What its author says they did: ${fileOf(target.id, 'report.md')}   — claims, not facts. A stated reason never makes a finding smaller.`);
+    }
+  } else {
+    if (!hasCommit(project.path)) throw new UsageError(`${project.path} is not a git repository with a commit — there is no change to hand over`);
+    snap = { base: 'HEAD', mixed: false, untracked: [] };
+  }
+  const { tracked, created } = changesSince(project.path, snap);
+  if (tracked.length + created.length === 0) throw new UsageError('nothing has changed — there is nothing to review');
+  return { snap, lines };
+}
+
+const reviewsFile = (id) => fileOf(id, 'reviews.json');
+/** The job a reviewer job was created to judge — set once, at creation, from `--reviews`. */
+function recordReviewTarget(id, targetId) {
+  writeFileSync(reviewsFile(id), `${JSON.stringify({ reviews: targetId })}\n`, { mode: 0o600 });
+}
+function reviewTargetOf(id) {
+  try {
+    return JSON.parse(readFileSync(reviewsFile(id), 'utf8')).reviews;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Creates a job and its brief. The brief carries what memory knows about the
+ * project, so the sub-agent starts with its context instead of spending turns
+ * finding it — and the main agent's conversation never has to hold it. Its
+ * model and effort are the local router's answer (`chooseRoute`, src/route.mjs),
+ * asked before the row is written: no answer, no job.
+ */
+export async function newJob(db, { project: nameOrAlias, title, agent = 'worker', task, guide: guideName, reviews, testsMayChange = false, retryOf, start, now = new Date().toISOString() }) {
+  if (!AGENTS.includes(agent)) throw new UsageError(`--agent is one of: ${AGENTS.join(', ')}`);
+  if (!title?.trim()) throw new UsageError('a job needs a --title');
+  if (!task?.trim()) throw new UsageError('describe the task on stdin — see guides/delegation.md for the five headings');
+  if (reviews !== undefined && agent !== 'reviewer') throw new UsageError('--reviews goes with --agent reviewer');
+  const project = getProject(db, nameOrAlias);
+  // Everything that can refuse the job is settled before the job exists.
+  const guide = guideName || agent === 'reviewer' ? guideFor(guideName ?? 'review') : null;
+  const judged = agent === 'reviewer' ? changeToJudge(db, { project, reviews }) : null;
+
+  // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory.
+  if (pendingTurns(db, 1).length > 0) await runScribe(db, { now });
+
+  const route = await chooseRoute(db, { agent, project, task, title: title.trim(), retryOf });
+
+  const session = db.prepare('SELECT id FROM sessions ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1').get();
+  const job = tx(db, () => {
+    const { lastInsertRowid } = db
+      .prepare(
+        `INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason, retry_of)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(project.slug, title.trim(), agent, session?.id ?? null, now, now, route.model, route.effort, route.reason, retryOf ?? null);
+    return getJob(db, Number(lastInsertRowid));
+  });
+
+  // The job's files. If any of them cannot be written the job is taken back: an open job with no brief is worse than no job.
+  try {
+    const known = card(db, project.slug, { budget: BRIEF_CARD_BUDGET, now }).split('\n').slice(1, -1).join('\n') || 'Nothing yet.';
+    mkdirSync(dirOf(job.id), { recursive: true, mode: 0o700 });
+    if (agent === 'reviewer' && reviews !== undefined) recordReviewTarget(job.id, reviews);
+
+    let change = null;
+    if (judged) {
+      const { file, files } = writeChanges(project.path, judged.snap, fileOf(job.id, 'changes.diff'));
+      change = [...judged.lines, `The whole change, ${files} file${files === 1 ? '' : 's'}: ${file}   — read it once; do not re-derive it with git.`].join('\n');
+    }
+    // Where a worker starts from, and the checks that judge it there, so what it changed — and only that — can be told apart later.
+    // A retry is handed the first attempt's start instead.
+    if (agent === 'worker') writeState(job.id, { ...(start ?? { snap: snapshot(project.path), declared: verifyCommands(project.path), baseline: null }), testsMayChange, verdict: null });
+    writeFileSync(fileOf(job.id, 'brief.md'), renderBrief({ job, project, known, task, guide, change, options: { testsMayChange } }), { mode: 0o600 });
+  } catch (cause) {
+    db.prepare('DELETE FROM jobs WHERE id = ?').run(job.id);
+    try {
+      rmSync(dirOf(job.id), { recursive: true, force: true });
+    } catch {
+      // Nothing was written there.
+    }
+    throw cause;
+  }
+
+  const warnings = [];
+  if (agent !== 'reviewer' && !/^#{1,3}\s*(the\s+)?check\b|^check\s*:/im.test(task)) {
+    warnings.push('note: the task names no check that proves the work — add a "## Check" with a command, or say why there is none');
+  }
+  if (agent === 'worker') {
+    const other = db.prepare(`SELECT * FROM jobs WHERE project = ? AND agent = 'worker' AND status = 'running' AND id <> ? ORDER BY id DESC`).get(project.slug, job.id);
+    if (other) warnings.push(`note: j${other.id} "${other.title}" is already a running worker in ${project.slug} — two workers in one working tree overwrite each other. Let it finish, or: sumo job abandon ${other.id}`);
+  }
+  return { job, warnings };
+}
+
+/**
+ * Retries a job: same project, same title (marked as a retry), same task, with
+ * what the previous attempt found carried into the new brief. The router is
+ * asked again for its route, like any new job. Only a failed job, or a done
+ * one a review found enough wrong with, is eligible.
+ */
+export async function retry(db, id, { now = new Date().toISOString() } = {}) {
+  const old = getJob(db, id);
+  const eligible = old.status === 'failed' || (old.status === 'done' && (old.important ?? 0) >= RETRY_IMPORTANT_THRESHOLD);
+  if (!eligible) {
+    throw new UsageError(
+      `j${id} is ${old.status}${old.status === 'done' ? ` (important: ${old.important ?? 0})` : ''} — only a failed job, or a done one reviewed with important >= ${RETRY_IMPORTANT_THRESHOLD}, can be retried`,
+    );
+  }
+  const task = taskFromBrief(readOr(fileOf(id, 'brief.md')));
+  if (!task) throw new UsageError(`j${id}'s brief has no "## The task" section to retry from`);
+
+  // What the original was allowed and pointed at travels with the task: a retry of a review judges the same job,
+  // and a retry of a worker keeps the permission the first attempt was given.
+  const reviews = reviewTargetOf(id) ?? undefined;
+  const state = readState(id);
+  const testsMayChange = Boolean(state?.testsMayChange);
+  // A worker's retry is judged from where the first attempt began, so what that attempt left in the tree is still answered for.
+  // Its baseline comes too: taken again now, it would call the first attempt's breakage "already there".
+  const start = state?.snap && stillThere(getProject(db, old.project).path, state.snap) ? { snap: state.snap, declared: state.declared, baseline: state.baseline } : undefined;
+  const { job, warnings } = await newJob(db, { project: old.project, title: `${old.title} (retry of j${id})`, agent: old.agent, task, reviews, testsMayChange, retryOf: id, start, now });
+
+  const oldNotes = readOr(fileOf(id, 'notes.md')).trim();
+  const oldReport = readOr(fileOf(id, 'report.md')).trim();
+  const found = [oldNotes && `### Notes\n${oldNotes}`, oldReport && `### Report\n${oldReport}`].filter(Boolean).join('\n\n');
+  if (found) appendFileSync(fileOf(job.id, 'brief.md'), `\n## What the previous attempt found\n${found}\n`, { mode: 0o600 });
+
+  return { job, warnings };
+}
+
+/** The task text a brief was built from — everything between "## The task" and the next section renderBrief adds. */
+function taskFromBrief(brief) {
+  const marker = '## The task\n';
+  const start = brief.indexOf(marker);
+  if (start === -1) return null;
+  const from = start + marker.length;
+  const stops = ['\n## The change to judge\n', '\n## How this kind of work is done here\n', '\n## How to work\n']
+    .map((section) => brief.indexOf(section, from))
+    .filter((i) => i !== -1);
+  return brief.slice(from, stops.length > 0 ? Math.min(...stops) : brief.length).trim();
+}
+
+/** `jobs, done, failed, reviewed, avg important` — one line per model/effort this project has finished. */
+export function stats(db, { project } = {}) {
+  return statsLines(db, { project: project === undefined ? undefined : getProject(db, project).slug });
+}
+
+/** Everything a sub-agent needs to start — or to start again cold, in another session, after being interrupted. */
+export function brief(db, id) {
+  const job = getJob(db, id);
+  const parts = [readOr(fileOf(id, 'brief.md')).trimEnd()];
+  const qa = readOr(fileOf(id, 'qa.md')).trim();
+  const notes = readOr(fileOf(id, 'notes.md')).trim();
+  const red = (readState(id)?.baseline ?? []).filter((c) => !c.ok);
+  if (red.length > 0) {
+    parts.push(`## Already failing before this job began — not yours to fix, and not to be made worse\n${red.map((c) => `- \`${c.command}\` — ${c.file}`).join('\n')}`);
+  }
+  if (qa) parts.push(`## Questions and answers so far\n${qa}`);
+  if (notes) parts.push(`## Progress so far (from an earlier run of this job — continue from here, do not start over)\n${notes}`);
+  if (job.status === 'done' || job.status === 'failed') parts.push(`## This job is already ${job.status}. Do nothing.`);
+  return parts.join('\n\n');
+}
+
+/** A worker job's recorded state and where its project lives — or a plain reason why there is nothing to check. */
+function checkable(db, id, verb) {
+  const job = getJob(db, id);
+  requireOpen(job, verb);
+  const state = readState(id);
+  if (job.agent !== 'worker' || !state) throw new UsageError(`j${id} is not a worker job with a recorded start — there is nothing to ${verb === 'verified' ? 'verify' : 'take a baseline of'}`);
+  const project = getProject(db, job.project);
+  if (!existsSync(project.path)) throw new UsageError(`${project.path} no longer exists`);
+  return { job, state, project };
+}
+
+/** The project's checks as they stand before the work. Taken once; a second call reports what the first found. */
+export function baseline(db, id) {
+  const { state, project } = checkable(db, id, 'given a baseline');
+  if (!state.baseline) {
+    const taken = takeBaseline(project.path, state.snap, dirOf(id));
+    if (taken.refused) return [`no baseline taken: ${taken.refused}.`, 'Every check that fails at the end will count as this job\'s.'];
+    writeState(id, { ...state, baseline: taken.checks });
+    state.baseline = taken.checks;
+  }
+  if (state.baseline.length === 0) return ['this project declares no check, test, lint or typecheck command — there is nothing to take a baseline of'];
+  return state.baseline.map((c) => `\`${c.command}\` ${c.ok ? 'passes' : `ALREADY FAILS — not yours to fix, and recorded so it is not blamed on you (${c.file})`}`);
+}
+
+/** Runs the checks now and records the verdict against the exact tree it judged. */
+export function verifyJob(db, id, now = new Date().toISOString()) {
+  const { state, project } = checkable(db, id, 'verified');
+  const verdict = verify(project.path, state, dirOf(id), now);
+  writeState(id, { ...state, verdict });
+  return verdict;
+}
+
+/** Everything a job changed, as one file a reviewer can read. */
+export function changes(db, id) {
+  const job = getJob(db, id);
+  const snap = readState(id)?.snap;
+  if (!snap) throw new UsageError(`j${id} recorded no starting point (not a worker job, or not a git repository)`);
+  return writeChanges(getProject(db, job.project).path, snap, fileOf(id, 'changes.diff'));
+}
+
+/**
+ * The verdict a DONE rests on: the recorded one when the tree has not moved
+ * since it was given, otherwise a fresh one. Outside git there is no telling
+ * whether the tree moved, so it is always run again.
+ */
+function verdictForDone(db, id, state, now) {
+  const project = getProject(db, getJob(db, id).project);
+  if (!existsSync(project.path)) return null;
+  const last = state.verdict;
+  if (last?.fingerprint && state.snap && unmoved(project.path, state.snap, last.fingerprint)) return last;
+  return verifyJob(db, id, now);
+}
+
+/** Whether the tree is exactly the one a verdict judged; a tree that cannot be compared has moved, as far as anyone can tell. */
+function unmoved(root, snap, fingerprint) {
+  try {
+    return changesSince(root, snap).fingerprint === fingerprint;
+  } catch {
+    return false;
+  }
+}
+
+function append(id, name, heading, text, now) {
+  appendFileSync(fileOf(id, name), `### ${heading} — ${now.slice(0, 16).replace('T', ' ')}\n${text.trim()}\n\n`, { mode: 0o600 });
+}
+
+export function note(db, id, text, now = new Date().toISOString()) {
+  const job = getJob(db, id);
+  requireOpen(job, 'noted on');
+  if (!text.trim()) throw new UsageError('the note is empty — put it on stdin');
+  append(id, 'notes.md', 'note', text, now);
+  setStatus(db, id, job.status, now);
+}
+
+export function ask(db, id, question, now = new Date().toISOString()) {
+  requireOpen(getJob(db, id), 'asked about');
+  if (!question.trim()) throw new UsageError('the question is empty — put it on stdin');
+  append(id, 'qa.md', 'Question', question, now);
+  setStatus(db, id, 'needs_input', now);
+}
+
+const inboxOf = (id) => fileOf(id, 'inbox');
+let told = 0;
+
+/**
+ * Something the user says to a running job from outside its process — the chat's `@j31 …` for a job in a
+ * Herdr pane, or `sumo job tell` from any shell. One file each, written whole and then given its name, and
+ * named so they sort in the order they were said: the job taking its inbox never reads half a message, and
+ * one that arrives while it is taking the others is simply there the next time.
+ */
+export function tell(db, id, text, now = new Date().toISOString()) {
+  requireOpen(getJob(db, id), 'told anything');
+  if (!text.trim()) throw new UsageError('the message is empty — put it on stdin');
+  mkdirSync(inboxOf(id), { recursive: true, mode: 0o700 });
+  const name = `${String(Date.now()).padStart(15, '0')}-${String(told++).padStart(6, '0')}-${process.pid}`;
+  const unnamed = join(inboxOf(id), `.${name}`);
+  writeFileSync(unnamed, JSON.stringify({ text: text.trim(), at: now }), { mode: 0o600 });
+  renameSync(unnamed, join(inboxOf(id), `${name}.json`));
+}
+
+/** How a run in another process ended — the lines `sumo job run` printed last — for a chat waiting on its pane. */
+export const outcomeFile = (id) => fileOf(id, 'outcome.txt');
+export function recordOutcome(id, lines) {
+  // A job that was never created has no directory, and nobody waiting on it.
+  if (existsSync(dirOf(id))) writeFileSync(outcomeFile(id), `${lines.join('\n')}\n`, { mode: 0o600 });
+}
+export function clearOutcome(id) {
+  if (existsSync(outcomeFile(id))) unlinkSync(outcomeFile(id));
+}
+
+/** What was told to the job since it last looked, taken off the disk so it is read once. A file that is not a message is passed over. */
+export function takeInbox(id) {
+  let names;
+  try {
+    names = readdirSync(inboxOf(id)).filter((name) => name.endsWith('.json')).sort();
+  } catch {
+    return [];
+  }
+  return names.flatMap((name) => {
+    const file = join(inboxOf(id), name);
+    const raw = readOr(file);
+    rmSync(file, { force: true });
+    try {
+      const { text } = JSON.parse(raw);
+      return typeof text === 'string' ? [text] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export function answer(db, id, text, now = new Date().toISOString()) {
+  const job = getJob(db, id);
+  if (job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — it is not waiting for an answer`);
+  if (!text.trim()) throw new UsageError('the answer is empty — put it on stdin');
+  append(id, 'qa.md', 'Answer', text, now);
+  setStatus(db, id, 'running', now);
+}
+
+/** The lines under "## Learned" in a report, without bullets, minus the ways of saying "nothing". */
+function learnedLines(report) {
+  const section = /^##\s*Learned\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(report)?.[1] ?? '';
+  return section
+    .split('\n')
+    .map((l) => l.replace(/^\s*[-*\d.)]+\s*/, '').trim())
+    .filter((l) => l.length > 12 && !/^(none|nothing|n\/a)\b/i.test(l))
+    .slice(0, MAX_LEARNED);
+}
+
+/**
+ * The findings under "## Findings" in a review — the count that becomes the
+ * reviewed job's `important`. One per line that opens the way the template
+ * asks (`1. `) or the way reviewers here also write them (`<file:line> — `);
+ * a wrapped line is indented, so it is never counted twice.
+ */
+function findingsCount(report) {
+  const section = /^##\s*Findings\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(report)?.[1] ?? '';
+  return (section.match(/^(?:\d+\.\s|\S+\.\w+:\d+)/gm) ?? []).length;
+}
+
+/**
+ * Closes a job. What the sub-agent learned is filed by code, not by trust: only
+ * as gotchas, only in this project, marked as observed, through the same
+ * validator as every other model-written memory.
+ */
+export function finish(db, id, { status, report, accept }, now = new Date().toISOString()) {
+  const job = getJob(db, id);
+  requireOpen(job, 'finished');
+  if (status !== 'DONE' && status !== 'FAILED') throw new UsageError('--status is DONE or FAILED (blocked on the user? use: sumo job ask)');
+  if (!report.trim()) throw new UsageError('the report is empty — put it on stdin');
+  if (accept !== undefined && !accept.trim()) throw new UsageError('--accept needs the reason the work is being taken without verification');
+
+  // The author of the work does not grade it. A worker's DONE rests on what the checks said, not on what the report says.
+  // A DONE that cannot be checked is refused, not waved through; --accept is the way to take it anyway, and it is written down.
+  const graded = job.agent === 'worker' && status === 'DONE';
+  const state = graded ? readState(id) : null;
+  const unchecked = (why) => new UsageError(`j${id} cannot be verified — ${why}. To take the work as it stands: sumo job finish ${id} --status DONE --accept "<why>"`);
+  if (graded && accept === undefined && !state) throw unchecked(`the record of where it began (${fileOf(id, 'verify.json')}) cannot be read`);
+  const verdict = state && accept === undefined ? verdictForDone(db, id, state, now) : null;
+  // The checks can take minutes: report a job closed in the meantime before interpreting their verdict.
+  requireOpen(getJob(db, id), 'finished');
+  if (graded && accept === undefined && !verdict) throw unchecked(`${getProject(db, job.project).path} no longer exists, so its checks cannot be run`);
+  if (verdict && !verdict.ok) {
+    throw new UsageError(
+      [
+        `j${id} is not done — the project's checks were run, and:`,
+        ...verdictLines(verdict).map((l) => `  ${l}`),
+        `Fix it and finish again. If it cannot be fixed: sumo job finish ${id} --status FAILED, or ask: sumo job ask ${id}`,
+      ].join('\n'),
+    );
+  }
+  const observed = verdict
+    ? `\n## Verified by code — not by the author of this report\n${verdictLines(verdict).map((l) => `- ${l}`).join('\n')}\n`
+    : graded && accept !== undefined
+      ? `\n## Accepted without verification\n${accept.trim()}\n`
+      : '';
+
+  // The checks can take minutes: a job abandoned or closed while they ran is left as it now is.
+  requireOpen(getJob(db, id), 'finished');
+  writeFileSync(fileOf(id, 'report.md'), `${report.trim()}\n${observed}`, { mode: 0o600 });
+  const closed = db.prepare(`UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND status IN ('running', 'needs_input')`).run(status === 'DONE' ? 'done' : 'failed', now, id);
+  if (closed.changes === 0) requireOpen(getJob(db, id), 'finished');
+
+  // A reviewer job created with --reviews <id> grades that job: the count of numbered Findings becomes its "important".
+  if (job.agent === 'reviewer' && status === 'DONE') {
+    const targetId = reviewTargetOf(id);
+    if (targetId !== null) db.prepare('UPDATE jobs SET important = ? WHERE id = ?').run(findingsCount(report), targetId);
+  }
+
+  const ops = learnedLines(report).map((body) => ({ op: 'gotcha', scope: `project:${job.project}`, body: clip(body, 300) }));
+  const learned = applyOps(db, ops, { source: 'worker', turns: new Map(), now });
+
+  const summary = /^##\s*Summary\s*\n+([^\n]+)/im.exec(report)?.[1]?.trim();
+  addCheckpoint(db, {
+    sessionId: job.session_id,
+    project: job.project,
+    done: clip(`${status === 'DONE' ? 'finished' : 'FAILED'} job j${id} "${job.title}"${summary ? `: ${summary}` : ''}`, 300),
+    next: status === 'FAILED' ? `read the report: sumo job show ${id}` : null,
+    now,
+  });
+  return { job: getJob(db, id), learned, verdict, unverified: graded && accept !== undefined };
+}
+
+export function abandon(db, id, now = new Date().toISOString()) {
+  requireOpen(getJob(db, id), 'abandoned');
+  setStatus(db, id, 'abandoned', now);
+}
+
+export function listJobs(db, { all = false } = {}) {
+  return db.prepare(`SELECT * FROM jobs ${all ? '' : `WHERE status IN ('running', 'needs_input')`} ORDER BY id DESC LIMIT 30`).all();
+}
+
+export function jobLine(job) {
+  return `j${job.id} [${job.agent}·${job.project}·${job.status}] ${job.title}`;
+}
+
+/** What the main agent needs to decide its next move — not the whole report. */
+export function show(db, id) {
+  const job = getJob(db, id);
+  const out = [jobLine(job), `files: ${dirOf(id)}`];
+  if (job.model && job.effort) out.push(`route: ${job.model}/${job.effort} — ${job.route_reason}`);
+  if (job.important !== null && job.important !== undefined) out.push(`important: ${job.important}`);
+  const qa = readOr(fileOf(id, 'qa.md')).trim();
+  if (job.status === 'needs_input' && qa) out.push('', 'waiting on this question:', qa.split(/^### /m).filter(Boolean).at(-1).replace(/^[^\n]*\n/, '').trim());
+  const notes = readOr(fileOf(id, 'notes.md')).trim();
+  if (notes) out.push('', 'latest note:', notes.split(/^### /m).filter(Boolean).at(-1).replace(/^[^\n]*\n/, '').trim());
+  const report = readOr(fileOf(id, 'report.md')).trim();
+  if (report) out.push('', report);
+  return out.join('\n');
+}
