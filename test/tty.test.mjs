@@ -161,6 +161,18 @@ describe('the chat terminal rendering', () => {
     assert.ok(lines.every((l) => l.length <= 30), `no line is wider than the window:\n${lines.join('\n')}`);
     assert.equal(new Set(lines.filter((l) => /^[│┌├└]/.test(l)).map((l) => l.length)).size, 1, 'the box keeps its shape');
     for (const word of ['stops', 'the', 'turn', 'that', 'is', 'running', 'now']) assert.ok(lines.some((l) => l.includes(word)), word);
+
+    // A word cut to fit its column is cut between characters, never through one: an emoji is two code units.
+    const emoji = [];
+    const e = createRenderer((t) => emoji.push(t), off, { width: 20 });
+    e.write(`| Key | What |\n|---|---|\n| a | x${'😀'.repeat(12)} |\n\n`);
+    assert.ok(emoji.join('').isWellFormed(), `no character is split in half:\n${emoji.join('')}`);
+    assert.equal(emoji.join('').match(/😀/g).length, 12, 'every emoji is still there');
+    // One joined from several (a family: three people and two joiners) is one character too.
+    const joined = [];
+    const j = createRenderer((t) => joined.push(t), off, { width: 20 });
+    j.write(`| Key | What |\n|---|---|\n| a | x${'👨‍👩‍👧'.repeat(3)} |\n\n`);
+    assert.equal(joined.join('').match(/👨‍👩‍👧/gu).length, 3, `no joined emoji is cut apart:\n${joined.join('')}`);
   });
 
   it('shows a tool call in full when asked: every line that came back, the file that was read or written', () => {

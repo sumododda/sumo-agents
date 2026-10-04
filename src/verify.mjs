@@ -1,11 +1,12 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isSecretPath } from './guard.mjs';
 import { UsageError } from './memory.mjs';
 import { secretShape } from './redact.mjs';
 import { verifyCommands } from './scan.mjs';
+import { killGroup } from './tools.mjs';
 
 /**
  * A job's work, judged by running things rather than by reading the report.
@@ -22,6 +23,8 @@ import { verifyCommands } from './scan.mjs';
 
 const DEFAULT_TIMEOUT_MS = 540_000; // under the ten minutes a harness gives one shell command
 const OUTPUT_TAIL_LINES = 200;
+/** How much of a log's end is read to find those lines: a check can print far more than is ever kept. */
+const OUTPUT_TAIL_BYTES = 1024 * 1024;
 const MAX_SCANNED_FILE_BYTES = 200_000;
 
 /** Paths whose job is to judge other code. Fixtures beside tests count: editing one can weaken the test that reads it. */
@@ -117,13 +120,21 @@ function timeoutMs() {
   return Number.isFinite(asked) && asked > 0 ? asked : DEFAULT_TIMEOUT_MS;
 }
 
-const killGroup = (pid) => {
+/** The last lines of a check's log, read from its end rather than whole. */
+function tailOf(file) {
+  const fd = openSync(file, 'r');
   try {
-    process.kill(-pid, 'SIGKILL');
-  } catch {
-    // Nothing left to kill.
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - OUTPUT_TAIL_BYTES);
+    const bytes = Buffer.alloc(size - start);
+    const lines = bytes.subarray(0, readSync(fd, bytes, 0, bytes.length, start)).toString('utf8').trimEnd().split('\n');
+    // Read from inside a line, the first piece is half of one.
+    if (start > 0 && lines.length > 1) lines.shift();
+    return lines.slice(-OUTPUT_TAIL_LINES).join('\n');
+  } finally {
+    closeSync(fd);
   }
-};
+}
 
 /** Runs each command where the project lives and keeps the end of what it printed, which is where runners put the failures. */
 function runChecks(root, commands, dir, prefix) {
@@ -133,14 +144,22 @@ function runChecks(root, commands, dir, prefix) {
     // In a group of its own, the time limit reaches everything the check started. That takes it out of this process's group,
     // which is what a stop kills — so a watcher in the check's group ends it once this process is gone.
     const watcher = `(while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done; kill -9 0) </dev/null >/dev/null 2>&1 &\n`;
-    const run = spawnSync(`${watcher}${command}`, { cwd: root, shell: true, detached: true, encoding: 'utf8', timeout: timeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
-    const timedOut = run.error?.code === 'ETIMEDOUT';
-    if (timedOut) killGroup(run.pid);
-    const output = `${run.stdout ?? ''}${run.stderr ?? ''}`.trimEnd().split('\n').slice(-OUTPUT_TAIL_LINES).join('\n');
     // Two checks of one name each keep their own output.
     const nth = (named.get(name) ?? 0) + 1;
     named.set(name, nth);
     const file = join(dir, `${prefix}-${name}${nth > 1 ? `-${nth}` : ''}.txt`);
+    // Printed into the file, not a pipe: a pipe stays open while anything the check left running holds it, and would be waited on to the time limit.
+    const into = openSync(file, 'w', 0o600);
+    let run;
+    try {
+      run = spawnSync(`${watcher}${command}`, { cwd: root, shell: true, detached: true, stdio: ['ignore', into, into], timeout: timeoutMs(), killSignal: 'SIGKILL' });
+    } finally {
+      closeSync(into);
+    }
+    const timedOut = run.error?.code === 'ETIMEDOUT';
+    // Whatever it left running goes with it, so nothing writes to the file once it is read.
+    killGroup(run.pid);
+    const output = tailOf(file);
     writeFileSync(file, `$ ${command}\n${output}\n${timedOut ? '\n(stopped: it ran past the time limit)\n' : ''}`, { mode: 0o600 });
     return { name, command, ok: run.status === 0, timedOut, ms: Date.now() - started, file };
   });

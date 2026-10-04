@@ -56,3 +56,19 @@ test('projects and workflows share the startup budget, leaving a pointer when a 
     assert.match(block, /^<sumo-memory[\s\S]*<\/sumo-memory>$/);
   });
 });
+
+test('a path is shortened with ~ only when it is inside the home directory, not when it merely starts with its name', async () => {
+  await withHome(freshHome(), { HOME: '/Users/sumo' }, async () => {
+    const db = openDb();
+    try {
+      const insert = db.prepare('INSERT INTO projects (slug, name, path, created_at) VALUES (?, ?, ?, ?)');
+      insert.run('mine', 'mine', '/Users/sumo/code/mine', NOW);
+      insert.run('theirs', 'theirs', '/Users/sumo2/code/theirs', NOW);
+      const block = prime(db, { now: NOW });
+      assert.match(block, /mine \(~\/code\/mine\)/);
+      assert.match(block, /theirs \(\/Users\/sumo2\/code\/theirs\)/);
+    } finally {
+      db.close();
+    }
+  });
+});

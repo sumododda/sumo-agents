@@ -63,7 +63,8 @@ export function redact(text) {
   for (const pattern of PATTERNS) out = out.replace(pattern, hit);
   out = out.replace(ASSIGNMENT, (m, name, sep, quote, value) => {
     if (!holdsSecret(sep, quote, value)) return m;
-    count++;
+    // A vendor token assigned to a name was already taken out, and counted, by its own pattern.
+    if (value !== MARK) count++;
     return `${name}${sep}${MARK}`;
   });
   out = out.replace(GENERIC, (m) => (/[a-z]/.test(m) && /[A-Z]/.test(m) && /\d/.test(m) ? hit() : m));

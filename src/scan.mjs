@@ -73,8 +73,11 @@ function stack(root, pkg) {
 function recipe(makefile, target) {
   const lines = makefile.split('\n');
   const at = lines.findIndex((l) => l.startsWith(`${target}:`));
-  const end = lines.findIndex((l, i) => i > at && !l.startsWith('\t'));
-  return lines.slice(at, end === -1 ? lines.length : end).join('\n');
+  // make reads past a blank or comment line inside a recipe; only the next line of anything else ends it.
+  const end = lines.findIndex((l, i) => i > at && !l.startsWith('\t') && l.trim() !== '' && !l.trimStart().startsWith('#'));
+  const own = lines.slice(at, end === -1 ? lines.length : end);
+  while (own.length > 1 && !own.at(-1).startsWith('\t')) own.pop();
+  return own.join('\n');
 }
 
 /**

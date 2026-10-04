@@ -75,11 +75,23 @@ const NO_STYLE = styles(false);
 
 const cellsOf = (row) => row.trim().slice(1, -1).split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, '|'));
 
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** A line cut into pieces no wider than `width`, between characters: an emoji, even one joined from several, stays whole. */
+function cut(line, width) {
+  const pieces = [''];
+  for (const { segment: ch } of GRAPHEMES.segment(line)) {
+    if (pieces.at(-1) && pieces.at(-1).length + ch.length > width) pieces.push('');
+    pieces[pieces.length - 1] += ch;
+  }
+  return pieces;
+}
+
 /** A cell's text folded to its column; a word wider than the column is cut, so the box keeps its shape. */
 function fold(text, width) {
   return wrap(text, width)
     .split('\n')
-    .flatMap((line) => (line.length <= width ? [line] : line.match(new RegExp(`.{1,${width}}`, 'g'))));
+    .flatMap((line) => (line.length <= width ? [line] : cut(line, width)));
 }
 
 function pad(text, width, align) {

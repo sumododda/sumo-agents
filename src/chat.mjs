@@ -364,7 +364,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         },
       });
       // Pictures the API refused would ride along with every later turn and be refused again: a turn refused before the model saw it keeps only its words.
-      if (outcome.stop === 'error' && pictures.length > 0 && !params.messages.slice(at + 1).some((m) => m.role === 'assistant')) params.messages[at].content = [{ type: 'text', text }];
+      // Only a refusal of the request itself (a 4xx); a rate limit, an overload or a dropped connection says nothing against the pictures.
+      const rejected = outcome.status >= 400 && outcome.status < 500 && outcome.status !== 429;
+      if (outcome.stop === 'error' && rejected && pictures.length > 0 && !params.messages.slice(at + 1).some((m) => m.role === 'assistant')) params.messages[at].content = [{ type: 'text', text }];
       // Stopped by the user: the turn still ended, so the scribe is woken, but nothing is asked of memory and nothing continues.
       if (outcome.stop === 'interrupted') {
         event('stop', { stop_hook_active: true });

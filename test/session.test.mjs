@@ -482,6 +482,22 @@ test('a search with no word in it is refused the same way for what the user said
   }
 });
 
+test('a slash command with a dash or a plugin prefix in its name is a command too, never a turn', () => {
+  const s = sandbox();
+  say(s, '/code-review high');
+  say(s, '/codex:rescue the flaky test');
+  say(s, '/usr/local/bin and /opt are both on PATH');
+  assert.deepEqual(s.sql((db) => db.prepare('SELECT text FROM user_turns ORDER BY id').all()).map((t) => t.text), ['/usr/local/bin and /opt are both on PATH']);
+});
+
+test('a long turn cut inside an emoji keeps no half of it, so no stray replacement character is stored', () => {
+  const s = sandbox();
+  say(s, `${'a'.repeat(3999)}😀 and more after the cut`);
+  const [{ text }] = s.sql((db) => db.prepare('SELECT text FROM user_turns').all());
+  assert.ok(text.endsWith(' …[cut]'));
+  assert.ok(!text.includes('\uFFFD'));
+});
+
 test('a secret the assistant repeated is scrubbed before the writer is shown the reply, even where the reply is cut', () => {
   const s = sandbox();
   withSimba(s);

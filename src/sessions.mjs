@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { redact } from './redact.mjs';
+import { head } from './text.mjs';
 
 const TURN_MAX_CHARS = 4000;
 
@@ -31,10 +32,11 @@ export function ensureSession(db, { id, harness = 'claude', cwd = null, transcri
  */
 export function recordTurn(db, { sessionId, text, now }) {
   const trimmed = text.trim();
-  if (!trimmed || /^\/\w+(\s|$)/.test(trimmed) || trimmed.startsWith('JOB:')) return null;
+  // A command's name may carry a dash or a plugin prefix (`/code-review`, `/codex:rescue`); a path (`/usr/bin`) still has a slash after its first word.
+  if (!trimmed || /^\/[\w:-]+(\s|$)/.test(trimmed) || trimmed.startsWith('JOB:')) return null;
 
   const cleaned = redact(trimmed);
-  const kept = cleaned.text.length > TURN_MAX_CHARS ? `${cleaned.text.slice(0, TURN_MAX_CHARS)} …[cut]` : cleaned.text;
+  const kept = cleaned.text.length > TURN_MAX_CHARS ? `${head(cleaned.text, TURN_MAX_CHARS)} …[cut]` : cleaned.text;
   const { lastInsertRowid } = db
     .prepare('INSERT INTO user_turns (session_id, ts, text, redacted) VALUES (?, ?, ?, ?)')
     .run(sessionId, now, kept, cleaned.count > 0 ? 1 : 0);

@@ -53,6 +53,7 @@ export function setGate(db, id, raw) {
 }
 
 export function parseId(raw) {
+  if (raw === undefined) throw new UsageError('a memory id is needed — ids look like m12');
   const match = /^m?(\d+)$/.exec(String(raw ?? '').trim());
   if (!match) throw new UsageError(`"${raw}" is not a memory id — ids look like m12`);
   return Number(match[1]);
@@ -248,7 +249,8 @@ export function search(db, query, opts = {}) {
   // words nobody picked — a sentence lifted from a reply — sets a floor on how many must be shared.
   const close = (row) => !opts.minShared || sharedStems(query, `${row.title ?? ''} ${row.cue ?? ''} ${row.body}`) >= opts.minShared;
   const candidates = rows.filter((row) => inScope(row) && close(row));
-  const bestRank = Math.min(...candidates.map((row) => row.rank));
+  // Not Math.min(...ranks): spread into arguments, a broad query's rows overflow the call stack.
+  const bestRank = candidates.reduce((best, row) => Math.min(best, row.rank), Infinity);
   const results = candidates
     .map((row) => ({ ...row, score: score(row, { projectScope, now, bestRank }) }))
     .sort((a, b) => b.score - a.score || b.id - a.id)

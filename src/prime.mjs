@@ -13,7 +13,8 @@ const MAX_CONFIRM = 3;
 const MAX_NOTICES = 2;
 const SCRIBE_FAILURES_TO_WARN = 3;
 
-const tilde = (path) => (path.startsWith(homedir()) ? `~${path.slice(homedir().length)}` : path);
+// Only a whole leading directory: /Users/sumo2 is not inside /Users/sumo.
+const tilde = (path) => (path === homedir() || path.startsWith(`${homedir()}/`) ? `~${path.slice(homedir().length)}` : path);
 
 /**
  * The block every session starts with. It is generated, never hand-kept, and

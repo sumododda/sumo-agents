@@ -2,7 +2,9 @@ import { spawn } from 'node:child_process';
 import { appendFileSync, closeSync, openSync, readFileSync, rmSync, statSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
+import { resolveAnthropicCredential } from './auth.mjs';
 import { getMeta, openDb, setMeta, tx } from './db.mjs';
+import { localServerStatus } from './local-server.mjs';
 import { callModel, logRun } from './model.mjs';
 import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
 import { aliasesOf, listProjects } from './projects.mjs';
@@ -219,11 +221,21 @@ export function buildBundle(db) {
   return { prompt, turns: new Map(turns.map((t) => [t.id, t])) };
 }
 
+/** The API model a pass is retried on when the local one could not answer and a credential is there to pay for it. */
+const FALLBACK_MODEL = 'haiku';
+
 /** Shared by the writer and the consolidation pass: ask, validate, record what it cost. */
 export async function askAndApply(db, { kind, promptFile, bundle, ops, sessionId, now }) {
-  const model = getMeta(db, `config.${kind}.model`) ?? CONFIG_DEFAULTS[`${kind}.model`];
+  let model = getMeta(db, `config.${kind}.model`) ?? CONFIG_DEFAULTS[`${kind}.model`];
   const system = readFileSync(join(REPO_ROOT, 'prompts', promptFile), 'utf8').trim();
-  const result = await callModel(db, { system, prompt: bundle.prompt, schema: opsSchema(db, ops), model });
+  const schema = opsSchema(db, ops);
+  let result = await callModel(db, { system, prompt: bundle.prompt, schema, model, kind });
+  // A local answer that failed (server down, bundle past its context, answer cut off) is one failed row, then one more try.
+  if (!result.ok && model === 'local' && resolveAnthropicCredential()) {
+    logRun(db, { kind, model, result, note: `${result.error} — retrying on ${FALLBACK_MODEL}`, now });
+    model = FALLBACK_MODEL;
+    result = await callModel(db, { system, prompt: bundle.prompt, schema, model, kind });
+  }
 
   if (!result.ok) {
     logRun(db, { kind, model, result, note: result.error, now });
@@ -273,10 +285,12 @@ export async function runScribe(db, { now = new Date().toISOString() } = {}) {
   });
 }
 
-export function scribeStatus(db) {
+export async function scribeStatus(db) {
   const failures = Number(getMeta(db, 'scribe.failures') ?? 0);
+  const model = getMeta(db, 'config.scribe.model') ?? CONFIG_DEFAULTS['scribe.model'];
   return [
-    `model: ${getMeta(db, 'config.scribe.model') ?? CONFIG_DEFAULTS['scribe.model']}`,
+    `model: ${model}`,
+    ...(model === 'local' ? [await localServerStatus(db, { file: getMeta(db, 'config.model.file') ?? CONFIG_DEFAULTS['model.file'] })] : []),
     `turns waiting: ${pendingTurns(db, 1000).length}`,
     `last run: ${getMeta(db, 'scribe.last_run') ?? 'never'}`,
     failures > 0 ? `failing: ${failures} in a row — ${getMeta(db, 'scribe.last_error')}` : 'healthy',

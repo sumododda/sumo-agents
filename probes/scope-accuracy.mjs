@@ -1,14 +1,15 @@
 #!/usr/bin/env node
-// A live measurement, not a test: it calls the real cheap model (about six calls, a few cents).
+// A live measurement, not a test: it calls the real cheap model (six calls: $0 on the local model, a few cents on an API one).
 // It answers one question — is the default model good enough at deciding WHAT to remember and WHERE?
 //   node probes/scope-accuracy.mjs            → runs with the configured scribe.model
-//   node probes/scope-accuracy.mjs sonnet     → runs with another model, to compare
+//   node probes/scope-accuracy.mjs haiku      → runs with another model, to compare
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { ENTRY } from '../src/paths.mjs';
+import { ENTRY, paths } from '../src/paths.mjs';
+import { CONFIG_DEFAULTS } from '../src/setup.mjs';
 
 const G = 'global';
 const SIMBA = 'project:simba';
@@ -59,6 +60,23 @@ delete env.SUMO_AGENTS_SCRIBE;
 delete env.SUMO_AGENTS_MODEL_CMD;
 const sumo = (args, input) => spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', ENTRY, ...args], { env, input, encoding: 'utf8' });
 
+// The local model and llama-server live in the real home; the throwaway one is pointed at the same files.
+const real = paths();
+if (existsSync(real.db)) {
+  const realDb = new DatabaseSync(real.db, { readOnly: true });
+  const llama = realDb.prepare(`SELECT value FROM meta WHERE key = 'llama.path'`).get()?.value;
+  const file = realDb.prepare(`SELECT value FROM meta WHERE key = 'config.model.file'`).get()?.value ?? CONFIG_DEFAULTS['model.file'];
+  realDb.close();
+  if (llama && existsSync(join(real.models, file))) {
+    sumo(['config']); // the first touch creates the throwaway database
+    mkdirSync(join(env.SUMO_AGENTS_HOME, 'models'), { recursive: true });
+    symlinkSync(join(real.models, file), join(env.SUMO_AGENTS_HOME, 'models', file));
+    const db = new DatabaseSync(join(env.SUMO_AGENTS_HOME, 'memory.db'));
+    db.prepare(`INSERT INTO meta (key, value) VALUES ('llama.path', ?)`).run(llama);
+    db.close();
+  }
+}
+
 for (const name of ['simba', 'slate']) {
   mkdirSync(join(root, name));
   writeFileSync(join(root, name, 'go.mod'), `module ${name}\n`);
@@ -79,7 +97,16 @@ process.stdout.write(`session ${session}: ${sumo(['scribe', 'run']).stdout.split
 const db = new DatabaseSync(join(root, 'home', 'memory.db'));
 const memories = db.prepare(`SELECT id, scope, provenance, source_turn, body FROM memories WHERE written_by = 'scribe' ORDER BY id`).all();
 const cost = db.prepare('SELECT SUM(cost_usd) AS usd, COUNT(*) AS runs FROM model_runs').get();
+// The throwaway home's llama-server would otherwise outlive the probe.
+const server = db.prepare(`SELECT value FROM meta WHERE key = 'llama.server'`).get()?.value;
 db.close();
+if (server) {
+  try {
+    process.kill(JSON.parse(server).pid, 'SIGTERM');
+  } catch {
+    // Already gone.
+  }
+}
 
 let remembered = 0;
 let rightScope = 0;
@@ -112,4 +139,4 @@ console.log(`remembered what it should not: ${noise.length} of ${TURNS.length - 
 if (missed.length) console.log(`\nmissed:\n${missed.join('\n')}`);
 if (noise.length) console.log(`\nnoise:\n${noise.join('\n')}`);
 if (unlinked.length) console.log(`\nnot tied to any turn:\n${unlinked.map((m) => `  [${m.scope}·${m.provenance}] ${m.body}`).join('\n')}`);
-console.log(`\ncost: $${cost.usd.toFixed(4)} over ${cost.runs} calls`);
+console.log(`\ncost: $${(cost.usd ?? 0).toFixed(4)} over ${cost.runs} calls`);

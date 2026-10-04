@@ -1,7 +1,7 @@
-import { callLocalModel } from './model.mjs';
+import { callLocalModel, MODEL_IDS } from './model.mjs';
 import { UsageError } from './memory.mjs';
 
-export const MODELS = ['haiku', 'sonnet', 'opus', 'fable'];
+export const MODELS = Object.keys(MODEL_IDS);
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 const KINDS = ['mechanical', 'routine', 'hard', 'novel'];

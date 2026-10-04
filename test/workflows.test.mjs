@@ -187,12 +187,31 @@ test('only sumo is let past the gate: a gated command chained to a sumo call sti
   assert.ok(held('sumo search "pr rules" && gh pr create --fill', 'b'), 'after &&');
   assert.ok(held('sumo show m1 2>&1 | tail -3; gh pr create', 'c'), 'a redirect is not the end of a command');
   assert.ok(held('cd /work && sumo job note 3 <<EOF\nabout to open it\nEOF\ngh pr create --fill', 'd'), 'after a heredoc that has closed');
+  assert.ok(held('sumo job note 3 <<"END OF NOTE"\nabout to open it\nEND OF NOTE\ngh pr create --fill', 'h'), 'after a heredoc whose quoted delimiter has a space');
+  assert.ok(held("cat <<'EOF\ngh pr create --fill", 'i'), 'after an opener that is not a heredoc after all');
+  assert.ok(held('sumo job note 3 $((1<<2))\ngh pr create --fill', 'k'), 'after an arithmetic shift, which opens no heredoc');
+  assert.ok(held('sumo job note 3 "$(( (1<<2) + 1 ))"; gh pr create --fill', 'l'), 'arithmetic with its own parentheses');
+  assert.ok(held('sumo add x # see <<EOF\ngh pr create --fill', 'm'), 'after a comment that mentions a heredoc');
+  assert.ok(held('sumo add x $[1<<2]\ngh pr create --fill', 'n'), 'after the old spelling of arithmetic');
+  assert.ok(held('sumo add x `echo <<EOF`\ngh pr create --fill', 'o'), 'after a backtick substitution');
+  assert.ok(held('sumo add x $(echo 1<<2)\ngh pr create --fill', 'p'), 'after a substitution holding a shift');
+  // The delimiter is the word after `<<` with its quotes removed, as the shell reads it.
+  assert.ok(held('sumo add x <<E"O"F\nbody\nEOF\ngh pr create --fill', 'q'), 'after a heredoc whose delimiter is partly quoted');
+  assert.ok(held('sumo add x <<E\\OF\nbody\nEOF\ngh pr create --fill', 'r'), 'after a heredoc whose delimiter has an escaped character');
+  assert.ok(held('sumo add x <<"EOF"x\nbody\nEOFx\ngh pr create --fill', 's'), 'after a heredoc whose delimiter continues past its quotes');
+  // A quote inside a substitution, and an escaped quote inside $'…', do not change where the command ends.
+  assert.ok(held('sumo add x $(echo ")"); gh pr create --fill', 't'), 'after a substitution holding a closing parenthesis in quotes');
+  assert.ok(held("sumo add x $'\\'' ; gh pr create --fill", 'u'), 'after an ANSI-C quoted string with an escaped quote');
+  // What a sumo call substitutes in is run by the shell, so it is judged; what it merely quotes is not.
+  assert.ok(held('sumo add "$(gh pr create --fill)"', 'v'), 'a gated command substituted into a sumo call');
+  assert.ok(held('sumo add "`gh pr create --fill`"', 'w'), 'a gated command in backticks inside a sumo call');
 
   // A heredoc belongs to the call that opens it, and a separator inside quotes is only a character.
   const teaching = `sumo learn "Creating a PR v2" --cue "create a PR" <<'EOF'\n1. run gh pr create only after the checks; never before\nEOF`;
   assert.equal(bash(s, teaching, { session_id: 'e' }).out, '');
   assert.equal(bash(s, 'sumo add preference "never run gh pr create; ask first" 2>&1', { session_id: 'f' }).out, '');
   assert.equal(bash(s, 'cd /work && /usr/local/bin/sumo show m1 | tail -3', { session_id: 'g' }).out, '', 'what is chained to it is judged on its own words');
+  assert.equal(bash(s, `sumo job note 3 <<"it's noted"\nnext: gh pr create once CI is green\nit's noted`, { session_id: 'j' }).out, '', "a quoted delimiter may hold the other quote, and the note it closes is the note's");
 });
 
 test('a gate that would take minutes over one command is refused when it is written, and one already stored cannot hold a turn', () => {

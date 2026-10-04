@@ -128,7 +128,7 @@ test('pictures the API refuses leave the turn with its words alone, so the turns
       const seen = [];
       const send = async (params) => {
         seen.push(structuredClone(params.messages));
-        if (params.messages.some((m) => Array.isArray(m.content) && m.content.some((b) => b.type === 'image'))) throw new Error('400 image exceeds 10 MB maximum');
+        if (params.messages.some((m) => Array.isArray(m.content) && m.content.some((b) => b.type === 'image'))) throw Object.assign(new Error('400 image exceeds 10 MB maximum'), { status: 400 });
         return reply('end_turn', [{ type: 'text', text: 'hi' }]);
       };
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
@@ -139,6 +139,25 @@ test('pictures the API refuses leave the turn with its words alone, so the turns
       assert.equal((await session.say('never mind, just say hi')).stop, 'end_turn');
       const users = seen.at(-1).filter((m) => m.role === 'user').map((m) => m.content.map((b) => b.text ?? b.type));
       assert.deepEqual(users.slice(-2), [['what is [Image #1]?'], ['never mind, just say hi']]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('pictures sent while the API is overloaded stay with the turn: nothing was said against them', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const send = async () => {
+        throw Object.assign(new Error('529 overloaded'), { status: 529 });
+      };
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
+      session.start('startup');
+      const failed = await session.say('what is [Image #1]?', 'what is [Image #1]?', [{ label: '[Image #1]', mediaType: 'image/png', data: 'Ymln' }]);
+      assert.equal(failed.stop, 'error');
+      const turn = session.params.messages.findLast((m) => m.role === 'user');
+      assert.ok(turn.content.some((b) => b.type === 'image'), 'the picture is still in the turn');
     } finally {
       db.close();
     }

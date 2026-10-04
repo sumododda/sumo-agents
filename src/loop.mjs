@@ -112,7 +112,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
         return { turns, stop: 'interrupted', error: null, text, totals };
       }
       log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns}: ${String(cause.message).slice(0, 200)}`);
-      return { turns, stop: 'error', error: String(cause.message).slice(0, 300), text, totals };
+      return { turns, stop: 'error', error: String(cause.message).slice(0, 300), status: cause.status ?? null, text, totals };
     }
     const usage = usageOf(params.model, response.usage);
     totals.inputTokens += usage.inputTokens;
@@ -221,12 +221,22 @@ function takeRunLock(id) {
       return lock;
     } catch (cause) {
       if (cause.code !== 'EEXIST' || attempt > 0) throw cause;
-      const holder = Number(readFileSync(lock, 'utf8'));
+      const holder = holderOf(lock);
       if (holder && alive(holder)) throw new UsageError(`j${id} is already being run (process ${holder}) — wait for it, or stop it there`);
       rmSync(lock, { force: true });
     }
   }
 }
+
+/** The process a lock names; none when the run that held it ended between taking a look and reading it. */
+const holderOf = (lock) => {
+  try {
+    return Number(readFileSync(lock, 'utf8'));
+  } catch (cause) {
+    if (cause.code === 'ENOENT') return 0;
+    throw cause;
+  }
+};
 
 const alive = (pid) => {
   try {
