@@ -3,9 +3,10 @@ import { appendFileSync, closeSync, openSync, readFileSync, rmSync, statSync, wr
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
+import { MODELS, offLine, usableModels } from './catalog.mjs';
 import { getMeta, openDb, setMeta, tx } from './db.mjs';
 import { localServerStatus } from './local-server.mjs';
-import { callModel, logRun } from './model.mjs';
+import { callModel, failure, logRun } from './model.mjs';
 import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
 import { aliasesOf, listProjects } from './projects.mjs';
 import { line } from './render.mjs';
@@ -221,19 +222,23 @@ export function buildBundle(db) {
   return { prompt, turns: new Map(turns.map((t) => [t.id, t])) };
 }
 
-/** The API model a pass is retried on when the local one could not answer and a credential is there to pay for it. */
-const FALLBACK_MODEL = 'haiku';
+/** The API model a pass is retried on when the local one could not answer: the cheapest one that is on, or none. */
+const fallbackModel = (db) => usableModels(db)[0] ?? null;
 
 /** Shared by the writer and the consolidation pass: ask, validate, record what it cost. */
 export async function askAndApply(db, { kind, promptFile, bundle, ops, sessionId, now }) {
   let model = getMeta(db, `config.${kind}.model`) ?? CONFIG_DEFAULTS[`${kind}.model`];
   const system = readFileSync(join(REPO_ROOT, 'prompts', promptFile), 'utf8').trim();
   const schema = opsSchema(db, ops);
-  let result = await callModel(db, { system, prompt: bundle.prompt, schema, model, kind });
-  // A local answer that failed (server down, bundle past its context, answer cut off) is one failed row, then one more try.
-  if (!result.ok && model === 'local' && resolveAnthropicCredential()) {
-    logRun(db, { kind, model, result, note: `${result.error} — retrying on ${FALLBACK_MODEL}`, now });
-    model = FALLBACK_MODEL;
+  // A writer set to a model the user has since turned off is not called: the refusal is the pass's failure, in the ledger like any other.
+  const off = MODELS.includes(model) ? offLine(db, model, `sumo config ${kind}.model local`) : null;
+  let result = off ? failure(off) : await callModel(db, { system, prompt: bundle.prompt, schema, model, kind });
+  // A local answer that failed (server down, bundle past its context, answer cut off) is one failed row, then one more try —
+  // when a credential is there to pay for it and a model is on to take it.
+  const fallback = !result.ok && model === 'local' && resolveAnthropicCredential() ? fallbackModel(db) : null;
+  if (fallback) {
+    logRun(db, { kind, model, result, note: `${result.error} — retrying on ${fallback}`, now });
+    model = fallback;
     result = await callModel(db, { system, prompt: bundle.prompt, schema, model, kind });
   }
 

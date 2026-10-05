@@ -16,6 +16,7 @@ export function sandbox() {
   const modelAnswer = join(root, 'model-answer.json');
   const modelSaw = join(root, 'model-saw.json');
   const routerAnswer = join(root, 'router-answer.json');
+  const modelsAnswer = join(root, 'models-answer.json');
   const env = {
     ...process.env,
     ...NO_KEY,
@@ -25,6 +26,7 @@ export function sandbox() {
     STUB_ANSWER: modelAnswer,
     STUB_CAPTURE: modelSaw,
     STUB_ROUTER_ANSWER: routerAnswer,
+    STUB_MODELS: modelsAnswer,
   };
 
   /** Runs `sumo` exactly as a user would. Never throws: exit code and streams come back for asserting on. */
@@ -74,8 +76,11 @@ export function sandbox() {
   const routerWillSay = (model, effort, reason = 'stand-in route') =>
     model === null ? rmSync(routerAnswer, { force: true }) : writeFileSync(routerAnswer, JSON.stringify({ is_error: false, result: '', structured_output: { model, effort, reason }, usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 }));
 
+  /** Which of Sumo's models the API will say it has, by short name, for every discovery from here on; `errors` names ones whose check fails. */
+  const modelsFound = (found, { errors = {} } = {}) => writeFileSync(modelsAnswer, JSON.stringify({ found, errors }));
+
   const modelWasShown = () => JSON.parse(readFileSync(modelSaw, 'utf8'));
   const spawned = () => (existsSync(spawnLog) ? readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean) : []);
 
-  return { root, home, sumo, sql, addProject, hook, modelWillSay, routerWillSay, modelWasShown, spawned };
+  return { root, home, sumo, sql, addProject, hook, modelWillSay, routerWillSay, modelsFound, modelWasShown, spawned };
 }

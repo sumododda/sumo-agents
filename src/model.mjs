@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { anthropicClientOptions, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
+import { describeApiError, modelId } from './catalog.mjs';
 import { getMeta } from './db.mjs';
 import { ensureLocalServer, LOCAL_REASONING_BUDGET, modelIdOf } from './local-server.mjs';
 import { paths } from './paths.mjs';
@@ -21,14 +22,6 @@ const MAX_API_ANSWER_TOKENS = 8192;
 /** What the SDK's beta parse() sent with a schema'd request, kept for the OAuth path that goes through the beta API. */
 const STRUCTURED_OUTPUTS_BETA = 'structured-outputs-2025-12-15';
 
-/** The short names the router and `sumo config` use, and the API model each one means. */
-export const MODEL_IDS = {
-  haiku: 'claude-haiku-4-5-20251001',
-  sonnet: 'claude-sonnet-5-5',
-  opus: 'claude-opus-5-5',
-  fable: 'claude-fable-5-1',
-};
-
 /** US dollars per million tokens: input, output, and what a cache read costs relative to input. */
 const PRICES = {
   'claude-haiku-4-5-20251001': { input: 1, output: 5, cacheRead: 0.1 },
@@ -37,8 +30,6 @@ const PRICES = {
   'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.025 },
 };
 const CACHE_WRITE = 1.25;
-
-export const modelId = (model) => MODEL_IDS[model] ?? model;
 
 /** What one response cost, from its usage and the price list; 0 for a model the list does not know. */
 export function costOf(model, usage) {
@@ -100,14 +91,6 @@ function envelopeToResult(run, command) {
   return { ok: true, data, usage, error: null };
 }
 
-/** What went wrong with an API call, in one line a person can act on. */
-function describe(cause) {
-  if (cause instanceof Anthropic.AuthenticationError) return 'the Anthropic credential is missing or invalid — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that runs sumo';
-  if (cause instanceof Anthropic.RateLimitError) return 'the API is rate-limiting this key — try again in a minute';
-  if (cause instanceof Anthropic.APIError) return `the API answered ${cause.status ?? 'an error'}: ${String(cause.message).slice(0, 300)}`;
-  return String(cause?.message ?? cause).slice(0, 300);
-}
-
 /**
  * One call to the cheap model, outside any conversation.
  *
@@ -156,7 +139,7 @@ export async function callModel(db, { system, prompt, schema, model, kind }) {
     if (data === null) return { ...failure('the answer was not the JSON that was asked for'), usage };
     return { ok: true, data, usage, error: null };
   } catch (cause) {
-    return failure(describe(cause));
+    return failure(describeApiError(cause));
   }
 }
 /** llama-server's error body, as one line a person can act on. */
@@ -254,7 +237,8 @@ export async function callLocalModel(db, { system, prompt, schema, kind = 'local
   }
 }
 
-function failure(error) {
+/** A call that did not happen or did not answer, in the envelope every caller reads: nothing spent, the reason in `error`. */
+export function failure(error) {
   return { ok: false, data: null, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0, cacheReadTokens: null, cacheCreationTokens: null }, error };
 }
 

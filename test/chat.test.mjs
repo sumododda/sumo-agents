@@ -7,11 +7,11 @@ import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { test } from 'node:test';
 import { chat, createChat, injection } from '../src/chat.mjs';
-import { MODEL_IDS } from '../src/model.mjs';
+import { MODEL_IDS, setModel } from '../src/catalog.mjs';
 import { openDb } from '../src/db.mjs';
 import { closeJobTab, reportAgent } from '../src/herdr.mjs';
 import { takeInbox } from '../src/jobs.mjs';
-import { add } from '../src/memory.mjs';
+import { add, UsageError } from '../src/memory.mjs';
 import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
@@ -1063,6 +1063,31 @@ test('memory answers a question only when the model ended its turn on one: after
       const outcome = await session.say('make a story for the login bug');
       assert.equal(outcome.stop, 'error');
       assert.equal(seen.length, 2, 'no third request was made on the strength of the earlier question');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a model that is off cannot be chatted on: not by configuration, not by /model, and the menu does not offer it', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      setModel(db, 'fable', false, NOW);
+      assert.throws(
+        () => createChat(db, { model: 'fable', effort: 'high', cwd: tmpdir(), send: () => assert.fail('never sent'), now: () => NOW }),
+        (err) => err instanceof UsageError && err.message === 'fable is off — sumo models enable fable, or sumo config chat.model <name>',
+      );
+
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: () => assert.fail('never sent'), now: () => NOW });
+      session.start('startup');
+      assert.throws(() => session.route('fable'), /fable is off — sumo models enable fable/);
+      assert.equal(session.route(''), 'opus/high', 'a refused change changes nothing');
+      const model = session.commands.find((c) => c.name === 'model');
+      assert.deepEqual(model.choices([]), ['auto', 'haiku', 'sonnet', 'opus']);
+      setModel(db, 'fable', true, NOW);
+      assert.deepEqual(model.choices([]), ['auto', 'haiku', 'sonnet', 'opus', 'fable'], 'the menu reads the switches as they are now');
+      assert.equal(session.route('fable'), 'fable/high');
     } finally {
       db.close();
     }

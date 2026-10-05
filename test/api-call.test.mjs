@@ -1,7 +1,8 @@
 // The cheap-model call to the Messages API: what is sent, what it costs, and how a short name becomes a model id.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { costOf, MODEL_IDS, modelId, requestFor } from '../src/model.mjs';
+import { MODEL_IDS, modelId } from '../src/catalog.mjs';
+import { costOf, requestFor } from '../src/model.mjs';
 
 test('a short model name becomes the API id, and an id is passed through', () => {
   assert.equal(modelId('haiku'), 'claude-haiku-4-5-20251001');

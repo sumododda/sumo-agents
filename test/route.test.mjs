@@ -7,10 +7,12 @@ import { openDb } from '../src/db.mjs';
 import * as memory from '../src/memory.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { chooseRoute, routeStats, statsLines } from '../src/route.mjs';
+import { MODELS, setModel } from '../src/catalog.mjs';
+import { chooseChatRoute, chooseRoute, routeStats, statsLines } from '../src/route.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const STAND_IN = join(REPO_ROOT, 'test', 'fixtures', 'model-stub.mjs');
+const NOW = '2026-10-05T12:00:00.000Z';
 
 /** A registered project a chooseRoute call can point at. */
 function makeProject(db, slug = 'demo') {
@@ -214,3 +216,38 @@ test('the router is shown only evidence against a route: a clean record never, a
 function writeAnswer(file, data) {
   writeFileSync(file, JSON.stringify({ is_error: false, result: '', structured_output: data, usage: { input_tokens: 10, output_tokens: 5 }, total_cost_usd: 0 }));
 }
+
+test('a model that is off is outside the router\'s grammar and prompt; an answer naming it is refused; with none on there is nothing to ask', async () => {
+  const capture = join(mkdtempSync(join(tmpdir(), 'sumo-agents-route-capture-')), 'saw.json');
+  await withRouter({ model: 'sonnet', effort: 'low', reason: 'x' }, async (db, project) => {
+    setModel(db, 'fable', false, NOW);
+    setModel(db, 'haiku', false, NOW);
+    process.env.STUB_CAPTURE = capture;
+    try {
+      await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
+    } finally {
+      delete process.env.STUB_CAPTURE;
+    }
+    const { schema, prompt } = JSON.parse(readFileSync(capture, 'utf8'));
+    assert.deepEqual(schema.anyOf.map((branch) => branch.properties.model.enum), [['sonnet', 'opus']], 'no haiku branch, no fable');
+    assert.match(prompt, /^models: sonnet, opus$/m, 'the router is told which models are on');
+  });
+  await withRouter({ model: 'fable', effort: 'high', reason: 'x' }, async (db, project) => {
+    setModel(db, 'fable', false, NOW);
+    await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /the router failed: the router answered outside its schema/);
+  });
+  await withRouter({ model: 'sonnet', effort: 'low', reason: 'x' }, async (db, project) => {
+    for (const model of MODELS) setModel(db, model, false, NOW);
+    await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), (err) => err instanceof memory.UsageError && /^no model is on — sumo models enable <name>/.test(err.message));
+    await assert.rejects(chooseChatRoute(db, { project, text: 'hi' }), (err) => err instanceof memory.UsageError && /^no model is on/.test(err.message));
+  });
+});
+
+test('a scout runs on haiku while haiku is on; off, it runs on the cheapest model that is on, at low effort', async () => {
+  await withRouter({ model: 'opus', effort: 'high', reason: 'deep trace' }, async (db, project) => {
+    setModel(db, 'haiku', false, NOW);
+    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'sonnet', effort: 'low', reason: 'router: deep trace; scout runs on sonnet, the cheapest model that is on' });
+    setModel(db, 'sonnet', false, NOW);
+    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'opus', effort: 'low', reason: 'router: deep trace; scout runs on opus, the cheapest model that is on' });
+  });
+});

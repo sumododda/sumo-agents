@@ -1,7 +1,7 @@
-import { callLocalModel, MODEL_IDS } from './model.mjs';
+import { usableModels } from './catalog.mjs';
+import { callLocalModel } from './model.mjs';
 import { UsageError } from './memory.mjs';
 
-export const MODELS = Object.keys(MODEL_IDS);
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 const KINDS = ['mechanical', 'routine', 'hard', 'novel'];
@@ -34,7 +34,13 @@ const answerShape = (models, efforts) => ({
   required: ['kind', 'surface', 'risky', 'model', 'effort', 'reason'],
   additionalProperties: false,
 });
-const ROUTER_SCHEMA = { anyOf: [answerShape(['haiku'], ['none']), answerShape(MODELS.filter((m) => m !== 'haiku'), EFFORTS)] };
+/** The grammar over the models that are on: the haiku branch while haiku is, the effort branch over the others. */
+const routerSchema = (usable) => ({
+  anyOf: [
+    ...(usable.includes('haiku') ? [answerShape(['haiku'], ['none'])] : []),
+    ...(usable.some((m) => m !== 'haiku') ? [answerShape(usable.filter((m) => m !== 'haiku'), EFFORTS)] : []),
+  ],
+});
 
 const TASK_CUT = 3500;
 
@@ -105,6 +111,7 @@ function routerPrompt(db, { agent, project, task, title, retryOf }) {
   return [
     `role: ${agent}`,
     `project: ${project.slug}${stack ? ` (${stack})` : ''}`,
+    `models: ${usableModels(db).join(', ')}`,
     ...(retryOf === undefined ? [] : [retryLine(db, retryOf)].filter(Boolean)),
     'history:',
     historyText(db, project.slug),
@@ -130,17 +137,19 @@ const CHAT_ROUTER_SYSTEM =
 
 function chatRouterPrompt(db, { project, text }) {
   const stack = project ? stackOf(db, project.slug) : null;
-  return [`project: ${project ? `${project.slug}${stack ? ` (${stack})` : ''}` : 'none'}`, 'turn:', String(text ?? '').slice(0, TASK_CUT)].join('\n');
+  return [`project: ${project ? `${project.slug}${stack ? ` (${stack})` : ''}` : 'none'}`, `models: ${usableModels(db).join(', ')}`, 'turn:', String(text ?? '').slice(0, TASK_CUT)].join('\n');
 }
 
 const askRouter = (db, { agent, project, task, title, retryOf }) => askFor(db, ROUTER_SYSTEM, routerPrompt(db, { agent, project, task, title, retryOf }));
 
 async function askFor(db, system, prompt) {
-  const result = await callLocalModel(db, { system, prompt, schema: ROUTER_SCHEMA });
+  const usable = usableModels(db);
+  if (usable.length === 0) throw new UsageError('no model is on — sumo models enable <name>');
+  const result = await callLocalModel(db, { system, prompt, schema: routerSchema(usable) });
   if (!result.ok) return { ok: false, error: result.error };
   const { model, effort, reason } = result.data ?? {};
   // The same pairing the schema enforces, checked again: a backend without grammar support can still answer anything.
-  const fits = model === 'haiku' ? effort === 'none' : MODELS.includes(model) && EFFORTS.includes(effort);
+  const fits = usable.includes(model) && (model === 'haiku' ? effort === 'none' : EFFORTS.includes(effort));
   if (!fits || typeof reason !== 'string' || !reason.trim()) return { ok: false, error: `the router answered outside its schema: ${JSON.stringify(result.data)}` };
   return { ok: true, model, effort, reason: reason.replace(/\s+/g, ' ').trim() };
 }
@@ -149,13 +158,17 @@ async function askFor(db, system, prompt) {
  * Chooses a job's model and effort by asking the local router — every job, every retry, no exceptions.
  * Its answer is the route; a router that cannot answer refuses the job, with no default to fall back
  * to. A retry tells the router what the previous attempt ran on and how it ended. The one change made
- * to an answer: a scout exists only on haiku.
+ * to an answer: a scout runs on haiku — or, while haiku is off, on the cheapest model that is on, at low effort.
  */
 export async function chooseRoute(db, { agent, project, task, title, retryOf }) {
   const routed = await askRouter(db, { agent, project, task, title, retryOf });
   if (!routed.ok) throw new UsageError(`the router failed: ${routed.error} — no job was created`);
   const reason = `router: ${routed.reason}`;
-  if (agent === 'scout' && routed.model !== 'haiku') return { model: 'haiku', effort: 'none', reason: `${reason}; scout runs on haiku` };
+  if (agent === 'scout' && routed.model !== 'haiku') {
+    const usable = usableModels(db);
+    if (usable.includes('haiku')) return { model: 'haiku', effort: 'none', reason: `${reason}; scout runs on haiku` };
+    return { model: usable[0], effort: 'low', reason: `${reason}; scout runs on ${usable[0]}, the cheapest model that is on` };
+  }
   return { model: routed.model, effort: routed.effort, reason };
 }
 

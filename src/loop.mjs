@@ -2,11 +2,12 @@ import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { anthropicClientOptions, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
+import { modelId, MODELS, usableModels } from './catalog.mjs';
 import { tx } from './db.mjs';
 import { handleEvent } from './hooks.mjs';
 import { brief, getJob, takeInbox } from './jobs.mjs';
 import { UsageError } from './memory.mjs';
-import { costOf, logRun, modelId, usageOf } from './model.mjs';
+import { costOf, logRun, usageOf } from './model.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
 import { BASH_TOOL, childEnv, EDITOR_TOOL, INTERRUPTED, runTool } from './tools.mjs';
@@ -189,6 +190,9 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   const job = getJob(db, id);
   if (job.status !== 'running' && job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — only a running job can be run`);
   if (!job.model) throw new UsageError(`j${id} has no route — it was created before routing existed; create it again`);
+  if (MODELS.includes(job.model) && !usableModels(db).includes(job.model)) {
+    throw new UsageError(`j${id} is routed to ${job.model}, which is off — sumo models enable ${job.model}, or abandon it and create it again`);
+  }
   const project = getProject(db, job.project);
   const params = jobParams({ job, text: brief(db, id) });
   const lock = tx(db, () => takeRunLock(id));

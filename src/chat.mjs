@@ -9,13 +9,13 @@ import { openJobTab, runHerdr } from './herdr.mjs';
 import { clearOutcome, getJob, guideFor, outcomeFile, tell as tellJob } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
 import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, textOf } from './loop.mjs';
-import { MODEL_IDS, modelId } from './model.mjs';
+import { assertOn, MODEL_IDS, MODELS, modelId, usableModels } from './catalog.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { UsageError } from './memory.mjs';
 import { openInBrowser, servePage } from './page.mjs';
 import { getProject } from './projects.mjs';
 import { redact } from './redact.mjs';
-import { chooseChatRoute, EFFORTS, MODELS } from './route.mjs';
+import { chooseChatRoute, EFFORTS } from './route.mjs';
 import { outcomeLines, runScribe } from './scribe.mjs';
 import { currentProject } from './sessions.mjs';
 import { BASH_TOOL, cap, capRedacted, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
@@ -46,17 +46,23 @@ const COMMANDS = {
   dream: () => 'Run `sumo dream run` and tell me, in a few lines, what it changed and what it wants me to confirm.',
 };
 
-/** What the command menu shows, in the order it shows it. */
-export const COMMAND_LIST = [
-  { name: 'fix', hint: 'fix a bug, by guides/fix.md' },
-  { name: 'feature', hint: 'build something, by guides/feature.md' },
-  { name: 'review', hint: 'have a reviewer job judge something' },
-  { name: 'dream', hint: 'tidy the memory and say what changed' },
-  { name: 'model', hint: 'the route, or set it: auto, or a model and an effort', choices: (given) => (given.length === 0 ? ['auto', ...MODELS] : given.length === 1 && MODELS.includes(given[0]) && given[0] !== 'haiku' ? EFFORTS : []) },
-  { name: 'memory', hint: 'see the memory in the browser: say yes or no, edit, forget' },
-  { name: 'new', hint: 'start a fresh session' },
-  { name: 'exit', hint: 'leave' },
-];
+/** What the command menu shows, in the order it shows it; the models `/model` offers are the ones that are on as it is typed. */
+export function commandList(db) {
+  const modelChoices = (given) => {
+    const usable = usableModels(db);
+    return given.length === 0 ? ['auto', ...usable] : given.length === 1 && usable.includes(given[0]) && given[0] !== 'haiku' ? EFFORTS : [];
+  };
+  return [
+    { name: 'fix', hint: 'fix a bug, by guides/fix.md' },
+    { name: 'feature', hint: 'build something, by guides/feature.md' },
+    { name: 'review', hint: 'have a reviewer job judge something' },
+    { name: 'dream', hint: 'tidy the memory and say what changed' },
+    { name: 'model', hint: 'the route, or set it: auto, or a model and an effort', choices: modelChoices },
+    { name: 'memory', hint: 'see the memory in the browser: say yes or no, edit, forget' },
+    { name: 'new', hint: 'start a fresh session' },
+    { name: 'exit', hint: 'leave' },
+  ];
+}
 
 const JOB_RUN = /^\s*sumo\s+job\s+run\s+j?(\d+)\s*(&?)\s*$/;
 /** The same command anywhere inside a longer one — piped, chained, under nohup: there it would start in the shell, which is given no credential. */
@@ -95,16 +101,17 @@ export function routeLine(session) {
 export const routeOf = ({ model, effort }) => (effort && effort !== 'none' ? `${model}/${effort}` : model);
 
 /**
- * What `/model` was given: a model, a model and an effort, or `auto`. The model alone keeps the
- * effort in hand; haiku takes none. Anything else is said back, and nothing changes.
+ * What `/model` was given: a model that is on, a model and an effort, or `auto`. The model alone keeps
+ * the effort in hand; haiku takes none. Anything else is said back, and nothing changes.
  */
-export function parseRoute(args, current) {
+export function parseRoute(args, current, db) {
   const [model, effort, ...rest] = args.split(/\s+/).filter(Boolean);
   if (model === 'auto') {
     if (effort) throw new UsageError('auto takes no effort — the router picks it each turn');
     return { model: 'auto', effort: null };
   }
-  if (!MODELS.includes(model)) throw new UsageError(`no such model "${model}" — one of: auto, ${MODELS.join(', ')}`);
+  if (!MODELS.includes(model)) throw new UsageError(`no such model "${model}" — one of: auto, ${usableModels(db).join(', ')}`);
+  assertOn(db, model);
   if (rest.length > 0) throw new UsageError(`/model takes a model and an effort, not "${args}"`);
   if (model === 'haiku') {
     if (effort) throw new UsageError('haiku takes no effort setting');
@@ -150,6 +157,8 @@ function configured(db, key) {
  */
 export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, herdr = runHerdr, env = process.env, poll = 500, route = chooseChatRoute, now = () => new Date().toISOString() } = {}) {
   model ??= configured(db, 'chat.model');
+  // A model the user turned off is not chatted on, however the chat came to be on it; auto reads the switches each turn.
+  if (model !== 'auto' && MODELS.includes(model)) assertOn(db, model, 'sumo config chat.model <name>');
   effort ??= model === 'auto' ? null : configured(db, 'chat.effort');
   // Haiku takes no effort setting, however the chat came to be on it: by flag, by configuration, or by /model.
   if (modelId(model) === MODEL_IDS.haiku) effort = 'none';
@@ -169,6 +178,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   /** The memory page, once /memory has asked for it: the promise of its address. */
   let page = null;
   const ledger = { kind: 'chat', sessionId: null };
+  const commands = commandList(db);
 
   const emit = (text) => out(text);
   /** The conversation as the model in hand can take it: one that takes no operator messages is sent them as text. The history itself is left alone, so a model that does take them still reads it from its cache. */
@@ -201,7 +211,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   function setRoute(args) {
     if (args.trim()) {
       // Off auto there is no effort in hand: the one kept is the user's configured one.
-      const next = parseRoute(args.trim(), { model, effort: effort ?? configured(db, 'chat.effort') });
+      const next = parseRoute(args.trim(), { model, effort: effort ?? configured(db, 'chat.effort') }, db);
       ({ model, effort } = next);
       routed = null;
       if (model !== 'auto') apply(next);
@@ -404,7 +414,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     if (name === 'new' || name === 'memory') return { control: name };
     if (name === 'model') return { control: name, args: args.trim() };
     const make = Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
-    return make ? { text: make(args.trim()), said: args.trim() } : { error: `no such command /${name} — one of: ${COMMAND_LIST.map((c) => `/${c.name}`).join(' ')}` };
+    return make ? { text: make(args.trim()), said: args.trim() } : { error: `no such command /${name} — one of: ${commands.map((c) => `/${c.name}`).join(' ')}` };
   }
 
   /** `/memory`: one page per chat, on this chat's store, gone when the chat is; asked for again, it is opened again. */
@@ -432,6 +442,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     memoryPage,
     route: setRoute,
     end,
+    commands,
     get sessionId() {
       return sessionId;
     },

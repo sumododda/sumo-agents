@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createElement as h, useEffect, useReducer, useRef } from 'react';
-import { COMMAND_LIST, routeLine, routeOf } from './chat.mjs';
+import { routeLine, routeOf } from './chat.mjs';
 import { stopReason } from './loop.mjs';
 import { paths } from './paths.mjs';
 import { editor, keysOf, menuOf, paste, press, under } from './editor.mjs';
@@ -481,7 +481,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
           .catch((cause) => notify(cause.message));
         continue;
       }
-      const pressed = press(state.ed, one, oneKey, COMMAND_LIST);
+      const pressed = press(state.ed, one, oneKey, session.commands);
       state.ed = pressed.state;
       if (pressed.submit !== undefined) submit(pressed.submit);
     }
@@ -500,7 +500,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
     redraw();
   });
 
-  const menu = menuOf(state.ed, COMMAND_LIST);
+  const menu = menuOf(state.ed, session.commands);
   const tail = state.reply?.tail ?? '';
   // Ink adds a line under the frame; a frame that reached the last row would be drawn as a full screen.
   const room = state.unmeasured.length > 0 ? 0 : Math.max(0, rows - state.used - 1);

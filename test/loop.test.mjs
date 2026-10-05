@@ -5,8 +5,9 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { setModel } from '../src/catalog.mjs';
 import { openDb } from '../src/db.mjs';
-import { add } from '../src/memory.mjs';
+import { add, UsageError } from '../src/memory.mjs';
 import { jobPrinter } from '../src/chat.mjs';
 import { takeInbox, tell } from '../src/jobs.mjs';
 import { converse, jobParams, markTail, runJob, runLines } from '../src/loop.mjs';
@@ -570,6 +571,22 @@ test('a job\'s shell never sees the credential, checked with one actually in the
       const env = seen[1].messages.at(-1).content[0].content;
       assert.match(env, /^PATH=/m, 'the command ran and printed its environment');
       assert.doesNotMatch(env, /ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|not-a-real/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a job routed to a model that is off is refused before anything is sent', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const { id } = seed(db, { model: 'fable', effort: 'high' });
+      setModel(db, 'fable', false, NOW);
+      await assert.rejects(
+        runJob(db, id, { send: () => assert.fail('nothing is sent'), now: () => NOW }),
+        (err) => err instanceof UsageError && err.message === `j${id} is routed to fable, which is off — sumo models enable fable, or abandon it and create it again`,
+      );
     } finally {
       db.close();
     }

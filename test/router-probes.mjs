@@ -12,7 +12,8 @@ import { getMeta, openDb, setMeta } from '../src/db.mjs';
 import { stopLocalServer } from '../src/local-server.mjs';
 import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { chooseRoute, EFFORTS, MODELS } from '../src/route.mjs';
+import { MODELS } from '../src/catalog.mjs';
+import { chooseRoute, EFFORTS } from '../src/route.mjs';
 import { CONFIG_DEFAULTS } from '../src/setup.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 

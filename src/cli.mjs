@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
+import { discoverModels, modelLines, setModel } from './catalog.mjs';
 import { openDb } from './db.mjs';
 import { dreamStatus, runDream } from './dream.mjs';
 import { backup, exportJson, exportMarkdown } from './export.mjs';
@@ -42,6 +43,7 @@ const HELP = `sumo — local memory for the sumo-agents process
   sumo prime            the block a session starts with
   sumo scribe run|show|status|stats  sumo dream run|status       the cheap-model passes
   sumo export [--json]  sumo backup
+  sumo models [discover | enable <name> | disable <name>]     the API models: which are here, which are on
   sumo setup            sumo doctor          sumo config [key [value]]
 
 Scope is global plus --project; other projects stay hidden without --everywhere.
@@ -96,6 +98,9 @@ sumo job list [--all]`,
   apply: 'sumo apply <ops.json> [--source scribe|dream]',
   export: 'sumo export [--json]',
   backup: 'sumo backup',
+  models: `sumo models                    every model Sumo knows: on or off, its API id, and why
+sumo models discover           ask the API which of them this credential can use, and set the switches from the answer
+sumo models enable|disable <name>`,
   setup: 'sumo setup [--bin-dir DIR] [--no-link] [--model-source URL] [--no-model]',
   doctor: 'sumo doctor',
   config: 'sumo config [key [value]]',
@@ -126,6 +131,7 @@ const COMMANDS = {
   apply: { value: ['source'], bool: [], run: runApply },
   export: { value: [], bool: ['json', 'md'], run: runExport },
   backup: { value: [], bool: [], run: runBackup },
+  models: { value: [], bool: [], run: runModels },
 };
 
 function parse(argv, spec) {
@@ -462,6 +468,22 @@ async function runMemoryPage(db) {
   await new Promise((resolve) => process.once('SIGINT', resolve));
   await page.close();
   return ['stopped'];
+}
+
+/** The models Sumo can run on, their switches, and the two ways the switches are set: by the API's answer, or by hand. */
+async function runModels(db, { args }) {
+  const [sub, name] = args;
+  if (sub === undefined) return modelLines(db);
+  if (sub === 'discover') {
+    const result = await discoverModels(db);
+    if (!result.ok) throw new Error(`could not check the models — ${result.error}; nothing was changed`);
+    return modelLines(db);
+  }
+  if ((sub === 'enable' || sub === 'disable') && name !== undefined) {
+    setModel(db, name, sub === 'enable');
+    return modelLines(db, [name]);
+  }
+  throw new UsageError(`usage: ${USAGE.models}`);
 }
 
 function runExport(db, { flags }) {
