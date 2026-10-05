@@ -2,7 +2,7 @@
 
 A delegation costs a brief and a fresh context.
 
-**Who.** `scout` (Haiku, no edit tools): finding, tracing, auditing — cheapest; tracing, not judging → say
+**Who.** `scout` (Haiku, or the cheapest model that is on; no edit tools): finding, tracing, auditing — cheapest; tracing, not judging → say
 "describe only". `worker`: building and fixing. `reviewer` (no edit tools): judging a change it did not
 write. The local router picks every route; if it fails, no job exists — tell the user. Failed, or
 `important >= 3` → `sumo job retry <id>`.

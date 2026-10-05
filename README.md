@@ -40,6 +40,9 @@ sumo setup --no-model                                                           
 sumo config model.source <url>                                                      # change it later
 sumo config chat.model opus                                                        # what `sumo chat` runs on; `auto` routes each turn
 sumo config chat.effort high                                                       # effort when using a fixed chat model
+sumo models                                                                         # the API models: on or off, and why
+sumo models discover                                                                # ask the API again which of them this credential can use
+sumo models disable fable                                                           # keep one out of the chat, the router and the passes
 ```
 
 Then just talk. Mention a project the way you normally would; the first time, the agent finds it on
@@ -135,7 +138,7 @@ the brief as its only user turn, a short frozen system prompt, and tools by role
 
 | Role | Model and effort | Tools | For |
 |---|---|---|---|
-| `scout` | always Haiku | shell | finding, tracing, auditing, summarizing — anything reading-heavy |
+| `scout` | Haiku — or, while Haiku is off, the cheapest model that is on, at low effort | shell | finding, tracing, auditing, summarizing — anything reading-heavy |
 | `worker` | chosen per job by the router | shell + editor | building and fixing |
 | `reviewer` | chosen per job by the router | shell | judging a change it did not write |
 
@@ -178,13 +181,25 @@ route would have done, and a router shown one keeps choosing it.
 If the router is missing, fails, or answers something no job can run on (a model outside the list, or
 no effort for a model that takes one), the command exits with the error and **no job is created**. The
 answer schema pairs Haiku with no effort and every other model with one. The only change made to an
-answer: a scout exists only on Haiku. `sumo doctor` fails while the router is missing.
+answer: a scout runs on Haiku — or, while Haiku is off, on the cheapest model that is on, at low effort.
+`sumo doctor` fails while the router is missing.
 
 Effort is real, not advisory: the route's effort goes on the request as `output_config.effort`, its model as the
 model id, and the run's ledger rows say what ran — so what was chosen is what runs.
 
 Models available to jobs: `haiku`, `sonnet`, `opus`, `fable`. Effort levels: `low`, `medium`,
 `high`, `xhigh`, `max`; Haiku takes none.
+
+Each of the four has a switch on this machine, and nothing assumes the API has all of them. `sumo setup`
+asks the API once which of them this credential can use (one `GET /v1/models/<id>` per model) and turns
+off the ones it does not have; `sumo models` lists them with the API id and the reason for each switch;
+`sumo models discover` asks again and sets the switches from the answer; `sumo models enable|disable
+<name>` sets one by hand. A check that fails — no credential, an error, or an answer with none of them —
+changes nothing and says why. A model that is off is outside the router's grammar and prompt, refused by
+`/model` and by `sumo config chat.model` / `scribe.model` / `dream.model`, never retried on by the passes
+(the retry goes to the cheapest model that is on, or nowhere), and a job routed to it before it was
+turned off is not run. `sumo doctor` says which are on, warns while nothing was checked, and fails when
+none is on or a configured one is off.
 
 **The label that grades a route is a review, not a green check.** A worker's DONE only proves the
 checks passed; every Sonnet worker here passed its checks and the Opus reviews that followed found 1 to 7
