@@ -14,6 +14,28 @@ import { redact } from './redact.mjs';
 export const BASH_TOOL = { type: 'bash_20250124', name: 'bash' };
 export const EDITOR_TOOL = { type: 'text_editor_20250728', name: 'str_replace_based_edit_tool' };
 
+/** The chat's own: hands a piece of work to a sub-agent with a fresh context and waits for its report. Several in one reply run at once. */
+export const DELEGATE_TOOL = {
+  name: 'delegate',
+  description:
+    'Hand a piece of work to a sub-agent with a fresh context: scout looks (no edits), worker builds, reviewer judges a change it did not write. ' +
+    'It runs on its own route and returns its report. Several calls in one reply run at the same time; one worker per project at a time. ' +
+    'To continue an open job instead (one from an earlier session), give only `job`.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      agent: { type: 'string', enum: ['scout', 'worker', 'reviewer'] },
+      project: { type: 'string', description: 'the project slug' },
+      title: { type: 'string', description: 'a few words' },
+      task: { type: 'string', description: 'the brief, a contract: ## Goal, ## Non-goals, ## Must not change, ## Check (the command that proves it, or why none), ## Report' },
+      guide: { type: 'string', enum: ['fix', 'feature'], description: 'carry guides/<guide>.md into the brief' },
+      reviews: { type: 'integer', description: 'reviewer only: the worker job whose change to judge; without it, the uncommitted change' },
+      tests_may_change: { type: 'boolean', description: 'worker only: existing tests may be edited' },
+      job: { type: 'integer', description: 'continue this open job; nothing else is given' },
+    },
+  },
+};
+
 const OUTPUT_CAP_CHARS = 16_000;
 const VIEW_CAP_LINES = 400;
 const COMMAND_TIMEOUT_MS = 540_000; // the same nine minutes a check gets

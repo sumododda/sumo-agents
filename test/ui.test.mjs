@@ -379,9 +379,10 @@ test('a job run in the chat is shown as it works — who it is, each thing it ru
 
       const working = gate();
       const { send, seen } = transport([
-        { reply: reply('tool_use', [call('t1', 'bash', { command: `sumo job run ${id}` })]) }, // the chat
+        { reply: reply('tool_use', [call('t1', 'delegate', { job: id })]) }, // the chat
         { reply: reply('tool_use', [{ type: 'text', text: 'looking around' }, call('j1', 'bash', { command: 'echo hi' })]), gate: working }, // the job
         { reply: reply('end_turn', [{ type: 'text', text: 'report one' }]) }, // the job
+        { reply: reply('end_turn', []) }, // the job, told once that it never closed itself
         { reply: reply('end_turn', [{ type: 'text', text: 'all finished' }]) }, // the chat
         { reply: reply('end_turn', [{ type: 'text', text: 'nobody here by that name' }]) }, // the chat, sent a line that starts with @
       ]);
@@ -411,7 +412,7 @@ test('a job run in the chat is shown as it works — who it is, each thing it ru
         await shows(/⏺ all finished/, 'the end of the turn');
         assert.match(seen[2].messages.at(-1).content.at(-1).text, /stay in src/, 'the job read it with its next request');
         assert.match(latest(), /\n {2}looking around\n {2}⏺ Bash\(echo hi\)\n {2}report one\n/, "the job's words and its call, one line each, set in under it");
-        assert.match(latest(), new RegExp(`⏺ Bash\\(sumo job run ${id}\\)\\n\\s+⎿\\s+STATUS: never closed — j${id}`), 'how the run ended');
+        assert.match(latest(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+STATUS: never closed — j${id}`), 'how the run ended');
         assert.doesNotMatch(latest(), /@ message talks to/, 'nobody to talk to once it is over');
 
         // Ctrl-O opens what the job's command printed.
@@ -568,59 +569,6 @@ test('the logo is the background of the window: faint and centred in it, the box
         await tty.type('\x04');
         await leaves(ui);
       } finally {
-        ui.unmount();
-      }
-    } finally {
-      db.close();
-    }
-  });
-});
-
-test('a message for a job that has closed while its tab is still finishing is said back on the screen, and the chat carries on', async () => {
-  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
-    const db = openDb();
-    try {
-      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-ui-job-'));
-      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
-      addProject(db, root, { slug: 'simba', now: NOW });
-      const { lastInsertRowid } = db
-        .prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('simba', 'look', 'scout', 'running', null, ?, ?, 'haiku', 'none', 'test')`)
-        .run(NOW, NOW);
-      const id = Number(lastInsertRowid);
-      mkdirSync(join(paths().jobs, String(id)), { recursive: true });
-
-      const herdr = (args) => (args[1] === 'create' ? { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:pH' } } }) } : { status: 0, stdout: '' });
-      const { send } = transport([
-        { reply: reply('tool_use', [call('t1', 'bash', { command: `sumo job run ${id}` })]) },
-        { reply: reply('end_turn', [{ type: 'text', text: 'all finished' }]) },
-      ]);
-      const events = new EventEmitter();
-      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, herdr, env: { HERDR_ENV: '1' }, poll: 10, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
-      const tty = fakeTty();
-      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', debug: true });
-      const latest = () => tty.screen().slice(tty.screen().lastIndexOf(MARK));
-      const shows = async (pattern, what) => {
-        for (let i = 0; i < 300; i++) {
-          if (pattern.test(latest())) return;
-          await new Promise((r) => setTimeout(r, 10));
-        }
-        assert.fail(`the screen never showed ${what}:\n${latest()}`);
-      };
-      try {
-        await tty.type(`have a scout look${ENTER}`);
-        await shows(new RegExp(`⏺ j${id} scout · haiku — look · in its Herdr tab`), 'the job in its tab');
-
-        // The job has closed itself, but its run is still saying its last words: the chat is waiting, and the job can no longer be told anything.
-        db.prepare(`UPDATE jobs SET status = 'done' WHERE id = ?`).run(id);
-        await tty.type(`@thanks${ENTER}`);
-        await shows(new RegExp(`j${id} is done — it cannot be told anything`), 'why the message went nowhere');
-
-        writeFileSync(join(paths().jobs, String(id), 'outcome.txt'), `STATUS: DONE — j${id}\n`, { mode: 0o600 });
-        await shows(/⏺ all finished/, 'the end of the turn');
-        await tty.type('\x04');
-      } finally {
-        // A wait this test did not end must not outlive it.
-        session.interrupt();
         ui.unmount();
       }
     } finally {

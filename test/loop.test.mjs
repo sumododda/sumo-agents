@@ -51,16 +51,16 @@ test('the request: frozen system with a cache breakpoint, the brief as the one u
   assert.equal(worker.model, 'claude-sonnet-5-5');
   assert.deepEqual(worker.system, [{ type: 'text', text: 'rules', cache_control: { type: 'ephemeral' } }]);
   assert.deepEqual(worker.messages, [{ role: 'user', content: [{ type: 'text', text: 'the brief' }] }]);
-  assert.deepEqual(worker.tools.map((t) => t.name), ['bash', 'str_replace_based_edit_tool']);
+  assert.deepEqual(worker.tools.map((t) => t.name), ['bash', 'str_replace_based_edit_tool', 'baseline', 'verify', 'note', 'ask', 'search_memory', 'finish']);
   assert.deepEqual(worker.output_config, { effort: 'medium' });
   assert.equal(worker.context_management.edits[0].type, 'clear_tool_uses_20250919');
   assert.equal(worker.max_tokens, 64_000, 'the thinking every current model does counts toward the limit, so it holds the thinking and the reply');
 
   const scout = jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' });
-  assert.deepEqual(scout.tools.map((t) => t.name), ['bash'], 'a scout cannot edit');
+  assert.deepEqual(scout.tools.map((t) => t.name), ['bash', 'note', 'ask', 'search_memory', 'finish'], 'a scout cannot edit, and has no checks to run');
   assert.equal('output_config' in scout, false, 'haiku takes no effort');
   const reviewer = jobParams({ job: { agent: 'reviewer', model: 'opus', effort: 'high' }, text: 'judge', system: 'rules' });
-  assert.deepEqual(reviewer.tools.map((t) => t.name), ['bash'], 'a reviewer cannot edit');
+  assert.deepEqual(reviewer.tools.map((t) => t.name), ['bash', 'note', 'ask', 'search_memory', 'finish'], 'a reviewer cannot edit');
 });
 
 test('a run: tool calls go through the guard, the jail and the cap; every response leaves a ledger row with the job on it', async () => {
@@ -73,10 +73,14 @@ test('a run: tool calls go through the guard, the jail and the cap; every respon
         reply('tool_use', [call('t2', 'bash', { command: 'rm -rf ~' }), call('t3', 'str_replace_based_edit_tool', { command: 'view', path: join(root, '.env') })]),
         reply('tool_use', [call('t4', 'str_replace_based_edit_tool', { command: 'view', path: '/etc/hosts' }), call('t5', 'str_replace_based_edit_tool', { command: 'str_replace', path: 'a.txt', old_str: 'two', new_str: '2' })]),
         reply('end_turn', [{ type: 'text', text: 'done' }], { input_tokens: 500, cache_read_input_tokens: 2000, output_tokens: 20 }),
+        reply('end_turn', [{ type: 'text', text: 'still not closing it' }]),
       ]);
       const outcome = await runJob(db, id, { send, now: () => NOW });
 
-      assert.equal(outcome.turns, 4);
+      // It stopped with the job open: told once to close it, and not again.
+      assert.match(seen[4].messages.at(-1).content[0].text, /^You ended without closing the job\. Call `finish` now/);
+      assert.equal(seen.length, 5);
+      assert.equal(outcome.turns, 5);
       assert.equal(outcome.stop, 'end_turn');
       assert.equal(outcome.totals.toolCalls, 5);
       assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'one\n2\nthree\n', 'the edit landed');
@@ -97,8 +101,8 @@ test('a run: tool calls go through the guard, the jail and the cap; every respon
       assert.deepEqual(seen[3].system[0].cache_control, { type: 'ephemeral' });
 
       const rows = db.prepare('SELECT kind, model, input_tokens, cache_read_tokens, job_id, session_id, note FROM model_runs ORDER BY id').all();
-      assert.equal(rows.length, 4);
-      assert.deepEqual(rows.map((r) => r.job_id), [id, id, id, id]);
+      assert.equal(rows.length, 5);
+      assert.deepEqual(rows.map((r) => r.job_id), [id, id, id, id, id]);
       assert.equal(rows[0].kind, 'worker');
       assert.equal(rows[0].model, 'claude-sonnet-5-5');
       assert.equal(rows[0].session_id, 's1');
@@ -272,6 +276,7 @@ test('a job told something from outside its process reads it with its next reque
       const { send, seen } = canned([
         reply('tool_use', [{ type: 'text', text: 'looking' }, call('t1', 'bash', { command: 'echo hi' })]),
         reply('end_turn', [{ type: 'text', text: 'done looking' }]),
+        reply('end_turn', []),
       ]);
       const printed = [];
       const outcome = await runJob(db, id, { send, now: () => NOW, ...jobPrinter((t) => printed.push(t), styles(false)) });
@@ -436,6 +441,7 @@ test('a job\'s commands meet the workflow gate as the chat\'s do: held once with
         reply('tool_use', [call('t1', 'bash', { command: 'gh pr create --fill' })]),
         reply('tool_use', [call('t2', 'bash', { command: 'echo gh pr create --fill' })]),
         reply('end_turn', [{ type: 'text', text: 'done' }]),
+        reply('end_turn', []),
       ]);
       await runJob(db, id, { send, now: () => NOW });
       const held = seen[1].messages.at(-1).content[0];
@@ -566,11 +572,42 @@ test('a job\'s shell never sees the credential, checked with one actually in the
     const db = openDb();
     try {
       const { id } = seed(db, { agent: 'scout', model: 'haiku', effort: 'none' });
-      const { send, seen } = canned([reply('tool_use', [call('t1', 'bash', { command: 'env' })]), reply('end_turn', [{ type: 'text', text: 'done' }])]);
+      const { send, seen } = canned([reply('tool_use', [call('t1', 'bash', { command: 'env' })]), reply('end_turn', [{ type: 'text', text: 'done' }]), reply('end_turn', [])]);
       await runJob(db, id, { send, now: () => NOW });
       const env = seen[1].messages.at(-1).content[0].content;
       assert.match(env, /^PATH=/m, 'the command ran and printed its environment');
       assert.doesNotMatch(env, /ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|not-a-real/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a job closes, notes and reads memory with tools of its own: each runs the sumo command a person would, in a process of its own', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const { id } = seed(db, { agent: 'scout', model: 'haiku', effort: 'none' });
+      add(db, { type: 'gotcha', body: 'The briefing cron runs in UTC, not local time', project: 'demo', now: NOW });
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'search_memory', { query: 'briefing cron' }), call('t2', 'note', { text: "found the cron; next: it's timezone" })]),
+        reply('tool_use', [call('t3', 'finish', { status: 'DONE' }), call('t4', 'finish', { status: 'DONE', report: "## Summary\nthe cron's in UTC\n## Learned\nnone" })]),
+        reply('end_turn', [{ type: 'text', text: 'closed' }]),
+      ]);
+      const outcome = await runJob(db, id, { send, now: () => NOW });
+
+      const [found, noted] = seen[1].messages.at(-1).content;
+      assert.match(found.content, /briefing cron runs in UTC/);
+      assert.equal(noted.is_error, false, noted.content);
+      assert.match(readFileSync(join(paths().jobs, String(id), 'notes.md'), 'utf8'), /found the cron; next: it's timezone/, 'the words reach the job as written, quotes and all');
+      const [incomplete, closed] = seen[2].messages.at(-1).content;
+      assert.equal(incomplete.is_error, true);
+      assert.match(incomplete.content, /finish is missing what it needs: \["status","report"\]/);
+      assert.equal(closed.is_error, false, closed.content);
+      assert.equal(outcome.job.status, 'done');
+      assert.equal(seen.length, 3, 'a job that closed itself is not told to close it');
+      assert.match(readFileSync(join(paths().jobs, String(id), 'report.md'), 'utf8'), /the cron's in UTC/);
+      assert.deepEqual(readdirSync(join(paths().jobs, String(id))).filter((f) => f.startsWith('.')), [], 'nothing the tools wrote is left behind');
     } finally {
       db.close();
     }
