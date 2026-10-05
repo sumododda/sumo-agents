@@ -9,6 +9,7 @@ import { createInterface } from 'node:readline/promises';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
 import { resolveAnthropicCredential } from './auth.mjs';
+import { assertOn, discoverModels, discoverySummary, knownModel, MODELS, modelsChecked, modelStates } from './catalog.mjs';
 import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mjs';
 import { stopLocalServer } from './local-server.mjs';
 import { UsageError } from './memory.mjs';
@@ -199,6 +200,7 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
       ? 'model     not downloaded — SUMO_AGENTS_MODEL_CMD is set (unset it, or pass --model-source, to fetch it)'
       : await ensureModel(db, { modelSource: source });
   }
+  const modelsLine = await checkModels(db);
   db.close();
 
   // Written aside and renamed in, so a hook running the launcher mid-setup never reads half a script.
@@ -209,6 +211,7 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
 
   const lines = [`home      ${p.home}`, `database  ${p.db}`, `launcher  ${p.launcher}`];
   if (modelLine) lines.push(modelLine);
+  lines.push(modelsLine);
   if (!llama) lines.push('llama-server not found — brew install llama.cpp');
   if (link) {
     const dir = binDir ?? pickBinDir();
@@ -220,6 +223,18 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
     }
   }
   return lines;
+}
+
+/**
+ * Which of Sumo's models this credential can use, asked of the API the first time only: a later setup
+ * leaves the switches as they are, since the user may have set some by hand — `sumo models discover` asks again.
+ * Never throws: a check that could not be made is not a reason for `sumo setup` to fail.
+ */
+async function checkModels(db) {
+  const checked = modelsChecked(db);
+  if (checked) return `models    checked ${checked.slice(0, 10)} — sumo models discover to check again`;
+  const result = await discoverModels(db);
+  return result.ok ? `models    ${discoverySummary(result)}` : `models    not checked — ${result.error}`;
 }
 
 function commandOnPath(name) {
@@ -253,17 +268,35 @@ export function doctor() {
 
   let db = null;
   // Read here, inside the one guarded open: a database that will not open is a failed check, not the end of the report.
-  let stored = { modelFile: null, llama: null };
+  let stored = { modelFile: null, llama: null, models: null, checked: null, configured: [] };
   try {
     db = openDb();
     const options = db.prepare('PRAGMA compile_options').all().map((r) => Object.values(r)[0]);
     check(options.includes('ENABLE_FTS5'), 'SQLite full-text search (FTS5)', 'this Node build lacks FTS5 — use the official nodejs.org build');
     check(schemaVersion(db) === SCHEMA_VERSION, `schema version ${schemaVersion(db)}`, 'database is from a newer sumo-agents — update this repo');
-    stored = { modelFile: getMeta(db, 'config.model.file'), llama: getMeta(db, 'llama.path') };
+    const setting = (key) => getMeta(db, `config.${key}`) ?? CONFIG_DEFAULTS[key];
+    stored = {
+      modelFile: getMeta(db, 'config.model.file'),
+      llama: getMeta(db, 'llama.path'),
+      models: modelStates(db),
+      checked: modelsChecked(db),
+      configured: ['chat.model', 'scribe.model', 'dream.model'].map((key) => [key, setting(key)]),
+    };
   } catch (cause) {
     check(false, 'database opens', cause.message);
   } finally {
     db?.close();
+  }
+
+  // The models the chat, the router and the passes may use: none on means nothing can run, and a setting naming one that is off runs nothing either.
+  if (stored.models) {
+    const on = MODELS.filter((name) => stored.models[name].on);
+    const off = MODELS.filter((name) => !stored.models[name].on);
+    check(on.length > 0, `models on: ${on.join(', ') || 'none'}${off.length > 0 ? `; off: ${off.join(', ')}` : ''}`, 'sumo models enable <name>');
+    check(stored.checked !== null, `models checked against the API${stored.checked ? ` (${stored.checked.slice(0, 10)})` : ''}`, 'run: sumo models discover', true);
+    for (const [key, value] of stored.configured) {
+      if (MODELS.includes(value)) check(stored.models[value].on, `${key} is on (${value})`, `sumo models enable ${value}, or sumo config ${key} <name>`);
+    }
   }
 
   const mode = (file) => (existsSync(file) ? statSync(file).mode & 0o777 : null);
@@ -329,9 +362,20 @@ export function config(key, value) {
     if (!Object.hasOwn(CONFIG_DEFAULTS, key)) {
       throw new UsageError(`unknown setting "${key}" — one of: ${Object.keys(CONFIG_DEFAULTS).join(', ')}`);
     }
-    // A budget that is not a number would be no budget at all: every session's block would carry every preference.
-    if (key === 'prime.budget' && value !== undefined) positiveInteger(value, 'prime.budget needs a positive number');
-    if (value !== undefined) setMeta(db, `config.${key}`, value);
+    if (value !== undefined) {
+      // A budget that is not a number would be no budget at all: every session's block would carry every preference.
+      if (key === 'prime.budget') positiveInteger(value, 'prime.budget needs a positive number');
+      // A model is one Sumo knows and one that is on; the passes also take `local` and `off`, the chat `auto`.
+      if (key === 'chat.model' && value !== 'auto') {
+        knownModel(value, ['auto']);
+        assertOn(db, value);
+      }
+      if ((key === 'scribe.model' || key === 'dream.model') && value !== 'local' && value !== 'off') {
+        knownModel(value, ['local', 'off']);
+        assertOn(db, value);
+      }
+      setMeta(db, `config.${key}`, value);
+    }
     return [shown(key)];
   } finally {
     db.close();
