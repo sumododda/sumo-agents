@@ -2,9 +2,7 @@
 // and a credential is there to pay for it.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { sandbox } from './helpers.mjs';
-
-const NO_KEY = { ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '' };
+import { NO_KEY, sandbox } from './helpers.mjs';
 
 test('by default the writer asks the local model, thinking on, and the ledger says so', () => {
   const s = sandbox();

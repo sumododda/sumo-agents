@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { ENTRY, REPO_ROOT } from '../src/paths.mjs';
 
+/** An empty credential environment: no ambient token decides whether a test pays for a fallback call. */
+export const NO_KEY = { ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '' };
+
 /** A throwaway home, so no test ever touches the real ~/.sumo-agents. */
 export function sandbox() {
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-test-'));
@@ -15,6 +18,7 @@ export function sandbox() {
   const routerAnswer = join(root, 'router-answer.json');
   const env = {
     ...process.env,
+    ...NO_KEY,
     SUMO_AGENTS_HOME: home,
     SUMO_AGENTS_SPAWN_LOG: spawnLog,
     SUMO_AGENTS_MODEL_CMD: join(REPO_ROOT, 'test', 'fixtures', 'model-stub.mjs'),
