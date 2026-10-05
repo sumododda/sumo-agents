@@ -9,7 +9,7 @@ import { setModel } from '../src/catalog.mjs';
 import { openDb } from '../src/db.mjs';
 import { add, UsageError } from '../src/memory.mjs';
 import { jobPrinter } from '../src/chat.mjs';
-import { takeInbox, tell } from '../src/jobs.mjs';
+import { getJob, takeInbox, tell } from '../src/jobs.mjs';
 import { converse, jobParams, markTail, runJob, runLines } from '../src/loop.mjs';
 import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
@@ -608,6 +608,36 @@ test('a job closes, notes and reads memory with tools of its own: each runs the 
       assert.equal(seen.length, 3, 'a job that closed itself is not told to close it');
       assert.match(readFileSync(join(paths().jobs, String(id), 'report.md'), 'utf8'), /the cron's in UTC/);
       assert.deepEqual(readdirSync(join(paths().jobs, String(id))).filter((f) => f.startsWith('.')), [], 'nothing the tools wrote is left behind');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a worker cannot take its own work unverified: the finish tool has no way to, and the shell refuses it', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const { id } = seed(db);
+      const params = jobParams({ job: { agent: 'worker', model: 'sonnet', effort: 'medium' }, text: 'x', system: 'rules' });
+      assert.deepEqual(Object.keys(params.tools.find((t) => t.name === 'finish').input_schema.properties), ['status', 'report']);
+      const { send, seen } = canned([
+        reply('tool_use', [
+          call('t1', 'bash', { command: `sumo job finish ${id} --status DONE --accept "trust me" <<'EOF'\n## Summary\nok\nEOF` }),
+          call('t2', 'finish', { status: 'DONE', report: '## Summary\nok', accept: 'trust me' }),
+        ]),
+        reply('end_turn', []),
+        reply('end_turn', []),
+      ]);
+      await runJob(db, id, { send, now: () => NOW });
+      const [viaShell, viaTool] = seen[1].messages.at(-1).content;
+      assert.equal(viaShell.is_error, true);
+      assert.match(viaShell.content, /^Refused: work is never taken unverified on its author's word/);
+      // The accept the model slipped in is not passed on: DONE has to be verified, this job cannot be, so it stays open.
+      assert.equal(viaTool.is_error, true);
+      assert.match(viaTool.content, /cannot be verified/);
+      assert.equal(getJob(db, id).status, 'running');
+      assert.equal(existsSync(join(paths().jobs, String(id), 'report.md')), false);
     } finally {
       db.close();
     }

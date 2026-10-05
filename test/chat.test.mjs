@@ -550,7 +550,7 @@ test('a delegated brief becomes a job on the route the router chose, and the rep
       ]);
       // The job closes itself as its brief says, before its last word: what `sumo job finish` does from its shell.
       const send = (params, options) => {
-        if (/^# Job j1 /.test(params.messages[0]?.content?.[0]?.text ?? '')) finish(db, 1, { status: 'DONE', report: '## Summary\nbriefings go out from src/send.mjs' }, NOW);
+        if (/^# Job j1 /.test(params.messages[0]?.content?.[0]?.text ?? '')) finish(db, 1, { status: 'DONE', report: '## Summary\nbriefings go out from src/send.mjs\nthe key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789' }, NOW);
         return replay(params, options);
       };
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
@@ -565,6 +565,7 @@ test('a delegated brief becomes a job on the route the router chose, and the rep
       const done = seen[3].messages.at(-1).content[0];
       assert.match(done.content, /^STATUS: DONE — j1/);
       assert.match(done.content, /## Summary\nbriefings go out from src\/send\.mjs/, 'the report itself, not a pointer to it');
+      assert.match(done.content, /the key is \[redacted\]/, 'a report is model-written: redacted like any tool output');
       assert.deepEqual(db.prepare('SELECT id, agent, status FROM jobs').all().map((j) => ({ ...j })), [{ id: 1, agent: 'scout', status: 'done' }]);
     } finally {
       db.close();
