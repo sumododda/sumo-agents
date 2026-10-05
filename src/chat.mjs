@@ -290,7 +290,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           },
         });
         const report = reportOf(id);
-        return { content: cap([...warnings, ...runLines(outcome), ...(report ? ['', report] : [])].join('\n')) };
+        // Model-written, like any tool output: redacted before it reaches the chat's context.
+        return { content: capRedacted([...warnings, ...runLines(outcome), ...(report ? ['', report] : [])].join('\n')) };
       } finally {
         jobs.delete(id);
         watch({ type: 'job-end', job: id });

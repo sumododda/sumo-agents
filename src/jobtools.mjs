@@ -22,12 +22,8 @@ const VERIFY = tool('verify', "Run the project's checks now and see the verdict 
 const FINISH = tool(
   'finish',
   "Close the job — the last thing you do, or nobody knows it ended. A worker's DONE runs the project's checks first and is refused while something new fails.",
-  {
-    status: { type: 'string', enum: ['DONE', 'FAILED'] },
-    report: text('the report, in the shape the brief gives'),
-    accept: text('worker only, rarely: why the work is taken as it stands when it cannot be verified'),
-  },
-  ['status', 'report'],
+  // No way to take the work unverified: that is for the user or the main agent to grant, never the author.
+  { status: { type: 'string', enum: ['DONE', 'FAILED'] }, report: text('the report, in the shape the brief gives') },
 );
 
 /** A role's job tools, in a fixed order so its cached prefix never moves. */
@@ -57,7 +53,7 @@ function commandFor(call, job) {
       return { args: ['job', 'verify', id], checks: true };
     case 'finish':
       if (!['DONE', 'FAILED'].includes(input.status) || !given(input.report)) return null;
-      return { args: ['job', 'finish', id, '--status', input.status, ...(given(input.accept) ? ['--accept', input.accept] : [])], stdin: input.report, checks: true };
+      return { args: ['job', 'finish', id, '--status', input.status], stdin: input.report, checks: true };
     default:
       return null;
   }

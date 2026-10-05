@@ -66,6 +66,9 @@ export function jobParams({ job, text, system = systemPrompt() }) {
   return paramsFor({ model: job.model, effort: job.effort, tools: [...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent)], text, system });
 }
 
+/** A job granting itself DONE without verification, through the shell: `--accept` is the user's to give, not the author's. */
+const SELF_ACCEPT = /\bsumo\b[\s\S]*\bfinish\b[\s\S]*--accept\b/;
+
 /** Said once to a job that ended its turn with the job still open: it finished the work but never said so. */
 const UNCLOSED = 'You ended without closing the job. Call `finish` now — DONE or FAILED, with your report — or `ask` if you are blocked.';
 
@@ -217,7 +220,9 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   // and with the job's own project in scope whether or not its card came up in the session.
   const gate = (call) => {
     if (isJobTool(call)) return runJobTool(call, { job, ctx, signal });
-    if (call.name !== BASH_TOOL.name || !job.session_id) return null;
+    if (call.name !== BASH_TOOL.name) return null;
+    if (SELF_ACCEPT.test(String(call.input?.command ?? ''))) return { content: 'Refused: work is never taken unverified on its author\'s word. Finish FAILED with what blocks verification, or ask.', isError: true };
+    if (!job.session_id) return null;
     const held = handleEvent(db, 'pre-tool', { session_id: job.session_id, agent_id: `j${id}`, project: job.project, cwd: project.path, tool_name: 'bash', tool_input: { command: String(call.input?.command ?? '') } }, now?.());
     return held ? { content: JSON.parse(held).deny, isError: true } : null;
   };
