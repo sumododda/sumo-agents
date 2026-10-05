@@ -8,7 +8,7 @@ import { dreamStatus, runDream } from './dream.mjs';
 import { backup, exportJson, exportMarkdown } from './export.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
 import { chat, jobPrinter } from './chat.mjs';
-import { closeJobTab, reportAgent, runHerdr } from './herdr.mjs';
+import { reportAgent, runHerdr } from './herdr.mjs';
 import { runHook } from './hooks.mjs';
 import { runJob as runJobLoop, runLines } from './loop.mjs';
 import * as jobs from './jobs.mjs';
@@ -328,7 +328,6 @@ function tabBegins(db, job, print) {
 function tabEnds(job, status) {
   process.stdin.pause();
   reportAgent(runHerdr, process.env, { job, state: job.status === 'needs_input' ? 'blocked' : 'idle', message: status });
-  closeJobTab(runHerdr, process.env, job);
 }
 
 async function runJob(db, { args, flags }) {
@@ -367,28 +366,21 @@ async function runJob(db, { args, flags }) {
     case 'run': {
       // The job runs here, in Sumo's own loop, on the route the router chose; it closes itself the way its brief says.
       // On a terminal the work is shown as it happens — the lines a Herdr pane shows; piped, only how it ended.
+      if (!resolveAnthropicCredential()) {
+        throw new UsageError(`j${id} not started — this shell has no Anthropic credential. Inside the chat, the delegate tool runs it; in a terminal, export CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY first`);
+      }
+      const watch = process.stdout.isTTY ? jobPrinter((t) => process.stdout.write(t), styles(colourEnabled())) : {};
+      // Ctrl-C stops the run the way Esc stops one in the chat: what it started is stopped, and how it ended is still said.
+      const stop = new AbortController();
+      const interrupt = () => stop.abort();
+      process.once('SIGINT', interrupt);
       let outcome;
       try {
-        if (!resolveAnthropicCredential()) {
-          throw new UsageError(`j${id} not started — this shell has no Anthropic credential. Inside the chat, type \`sumo job run ${id}\` on its own; in a terminal, export CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY first`);
-        }
-        const watch = process.stdout.isTTY ? jobPrinter((t) => process.stdout.write(t), styles(colourEnabled())) : {};
-        // Ctrl-C stops the run the way Esc stops one in the chat: what it started is stopped, and how it ended is still written down.
-        const stop = new AbortController();
-        const interrupt = () => stop.abort();
-        process.once('SIGINT', interrupt);
-        try {
-          outcome = await runJobLoop(db, id, { ...watch, signal: stop.signal, ...(process.stdout.isTTY ? { onStart: (job) => tabBegins(db, job, watch.onStart) } : {}) });
-        } finally {
-          process.off('SIGINT', interrupt);
-        }
-      } catch (cause) {
-        // A chat waiting on this run's tab reads how it ended from disk; a run that never began has to say so there too.
-        jobs.recordOutcome(id, [cause.message]);
-        throw cause;
+        outcome = await runJobLoop(db, id, { ...watch, signal: stop.signal, ...(process.stdout.isTTY ? { onStart: (job) => tabBegins(db, job, watch.onStart) } : {}) });
+      } finally {
+        process.off('SIGINT', interrupt);
       }
       const lines = runLines(outcome);
-      jobs.recordOutcome(id, lines);
       tabEnds(outcome.job, lines[0]);
       return lines;
     }
@@ -402,7 +394,7 @@ async function runJob(db, { args, flags }) {
       return [`STATUS: NEEDS_INPUT — j${id}. Stop now; you will be resumed with the answer.`];
     case 'answer':
       jobs.answer(db, id, stdinText(flags));
-      return [`answered j${id}. Continue it: sumo job run ${id}   (the brief now carries the answer)`];
+      return [`answered j${id}. Continue it: delegate with job ${id}, or sumo job run ${id} in a terminal   (the brief now carries the answer)`];
     case 'tell':
       jobs.tell(db, id, stdinText(flags));
       return [`told j${id} — it reads it with its next request`];
