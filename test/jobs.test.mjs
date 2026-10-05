@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { sandbox } from './helpers.mjs';
+import { NO_KEY, sandbox } from './helpers.mjs';
 
 const TASK = `## Goal
 Migrate the project from npm to pnpm.
@@ -176,7 +176,7 @@ test('a job run in a shell with no Anthropic credential is refused in one line, 
   s.routerWillSay('haiku', 'none');
   withSimba(s);
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
-  const run = s.sumo(['job', 'run', '1'], { extraEnv: { ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '' } });
+  const run = s.sumo(['job', 'run', '1'], { extraEnv: NO_KEY });
   assert.notEqual(run.code, 0);
   assert.match(run.err, /j1 not started — this shell has no Anthropic credential\. Inside the chat, type `sumo job run 1` on its own/);
   assert.match(s.sumo(['job', 'show', '1']).out, /running/, 'the job is left as it was');
@@ -188,20 +188,19 @@ test('a run that never starts still leaves how it ended on disk, so a chat waiti
   withSimba(s);
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
   const outcome = join(s.home, 'jobs', '1', 'outcome.txt');
-  const noCredential = { ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '' };
 
-  assert.notEqual(s.sumo(['job', 'run', '1'], { extraEnv: noCredential }).code, 0);
+  assert.notEqual(s.sumo(['job', 'run', '1'], { extraEnv: NO_KEY }).code, 0);
   assert.match(readFileSync(outcome, 'utf8'), /^j1 not started — this shell has no Anthropic credential/);
 
   // A job that is over cannot be run; the reason reaches the same place.
   s.sumo(['job', 'abandon', '1']);
-  const closed = s.sumo(['job', 'run', '1'], { extraEnv: { ...noCredential, ANTHROPIC_API_KEY: 'sk-ant-test' } });
+  const closed = s.sumo(['job', 'run', '1'], { extraEnv: { ...NO_KEY, ANTHROPIC_API_KEY: 'sk-ant-test' } });
   assert.notEqual(closed.code, 0);
   assert.match(closed.err, /j1 is abandoned — only a running job can be run/);
   assert.match(readFileSync(outcome, 'utf8'), /^j1 is abandoned — only a running job can be run/);
 
   // A job that does not exist has nobody waiting on it, and nowhere to write: the refusal is still the one about the job.
-  assert.match(s.sumo(['job', 'run', '99'], { extraEnv: { ...noCredential, ANTHROPIC_API_KEY: 'sk-ant-test' } }).err, /^sumo: no job j99\n$/);
+  assert.match(s.sumo(['job', 'run', '99'], { extraEnv: { ...NO_KEY, ANTHROPIC_API_KEY: 'sk-ant-test' } }).err, /^sumo: no job j99\n$/);
 });
 
 test('a job that cannot be set up is not left behind as an open job with no brief', () => {
