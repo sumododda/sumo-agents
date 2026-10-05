@@ -101,7 +101,7 @@ function Item({ item }) {
   if (item.kind === 'user') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, '> '), h(Text, { dimColor: true }, item.text));
   if (item.kind === 'text') return h(Reply, item);
   if (item.kind === 'tool') return h(Tool, item);
-  if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, null, h(Text, { color: ACCENT }, '⏺ '), h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, item.pane ? h(Text, { dimColor: true }, ' · in its Herdr tab, on the left') : null));
+  if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, null, h(Text, { color: ACCENT }, '⏺ '), h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`));
   if (item.kind === 'said') return h(Box, { marginLeft: 2 }, h(Text, { dimColor: true }, item.text));
   if (item.kind === 'error') return h(Box, { marginTop: 1 }, h(Text, { color: 'red' }, item.text));
   return h(Text, { dimColor: true }, `  ⎿  ${item.text.split('\n').join('\n     ')}`);
@@ -144,9 +144,9 @@ function Menu({ menu, pick }) {
   );
 }
 
-function Status({ session, leaving, notice, full, job }) {
+function Status({ session, leaving, notice, full, jobs }) {
   const size = session.contextTokens >= 1000 ? ` · ${Math.round(session.contextTokens / 1000)}k context` : '';
-  const hint = leaving ? 'Ctrl-C again to leave' : notice ? notice : job ? `@ message talks to j${job} · ctrl-o ${full ? 'to fold' : 'full output'}` : full ? 'full output · ctrl-o to fold' : '/ commands · ! shell · \\⏎ new line · ctrl-v image · ctrl-o full output';
+  const hint = leaving ? 'Ctrl-C again to leave' : notice ? notice : jobs.length > 0 ? `${jobs.length === 1 ? `@ message talks to j${jobs[0]}` : '@j<id> message talks to that job'} · ctrl-o ${full ? 'to fold' : 'full output'}` : full ? 'full output · ctrl-o to fold' : '/ commands · ! shell · \\⏎ new line · ctrl-v image · ctrl-o full output';
   // In a narrow window the hints give way; the model and the size of the context never fold.
   return h(
     Box,
@@ -183,7 +183,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
   // What the screen holds between draws. Keys and the session's events both write here, in the order they happen, and then ask for a draw.
   // `log` is what happened, as it was said; `items` is the log drawn for this window, and is drawn again when the window or the view changes.
   const st = useRef(null);
-  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, tokens: 0, running: null, job: null, jobRunning: null, reply: null, fresh: true, leaving: null, gone: false };
+  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, tokens: 0, running: null, jobs: new Map(), reply: null, fresh: true, leaving: null, gone: false };
   const state = st.current;
   state.columns = columns;
   state.rows = rows;
@@ -345,8 +345,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       record({ kind: 'error', text: `error: ${cause.message}` });
     } finally {
       state.running = null;
-      state.job = null;
-      state.jobRunning = null;
+      state.jobs.clear();
       state.working = null;
       redraw();
       if (state.gone) exit();
@@ -359,13 +358,13 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
     // For a job, not for the chat: `@j31 …` reaches that job wherever it runs, a bare `@…` the one running here.
     // A job that cannot be told anything — closed by now, or never there — is said back, whichever way it was named.
     const named = /^@j?(\d+)\s+(\S[\s\S]*)$/.exec(line);
-    const said = named ? named[2].trim() : state.job && line.startsWith('@') ? line.slice(1).trim() : '';
+    const said = named ? named[2].trim() : state.jobs.size > 0 && line.startsWith('@') ? line.slice(1).trim() : '';
     if (said) {
       // A job is told words only; a picture would be dropped without a word.
       if (picturesIn(said).length > 0) return record({ kind: 'error', text: 'a job is told words only — send the picture to the chat, without the @' });
       try {
         const told = named ? session.tell(said, Number(named[1])) : session.tell(said);
-        if (told) return record({ kind: 'user', text: `@j${named ? named[1] : state.job} ${said}` });
+        if (told) return record({ kind: 'user', text: `@j${told} ${said}` });
       } catch (cause) {
         return record({ kind: 'error', text: cause.message });
       }
@@ -390,7 +389,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       redraw();
     };
     const onTool = ({ call, job }) => {
-      if (job) state.jobRunning = call;
+      if (job) state.jobs.set(job, call);
       else {
         closeReply();
         state.running = call;
@@ -398,18 +397,18 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       redraw();
     };
     const onResult = ({ call, result, job }) => {
-      if (job) state.jobRunning = null;
-      else state.running = null;
+      if (job) state.jobs.set(job, null);
+      // Delegated jobs run side by side: one ending leaves the others' calls on the screen.
+      else if (state.running?.id === call.id) state.running = null;
       record({ kind: 'tool', call, result, job });
     };
-    const onJob = ({ job, pane = null }) => {
-      state.job = job.id;
-      record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job), pane });
+    const onJob = ({ job }) => {
+      state.jobs.set(job.id, null);
+      record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job) });
     };
     const onSaid = ({ text }) => record({ kind: 'said', text });
-    const onJobEnd = () => {
-      state.job = null;
-      state.jobRunning = null;
+    const onJobEnd = ({ job }) => {
+      state.jobs.delete(job);
       redraw();
     };
     const onUsage = ({ totals }) => {
@@ -510,7 +509,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
     h(Static, { key: state.epoch, items: state.items }, (item) => h(Item, { key: item.id, item })),
     tail ? h(Reply, { text: tail, first: state.fresh }) : null,
     state.running ? h(Tool, { view: toolView(state.running), running: true }) : null,
-    state.jobRunning ? h(Tool, { view: toolView(state.jobRunning), running: true, nested: true }) : null,
+    ...[...state.jobs.values()].filter(Boolean).map((call) => h(Tool, { key: call.id, view: toolView(call), running: true, nested: true })),
     state.working ? h(Working, { messages, first: state.working, tokens: state.tokens }) : null,
     h(Room, { logo, rows, from: state.used }),
     h(
@@ -518,7 +517,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       { flexDirection: 'column', marginTop: 1 },
       ...state.queue.map(({ line }, i) => h(Text, { key: i, dimColor: true }, `  queued: ${line}`)),
       h(Input, { state: state.ed, width: columns }),
-      menu.length > 0 ? h(Menu, { menu, pick: state.ed.pick }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, full: state.full, job: state.job }),
+      menu.length > 0 ? h(Menu, { menu, pick: state.ed.pick }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, full: state.full, jobs: [...state.jobs.keys()] }),
     ),
   );
 }

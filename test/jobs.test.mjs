@@ -32,6 +32,7 @@ test('a brief carries the task, what memory knows about the project, and how to 
   const s = sandbox();
   s.routerWillSay('sonnet', 'medium');
   const dir = withSimba(s);
+  s.sumo(['add', 'preference', 'Never add AI attribution to commits']);
 
   const created = s.sumo(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm', '--agent', 'worker'], { input: TASK });
   assert.equal(created.code, 0, created.err);
@@ -47,9 +48,11 @@ test('a brief carries the task, what memory knows about the project, and how to 
   assert.match(brief, /gotcha m\d+: time-zone tests need SIMBA_TZ exported/);
   assert.match(brief, /commands: test `make test`/);
   assert.match(brief, /## Goal\nMigrate the project from npm to pnpm\./);
-  assert.match(brief, /sumo job finish 1 --status DONE/);
+  assert.match(brief, /close the job, or nobody knows it ended: `finish` with DONE/);
+  assert.doesNotMatch(brief, /sumo job/, 'the job is worked with its own tools, not commands it must remember to type');
   assert.match(brief, /You never write it\./);
-  assert.match(brief, /each major milestone.*sumo job note/, 'a worker notes milestones without being asked');
+  assert.match(brief, /## The user's standing rules — they hold here too\n- m\d+ Never add AI attribution to commits/, "the user's own rules go with every job, not only the project's");
+  assert.match(brief, /each major milestone.*`note`/, 'a worker notes milestones without being asked');
   assert.match(brief, /Every message and report: short lines, facts only\. No prose/, 'reports stay terse');
 });
 
@@ -101,8 +104,7 @@ test('cold restart: the brief replays the answers and the progress notes', () =>
 
   assert.equal(s.sumo(['job', 'answer', '1'], { input: '' }).code, 2);
   const answered = s.sumo(['job', 'answer', '1'], { input: 'Pin pnpm 9.' });
-  assert.match(answered.out, /sumo job run \d+/);
-  assert.match(answered.out, /Continue it: sumo job run 1/);
+  assert.match(answered.out, /Continue it: delegate with job 1, or sumo job run 1 in a terminal/);
   assert.match(s.sumo(['job', 'list']).out, /^j1 \[worker·proj-simba·running\]/);
 
   const brief = s.sumo(['job', 'brief', '1']).out;
@@ -178,28 +180,19 @@ test('a job run in a shell with no Anthropic credential is refused in one line, 
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
   const run = s.sumo(['job', 'run', '1'], { extraEnv: NO_KEY });
   assert.notEqual(run.code, 0);
-  assert.match(run.err, /j1 not started — this shell has no Anthropic credential\. Inside the chat, type `sumo job run 1` on its own/);
+  assert.match(run.err, /j1 not started — this shell has no Anthropic credential\. Inside the chat, the delegate tool runs it/);
   assert.match(s.sumo(['job', 'show', '1']).out, /running/, 'the job is left as it was');
 });
 
-test('a run that never starts still leaves how it ended on disk, so a chat waiting on its tab is not left waiting', () => {
+test('a job that is over, or not there, is refused by name before anything runs', () => {
   const s = sandbox();
   s.routerWillSay('haiku', 'none');
   withSimba(s);
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
-  const outcome = join(s.home, 'jobs', '1', 'outcome.txt');
-
-  assert.notEqual(s.sumo(['job', 'run', '1'], { extraEnv: NO_KEY }).code, 0);
-  assert.match(readFileSync(outcome, 'utf8'), /^j1 not started — this shell has no Anthropic credential/);
-
-  // A job that is over cannot be run; the reason reaches the same place.
   s.sumo(['job', 'abandon', '1']);
   const closed = s.sumo(['job', 'run', '1'], { extraEnv: { ...NO_KEY, ANTHROPIC_API_KEY: 'sk-ant-test' } });
   assert.notEqual(closed.code, 0);
   assert.match(closed.err, /j1 is abandoned — only a running job can be run/);
-  assert.match(readFileSync(outcome, 'utf8'), /^j1 is abandoned — only a running job can be run/);
-
-  // A job that does not exist has nobody waiting on it, and nowhere to write: the refusal is still the one about the job.
   assert.match(s.sumo(['job', 'run', '99'], { extraEnv: { ...NO_KEY, ANTHROPIC_API_KEY: 'sk-ant-test' } }).err, /^sumo: no job j99\n$/);
 });
 

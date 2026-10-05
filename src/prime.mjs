@@ -53,7 +53,8 @@ export function prime(db, { budget, now = new Date().toISOString() } = {}) {
   return wrap([...kept, more]);
 }
 
-function preferences(db, room) {
+/** The user's global preferences and decisions under a budget: a heading, then one line each. */
+export function preferences(db, room) {
   const rows = db
     .prepare(
       `SELECT * FROM memories WHERE scope = 'global' AND state = 'active' AND type IN ('preference', 'decision')

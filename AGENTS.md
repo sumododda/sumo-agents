@@ -18,8 +18,8 @@ A project's card arrives when it first comes up; for one that has not, `sumo pro
 
 ## Work
 Small or sequential → do it yourself, absolute paths. Big, parallel, context-heavy, or the context
-nudge has fired → delegate: `scout` looks, `worker` builds, `reviewer` judges. A job is a written brief
-(`sumo job new`) run with `sumo job run <id>` — read guides/delegation.md first.
+nudge has fired → the `delegate` tool: `scout` looks, `worker` builds, `reviewer` judges. Several calls
+run at once — read guides/delegation.md first.
 
 ## Context
 A line saying how big the context is means: finish the piece in hand, note where you are, and ask the

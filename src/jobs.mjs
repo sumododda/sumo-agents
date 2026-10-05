@@ -1,10 +1,11 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
 import { tx } from './db.mjs';
 import { UsageError } from './memory.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
+import { preferences } from './prime.mjs';
 import { getProject } from './projects.mjs';
 import { chooseRoute, statsLines } from './route.mjs';
 import { verifyCommands } from './scan.mjs';
@@ -17,6 +18,8 @@ const AGENTS = ['scout', 'worker', 'reviewer'];
 /** Work with a written way of doing it: guides/<name>.md, carried into the brief on request. */
 const GUIDES = ['fix', 'feature', 'review'];
 const BRIEF_CARD_BUDGET = 400;
+/** The user's own rules — global preferences and decisions — ride with every brief, the way the memory block opens every chat. */
+const BRIEF_RULES_BUDGET = 400;
 const MAX_LEARNED = 5;
 /** A failed job can always be retried; a done one only once review found enough wrong with it. */
 const RETRY_IMPORTANT_THRESHOLD = 3;
@@ -87,43 +90,43 @@ const REPORT = {
 
 /** How a worker's result gets judged. Said up front, because a rule met only at the end reads as a trap. */
 function workerRules(job, { testsMayChange }) {
-  return `- Before you edit anything: \`sumo job baseline ${job.id}\` (allow it ten minutes). It runs the project's checks and records what already fails, so none of that is blamed on you — and nothing you break can hide behind it.
+  return `- Before you edit anything: \`baseline\` (allow it ten minutes). It runs the project's checks and records what already fails, so none of that is blamed on you — and nothing you break can hide behind it.
 - Tests that are already here judge your change; they are not part of it. ${
     testsMayChange
       ? 'This task may change them — say in the report which, and why.'
-      : `Do not edit, skip or delete one. A test that is genuinely wrong, or that contradicts the task: stop and say why with \`sumo job ask ${job.id}\`.`
+      : `Do not edit, skip or delete one. A test that is genuinely wrong, or that contradicts the task: stop and say why with \`ask\`.`
   } Never loosen a lint or type setting, add an ignore, or special-case a test's input to get green.
 - A question you can settle yourself: decide, carry on, and list it under Decisions. Stop and ask only for something destructive or irreversible, security-sensitive, outside this project, or a task so unclear that every path is a guess.
 - You do not start other jobs. Review comes after you, from someone who did not write the code.
-- At each major milestone (a phase of the task done) note one line: \`sumo job note ${job.id}\` — \`<what now works>; next: <step>\`. Nothing else in between.
+- At each major milestone (a phase of the task done) \`note\` one line — \`<what now works>; next: <step>\`. Nothing else in between.
 `;
 }
 
-function renderBrief({ job, project, known, task, guide, change, options = {} }) {
+function renderBrief({ job, project, known, rules, task, guide, change, options = {} }) {
   const closing =
     job.agent === 'worker'
-      ? `\`sumo job finish ${job.id} --status DONE\` (or \`FAILED\`). DONE is not taken on your word: the project's checks are run and compared with the baseline, and it is refused while something new fails. See the verdict first with \`sumo job verify ${job.id}\` (allow it ten minutes). Report on stdin:`
-      : `\`sumo job finish ${job.id} --status DONE\` (or \`FAILED\`), with this report on stdin:`;
+      ? `\`finish\` with DONE (or FAILED). DONE is not taken on your word: the project's checks are run and compared with the baseline, and it is refused while something new fails. See the verdict first with \`verify\` (allow it ten minutes). The report:`
+      : `\`finish\` with DONE (or FAILED), and this report:`;
   return `# Job j${job.id} — ${job.title}
 
 ${ROLE[job.agent]}
-Work only inside: ${project.path}   (always use absolute paths — your shell does not start there)
+Work only inside: ${project.path}   (bash starts there; give files by absolute path)
 
 ## What is already known about this project
 ${known}
-
+${rules ? `\n## The user's standing rules — they hold here too\n${rules}\n` : ''}
 ## The task
 ${task.trim()}
 ${change ? `\n## The change to judge\n${change}\n` : ''}${guide ? `\n## How this kind of work is done here\n${guide}\n` : ''}
 ## How to work
-${job.agent === 'worker' ? workerRules(job, options) : ''}- Worth keeping if you are interrupted — what you found, what you tried, what is left: \`sumo job note ${job.id}\` (text on stdin).
-- Blocked on something only the user can decide: \`sumo job ask ${job.id}\` (one question on stdin), then stop. You will be resumed with the answer.
-- You may read memory: \`sumo search "<words>" --project ${project.slug}\`. You never write it.
-- If a command is refused, carry on another way (grep, a view of a line range). \`sumo\` commands are always allowed, so a refusal never stops you from noting, asking or finishing.
+${job.agent === 'worker' ? workerRules(job, options) : ''}- Worth keeping if you are interrupted — what you found, what you tried, what is left: \`note\`.
+- Blocked on something only the user can decide: \`ask\` (one question), then stop. You will be resumed with the answer.
+- You may read memory: \`search_memory\`. You never write it.
+- If a command is refused, carry on another way (grep, a view of a line range).
 - When finished you must close the job, or nobody knows it ended: ${closing}
 ${REPORT[job.agent]}
 - Every message and report: short lines, facts only. No prose, no preamble, no restating the task.
-- Your final message: the STATUS line, then one line per ${job.agent === 'reviewer' ? 'finding' : 'file changed'}. Nothing else — the report is already on disk.
+- After \`finish\`, stop: the report is your answer, and nothing more is read.
 `;
 }
 
@@ -225,6 +228,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
   // The job's files. If any of them cannot be written the job is taken back: an open job with no brief is worse than no job.
   try {
     const known = card(db, project.slug, { budget: BRIEF_CARD_BUDGET, now }).split('\n').slice(1, -1).join('\n') || 'Nothing yet.';
+    const rules = preferences(db, BRIEF_RULES_BUDGET).slice(1).join('\n');
     mkdirSync(dirOf(job.id), { recursive: true, mode: 0o700 });
     if (agent === 'reviewer' && reviews !== undefined) recordReviewTarget(job.id, reviews);
 
@@ -236,7 +240,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
     // Where a worker starts from, and the checks that judge it there, so what it changed — and only that — can be told apart later.
     // A retry is handed the first attempt's start instead.
     if (agent === 'worker') writeState(job.id, { ...(start ?? { snap: snapshot(project.path), declared: verifyCommands(project.path), baseline: null }), testsMayChange, verdict: null });
-    writeFileSync(fileOf(job.id, 'brief.md'), renderBrief({ job, project, known, task, guide, change, options: { testsMayChange } }), { mode: 0o600 });
+    writeFileSync(fileOf(job.id, 'brief.md'), renderBrief({ job, project, known, rules, task, guide, change, options: { testsMayChange } }), { mode: 0o600 });
   } catch (cause) {
     db.prepare('DELETE FROM jobs WHERE id = ?').run(job.id);
     try {
@@ -412,8 +416,8 @@ const inboxOf = (id) => fileOf(id, 'inbox');
 let told = 0;
 
 /**
- * Something the user says to a running job from outside its process — the chat's `@j31 …` for a job in a
- * Herdr pane, or `sumo job tell` from any shell. One file each, written whole and then given its name, and
+ * Something the user says to a running job from outside its process — the chat's `@j31 …` for a job it is
+ * not running, or `sumo job tell` from any shell. One file each, written whole and then given its name, and
  * named so they sort in the order they were said: the job taking its inbox never reads half a message, and
  * one that arrives while it is taking the others is simply there the next time.
  */
@@ -425,16 +429,6 @@ export function tell(db, id, text, now = new Date().toISOString()) {
   const unnamed = join(inboxOf(id), `.${name}`);
   writeFileSync(unnamed, JSON.stringify({ text: text.trim(), at: now }), { mode: 0o600 });
   renameSync(unnamed, join(inboxOf(id), `${name}.json`));
-}
-
-/** How a run in another process ended — the lines `sumo job run` printed last — for a chat waiting on its pane. */
-export const outcomeFile = (id) => fileOf(id, 'outcome.txt');
-export function recordOutcome(id, lines) {
-  // A job that was never created has no directory, and nobody waiting on it.
-  if (existsSync(dirOf(id))) writeFileSync(outcomeFile(id), `${lines.join('\n')}\n`, { mode: 0o600 });
-}
-export function clearOutcome(id) {
-  if (existsSync(outcomeFile(id))) unlinkSync(outcomeFile(id));
 }
 
 /** What was told to the job since it last looked, taken off the disk so it is read once. A file that is not a message is passed over. */
@@ -564,6 +558,9 @@ export function listJobs(db, { all = false } = {}) {
 export function jobLine(job) {
   return `j${job.id} [${job.agent}·${job.project}·${job.status}] ${job.title}`;
 }
+
+/** The report a job closed with, as its sub-agent wrote it; empty while it has none. */
+export const reportOf = (id) => readOr(fileOf(id, 'report.md')).trim();
 
 /** What the main agent needs to decide its next move — not the whole report. */
 export function show(db, id) {

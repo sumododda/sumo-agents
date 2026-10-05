@@ -5,8 +5,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { getMeta } from './db.mjs';
 import { runDream } from './dream.mjs';
-import { openJobTab, runHerdr } from './herdr.mjs';
-import { clearOutcome, getJob, guideFor, outcomeFile, tell as tellJob } from './jobs.mjs';
+import { getJob, guideFor, newJob, parseJobId, reportOf, tell as tellJob } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
 import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, textOf } from './loop.mjs';
 import { assertOn, MODEL_IDS, MODELS, modelId, usableModels } from './catalog.mjs';
@@ -18,7 +17,7 @@ import { redact } from './redact.mjs';
 import { chooseChatRoute, EFFORTS } from './route.mjs';
 import { outcomeLines, runScribe } from './scribe.mjs';
 import { currentProject } from './sessions.mjs';
-import { BASH_TOOL, cap, capRedacted, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
+import { BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { colourEnabled, createRenderer, header, prompt, renderBlock, styles, widthOf } from './tty.mjs';
 
@@ -27,12 +26,11 @@ import { colourEnabled, createRenderer, header, prompt, renderBlock, styles, wid
  * the session policy raised in process — the memory block first, a project's
  * card when it comes up, a taught workflow before the command it gates, memory
  * before a question goes to the user, the size of the context said once per
- * band — and the scribe woken when a turn ends. A `sumo job run` typed by the
- * model runs here, in this process, so the API key never enters a shell; the
- * job's work is shown as it happens, and the user can talk to it while it runs.
- * Inside Herdr every job gets a tab of its own, listed on the left: without `&`
- * the chat waits for it to close and reads how it ended, with `&` it carries
- * on. Outside Herdr a job runs here, and `&` is refused — Herdr is required.
+ * band — and the scribe woken when a turn ends. Work is handed to sub-agents
+ * with the `delegate` tool: each job runs here, in this process, on its own
+ * route and in a context of its own, so the API key never enters a shell; its
+ * work is shown as it happens, the user can talk to it while it runs, and its
+ * report is the tool's result. Several delegated in one reply run at once.
  */
 
 /** Models that take operator instructions as `role: "system"` messages mid-conversation; the others get them as text in the user turn. */
@@ -42,7 +40,7 @@ const SYSTEM_MESSAGES = new Set([MODEL_IDS.opus, MODEL_IDS.sonnet, MODEL_IDS.fab
 const COMMANDS = {
   fix: (args) => `${guideFor('fix')}\n\nFollow that, in order, for this: ${args}`,
   feature: (args) => `${guideFor('feature')}\n\nFollow that, in order, for this: ${args}`,
-  review: (args) => `Review this: ${args}\nCode written in this session is never reviewed in this session: create a reviewer job (sumo job new --agent reviewer, what was asked on stdin) and run it with sumo job run <id>; then this is how to treat the findings:\n${guideFor('review').replace(/^[\s\S]*?\*\*Receiving a review\.\*\*\s*/, '')}`,
+  review: (args) => `Review this: ${args}\nCode written in this session is never reviewed in this session: delegate it to a reviewer (agent "reviewer", the task what was asked); then this is how to treat the findings:\n${guideFor('review').replace(/^[\s\S]*?\*\*Receiving a review\.\*\*\s*/, '')}`,
   dream: () => 'Run `sumo dream run` and tell me, in a few lines, what it changed and what it wants me to confirm.',
 };
 
@@ -64,9 +62,8 @@ export function commandList(db) {
   ];
 }
 
-const JOB_RUN = /^\s*sumo\s+job\s+run\s+j?(\d+)\s*(&?)\s*$/;
-/** The same command anywhere inside a longer one — piped, chained, under nohup: there it would start in the shell, which is given no credential. */
-const JOB_RUN_INSIDE = /\bsumo\s+job\s+run\b/;
+/** A job is run with `delegate`, never from the shell: there it would be an agent in a shell of its own, holding no credential. */
+const JOB_RUN = /(?:^|[\n;&|(`]|\$\()\s*(?:\w+=\S*\s+|nohup\s+|exec\s+)*sumo\s+job\s+(run|new)\b/;
 /** A cheap-model pass the model asks for: run here too, since the shell it would start in holds no credential. */
 const PASS_RUN = /^\s*sumo\s+(scribe|dream)\s+run\s*$/;
 
@@ -86,6 +83,7 @@ const asText = (text) => ({ role: 'user', content: [{ type: 'text', text: `<sumo
 /** One line per tool call, so the user can watch the work: the command, or the edit and its file. */
 export function describeCall(call) {
   if (call.name === BASH_TOOL.name) return `$ ${String(call.input?.command ?? '').split('\n')[0].slice(0, 120)}`;
+  if (call.name === DELEGATE_TOOL.name) return call.input?.job !== undefined ? `delegate j${call.input.job}` : `delegate ${call.input?.agent ?? 'worker'} — ${call.input?.title ?? ''}`;
   if (call.name === EDITOR_TOOL.name) return `${call.input?.command ?? 'edit'} ${call.input?.path ?? ''}${Array.isArray(call.input?.view_range) ? `:${call.input.view_range.join('-')}` : ''}`;
   return call.name;
 }
@@ -150,12 +148,11 @@ function configured(db, key) {
  * result, and the running totals, for a screen that shows the work — and, for
  * a job run here, the job as it starts, its calls and results (marked with its
  * id), what it says, and its end. `tell(text)` talks to the job running here;
- * `tell(text, id)` to any open job, through its inbox on disk. `herdr` runs
- * the Herdr CLI and `env` says whether this is a Herdr pane — both swapped in
- * tests; `poll` is how often a pane job is checked for its end. `route` is the
- * router asked for each turn's model when the model is `auto`.
+ * `tell(text, id)` to any open job, through its inbox on disk if it runs
+ * elsewhere. `route` is the router asked for each turn's model when the model
+ * is `auto`.
  */
-export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, herdr = runHerdr, env = process.env, poll = 500, route = chooseChatRoute, now = () => new Date().toISOString() } = {}) {
+export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, route = chooseChatRoute, now = () => new Date().toISOString() } = {}) {
   model ??= configured(db, 'chat.model');
   // A model the user turned off is not chatted on, however the chat came to be on it; auto reads the switches each turn.
   if (model !== 'auto' && MODELS.includes(model)) assertOn(db, model, 'sumo config chat.model <name>');
@@ -165,16 +162,17 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   /** On auto, the route the last turn ran on; null otherwise. */
   let routed = null;
   const system = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim();
-  const tools = [BASH_TOOL, EDITOR_TOOL];
+  const tools = [BASH_TOOL, EDITOR_TOOL, DELEGATE_TOOL];
   let sessionId;
   let params;
   let transcript;
   let lastContext = 0;
   let project = null;
   let stopper = null;
-  /** What the user has said to the job running here that it has not read yet; null while no job runs. */
-  let inbox = null;
-  let running = null;
+  /** The jobs running here, each with what the user has said to it that it has not read yet. */
+  const jobs = new Map();
+  /** The projects a worker is running in: two in one working tree overwrite each other. */
+  const workers = new Set();
   /** The memory page, once /memory has asked for it: the promise of its address. */
   let page = null;
   const ledger = { kind: 'chat', sessionId: null };
@@ -228,8 +226,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return project ? contextFor(project) : contextFor({ path: cwd });
   }
 
-  /** The workflow gate and the in-process job run; anything else is the tool's own business. */
+  /** The workflow gate, the cheap-model passes and `delegate`; anything else is the tool's own business. */
   async function beforeTool(call) {
+    if (call.name === DELEGATE_TOOL.name) return delegate(call.input ?? {});
     if (call.name !== BASH_TOOL.name) return null;
     const command = String(call.input?.command ?? '');
     const gate = event('pre-tool', { tool_name: 'bash', tool_input: { command } });
@@ -239,82 +238,82 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       activity(`running the ${pass[1]} pass…`);
       return { content: outcomeLines(pass[1] === 'dream' ? await runDream(db, { force: true }) : await runScribe(db)).join('\n') };
     }
-    const run = JOB_RUN.exec(command);
-    if (!run) {
-      if (!JOB_RUN_INSIDE.test(command)) return null;
-      return { content: '`sumo job run <id>` goes alone in its command, nothing before or after it (append & for a pane the chat does not wait for): anywhere else it would start in the shell, which holds no API credential', isError: true };
-    }
-    const id = Number(run[1]);
-    if (run[2] === '&' || env.HERDR_ENV) {
-      const job = getJob(db, id);
-      clearOutcome(id);
-      const pane = openJobTab(herdr, { job, project: getProject(db, job.project), env });
-      if (run[2] === '&') return { content: `started j${id} in a Herdr tab of its own (on the left, "j${id} ${job.agent}") — it reports when it closes; @j${id} <message> talks to it` };
-      return waitForPane(job, pane);
-    }
-    activity(`running j${id}…`);
-    inbox = [];
-    running = id;
-    try {
-      const outcome = await runJob(db, id, {
-        send: (p) => send(p, { signal: stopper.signal }),
-        signal: stopper.signal,
-        inbox: () => inbox.splice(0),
-        onStart: (job) => watch({ type: 'job', job }),
-        onTool: (call) => {
-          activity(`j${id} ${describeCall(call)}`);
-          watch({ type: 'tool', call, job: id });
-        },
-        onResult: (call, result) => watch({ type: 'result', call, result, job: id }),
-        onTurn: (response) => {
-          const text = textOf(response.content);
-          if (text) watch({ type: 'said', job: id, text });
-        },
-      });
-      return { content: runLines(outcome).join('\n') };
-    } finally {
-      inbox = null;
-      running = null;
-      watch({ type: 'job-end', job: id });
-    }
+    const job = JOB_RUN.exec(command);
+    if (job) return { content: `jobs are not ${job[1] === 'new' ? 'made' : 'run'} from the shell: use the delegate tool${job[1] === 'run' ? ' (only `job` for one already made)' : ''}`, isError: true };
+    return null;
   }
 
   /**
-   * The job is in its tab; the chat waits here, as it would for a run of its own, until the run leaves its
-   * outcome on disk. Esc ends the wait, not the job — it is another process, and the tab keeps it.
+   * `delegate`: a job is made from the brief, or an open one picked up, and run here on its own route; the chat waits
+   * for its report. Calls in one reply run side by side, but a worker has its project's working tree to itself.
    */
-  async function waitForPane(job, pane) {
-    activity(`j${job.id} running in its Herdr tab…`);
-    running = job.id;
-    watch({ type: 'job', job, pane });
+  async function delegate(input) {
+    const { signal } = stopper;
+    let claimed = null;
+    const claim = (agent, slug) => {
+      if (agent !== 'worker') return;
+      if (workers.has(slug)) throw new UsageError(`a worker is already running in ${slug} — two in one working tree overwrite each other; wait for its report`);
+      workers.add(slug);
+      claimed = slug;
+    };
     try {
-      while (!existsSync(outcomeFile(job.id))) {
-        if (stopper.signal.aborted) {
-          return { content: `stopped waiting for j${job.id} — it is still running in its Herdr tab ("j${job.id} ${job.agent}", on the left); sumo job show ${job.id} when it closes`, isError: true };
-        }
-        await new Promise((r) => setTimeout(r, poll));
+      let id;
+      let warnings = [];
+      if (input.job !== undefined && input.job !== null) {
+        const job = getJob(db, parseJobId(input.job));
+        claim(job.agent, job.project);
+        id = job.id;
+      } else {
+        const agent = input.agent ?? 'worker';
+        const project = getProject(db, input.project ?? '');
+        if (!project) throw new UsageError(`no project "${input.project ?? ''}" — the delegate call names one by its slug`);
+        claim(agent, project.slug);
+        activity(`briefing a ${agent}…`);
+        ({ job: { id }, warnings } = await newJob(db, { project: project.slug, title: input.title, agent, task: input.task, guide: input.guide, reviews: input.reviews ?? undefined, testsMayChange: Boolean(input.tests_may_change), now: now() }));
       }
-      return { content: readFileSync(outcomeFile(job.id), 'utf8').trimEnd() };
+      const inbox = [];
+      jobs.set(id, inbox);
+      try {
+        const outcome = await runJob(db, id, {
+          send: (p) => send(p, { signal }),
+          signal,
+          inbox: () => inbox.splice(0),
+          onStart: (job) => watch({ type: 'job', job }),
+          onTool: (call) => {
+            activity(`j${id} ${describeCall(call)}`);
+            watch({ type: 'tool', call, job: id });
+          },
+          onResult: (call, result) => watch({ type: 'result', call, result, job: id }),
+          onTurn: (response) => {
+            const text = textOf(response.content);
+            if (text) watch({ type: 'said', job: id, text });
+          },
+        });
+        const report = reportOf(id);
+        return { content: cap([...warnings, ...runLines(outcome), ...(report ? ['', report] : [])].join('\n')) };
+      } finally {
+        jobs.delete(id);
+        watch({ type: 'job-end', job: id });
+      }
     } finally {
-      running = null;
-      watch({ type: 'job-end', job: job.id });
+      if (claimed) workers.delete(claimed);
     }
   }
 
   /**
-   * Something for a job. Without an id: the job this chat is on — here, or in the pane it is waiting on — or
-   * false when there is none, so the caller can treat the words as its own. With an id: that job, through its
-   * inbox on disk if it is not the one running here; a job that is not open is refused.
+   * Something for a job. Without an id: the one job running here, or false when there is none, so the caller can
+   * treat the words as its own; with several running, it must be named. With an id: that job, through its inbox on
+   * disk if it is not running here; a job that is not open is refused. What comes back is the job it reached.
    */
   function tell(text, id) {
-    const target = id ?? running;
-    if (target === null || target === undefined) return false;
-    if (inbox && target === running) {
-      inbox.push(text);
-      return true;
+    if (id === undefined || id === null) {
+      if (jobs.size === 0) return false;
+      if (jobs.size > 1) throw new UsageError(`${[...jobs.keys()].map((j) => `j${j}`).join(', ')} are running — name the one: @j<id> …`);
+      [id] = jobs.keys();
     }
-    tellJob(db, target, text, now());
-    return true;
+    if (jobs.has(id)) jobs.get(id).push(text);
+    else tellJob(db, id, text, now());
+    return id;
   }
 
   /** A turn that ended before the model answered left its operator message at the tail; the API takes one only where the model answers next, so before anything follows it, it becomes text. */
@@ -360,6 +359,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         ctx: workspace(),
         ledger,
         beforeTool,
+        concurrent: (call) => call.name === DELEGATE_TOOL.name,
         signal: stopper.signal,
         onText: emit,
         onTool: (call) => {

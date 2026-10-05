@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { REPO_ROOT } from './paths.mjs';
-import { BASH_TOOL } from './tools.mjs';
+import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
 
 /**
  * What the chat terminal looks like: the reply's markdown turned into bold,
@@ -260,6 +260,17 @@ export function toolView(call, result = null, { full = false } = {}) {
     if (!result) return { title: 'Bash', detail, lines: [] };
     if (result.content === '') return { title: 'Bash', detail, lines: [{ text: '(no output)', tone: 'dim' }] };
     return { title: 'Bash', detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+  }
+  if (call.name === DELEGATE_TOOL.name) {
+    const detail = input.job !== undefined ? `j${input.job}` : `${input.agent ?? 'worker'} · ${input.title ?? ''}`;
+    if (!result) return { title: 'Delegate', detail, lines: [] };
+    return { title: 'Delegate', detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+  }
+  if (call.name !== EDITOR_TOOL.name) {
+    // A job's own tools: what it was given in a line, what came back under it.
+    const given = String(input.status ?? input.query ?? input.question ?? input.text ?? '').split('\n')[0].slice(0, 80);
+    if (!result) return { title: call.name, detail: given, lines: [] };
+    return { title: call.name, detail: given, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
   }
   const range = Array.isArray(input.view_range) ? `:${input.view_range.join('-')}` : '';
   const title = input.command === 'view' ? 'Read' : input.command === 'create' ? 'Write' : input.command === 'str_replace' || input.command === 'insert' ? 'Update' : call.name;

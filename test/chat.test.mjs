@@ -1,6 +1,5 @@
-// The chat session: the memory block first, the policy raised in process, a job run inside the process, the session log.
+// The chat session: the memory block first, the policy raised in process, delegated jobs run inside the process, the session log.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,10 +8,10 @@ import { test } from 'node:test';
 import { chat, createChat, injection } from '../src/chat.mjs';
 import { MODEL_IDS, setModel } from '../src/catalog.mjs';
 import { openDb } from '../src/db.mjs';
-import { closeJobTab, reportAgent } from '../src/herdr.mjs';
-import { takeInbox } from '../src/jobs.mjs';
+import { reportAgent } from '../src/herdr.mjs';
+import { finish, takeInbox } from '../src/jobs.mjs';
 import { add, UsageError } from '../src/memory.mjs';
-import { paths } from '../src/paths.mjs';
+import { paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
@@ -164,7 +163,7 @@ test('pictures sent while the API is overloaded stay with the turn: nothing was 
   });
 });
 
-test('a job run typed by the model runs in this process, and a question memory can answer is answered before it reaches the user', async () => {
+test('a job the model delegates runs in this process, and a question memory can answer is answered before it reaches the user', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -180,8 +179,9 @@ test('a job run typed by the model runs in this process, and a question memory c
       writeFileSync(join(paths().jobs, String(id), 'brief.md'), '# Job\n\n## The task\nlook around\n');
 
       const { send, seen } = canned([
-        reply('tool_use', [call('t1', 'bash', { command: `sumo job run ${id}` })]), // the chat
+        reply('tool_use', [call('t1', 'delegate', { job: id })]), // the chat
         reply('end_turn', [{ type: 'text', text: 'scout report: nothing to see' }]), // the job, inside the same process
+        reply('end_turn', []), // the job, told once that it never closed itself
         reply('end_turn', [{ type: 'text', text: 'Which tracker board are your tickets on?' }]), // the chat, ending on a question
         reply('end_turn', [{ type: 'text', text: 'Atlas it is.' }]), // the chat, continued with the memory
       ]);
@@ -190,12 +190,13 @@ test('a job run typed by the model runs in this process, and a question memory c
       const outcome = await session.say('check simba');
 
       assert.equal(seen[1].model, 'claude-haiku-4-5-20251001', 'the job ran on its own route, not the chat model');
-      assert.match(seen[2].messages.at(-1).content[0].content, /STATUS: never closed — j\d+[\s\S]*scout report/, 'the chat sees the run the way sumo job run prints it');
+      assert.match(seen[2].messages.at(-1).content[0].text, /^You ended without closing the job/);
+      assert.match(seen[3].messages.at(-1).content[0].content, /STATUS: never closed — j\d+[\s\S]*scout report/, 'the chat sees how the run ended, and what the job said last');
       assert.equal(outcome.text, 'Atlas it is.');
-      const held = seen[3].messages.at(-1);
+      const held = seen[4].messages.at(-1);
       assert.equal(held.role, 'user', 'after the assistant turn the memory goes as text; the API refuses a system message there');
       assert.match(held.content[0].text, /memory already holds[\s\S]*tracker board Atlas/);
-      assert.equal(seen.length, 4);
+      assert.equal(seen.length, 5);
       assert.equal(existsSync(join(paths().jobs, String(id), 'run.log')), false);
     } finally {
       db.close();
@@ -288,7 +289,7 @@ test('a tool that fails is an answer the model can read, not a hole in the conve
     const db = openDb();
     try {
       const { send, seen } = gated([
-        { reply: reply('tool_use', [call('t1', 'bash', { command: 'sumo job run 999' })]) },
+        { reply: reply('tool_use', [call('t1', 'delegate', { job: 999 })]) },
         { reply: reply('end_turn', [{ type: 'text', text: 'there is no such job' }]) },
       ]);
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
@@ -304,7 +305,7 @@ test('a tool that fails is an answer the model can read, not a hole in the conve
   });
 });
 
-test('a turn stopped before the model answered leaves no operator message stranded, and a job run inside the chat stops with it', async () => {
+test('a turn stopped before the model answered leaves no operator message stranded, and a delegated job stops with it', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -321,7 +322,7 @@ test('a turn stopped before the model answered leaves no operator message strand
       const never = new Promise(() => {});
       const { send, seen } = gated([
         { reply: reply('end_turn', [{ type: 'text', text: 'never said' }]), gate: never },
-        { reply: reply('tool_use', [call('t1', 'bash', { command: `sumo job run ${id}` })]) },
+        { reply: reply('tool_use', [call('t1', 'delegate', { job: id })]) },
         { reply: reply('end_turn', [{ type: 'text', text: 'the job never says this' }]), gate: never },
         { reply: reply('end_turn', [{ type: 'text', text: 'fine' }]) },
       ]);
@@ -369,7 +370,18 @@ function scoutJob(db, prefix) {
   return id;
 }
 
-test('a job run inside the chat is watched as it works, and what the user tells it reaches it with its next request', async () => {
+/** Another open job in that project, its brief headed the way a real one is, so a test can tell whose request it is answering. */
+function openJob(db, agent) {
+  const { lastInsertRowid } = db
+    .prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('simba', 'look', ?, 'running', null, ?, ?, 'haiku', 'none', 'test')`)
+    .run(agent, NOW, NOW);
+  const id = Number(lastInsertRowid);
+  mkdirSync(join(paths().jobs, String(id)), { recursive: true });
+  writeFileSync(join(paths().jobs, String(id), 'brief.md'), `# Job j${id} — look\n\n## The task\nlook around\n`);
+  return id;
+}
+
+test('a delegated job is watched as it works, and what the user tells it reaches it with its next request', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -378,10 +390,11 @@ test('a job run inside the chat is watched as it works, and what the user tells 
       const held = (name) => new Promise((r) => (open[name] = r));
       const watched = [];
       const { send, seen } = gated([
-        { reply: reply('tool_use', [call('t1', 'bash', { command: `sumo job run ${id}` })]) }, // the chat
+        { reply: reply('tool_use', [call('t1', 'delegate', { job: id })]) }, // the chat
         { reply: reply('tool_use', [{ type: 'text', text: 'looking' }, call('j1', 'bash', { command: 'echo hi' })]), gate: held('first') }, // the job
         { reply: reply('end_turn', [{ type: 'text', text: 'report one' }]), gate: held('second') }, // the job, about to end
         { reply: reply('end_turn', [{ type: 'text', text: 'because you asked' }]) }, // the job, answering what it was told
+        { reply: reply('end_turn', []) }, // the job, told once that it never closed itself
         { reply: reply('end_turn', [{ type: 'text', text: 'done' }]) }, // the chat
       ]);
       const lines = [];
@@ -391,7 +404,7 @@ test('a job run inside the chat is watched as it works, and what the user tells 
 
       const turn = session.say('check simba');
       await until(() => seen.length === 2, 'the job to be talking to its model');
-      assert.equal(session.tell('stay in src'), true);
+      assert.equal(session.tell('stay in src'), id, 'a bare message reaches the one job running here');
       open.first();
       await until(() => seen.length === 3, "the job's second request");
       const heard = seen[2].messages.at(-1).content;
@@ -399,7 +412,7 @@ test('a job run inside the chat is watched as it works, and what the user tells 
       assert.match(heard[1].text, /stay in src/);
 
       // Told while the job is ending: it gets one more request, so the message is read and answered.
-      assert.equal(session.tell('and say why'), true);
+      assert.equal(session.tell('and say why'), id);
       open.second();
       await until(() => seen.length >= 4, 'the request that carries the second message');
       assert.equal(seen[3].model, 'claude-haiku-4-5-20251001');
@@ -408,7 +421,7 @@ test('a job run inside the chat is watched as it works, and what the user tells 
 
       assert.equal((await turn).text, 'done');
       assert.equal(session.tell('too late'), false, 'the job is over');
-      assert.match(seen[4].messages.at(-1).content[0].content, /STATUS: never closed — j\d+[\s\S]*because you asked/);
+      assert.match(seen[5].messages.at(-1).content[0].content, /STATUS: never closed — j\d+[\s\S]*because you asked/);
 
       const told = watched.filter((e) => e.type !== 'usage').map((e) => [e.type, e.job?.id ?? e.job ?? null, e.call?.id ?? e.text ?? null]);
       assert.deepEqual(told, [
@@ -422,7 +435,7 @@ test('a job run inside the chat is watched as it works, and what the user tells 
         ['job-end', id, null],
         ['result', null, 't1'],
       ]);
-      assert.deepEqual(lines, [`$ sumo job run ${id}`, `running j${id}…`, `j${id} $ echo hi`], 'without a screen, the same work is a line per call');
+      assert.deepEqual(lines, [`delegate j${id}`, `j${id} $ echo hi`], 'without a screen, the same work is a line per call');
       const started = watched.find((e) => e.type === 'job').job;
       assert.deepEqual([started.agent, started.title, started.model], ['scout', 'look', 'haiku']);
       assert.deepEqual(watched.find((e) => e.type === 'result' && e.job === id).result, { content: 'hi', isError: false });
@@ -432,7 +445,7 @@ test('a job run inside the chat is watched as it works, and what the user tells 
   });
 });
 
-test('a job run that is not alone in its command is refused, because the shell holds no credential to run it with', async () => {
+test('a job is not made or run from the shell: the model is pointed at delegate, and other job commands still run', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -440,140 +453,139 @@ test('a job run that is not alone in its command is refused, because the shell h
         reply('tool_use', [
           call('t1', 'bash', { command: 'sumo job run 7 2>&1 | tail -3' }),
           call('t2', 'bash', { command: 'cd /tmp && nohup sumo job run 7 > /tmp/j7.log 2>&1 &' }),
-          call('t3', 'bash', { command: 'echo "see: sumo job run 7"' }),
-          call('t4', 'bash', { command: 'sumo job show 7' }),
+          call('t3', 'bash', { command: 'sumo job new --project simba --title look <<EOF\nlook\nEOF' }),
+          call('t4', 'bash', { command: 'echo "see: sumo job run 7"' }),
+          call('t5', 'bash', { command: 'sumo job show 7' }),
         ]),
         reply('end_turn', [{ type: 'text', text: 'ok' }]),
       ]);
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
       session.start('startup');
       await session.say('run job 7');
-      const [piped, nohupped, quoted, other] = seen[1].messages.at(-1).content;
-      for (const refused of [piped, nohupped, quoted]) {
+      const [piped, nohupped, made, quoted, other] = seen[1].messages.at(-1).content;
+      for (const refused of [piped, nohupped, made]) {
         assert.equal(refused.is_error, true, refused.content);
-        assert.match(refused.content, /alone in its command/);
+        assert.match(refused.content, /from the shell: use the delegate tool/);
       }
+      assert.equal(quoted.content, 'see: sumo job run 7', 'words about a job run are not one');
       assert.match(other.content, /no job j7/, 'other job commands still run in the shell');
+      assert.ok(seen[0].tools.some((t) => t.name === 'delegate'), 'the chat model is given the tool');
     } finally {
       db.close();
     }
   });
 });
 
-test('a job run with & gets a Herdr tab of its own in the chat\'s workspace, or is not started when Herdr is not there; @j<id> reaches a job in a tab through its inbox', async () => {
-  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log'), HERDR_WORKSPACE_ID: 'w2' }, async () => {
+test('jobs delegated in one reply run side by side; a second worker in the same project is refused, and a bare message must name its job', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
-      const id = scoutJob(db, 'sumo-agents-chat-pane-');
-      const project = db.prepare('SELECT path FROM projects').get().path;
-      const calls = [];
-      const answers = [
-        { status: 0, stdout: JSON.stringify({ id: 'cli:tab:create', result: { root_pane: { pane_id: 'w2:pJ', tab_id: 'w2:tF' }, tab: { tab_id: 'w2:tF', label: 'j1 scout · look' }, type: 'tab_created' } }) },
-        { status: 0, stdout: '' },
-        { status: 1, stdout: JSON.stringify({ id: 'cli:tab:create', error: { code: 'server_not_running', message: 'no herdr server is running' } }) },
-        { error: Object.assign(new Error('spawnSync herdr ENOENT'), { code: 'ENOENT' }) },
-      ];
-      const herdr = (args) => {
-        calls.push(args);
-        return answers.shift();
+      const first = scoutJob(db, 'sumo-agents-chat-side-');
+      writeFileSync(join(paths().jobs, String(first), 'brief.md'), `# Job j${first} — look\n\n## The task\nlook around\n`);
+      const second = openJob(db, 'scout');
+      const worker = openJob(db, 'worker');
+      const busy = openJob(db, 'worker');
+      // A job's requests wait until the test lets that job go; once let go, it stays so (a job told something asks once more).
+      const open = {};
+      const gates = {};
+      const held = (name) => (gates[name] ??= new Promise((r) => (open[name] = r)));
+      // Each job's request is answered by which job is asking: its brief is its first message.
+      const replies = {
+        chat: [
+          reply('tool_use', [call('t1', 'delegate', { job: first }), call('t2', 'delegate', { job: second }), call('t3', 'delegate', { job: worker }), call('t4', 'delegate', { job: busy })]),
+          reply('end_turn', [{ type: 'text', text: 'all back' }]),
+        ],
       };
-      const { send, seen } = canned([
-        reply('tool_use', [call('t1', 'bash', { command: `sumo job run ${id} &` })]),
-        reply('tool_use', [call('t2', 'bash', { command: `sumo job run ${id} &` })]),
-        reply('tool_use', [call('t3', 'bash', { command: `sumo job run ${id} &` })]),
-        reply('end_turn', [{ type: 'text', text: 'ok' }]),
-      ]);
-      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, herdr, now: () => NOW });
+      const seen = [];
+      const send = async (params) => {
+        seen.push(structuredClone(params));
+        const brief = params.messages[0]?.content?.[0]?.text ?? '';
+        const job = /^# Job j(\d+)/.exec(brief)?.[1];
+        if (!job) return replies.chat.shift();
+        await held(`j${job}`);
+        const told = JSON.stringify(params.messages).includes('hurry');
+        return reply('end_turn', [{ type: 'text', text: told ? `j${job} hurried` : `j${job} saw nothing` }]);
+      };
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
       session.start('startup');
-      await session.say('run it in the background');
+      const turn = session.say('look at simba three ways');
 
-      const started = seen[1].messages.at(-1).content[0];
-      assert.equal(started.is_error, false);
-      assert.match(started.content, new RegExp(`started j${id} in a Herdr tab of its own \\(on the left, "j${id} scout"\\)`));
-      assert.deepEqual(calls[0], ['tab', 'create', '--workspace', 'w2', '--cwd', project, '--label', `j${id} scout · look`, '--no-focus'], "a tab in the chat's workspace, in the project, named after the job");
-      assert.deepEqual(calls[1], ['pane', 'run', 'w2:pJ', `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${paths().home} ${paths().launcher} job run ${id}`], 'the run is marked as the tab\'s own, so the tab may close itself after, and it opens the home the chat has open');
+      await until(() => open[`j${first}`] && open[`j${second}`] && open[`j${worker}`], 'all three jobs to be talking to their models at once');
+      assert.throws(() => session.tell('hurry'), /are running — name the one: @j<id>/);
+      assert.equal(session.tell('hurry', second), second);
+      open[`j${second}`]();
+      open[`j${worker}`]();
+      open[`j${first}`]();
 
-      const stopped = seen[2].messages.at(-1).content[0];
-      assert.equal(stopped.is_error, true);
-      assert.match(stopped.content, /not started — background jobs run in Herdr tabs, and no herdr server is running\. Start Herdr, or run it in the chat without &/);
-      const missing = seen[3].messages.at(-1).content[0];
-      assert.equal(missing.is_error, true);
-      assert.match(missing.content, /`herdr` is not on PATH/);
-      assert.equal(calls.length, 4, 'no run is attempted when the split failed');
+      assert.equal((await turn).text, 'all back');
+      const results = seen.at(-1).messages.at(-1).content;
+      assert.deepEqual(results.map((r) => r.tool_use_id), ['t1', 't2', 't3', 't4'], 'each call answered, in the order it was made');
+      assert.match(results[0].content, new RegExp(`STATUS: never closed — j${first}[\\s\\S]*j${first} saw nothing`));
+      assert.match(results[1].content, new RegExp(`j${second} hurried`), 'the named job read what it was told');
+      assert.equal(results[3].is_error, true);
+      assert.match(results[3].content, /a worker is already running in simba/);
+      assert.equal(paired(seen.at(-1).messages), true);
+    } finally {
+      db.close();
+    }
+  });
+});
 
-      // Talking to the job in its pane: the message waits on disk for the job's next request.
-      assert.equal(session.tell('only go and ui', id), true);
+test('a delegated brief becomes a job on the route the router chose, and the report it closed with comes back whole', async () => {
+  const routerAnswer = join(mkdtempSync(join(tmpdir(), 'sumo-agents-router-')), 'answer.json');
+  writeFileSync(routerAnswer, JSON.stringify({ is_error: false, result: '', structured_output: { model: 'sonnet', effort: 'medium', reason: 'small' }, usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 }));
+  const env = { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log'), SUMO_AGENTS_MODEL_CMD: join(REPO_ROOT, 'test', 'fixtures', 'model-stub.mjs'), STUB_ROUTER_ANSWER: routerAnswer };
+  await withHome(freshHome(), env, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-chat-brief-'));
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
+      addProject(db, root, { slug: 'simba', now: NOW });
+      const task = '## Goal\nfind where briefings are sent\n## Check\nnone: describe only';
+      const { send: replay, seen } = canned([
+        reply('tool_use', [call('t1', 'delegate', { agent: 'reviewer', project: 'simba', title: 'judge', task: 'x' }), call('t2', 'delegate', { agent: 'scout', project: 'nowhere', title: 'look', task })]),
+        reply('tool_use', [call('t3', 'delegate', { agent: 'scout', project: 'simba', title: 'find briefings', task })]),
+        reply('end_turn', [{ type: 'text', text: 'STATUS: DONE — j1' }]),
+        reply('end_turn', [{ type: 'text', text: 'found it' }]),
+      ]);
+      // The job closes itself as its brief says, before its last word: what `sumo job finish` does from its shell.
+      const send = (params, options) => {
+        if (/^# Job j1 /.test(params.messages[0]?.content?.[0]?.text ?? '')) finish(db, 1, { status: 'DONE', report: '## Summary\nbriefings go out from src/send.mjs' }, NOW);
+        return replay(params, options);
+      };
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
+      session.start('startup');
+      assert.equal((await session.say('where do briefings go out?')).text, 'found it');
+
+      const [review, nowhere] = seen[1].messages.at(-1).content;
+      assert.equal(review.is_error, true, 'a review of nothing is refused before a job exists');
+      assert.match(nowhere.content, /nowhere/);
+      assert.match(seen[2].messages[0].content[0].text, /^# Job j1 — find briefings[\s\S]*You are a scout[\s\S]*find where briefings are sent/, "the brief is the job's first message");
+      assert.equal(seen[2].model, 'claude-haiku-4-5-20251001', 'a scout runs on haiku whatever the router said');
+      const done = seen[3].messages.at(-1).content[0];
+      assert.match(done.content, /^STATUS: DONE — j1/);
+      assert.match(done.content, /## Summary\nbriefings go out from src\/send\.mjs/, 'the report itself, not a pointer to it');
+      assert.deepEqual(db.prepare('SELECT id, agent, status FROM jobs').all().map((j) => ({ ...j })), [{ id: 1, agent: 'scout', status: 'done' }]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('@j<id> reaches a job this chat is not running through its inbox on disk, and a job that is not there is said back', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const id = scoutJob(db, 'sumo-agents-chat-inbox-');
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send: canned([]).send, now: () => NOW });
+      session.start('startup');
+      assert.equal(session.tell('only go and ui', id), id);
       assert.deepEqual(takeInbox(id), ['only go and ui']);
       assert.throws(() => session.tell('hello?', 999), /no job j999/);
     } finally {
       db.close();
     }
   });
-});
-
-test('inside Herdr a job run without & still gets a tab; the chat waits for how it ended, a bare message goes to it, and Esc ends the wait but not the job', async () => {
-  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
-    const db = openDb();
-    try {
-      const id = scoutJob(db, 'sumo-agents-chat-wait-');
-      writeFileSync(join(paths().jobs, String(id), 'outcome.txt'), 'STALE\n', { mode: 0o600 });
-      const calls = [];
-      const herdr = (args) => {
-        calls.push(args);
-        return args[1] === 'create' ? { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:pH' } } }) } : { status: 0, stdout: '' };
-      };
-      const watched = [];
-      const { send, seen } = canned([
-        reply('tool_use', [call('t1', 'bash', { command: `sumo job run ${id}` })]),
-        reply('end_turn', [{ type: 'text', text: 'read it' }]),
-        reply('tool_use', [call('t2', 'bash', { command: `sumo job run ${id}` })]),
-        reply('end_turn', [{ type: 'text', text: 'fine' }]),
-      ]);
-      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, herdr, env: { HERDR_ENV: '1', HERDR_WORKSPACE_ID: 'w2' }, poll: 10, watch: (e) => watched.push(e), now: () => NOW });
-      session.start('startup');
-
-      const turn = session.say('have a scout look');
-      await until(() => calls.length === 2, 'the pane to be opened');
-      assert.deepEqual(calls[0].slice(0, 4), ['tab', 'create', '--workspace', 'w2']);
-      assert.equal(session.tell('only go'), true, 'a bare message goes to the job in the pane');
-      assert.deepEqual(takeInbox(id), ['only go']);
-      assert.equal(seen.length, 1, 'the chat is waiting, not talking');
-      await new Promise((r) => setTimeout(r, 40));
-      assert.equal(seen.length, 1, 'a stale outcome from an earlier run does not end the wait');
-      writeFileSync(join(paths().jobs, String(id), 'outcome.txt'), `STATUS: DONE — j${id}\n3 turns, 2 tool calls\n`, { mode: 0o600 });
-      assert.equal((await turn).text, 'read it');
-      assert.equal(seen[1].messages.at(-1).content[0].content, `STATUS: DONE — j${id}\n3 turns, 2 tool calls`, 'the chat reads how the run ended, as the run printed it');
-      assert.deepEqual(watched.filter((e) => e.type !== 'usage').map((e) => e.type), ['tool', 'job', 'job-end', 'result']);
-      assert.equal(session.tell('late'), false);
-
-      // Esc while waiting: the wait ends, the pane keeps the job.
-      const second = session.say('again');
-      await until(() => calls.length === 4, 'the second pane');
-      session.interrupt();
-      assert.equal((await second).stop, 'interrupted');
-      assert.match(session.params.messages.at(-1).content[0].content, new RegExp(`stopped waiting for j${id} — it is still running in its Herdr tab`));
-    } finally {
-      db.close();
-    }
-  });
-});
-
-test('a job done in a tab of its own closes the tab; one that failed or stopped on a question keeps it, and a tab the user opened is never closed', () => {
-  const calls = [];
-  const herdr = (args) => {
-    calls.push(args);
-    return { status: 0, stdout: '' };
-  };
-  const own = { HERDR_PANE_ID: 'w2:pJ', HERDR_TAB_ID: 'w2:tJ', SUMO_JOB_TAB: '1' };
-  const job = { id: 33, agent: 'scout', title: 'Describe what simba does', status: 'done' };
-  closeJobTab(herdr, own, job);
-  assert.deepEqual(calls, [['tab', 'close', 'w2:tJ']]);
-  calls.length = 0;
-  closeJobTab(herdr, own, { ...job, status: 'failed' });
-  closeJobTab(herdr, own, { ...job, status: 'needs_input' });
-  closeJobTab(herdr, { HERDR_PANE_ID: 'w2:pJ', HERDR_TAB_ID: 'w2:tJ' }, job);
-  closeJobTab(herdr, {}, job);
-  assert.deepEqual(calls, [], 'nothing to read in a tab that is gone: a failed or blocked job keeps its tab, and a tab that is not the job\'s own is left alone');
 });
 
 test('a job in its own tab tells Herdr it is working, then blocked or idle, under the name the tab shows; outside a pane it says nothing', () => {
@@ -800,32 +812,6 @@ test('a command the user runs themselves where the directory is gone says so, to
       const said = await session.shell('echo hi');
       assert.match(said, /^the command could not be started: .*removed does not exist$/);
       assert.match(session.params.messages.at(-1).content[0].text, /^I ran `echo hi` myself:\nthe command could not be started: /);
-    } finally {
-      db.close();
-    }
-  });
-});
-
-test('a home with a space in its path still starts a job in its tab: the launcher is quoted for the shell the tab runs', async () => {
-  const home = join(mkdtempSync(join(tmpdir(), 'sumo agents it\'s here ')), 'home');
-  await withHome(home, { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
-    const db = openDb();
-    try {
-      const id = scoutJob(db, 'sumo-agents-chat-pane-');
-      const calls = [];
-      const herdr = (args) => {
-        calls.push(args);
-        return args[1] === 'create' ? { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:pJ' } } }) } : { status: 0, stdout: '' };
-      };
-      const { send } = canned([reply('tool_use', [call('t1', 'bash', { command: `sumo job run ${id} &` })]), reply('end_turn', [{ type: 'text', text: 'started' }])]);
-      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, herdr, env: { HERDR_ENV: '1' }, now: () => NOW });
-      session.start('startup');
-      await session.say('have a scout look');
-
-      const typed = calls[1][3];
-      // What the tab's shell makes of it: the words it would hand to env.
-      const words = spawnSync('sh', ['-c', `printf '%s\\n' ${typed}`], { encoding: 'utf8' }).stdout.trimEnd().split('\n');
-      assert.deepEqual(words, ['env', 'SUMO_JOB_TAB=1', `SUMO_AGENTS_HOME=${paths().home}`, paths().launcher, 'job', 'run', String(id)]);
     } finally {
       db.close();
     }

@@ -6,6 +6,7 @@ import { modelId, MODELS, usableModels } from './catalog.mjs';
 import { tx } from './db.mjs';
 import { handleEvent } from './hooks.mjs';
 import { brief, getJob, takeInbox } from './jobs.mjs';
+import { isJobTool, jobTools, runJobTool } from './jobtools.mjs';
 import { UsageError } from './memory.mjs';
 import { costOf, logRun, usageOf } from './model.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
@@ -34,7 +35,16 @@ const CONTEXT_EDITS = [
 ];
 
 export const promptFile = (name) => readFileSync(join(REPO_ROOT, 'prompts', name), 'utf8').trim();
-export const systemPrompt = () => promptFile('agent.md');
+/**
+ * A sub-agent works by the user's coding rules as the chat does: the Coding section of AGENTS.md, read from its one
+ * home, without the lines that point at guides — a job is handed its guide in the brief.
+ */
+export function codingRules() {
+  const agents = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8');
+  const section = /^## Coding\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(agents)?.[1] ?? '';
+  return section.split('\n').filter((l) => l.trim() && !/guides\//.test(l)).join('\n');
+}
+export const systemPrompt = () => [promptFile('agent.md'), `## How the user wants code changed\n${codingRules()}`].join('\n\n');
 
 /** The request for a conversation's first turn. */
 export function paramsFor({ model, effort, tools, text, system }) {
@@ -53,8 +63,11 @@ export function paramsFor({ model, effort, tools, text, system }) {
 
 /** The request for a job: tools by role, effort by route, the brief as the one user turn. */
 export function jobParams({ job, text, system = systemPrompt() }) {
-  return paramsFor({ model: job.model, effort: job.effort, tools: job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL], text, system });
+  return paramsFor({ model: job.model, effort: job.effort, tools: [...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent)], text, system });
 }
+
+/** Said once to a job that ended its turn with the job still open: it finished the work but never said so. */
+const UNCLOSED = 'You ended without closing the job. Call `finish` now — DONE or FAILED, with your report — or `ask` if you are blocked.';
 
 /**
  * One cache breakpoint rides on the last block of the last message that can
@@ -85,7 +98,7 @@ export async function sendToApi(params, { onText, signal } = {}) {
  * Runs one conversation from its current messages until the model stops
  * calling tools. `send` is the transport (canned in tests); `beforeTool` may
  * refuse a call or answer it itself, which is how the workflow gate and the
- * in-process `sumo job run` work. Totals and the stop reason come back; the
+ * chat's `delegate` work; the calls `concurrent` picks run at the same time. Totals and the stop reason come back; the
  * messages are mutated in place, so a chat can keep going from them. `signal`
  * is the user saying stop: the request is dropped, a running command is
  * killed, and every tool call still gets a result, so the history stays one
@@ -93,7 +106,7 @@ export async function sendToApi(params, { onText, signal } = {}) {
  * while it worked: it is read with the next request, behind the tool results,
  * and a conversation about to end is given one more request to answer it.
  */
-export async function converse(db, params, { send = sendToApi, ctx, ledger, beforeTool = null, onText = null, onTool = null, onResult = null, onTurn = null, inbox = null, signal = null, now = () => new Date().toISOString() }) {
+export async function converse(db, params, { send = sendToApi, ctx, ledger, beforeTool = null, concurrent = null, onText = null, onTool = null, onResult = null, onTurn = null, inbox = null, signal = null, now = () => new Date().toISOString() }) {
   const totals = { inputTokens: 0, outputTokens: 0, costUsd: 0, toolCalls: 0, contextTokens: 0 };
   let turns = 0;
   let stop = 'max_turns';
@@ -144,12 +157,8 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     }
 
     totals.toolCalls += calls.length;
-    const results = [];
-    for (const call of calls) {
-      if (signal?.aborted) {
-        results.push({ type: 'tool_result', tool_use_id: call.id, content: 'not run: interrupted by the user', is_error: true });
-        continue;
-      }
+    const answer = async (call) => {
+      if (signal?.aborted) return { type: 'tool_result', tool_use_id: call.id, content: 'not run: interrupted by the user', is_error: true };
       onTool?.(call);
       let out;
       try {
@@ -159,8 +168,13 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
         out = { content: `the tool failed: ${cause.message}`, isError: true };
       }
       onResult?.(call, out);
-      results.push({ type: 'tool_result', tool_use_id: call.id, content: out.content, is_error: Boolean(out.isError) });
-    }
+      return { type: 'tool_result', tool_use_id: call.id, content: out.content, is_error: Boolean(out.isError) };
+    };
+    // Calls that may overlap (delegated jobs) all start now; the rest run one at a time, in order, beside them.
+    const started = new Map(calls.filter((call) => concurrent?.(call)).map((call) => [call.id, answer(call)]));
+    const pending = [];
+    for (const call of calls) pending.push(started.get(call.id) ?? (await answer(call)));
+    const results = await Promise.all(pending);
     if (signal?.aborted) {
       params.messages.push({ role: 'user', content: results });
       stop = 'interrupted';
@@ -180,7 +194,8 @@ export function contextFor(project, { jobId = null } = {}) {
 /**
  * Runs a job to the end of its conversation. Returns what happened, never
  * throws for anything the model did; a job that is not open is refused up front.
- * The job closes itself through `sumo job finish` in bash, as its brief says.
+ * The job closes itself with its `finish` tool; one that stops with the job
+ * still open is told so once.
  * `onStart` is told the job once it is known to be runnable; the other
  * callbacks and `inbox` are the conversation's own, for a caller that watches.
  * What `sumo job tell` left on disk is read with the caller's inbox, so a job
@@ -197,16 +212,25 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   const params = jobParams({ job, text: brief(db, id) });
   const lock = tx(db, () => takeRunLock(id));
   const heard = () => [...(inbox?.() ?? []), ...takeInbox(id)];
+  const ctx = contextFor(project, { jobId: id });
   // The workflow gate holds a job's commands as it holds the chat's: once per session for this job, which has a context of its own,
   // and with the job's own project in scope whether or not its card came up in the session.
   const gate = (call) => {
+    if (isJobTool(call)) return runJobTool(call, { job, ctx, signal });
     if (call.name !== BASH_TOOL.name || !job.session_id) return null;
     const held = handleEvent(db, 'pre-tool', { session_id: job.session_id, agent_id: `j${id}`, project: job.project, cwd: project.path, tool_name: 'bash', tool_input: { command: String(call.input?.command ?? '') } }, now?.());
     return held ? { content: JSON.parse(held).deny, isError: true } : null;
   };
   try {
     onStart?.(job);
-    const outcome = await converse(db, params, { send, now, signal, onTool, onResult, onTurn, inbox: heard, beforeTool: gate, ctx: contextFor(project, { jobId: id }), ledger: { kind: job.agent, jobId: id, sessionId: job.session_id } });
+    const run = () => converse(db, params, { send, now, signal, onTool, onResult, onTurn, inbox: heard, beforeTool: gate, ctx, ledger: { kind: job.agent, jobId: id, sessionId: job.session_id } });
+    let outcome = await run();
+    if (outcome.stop === 'end_turn' && getJob(db, id).status === 'running') {
+      params.messages.push({ role: 'user', content: [{ type: 'text', text: UNCLOSED }] });
+      const more = await run();
+      const totals = Object.fromEntries(Object.keys(more.totals).map((k) => [k, k === 'contextTokens' ? more.totals[k] : outcome.totals[k] + more.totals[k]]));
+      outcome = { ...more, turns: outcome.turns + more.turns, text: more.text || outcome.text, totals };
+    }
     return { ...outcome, job: getJob(db, id) };
   } finally {
     rmSync(lock, { force: true });

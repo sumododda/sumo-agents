@@ -132,37 +132,37 @@ sumo forget <id>                    # stop it being true (history kept);  --purg
 
 ## Delegation
 
-The main agent does small things itself. Big, parallel or reading-heavy work goes to a job: a written
-brief (`sumo job new`) run in its own loop (`sumo job run <id>`, or `… &` for a Herdr pane). The job gets
-the brief as its only user turn, a short frozen system prompt, and tools by role:
+The main agent does small things itself. Big, parallel or reading-heavy work it hands off with its
+`delegate` tool: a written brief becomes a job, the job runs in the chat's own process on the route the
+router chose, and its report comes back as the tool's result. Several `delegate` calls in one reply run at
+the same time. The job gets the brief as its only user turn — with the project's card and your global
+rules in it — a short frozen system prompt that carries the Coding rules from `AGENTS.md`, and tools by role:
 
 | Role | Model and effort | Tools | For |
 |---|---|---|---|
-| `scout` | Haiku — or, while Haiku is off, the cheapest model that is on, at low effort | shell | finding, tracing, auditing, summarizing — anything reading-heavy |
-| `worker` | chosen per job by the router | shell + editor | building and fixing |
-| `reviewer` | chosen per job by the router | shell | judging a change it did not write |
+| `scout` | Haiku — or, while Haiku is off, the cheapest model that is on, at low effort | shell + job tools | finding, tracing, auditing, summarizing — anything reading-heavy |
+| `worker` | chosen per job by the router | shell + editor + `baseline`/`verify` + job tools | building and fixing |
+| `reviewer` | chosen per job by the router | shell + job tools | judging a change it did not write |
 
-A `sumo job run` typed by the chat agent runs inside the chat process, so the Anthropic credential never enters a
-shell — which is why it goes alone in its command: piped or chained it is refused. While it runs the chat
-shows it: a line saying which job, on what model, then each thing it runs (one line each; Ctrl-O for the
-output) and what it says. A line starting with `@` is said to the job, and read with its next request. A
-chat started inside [Herdr](https://herdr.dev) gives every job a tab of its own, listed on the left and
-showing the same lines; the chat waits for it to close and reads how it ended, or carries on when the run was
-typed with `&`. A job that finished closes its tab behind itself; one that failed or stopped on a question
-keeps it, with what went wrong or what it asked on it. Outside Herdr `&` is refused — Herdr is required for tabs. `@j<id> …` reaches a job in a
-pane too (on disk, through `sumo job tell <id>`), so does any shell. A blocked job asks (`sumo job ask`); the main agent checks memory before it asks you. Briefs,
-notes, answers, reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today
-can be picked up tomorrow with the same command. One worker per project at a time — they share a
-working tree, and `sumo job new` says so when a second one is created.
+The job tools are `note`, `ask`, `search_memory` and `finish`. Each runs the `sumo job` command a person
+would, in a process of its own, so a worker's checks never stall the chat or the jobs beside it. A job that
+stops without calling `finish` is told once to close itself. The Anthropic credential never enters a shell:
+`sumo job run` and `sumo job new` typed into the chat's shell are refused with a pointer to `delegate`.
+While jobs run the chat shows them: which job, on what model, each thing it runs (one line each; Ctrl-O for
+the output) and what it says. `@ …` is said to the one job running, `@j<id> …` to a named one — read with
+its next request; a job running elsewhere is reached on disk, as with `sumo job tell <id>`. Briefs, notes,
+answers, reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today can be
+picked up tomorrow: `delegate` with only its `job` id, or `sumo job run <id>` in a terminal. One worker per
+project at a time — they share a working tree.
 
 ## Which model and effort a job gets
 
-The model you chat with never decides this. `sumo job new` does, in plain code, and prints the result:
+The model you chat with never decides this. Making the job does, in plain code; `sumo job new` prints the result:
 
 ```
 created j27 [worker·sumo-agents·running] Session hygiene: context gauge …
 route: opus/xhigh — router: a new feature across hooks and sessions with tests
-run it: sumo job run 27   (append & to run it in the background)
+run it: sumo job run 27   (append & to carry on without waiting for it)
 ```
 
 The route is the router's answer, and nothing else's. On every `sumo job new` and every `sumo job retry`, a

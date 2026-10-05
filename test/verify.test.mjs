@@ -59,7 +59,7 @@ test("a worker's DONE rests on what the project's checks say, not on what its re
   s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
   newWorker(s);
-  assert.match(s.sumo(['job', 'brief', '1']).out, /Before you edit anything: `sumo job baseline 1`/);
+  assert.match(s.sumo(['job', 'brief', '1']).out, /Before you edit anything: `baseline`/);
   assert.match(s.sumo(['job', 'baseline', '1']).out, /^`make test` passes/);
 
   p.write('src.js', 'export const thing = 2;\n');
