@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -35,6 +36,14 @@ function gitProject(s, { status = 'ok', recipe = '@test "$$(cat status)" = ok' }
   git('commit', '-q', '-m', 'start');
   s.sumo(['project', 'add', dir, '--alias', 'gitproj']);
   return { dir, git, write: (file, text) => writeFileSync(join(dir, file), text) };
+}
+
+/** A job's record changed the way sumo itself would write it — the digest kept beside it too — to stand for a repository that changed under the job. */
+function rewriteState(s, id, change) {
+  const file = join(s.home, 'jobs', id, 'verify.json');
+  const text = `${JSON.stringify(change(JSON.parse(readFileSync(file, 'utf8'))), null, 2)}\n`;
+  writeFileSync(file, text);
+  s.sql((db) => db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(createHash('sha256').update(text).digest('hex'), `job.${id}.verify`));
 }
 
 const newWorker = (s, extra = []) => s.sumo(['job', 'new', '--project', 'gitproj', '--title', 'return 2', ...extra], { input: TASK });
@@ -292,8 +301,7 @@ test('a recorded start that git has since collected is said out loud, never read
   newWorker(s);
   p.write('test/thing.test.js', '// asserts nothing\n');
   const stateFile = join(s.home, 'jobs', '1', 'verify.json');
-  const state = JSON.parse(readFileSync(stateFile, 'utf8'));
-  writeFileSync(stateFile, JSON.stringify({ ...state, snap: { ...state.snap, base: '0123456789abcdef0123456789abcdef01234567' } }));
+  rewriteState(s, '1', (state) => ({ ...state, snap: { ...state.snap, base: '0123456789abcdef0123456789abcdef01234567' } }));
 
   assert.match(s.sumo(['job', 'verify', '1']).out, /note: the recorded start of this job is no longer in the repository — what changed, and whether existing tests were touched, could not be checked/);
   const changes = s.sumo(['job', 'changes', '1']);
@@ -405,8 +413,7 @@ test('a baseline is refused when there is no telling what has changed: the start
   newWorker(s);
   p.write('status', 'broken\n');
   const stateFile = join(s.home, 'jobs', '1', 'verify.json');
-  const state = JSON.parse(readFileSync(stateFile, 'utf8'));
-  writeFileSync(stateFile, JSON.stringify({ ...state, snap: { ...state.snap, base: '0123456789abcdef0123456789abcdef01234567' } }));
+  rewriteState(s, '1', (state) => ({ ...state, snap: { ...state.snap, base: '0123456789abcdef0123456789abcdef01234567' } }));
 
   assert.match(s.sumo(['job', 'baseline', '1']).out, /^no baseline taken: the recorded start of this job is no longer in the repository/);
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).baseline, null, 'the job\'s own breakage is not written down as "already failing"');
@@ -637,4 +644,56 @@ test('a check that prints more than is kept is read from its end: the log holds 
   assert.equal(lines.length, 201);
   assert.equal(lines[1], 'line 399801');
   assert.equal(lines.at(-1), 'line 400000');
+});
+
+test('a record of the baseline changed outside sumo judges nothing: a job cannot make its own breakage "already failing"', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const { write } = gitProject(s);
+  newWorker(s);
+  assert.match(s.sumo(['job', 'baseline', '1']).out, /^`make test` passes/);
+  write('status', 'broken\n');
+  // What a job's shell could do to its own folder: call the check that passed a failing one.
+  const record = join(s.home, 'jobs', '1', 'verify.json');
+  writeFileSync(record, readFileSync(record, 'utf8').replace('"ok": true', '"ok": false'));
+  const forged = finish(s);
+  assert.equal(forged.code, 2, forged.out);
+  assert.match(forged.err, /cannot be verified — the record of where it began .* cannot be read, or was changed since sumo wrote it/);
+});
+
+test("a job's editor reads its own folder but writes only in the project", async () => {
+  const { runEditor } = await import('../src/tools.mjs');
+  const s = sandbox();
+  const project = join(s.root, 'proj-edit');
+  const jobDir = join(s.root, 'job-folder');
+  mkdirSync(project, { recursive: true });
+  mkdirSync(jobDir, { recursive: true });
+  writeFileSync(join(jobDir, 'verify.json'), '{"ok": true}\n');
+  const ctx = { cwd: project, roots: [project, jobDir] };
+  assert.equal(runEditor({ command: 'view', path: join(jobDir, 'verify.json') }, ctx).isError, false);
+  for (const input of [
+    { command: 'str_replace', path: join(jobDir, 'verify.json'), old_str: 'true', new_str: 'false' },
+    { command: 'create', path: join(jobDir, 'extra.json'), file_text: '{}' },
+    { command: 'insert', path: join(jobDir, 'verify.json'), insert_line: 0, insert_text: 'x\n' },
+  ]) {
+    const refused = runEditor(input, ctx);
+    assert.equal(refused.isError, true, input.command);
+    assert.match(refused.content, /can be read, not changed/);
+  }
+  assert.equal(readFileSync(join(jobDir, 'verify.json'), 'utf8'), '{"ok": true}\n');
+  assert.equal(runEditor({ command: 'create', path: join(project, 'a.txt'), file_text: 'hi' }, ctx).isError, false);
+});
+
+test("a checker's own settings changed by the job are put in front of a person", () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const p = gitProject(s);
+  p.write('tsconfig.json', '{ "compilerOptions": { "strict": true } }\n');
+  p.git('add', '-A');
+  p.git('commit', '-q', '-m', 'types');
+  newWorker(s);
+  p.write('tsconfig.json', '{ "compilerOptions": { "strict": false } }\n');
+  const done = finish(s);
+  assert.equal(done.code, 0, done.err);
+  assert.match(done.out, /^ {2}look at: a checker's settings were changed: tsconfig\.json — see that nothing it checked was loosened$/m);
 });

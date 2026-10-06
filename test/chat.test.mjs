@@ -1031,6 +1031,35 @@ test('piped into the chat, every line is a turn: the ones that arrive while anot
   });
 });
 
+test('piped in but shown on a terminal, nothing the model or a command prints can drive that terminal', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const { send } = canned([reply('end_turn', [{ type: 'text', text: 'hi \x1b]0;MODEL-TITLE\x07there' }])]);
+      const printed = [];
+      const output = new Writable({
+        write(chunk, _encoding, done) {
+          printed.push(String(chunk));
+          done();
+        },
+      });
+      output.isTTY = true;
+      output.columns = 80;
+      const input = Readable.from(["!printf 'a\\033]52;c;cHduZWQ=\\007b'\n!printf '10%%\\r50%%\\r100%%'\nhello\n"]);
+      input.isTTY = false;
+      assert.equal(await chat(db, { model: 'opus', effort: 'high', send, input, output }), 0);
+      const all = printed.join('');
+      assert.doesNotMatch(all, /\x1b\]/, 'no OSC sequence: no clipboard write, no window title');
+      assert.doesNotMatch(all, /\x07/);
+      assert.match(all, /a\]52;c;cHduZWQ=b/);
+      assert.match(all, /hi \]0;MODEL-TITLEthere/);
+      assert.match(all, /10%\n50%\n100%/, 'a progress bar redrawn in place reads as lines, not one run-on word');
+    } finally {
+      db.close();
+    }
+  });
+});
+
 test('what the user runs themselves is theirs to see in full, and reaches the model without its secrets', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
@@ -1039,7 +1068,7 @@ test('what the user runs themselves is theirs to see in full, and reaches the mo
       session.start('startup');
       assert.equal(await session.shell('echo token ghp_abcdefghijklmnopqrstuvwxyz0123456789'), 'token ghp_abcdefghijklmnopqrstuvwxyz0123456789');
       const told = session.params.messages.at(-1).content[0].text;
-      assert.match(told, /^I ran `echo token ghp_[^`]*` myself:\ntoken \[redacted\]$/);
+      assert.equal(told, 'I ran `echo token [redacted]` myself:\ntoken [redacted]');
     } finally {
       db.close();
     }
@@ -1124,6 +1153,75 @@ test('a model that is off cannot be chatted on: not by configuration, not by /mo
       setModel(db, 'fable', true, NOW);
       assert.deepEqual(model.choices([]), ['auto', 'haiku', 'sonnet', 'opus', 'fable'], 'the menu reads the switches as they are now');
       assert.equal(session.route('fable'), 'fable/high');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('Enter on the /model menu after a model keeps the effort in hand, never drops it to the lowest', async () => {
+  const { editor, press } = await import('../src/editor.mjs');
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const session = createChat(db, { model: 'opus', effort: 'xhigh', cwd: tmpdir(), send: () => assert.fail('never sent'), now: () => '2026-10-05T00:00:00.000Z' });
+      session.start('startup');
+      let state = editor();
+      for (const ch of '/model sonnet ') state = press(state, ch, {}, session.commands).state;
+      const picked = press(state, '\r', { return: true }, session.commands).state.text;
+      assert.equal(picked, '/model sonnet xhigh ');
+      assert.equal(session.route('sonnet xhigh'), 'sonnet/xhigh');
+      const menu = session.commands.find((c) => c.name === 'model');
+      assert.deepEqual([...menu.choices(['opus'])].sort(), ['high', 'low', 'max', 'medium', 'xhigh'], 'every effort is still offered');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('Esc ends the turn while the router is still thinking, without waiting for it to answer', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      let fail;
+      const route = () => new Promise((_resolve, reject) => (fail = reject));
+      const session = createChat(db, { model: 'auto', cwd: tmpdir(), send: () => assert.fail('nothing is sent'), route, now: () => '2026-10-05T00:00:00.000Z' });
+      session.start('startup');
+      const turn = session.say('rewrite the whole scheduler');
+      await new Promise((r) => setTimeout(r, 10));
+      session.interrupt();
+      const ended = await Promise.race([turn, new Promise((r) => setTimeout(() => r('still waiting on the router'), 500))]);
+      assert.equal(ended.stop, 'interrupted');
+      fail(new Error('the router answers late, and badly')); // let go unread: no unhandled rejection
+      await new Promise((r) => setTimeout(r, 10));
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('on auto, the /model menu offers first the effort a model alone would keep: the configured one', async () => {
+  const { setMeta } = await import('../src/db.mjs');
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      setMeta(db, 'config.chat.effort', 'medium');
+      const session = createChat(db, { model: 'auto', cwd: tmpdir(), send: () => assert.fail('never sent'), now: () => '2026-10-05T00:00:00.000Z' });
+      session.start('startup');
+      assert.equal(session.commands.find((c) => c.name === 'model').choices(['opus'])[0], 'medium');
+      assert.equal(session.route('opus'), 'opus/medium');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a model named by its full API id is switched off with it', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      setModel(db, 'fable', false, '2026-10-05T00:00:00.000Z');
+      assert.throws(() => createChat(db, { model: MODEL_IDS.fable, effort: 'high', cwd: tmpdir(), send: () => assert.fail('never sent') }), /fable is off/);
     } finally {
       db.close();
     }

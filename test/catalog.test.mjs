@@ -1,7 +1,7 @@
 // The models Sumo can run on: which ones the API has here, found once by `sumo setup` and again by
 // `sumo models discover`, and which the user has turned off — and what every command does with that.
 import assert from 'node:assert/strict';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { sandbox } from './helpers.mjs';
@@ -190,4 +190,19 @@ test('a job routed to a model that has since been turned off is not run', () => 
   const run = s.sumo(['job', 'run', id], { extraEnv: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
   assert.notEqual(run.code, 0);
   assert.match(run.err, new RegExp(`j${id} is routed to fable, which is off — sumo models enable fable, or abandon it and create it again`), run.out + run.err);
+});
+
+test('discovery that could not reach the API says so rather than blaming the credential, and an answer that is not a list is a failed check', () => {
+  const s = sandbox();
+  s.modelsFound([], { errors: { haiku: 'Connection error.', sonnet: 'Connection error.', opus: 'Connection error.' } });
+  const unreachable = s.sumo(['models', 'discover']);
+  assert.notEqual(unreachable.code, 0);
+  assert.match(unreachable.err, /Connection error\./);
+  assert.doesNotMatch(unreachable.err, /credential may not be allowed/);
+
+  writeFileSync(join(s.root, 'models-answer.json'), 'null');
+  const odd = s.sumo(['models', 'discover']);
+  assert.notEqual(odd.code, 0);
+  assert.match(odd.err, /could not check the models — .* not a list of models/);
+  assert.doesNotMatch(odd.err, /Cannot read properties/);
 });

@@ -20,8 +20,11 @@ const MIN_SHARED_WORDS = 2;
 // A sub-agent has its own context: a memory handed to the main agent was never handed to it.
 const key = (memory, agentId) => `recall:m${memory.id}${agentId ? `@${agentId}` : ''}`;
 
+/** A question, back to where its sentence began: a stop ends a sentence only where a space or a line follows it, so `package.json?` and `v22.1?` stay whole. */
+const QUESTION = /(?:[^.!?\n]|[.!?](?=[^\s.!?]))*\?/g;
+
 export function closingQuestions(reply) {
-  return (reply.slice(-CLOSING_CHARS).match(/[^.!?\n]*\?/g) ?? []).join(' ');
+  return (reply.slice(-CLOSING_CHARS).match(QUESTION) ?? []).join(' ');
 }
 
 /**

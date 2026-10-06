@@ -30,6 +30,14 @@ const MAX_SCANNED_FILE_BYTES = 200_000;
 /** Paths whose job is to judge other code. Fixtures beside tests count: editing one can weaken the test that reads it. */
 const TEST_PATH = /(^|\/)(tests?|__tests__|specs?)\/|[._](test|spec)\.[a-z]+$|(^|\/)test_[^/]+\.py$/i;
 
+/**
+ * The settings of a checker — the type checker, the linter, the test runner. Changing one can loosen what judges the
+ * change (`"strict": false`, a test path ignored) as surely as editing a test can. Flagged for a person, not blocking:
+ * a new path alias or a new lint rule are honest reasons to touch one.
+ */
+const CHECKER_CONFIG =
+  /(^|\/)(tsconfig[^/]*\.json|jsconfig\.json|\.eslintrc[^/]*|eslint\.config\.[cm]?[jt]s|(jest|vitest|karma|playwright)\.config\.[cm]?[jt]s|pytest\.ini|tox\.ini|setup\.cfg|conftest\.py|\.flake8|mypy\.ini|ruff\.toml|\.golangci\.ya?ml|phpunit\.xml(\.dist)?|\.rubocop\.yml)$/;
+
 /** Ways of telling a checker to look away. Reported, never blocking: each has honest uses, and a person should see them. */
 const LOOKS_AWAY =
   /eslint-disable|@ts-ignore|@ts-nocheck|@ts-expect-error|#\s*noqa|#\s*type:\s*ignore|pylint:\s*disable|\/\/\s*nolint|#\[ignore\]|\b(?:it|test|describe)\.(?:skip|only)\b|\bx(?:it|describe)\(|@pytest\.mark\.skip|@unittest\.skip|\bt\.Skip\(|@Disabled\b|@Ignore\b/;
@@ -271,6 +279,8 @@ export function verify(root, { snap, baseline, testsMayChange, declared }, dir, 
     const added = scanAdded(root, snap, changes);
     if (added.key.length > 0) blocking.push(`a key, token or private key was added: ${some(added.key)} — remove it and read it from the environment`);
     if (added.away.length > 0) flags.push(`added lines tell a checker to look away (skip, ignore, disable): ${some(added.away)}`);
+    const settings = changes.tracked.filter((c) => c.status !== 'A' && CHECKER_CONFIG.test(c.path)).map((c) => c.path);
+    if (settings.length > 0) flags.push(`a checker's settings were changed: ${some(settings)} — see that nothing it checked was loosened`);
     if (added.maybe.length > 0) flags.push(`added lines look like credentials (password=, token=, or a long random string): ${some(added.maybe)}`);
   } else {
     notes.push('not a git repository — what changed, and whether existing tests were touched, could not be checked');

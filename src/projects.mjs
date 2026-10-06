@@ -50,6 +50,8 @@ export function addAlias(db, slug, rawAlias) {
  */
 export function addProject(db, rawPath, { slug: wantedSlug, aliases = [], now = new Date().toISOString() } = {}) {
   const path = expand(rawPath);
+  // Read off disk before the write lock is taken, as rescan does.
+  const read = { scanned: scan(path), remote: gitRemote(path) };
   return tx(db, () => {
     let project = db.prepare('SELECT * FROM projects WHERE path = ?').get(path);
     const created = !project;
@@ -63,15 +65,18 @@ export function addProject(db, rawPath, { slug: wantedSlug, aliases = [], now = 
         slug,
         basename(path),
         path,
-        gitRemote(path),
+        read.remote,
         now,
         now,
       );
       project = db.prepare('SELECT * FROM projects WHERE slug = ?').get(slug);
     }
+    // Adding an archived project again is how it comes back: there is no other way to undo `archive`.
+    const restored = !created && project.status === 'archived';
+    if (restored) db.prepare(`UPDATE projects SET status = 'active' WHERE slug = ?`).run(project.slug);
     for (const alias of aliases) addAlias(db, project.slug, alias);
-    const changes = rescan(db, project.slug, now);
-    return { project: db.prepare('SELECT * FROM projects WHERE slug = ?').get(project.slug), created, changes };
+    const changes = rescan(db, project.slug, now, read);
+    return { project: db.prepare('SELECT * FROM projects WHERE slug = ?').get(project.slug), created, restored, changes };
   });
 }
 
@@ -80,10 +85,12 @@ export function addProject(db, rawPath, { slug: wantedSlug, aliases = [], now = 
  * the scanner wrote are touched — nothing the user stated can be replaced by
  * something read off disk.
  */
-export function rescan(db, nameOrAlias, now = new Date().toISOString()) {
+export function rescan(db, nameOrAlias, now = new Date().toISOString(), read = null) {
   const project = getProject(db, nameOrAlias);
   if (!existsSync(project.path)) throw new UsageError(`${project.path} no longer exists — archive the project or re-add it at its new path`);
   const scope = `project:${project.slug}`;
+  // Read off disk before the write lock is taken: a slow disk or a strange file must not hold every other writer.
+  const { scanned, remote } = read ?? { scanned: scan(project.path), remote: gitRemote(project.path) };
 
   return tx(db, () => {
     const current = new Map(
@@ -94,11 +101,14 @@ export function rescan(db, nameOrAlias, now = new Date().toISOString()) {
     );
     const changes = { added: 0, updated: 0, removed: 0 };
 
-    for (const { key, body } of scan(project.path)) {
+    for (const { key, body } of scanned) {
       const before = current.get(key);
       current.delete(key);
       // Compared as it would be stored: a scrubbed secret is not a change.
-      if (before?.body === memory.storedBody('fact', body).text) continue;
+      const stored = memory.storedBody('fact', body).text;
+      if (before?.body === stored) continue;
+      // Forgotten or replaced since, and the disk still says the same: it stays let go.
+      if (!before && memory.scanRetired(db, scope, key, stored)) continue;
       // The old fact has to stop being active first: only one active fact per key is allowed.
       if (before) db.prepare(`UPDATE memories SET state = 'superseded', invalid_at = ? WHERE id = ?`).run(now, before.id);
       const { memory: saved } = memory.add(db, {
@@ -114,7 +124,7 @@ export function rescan(db, nameOrAlias, now = new Date().toISOString()) {
       changes.removed++;
     }
 
-    db.prepare('UPDATE projects SET scanned_at = ?, remote = ? WHERE slug = ?').run(now, gitRemote(project.path), project.slug);
+    db.prepare('UPDATE projects SET scanned_at = ?, remote = ? WHERE slug = ?').run(now, remote, project.slug);
     return changes;
   });
 }

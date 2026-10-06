@@ -148,6 +148,10 @@ function toConfirm(db) {
 
 function warnings(db) {
   const out = [];
+  // AGENTS.md says a background writer files what the user says; with it off, nothing does unless the model is told.
+  if ((getMeta(db, 'config.scribe.model') ?? CONFIG_DEFAULTS['scribe.model']) === 'off') {
+    out.push('The memory writer is off (scribe.model): save what the user states that should last, as it is said, with sumo add.');
+  }
   const failures = Number(getMeta(db, 'scribe.failures') ?? 0);
   if (failures >= SCRIBE_FAILURES_TO_WARN) out.push(`Warning: the background memory writer has failed ${failures} times in a row — nothing new is being remembered. Tell the user; sumo scribe status shows why.`);
   const backup = getMeta(db, 'backup.failed');

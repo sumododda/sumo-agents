@@ -1,5 +1,6 @@
-import { chmodSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { getMeta, setMeta } from './db.mjs';
 import { paths } from './paths.mjs';
 
@@ -86,4 +87,46 @@ export function backup(db, now = new Date()) {
     .slice(0, -KEEP_BACKUPS);
   for (const f of old) rmSync(join(dir, f), { force: true });
   return { file, pruned: old.length };
+}
+
+/**
+ * A purge reaches the backups too: "erased, not recoverable" must hold for every copy this machine keeps. Each backup
+ * loses the memory and the sentence it came from, and is rewritten so the pages that held them are gone.
+ * Returns how many were cleaned, and the ones that could not be — said, never hidden.
+ */
+export function purgeFromBackups({ id, body, created_at: createdAt, source_turn: sourceTurn }) {
+  const dir = paths().backups;
+  const files = existsSync(dir) ? readdirSync(dir).filter((f) => /^memory-.*\.db$/.test(f)) : [];
+  const failed = [];
+  let cleaned = 0;
+  for (const f of files) {
+    let db = null;
+    try {
+      db = new DatabaseSync(join(dir, f));
+      db.exec('PRAGMA secure_delete = ON;');
+      // The same memory, not just the same number: a backup from after a restore may hold another one under this id.
+      const row = db.prepare('SELECT source_turn FROM memories WHERE id = ? AND body = ? AND created_at = ?').get(id, body, createdAt);
+      if (row) {
+        // All of it or none: a backup this cannot clean whole is left as it was, and named.
+        db.exec('BEGIN');
+        try {
+          db.prepare('DELETE FROM memories WHERE id = ?').run(id);
+          if (sourceTurn !== null) db.prepare('DELETE FROM user_turns WHERE id = ?').run(sourceTurn);
+          // A deleted row's words stay in the full-text index's pages until it is rebuilt; VACUUM keeps those pages.
+          db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('rebuild'); INSERT INTO user_turns_fts(user_turns_fts) VALUES ('rebuild');`);
+          db.exec('COMMIT');
+        } catch (cause) {
+          db.exec('ROLLBACK');
+          throw cause;
+        }
+        db.exec('VACUUM');
+        cleaned++;
+      }
+    } catch {
+      failed.push(join(dir, f));
+    } finally {
+      db?.close();
+    }
+  }
+  return { cleaned, failed };
 }

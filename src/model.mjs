@@ -11,6 +11,9 @@ import { paths } from './paths.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 
 const TIMEOUT_MS = 180_000;
+// The SDK tries twice more by default, a timeout included: three minutes would be nine, and a call the API did
+// answer could be sent and billed again. One more try rides out a moment of overload; the scribe's fallback does the rest.
+const MAX_RETRIES = 1;
 // Room for a schema'd answer with a sentence of reasoning; a small model cut off mid-string is unparseable JSON.
 const MAX_ANSWER_TOKENS = 400;
 // A memory pass on the local model thinks first, up to the server's reasoning budget, then lists its operations.
@@ -120,7 +123,8 @@ export async function callModel(db, { system, prompt, schema, model, kind }) {
 
   try {
     const credential = resolveAnthropicCredential();
-    const client = new Anthropic(anthropicClientOptions(TIMEOUT_MS, credential));
+    if (!credential) return failure('no Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that runs sumo');
+    const client = new Anthropic({ ...anthropicClientOptions(TIMEOUT_MS, credential), maxRetries: MAX_RETRIES });
     const request = authenticatedRequest(requestFor({ system, prompt, schema, model }), credential);
     // Not the SDK's parse(): it throws on an answer that is not JSON before the stop reason or the usage can be read,
     // so a cut-off or refused answer would be misnamed and what it spent never logged. The answer is parsed below instead.

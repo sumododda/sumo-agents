@@ -51,3 +51,8 @@ test('a paste that is only paths of image files is those images, typed by their 
   writeFileSync(big, Buffer.concat([PNG, Buffer.alloc(MAX_IMAGE_BYTES)]));
   assert.throws(() => droppedImages(big), /too big/);
 });
+
+test('with no osascript, Ctrl-V says the clipboard needs macOS rather than that it holds no image', async () => {
+  const missing = Object.assign(new Error('spawn osascript ENOENT'), { code: 'ENOENT' });
+  await assert.rejects(clipboardImage(async () => { throw missing; }), /needs macOS — drop the image file on the box instead/);
+});

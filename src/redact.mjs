@@ -9,6 +9,7 @@
 const PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\bsk-[A-Za-z0-9_-]{20,}/g,
+  /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g,
   /\bgh[pousr]_[A-Za-z0-9]{36,}/g,
   /\bgithub_pat_[A-Za-z0-9_]{40,}/g,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}/g,
@@ -19,6 +20,16 @@ const PATTERNS = [
 // The name may be the tail of a longer one (DB_PASSWORD, GITHUB_TOKEN) and may be quoted, as a JSON key is; what follows it must be the assignment itself.
 const ASSIGNMENT = /(password|passwd|secret|token|api[_-]?key|access[_-]?key)(["']?\s*[:=]\s*)(["']?)([^\s"']{6,})\3/gi;
 
+/**
+ * The key names an env file keeps secrets under (SECRET_KEY, JWT_SECRET_KEY, SECRET_KEY_BASE, STRIPE_PRIVATE_KEY), in
+ * the env file's own spelling: capitals, `=` with nothing around it. In code the same words name variables and types
+ * (`secret_key: Vec<u8>`, `SECRET_KEY = os.environ[...]`), which a reader needs to see.
+ */
+const ENV_NAME = String.raw`\b((?:[A-Z0-9]+_)*(?:SECRET_KEY(?:_BASE)?|PRIVATE_KEY|SIGNING_KEY|ENCRYPTION_KEY|MASTER_KEY))`;
+/** Quoted, the value is the secret whatever the spacing (`SECRET_KEY = "a long pass phrase"`); bare, only in an env file's or YAML's own form, and never a `${…}` reference to one. */
+const ENV_KEY_QUOTED = new RegExp(String.raw`${ENV_NAME}(\s*[=:]\s*)(["'])((?:(?!\3)[^\n]){6,})\3`, 'g');
+const ENV_KEY = new RegExp(String.raw`${ENV_NAME}(=|:[ \t]+)(?!\$\{)([^\s"'[\]{}<>,;]{6,})(?=\s|$|[,;])`, 'gm');
+
 /** A value that is code, not a secret: a type (`token: string;`), or a member or a call it reads from (`credential.token`, `getPassword()`). Digits never pass for code. */
 const CODE_VALUE = /^(?:(?:string|boolean|number|bigint|object|symbol|unknown|undefined|integer|buffer)(?:\[\])?|[a-z_$]+(?:\.[a-z_$]+)+|[a-z_$]+(?:\.[a-z_$]+)*\(\D*)[;,)]*$/i;
 
@@ -26,7 +37,8 @@ const CODE_VALUE = /^(?:(?:string|boolean|number|bigint|object|symbol|unknown|un
 const holdsSecret = (sep, quote, value) => quote !== '' || !/[:\s]/.test(sep) || !CODE_VALUE.test(value);
 
 /** A password inside a URL (`postgres://app:pw@db/app`): only the password goes; the scheme, the user and the host stay. */
-const URL_PASSWORD = /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi;
+// The scheme is bounded: unbounded, every word of a long dotted run (minified code) is tried as one, and that is quadratic.
+const URL_PASSWORD = /\b([a-z][a-z0-9+.-]{0,31}:\/\/[^\s:/@]+:)[^\s@/]+@/gi;
 
 const GENERIC = /(?<![A-Za-z0-9+_=-])[A-Za-z0-9+_=-]{48,}(?![A-Za-z0-9+_=-])/g;
 
@@ -73,6 +85,57 @@ export function redact(raw) {
   return { text: hidden ? `${found.text}\n[${hidden} hidden character${hidden === 1 ? '' : 's'} taken out before redacting]` : found.text, count: found.count };
 }
 
+/** What a view, `grep -n` (`12:`, or `12-` for context), `nl` or `cat -n` puts before a line. */
+const LINE_NO = /^[ \t]*(?:\d+(?:[\t:→-]| {2}))?/;
+/** A line of a PEM body: 40 base64 characters or more, or a last one ending in padding. */
+const PEM_LINE = /^(?:[A-Za-z0-9+/]{40,}={0,2}|[A-Za-z0-9+/]+={1,2})[ \t]*$/;
+/** The last line before END may be short and unpadded: the DER's length decides. */
+const PEM_LAST = /^[A-Za-z0-9+/]+={0,2}[ \t]*$/;
+const BEGIN_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
+const END_KEY = /^-----END [A-Z ]*PRIVATE KEY-----/;
+/** An encrypted PKCS#1 key's headers, and the blank line after them, before its body. */
+const PEM_HEADER = /^(?:(?:Proc-Type|DEK-Info):.*|[ \t]*)$/;
+
+const bare = (line) => line.slice(LINE_NO.exec(line)[0].length);
+
+/**
+ * A private key a cut left half of, after the whole ones are gone: a BEGIN line with its body below it and no END, or
+ * a body ending in END with its BEGIN cut away. Found by walking lines — once each — never by a pattern that retries
+ * at every line of a long base64 block. A line that only names the header, with no body under it, is code: it stays.
+ */
+function keyFragments(text, hit) {
+  if (!/PRIVATE KEY-----/.test(text)) return text;
+  const lines = text.split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const begin = BEGIN_KEY.exec(lines[i]);
+    if (begin) {
+      let j = i + 1;
+      while (j < lines.length && PEM_HEADER.test(bare(lines[j])) && bare(lines[j]).trim() !== '' && j - i < 4) j++;
+      if (j < lines.length && bare(lines[j]).trim() === '' && j > i + 1) j++;
+      const body = j;
+      while (j < lines.length && PEM_LINE.test(bare(lines[j]))) j++;
+      if (j > body) {
+        out.push(lines[i].slice(0, begin.index) + hit());
+        i = j - 1;
+        continue;
+      }
+    }
+    if (END_KEY.test(bare(lines[i]))) {
+      let k = out.length;
+      if (k > 0 && PEM_LAST.test(bare(out[k - 1])) && !PEM_LINE.test(bare(out[k - 1]))) k--;
+      while (k > 0 && PEM_LINE.test(bare(out[k - 1]))) k--;
+      if (k < out.length && (k === out.length - 1 ? PEM_LINE.test(bare(out[k])) : true)) {
+        out.length = k;
+        out.push(hit());
+        continue;
+      }
+    }
+    out.push(lines[i]);
+  }
+  return out.join('\n');
+}
+
 function redactReadable(text) {
   let count = 0;
   const hit = () => {
@@ -86,6 +149,18 @@ function redactReadable(text) {
     return `${head}${MARK}@`;
   });
   for (const pattern of PATTERNS) out = out.replace(pattern, hit);
+  out = keyFragments(out, hit);
+  out = out.replace(ENV_KEY_QUOTED, (m, name, sep, _quote, value) => {
+    if (value.startsWith('${')) return m;
+    count++;
+    return `${name}${sep}${MARK}`;
+  });
+  out = out.replace(ENV_KEY, (m, name, sep, value) => {
+    // Code that names the key is code: a type (`STRIPE_SECRET_KEY: string;`) or what it is read from (`process.env.SECRET_KEY`).
+    if (CODE_VALUE.test(value) || /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(value)) return m;
+    if (value !== MARK) count++;
+    return `${name}${sep}${MARK}`;
+  });
   out = out.replace(ASSIGNMENT, (m, name, sep, quote, value) => {
     if (!holdsSecret(sep, quote, value)) return m;
     // A vendor token assigned to a name was already taken out, and counted, by its own pattern.

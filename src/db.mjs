@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { paths } from './paths.mjs';
@@ -257,12 +257,20 @@ const BUSY_MS = 3000;
  */
 export function openDb(file = paths().db) {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  const fresh = !existsSync(file);
+  // SQLite gives the -wal and -shm files the database's own mode: the file is made private before SQLite first opens
+  // it, or they are born readable by everyone (umask 022) and keep the latest writes there.
+  if (!existsSync(file)) closeSync(openSync(file, 'a', 0o600));
+  for (const side of [file, `${file}-wal`, `${file}-shm`]) {
+    try {
+      if (statSync(side).mode & 0o077) chmodSync(side, 0o600);
+    } catch {
+      // Not there yet: made with the database's mode when it is.
+    }
+  }
   const db = new DatabaseSync(file);
   db.exec(`PRAGMA busy_timeout = ${BUSY_MS}; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;`);
   useWal(db);
   migrate(db);
-  if (fresh) chmodSync(file, 0o600);
   return db;
 }
 

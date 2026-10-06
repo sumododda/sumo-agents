@@ -1,6 +1,6 @@
-import { readFileSync } from 'node:fs';
 import { redact } from './redact.mjs';
 import { head } from './text.mjs';
+import { readBackwards } from './transcript.mjs';
 
 const TURN_MAX_CHARS = 4000;
 
@@ -119,11 +119,16 @@ export function searchTurns(db, match, limit = 8) {
  */
 export function contextUse(transcriptPath) {
   if (!transcriptPath) return null;
-  try {
-    const lines = readFileSync(transcriptPath, 'utf8').split('\n');
+  // Read from the end, on every prompt: the size is in the last reply, and the file can be hundreds of megabytes.
+  return readBackwards(transcriptPath, (lines) => {
     for (let i = lines.length - 1; i >= 0; i--) {
       if (!lines[i].includes('"type":"assistant"')) continue;
-      const entry = JSON.parse(lines[i]);
+      let entry;
+      try {
+        entry = JSON.parse(lines[i]);
+      } catch {
+        return null; // A transcript that cannot be parsed answers nothing at all.
+      }
       // An error Claude Code writes in the reply's place (a rate limit, a failed sign-in) bills nothing; the size is in the reply before it.
       if (entry.isApiErrorMessage || entry.message?.model === '<synthetic>') continue;
       const { message } = entry;
@@ -131,10 +136,8 @@ export function contextUse(transcriptPath) {
       const { input_tokens: input = 0, cache_read_input_tokens: read = 0, cache_creation_input_tokens: written = 0 } = message.usage;
       return { tokens: input + read + written, model: message.model ?? null };
     }
-  } catch {
-    // A transcript that cannot be read or parsed answers nothing at all.
-  }
-  return null;
+    return undefined;
+  });
 }
 
 /** 'watch', 'act', or null while the session is still small. */
@@ -160,7 +163,7 @@ export function contextNudge(band, tokens, focus) {
  * no transcript path — how big it is cannot be known, and nothing is guessed.
  */
 export function taskEndedNudge(db) {
-  const path = db.prepare('SELECT transcript_path FROM sessions ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1').get()?.transcript_path ?? null;
+  const path = db.prepare(`SELECT transcript_path FROM sessions WHERE id NOT LIKE 'job:%' ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1`).get()?.transcript_path ?? null;
   const use = contextUse(path);
   if (!use || !contextBand(use.tokens)) return null;
   return `this session is at ${inK(use.tokens)} tokens and the task just ended — a good moment for /new; the memory block brings the thread back.`;

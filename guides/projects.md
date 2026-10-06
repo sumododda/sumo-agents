@@ -8,7 +8,7 @@ A project is a directory somewhere on this machine, registered once.
 3. Confirm the path with the user once, then
    `sumo project add <path> --alias <what the user calls it>` (repeat `--alias` for each name).
    It scans the repo — stack, commands, its own instruction files, index — and prints the project card.
-4. Do what the last line says (`/add-dir <path>`) so this session may edit there.
+   The tools work in its directory once the user names it in a message (its card arrives with that turn).
 
 **Working in one**
 - The card arrives by itself the first time the user names the project. Otherwise `sumo project show <slug>`.

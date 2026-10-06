@@ -190,3 +190,90 @@ test('a directory that shares a command name on PATH is not that command', () =>
   assert.match(run.out, /llama-server not found/);
   assert.equal(s.sql((db) => db.prepare(`SELECT value FROM meta WHERE key = 'llama.path'`).get()), undefined);
 });
+
+test('a model source with a token downloads with it as a header, and offline a model already here is kept, not called missing', async () => {
+  const { createServer } = await import('node:http');
+  const { freshHome, withHome } = await import('./fixtures/env-sandbox.mjs');
+  const { setup } = await import('../src/setup.mjs');
+  const { paths } = await import('../src/paths.mjs');
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push({ method: req.method, url: req.url, auth: req.headers.authorization ?? null });
+    if (req.headers.authorization !== `Basic ${Buffer.from('me:hf_TOKEN').toString('base64')}`) {
+      res.writeHead(401).end();
+      return;
+    }
+    res.writeHead(200, { 'content-length': '4' }).end(req.method === 'HEAD' ? undefined : 'gguf');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const home = freshHome();
+  const quiet = { SUMO_AGENTS_MODEL_CMD: '', ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '' };
+  try {
+    await withHome(home, quiet, async () => {
+      const lines = await setup({ link: false, modelSource: `http://me:hf_TOKEN@127.0.0.1:${server.address().port}` });
+      assert.match(lines.join('\n'), /downloaded/, lines.join('\n'));
+      assert.deepEqual(seen.map((r) => r.method), ['HEAD', 'GET']);
+      assert.ok(!lines.join('\n').includes('hf_TOKEN'));
+      assert.equal(statSync(join(paths().models, 'Qwen3-4B-Q4_K_M.gguf')).size, 4);
+
+      const offline = await setup({ link: false, modelSource: 'http://127.0.0.1:1' });
+      assert.match(offline.join('\n'), /^model .*present; not checked against http:\/\/127\.0\.0\.1:1/m, offline.join('\n'));
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('config refuses an effort the API does not take and a model file that is a path', async () => {
+  const s = sandbox();
+  for (const [args, message] of [
+    [['config', 'chat.effort', 'banana'], /no such effort "banana"/],
+    [['config', 'model.file', '../../etc/passwd'], /model\.file is a file name/],
+  ]) {
+    const run = s.sumo(args);
+    assert.equal(run.code, 2, `${args.join(' ')} → ${run.out}`);
+    assert.match(run.err, message);
+  }
+  assert.match(s.sumo(['config', 'chat.effort', 'xhigh']).out, /chat\.effort = xhigh/);
+  const { CHAT_EFFORTS } = await import('../src/setup.mjs');
+  const { EFFORTS } = await import('../src/route.mjs');
+  assert.deepEqual(CHAT_EFFORTS, EFFORTS);
+});
+
+test('a model source that is not a web address is refused before it is stored, and a stored one that cannot be read never stops setup', async () => {
+  const s = sandbox();
+  for (const args of [['config', 'model.source', 'huggingface.co'], ['setup', '--no-link', '--model-source', 'huggingface.co']]) {
+    const run = s.sumo(args);
+    assert.equal(run.code, 2, `${args.join(' ')} → ${run.out}`);
+    assert.match(run.err, /is not a web address/);
+  }
+  assert.match(s.sumo(['config', 'model.source']).out, /^model\.source = https:\/\/huggingface\.co$/m, 'nothing was stored');
+
+  const { freshHome, withHome } = await import('./fixtures/env-sandbox.mjs');
+  const { setup } = await import('../src/setup.mjs');
+  const { paths } = await import('../src/paths.mjs');
+  await withHome(freshHome(), { SUMO_AGENTS_MODEL_CMD: '', ANTHROPIC_API_KEY: '' }, async () => {
+    const lines = await setup({ link: false, modelSource: 'https://u:%E0@127.0.0.1:9' });
+    assert.match(lines.join('\n'), /could not download the router model/);
+    assert.equal(statSync(paths().launcher).isFile(), true, 'the launcher is written all the same');
+  });
+});
+
+test('doctor only warns without herdr: a job runs without it, only its tab is not opened', () => {
+  const s = sandbox();
+  const binDir = join(s.root, 'bin');
+  mkdirSync(binDir);
+  s.sumo(['setup', '--bin-dir', binDir]);
+  const run = s.sumo(['doctor'], { extraEnv: { PATH: `${binDir}:/usr/bin:/bin` } });
+  assert.match(run.out, /^warn {2}herdr on PATH \(optional/m, run.out);
+  assert.doesNotMatch(run.out, /FAIL {2}herdr/);
+});
+
+test('setup says what it skipped and what to run next', () => {
+  const s = sandbox();
+  const run = s.sumo(['setup', '--no-model', '--no-link']);
+  assert.equal(run.code, 0, run.err);
+  assert.match(run.out, /^model {5}not fetched \(--no-model\)/m);
+  assert.match(run.out, /^command {3}not linked \(--no-link\)/m);
+  assert.match(run.out, /^next {6}sumo doctor$/m);
+});

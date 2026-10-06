@@ -229,3 +229,15 @@ test('a gate that would take minutes over one command is refused when it is writ
   assert.equal(bash(s, `echo ${'a'.repeat(44)}!`).out, '');
   assert.ok(Date.now() - started < 3000, `the check took ${Date.now() - started} ms`);
 });
+
+test('what a sumo call has the shell run — a process substitution, or a substitution in an unquoted heredoc — is judged on its own', async () => {
+  const { withoutSumoCalls } = await import('../src/workflows.mjs');
+  assert.match(withoutSumoCalls('sumo show m1 > >(gh pr create --fill)'), /gh pr create --fill/);
+  assert.match(withoutSumoCalls('sumo show m1 <(gh pr create --fill)'), /gh pr create --fill/);
+  assert.match(withoutSumoCalls('sumo learn x <<EOF\n$(gh pr create --fill)\nEOF'), /gh pr create --fill/);
+  assert.match(withoutSumoCalls('sumo learn x <<EOF\n`gh pr create --fill`\nEOF'), /gh pr create --fill/);
+  // Quoted, the heredoc is only text, and an escaped substitution is not one.
+  assert.equal(withoutSumoCalls("sumo learn x <<'EOF'\n$(gh pr create --fill)\nEOF"), '');
+  assert.equal(withoutSumoCalls('sumo learn x <<EOF\n\\$(gh pr create --fill)\nEOF'), '');
+  assert.equal(withoutSumoCalls('sumo learn "open a PR" --cue "gh pr create"'), '');
+});

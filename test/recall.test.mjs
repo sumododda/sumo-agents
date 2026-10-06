@@ -69,3 +69,10 @@ test('a project\'s memory answers only in a session where that project has come 
   assert.match(feedback(stop(s, asking)).context, /m1 \[fact·simba·stated\] deploys go to the staging cluster first/);
   assert.equal(s.sql((db) => currentProject(db, SESSION.session_id)), 'simba', 'what was recalled is not mistaken for the project in hand');
 });
+
+test('a question that names a file or a version is read whole, not from its last dot', async () => {
+  const { closingQuestions } = await import('../src/recall.mjs');
+  assert.equal(closingQuestions('Done. Should the deploy go through staging first (see deploy.yml)?').trim(), 'Should the deploy go through staging first (see deploy.yml)?');
+  assert.equal(closingQuestions('I bumped it. Pin node to v22.1?').trim(), 'Pin node to v22.1?');
+  assert.equal(closingQuestions('Tests pass. Ready?\nOr wait for CI?').split('?').filter((q) => q.trim()).length, 2);
+});

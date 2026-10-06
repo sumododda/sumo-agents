@@ -71,7 +71,7 @@ export async function runJobTool(call, { job, ctx, signal = null }) {
     // The checks give each command its own limit; anything else is quick.
     const run = await runCommand(sumo(args), { cwd: ctx.cwd, env: ctx.env, signal, timeoutMs: command.checks ? null : 60_000 });
     if (run.error) return { content: run.error, isError: true };
-    const output = capRedacted(`${run.stdout}${run.stderr}`.trim());
+    const output = capRedacted(run.output.trim(), undefined, run.omitted);
     return { content: output || '(done)', isError: run.stopped !== null || run.status !== 0 };
   } finally {
     if (file) rmSync(file, { force: true });

@@ -77,22 +77,26 @@ const SUMO_CALL = /^\s*(\S*\/)?sumo(\s|$)/;
 function heredocOpener(command, at) {
   let i = at + /^<<-?[\t ]*/.exec(command.slice(at))[0].length;
   let delimiter = '';
+  // Any quoting of the delimiter keeps the body as written; without it the shell expands the body's substitutions.
+  let quoted = false;
   while (i < command.length && !WORD_END.test(command[i])) {
     const ch = command[i];
     if (ch === "'" || ch === '"') {
       const close = command.indexOf(ch, i + 1);
       if (close === -1 || command.slice(i, close).includes('\n')) return null;
       delimiter += command.slice(i + 1, close);
+      quoted = true;
       i = close + 1;
     } else if (ch === '\\') {
       delimiter += command[i + 1] ?? '';
+      quoted = true;
       i += 2;
     } else {
       delimiter += ch;
       i++;
     }
   }
-  return delimiter ? { delimiter, length: i - at } : null;
+  return delimiter ? { delimiter, quoted, length: i - at } : null;
 }
 
 /**
@@ -122,6 +126,24 @@ function substitution(command, at) {
   }
   const end = Math.min(j, command.length - 1);
   return { end, inner: arithmetic ? null : command.slice(open + 1, end) };
+}
+
+/** The commands an unquoted heredoc body substitutes in: `$(…)` and backticks, not ones escaped with a backslash. */
+function substitutionsIn(body) {
+  const found = [];
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === '\\') i++;
+    else if (body.startsWith('$(', i) && !body.startsWith('$((', i)) {
+      const { end, inner } = substitution(body, i);
+      if (inner !== null) found.push(inner);
+      i = end;
+    } else if (body[i] === '`') {
+      const { end, inner } = substitution(body, i);
+      found.push(inner);
+      i = end;
+    }
+  }
+  return found;
 }
 
 /**
@@ -169,7 +191,8 @@ export function withoutSumoCalls(command) {
     } else if (ch === "'" || ch === '"') {
       quote = ch;
       part += ch;
-    } else if (command.startsWith('$(', i) || command.startsWith('((', i) || ch === '`') {
+    } else if (command.startsWith('$(', i) || command.startsWith('((', i) || ch === '`' || ((ch === '<' || ch === '>') && command[i + 1] === '(')) {
+      // `<(…)` and `>(…)` are run by the shell as surely as `$(…)` is.
       // A substitution or arithmetic: a `<<` inside is a shift, or the substitution's own, never this command's heredoc.
       i = takeSubstitution(i);
     } else if (command.startsWith('$[', i)) {
@@ -185,16 +208,17 @@ export function withoutSumoCalls(command) {
       part += command.slice(i, end);
       i = end - 1;
     } else if (ch === '<' && command[i + 1] === '<' && command[i + 2] !== '<' && command[i - 1] !== '<' && (opened = heredocOpener(command, i))) {
-      heredocs.push(opened.delimiter);
+      heredocs.push(opened);
       part += command.slice(i, i + opened.length);
       i += opened.length - 1;
     } else if (ch === '\n' && heredocs.length > 0) {
       // Each body runs to a line that is its delimiter alone, and belongs to the call that opened it.
       let at = i;
-      for (const end of heredocs) {
+      for (const { delimiter: end, quoted } of heredocs) {
         const rest = command.slice(at + 1);
         const close = new RegExp(`^[\\t ]*${escaped(end)}[\\t ]*$`, 'm').exec(rest);
         const last = at + (close ? close.index + close[0].length : rest.length);
+        if (!quoted) subs.push(...substitutionsIn(rest.slice(0, close ? close.index : rest.length)));
         part += command.slice(at, last + 1);
         at = last + 1;
         if (at >= command.length) break;
