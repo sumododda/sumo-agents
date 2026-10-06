@@ -66,6 +66,15 @@ export function jobParams({ job, text, system = systemPrompt() }) {
   return paramsFor({ model: job.model, effort: job.effort, tools: [...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent)], text, system });
 }
 
+/**
+ * The first of two guards on a job taking its own work unverified: the command as written — `--accept` on a finish,
+ * or clearing or setting the SUMO_JOB marker the second guard reads (reading code that names it is fine). `sumo job finish` refuses `--accept` under that marker
+ * however the command was spelled. Both stop mistakes, not a shell set on getting round them: a job's shell runs
+ * with the user's own access.
+ */
+const SELF_GRANT = /\bjob\s+finish\b[\s\S]*--accept\b|\b(?:unset|env\b[^;&|\n]*\s-u)\s+SUMO_JOB\b|\bSUMO_JOB=/;
+const SELF_GRANT_REFUSED = "Refused: work is never taken unverified on its author's word. Finish FAILED with what blocks verification, or ask.";
+
 /** Said once to a job that ended its turn with the job still open: it finished the work but never said so. */
 const UNCLOSED = 'You ended without closing the job. Call `finish` now — DONE or FAILED, with your report — or `ask` if you are blocked.';
 
@@ -219,7 +228,9 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   // and with the job's own project in scope whether or not its card came up in the session.
   const gate = (call) => {
     if (isJobTool(call)) return runJobTool(call, { job, ctx, signal });
-    if (call.name !== BASH_TOOL.name || !job.session_id) return null;
+    if (call.name !== BASH_TOOL.name) return null;
+    if (SELF_GRANT.test(String(call.input?.command ?? ''))) return { content: SELF_GRANT_REFUSED, isError: true };
+    if (!job.session_id) return null;
     const held = handleEvent(db, 'pre-tool', { session_id: job.session_id, agent_id: `j${id}`, project: job.project, cwd: project.path, tool_name: 'bash', tool_input: { command: String(call.input?.command ?? '') } }, now?.());
     return held ? { content: JSON.parse(held).deny, isError: true } : null;
   };
