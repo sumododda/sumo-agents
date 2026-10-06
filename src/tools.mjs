@@ -40,6 +40,32 @@ const OUTPUT_CAP_CHARS = 16_000;
 const VIEW_CAP_LINES = 400;
 const COMMAND_TIMEOUT_MS = 540_000; // the same nine minutes a check gets
 const MAX_BUFFER_CHARS = 64 * 1024 * 1024;
+/** What is held of a command's output at each end: more than any cap keeps, so the cut is always made by the cap, never here. */
+const KEPT_EACH_END = 64 * 1024;
+
+/** A stream's first and last KEPT_EACH_END characters, and how many fell between them — never the whole flood. */
+function keeper() {
+  let head = '';
+  let tail = '';
+  let total = 0;
+  return {
+    push(chunk) {
+      total += chunk.length;
+      const room = KEPT_EACH_END - head.length;
+      if (room > 0) {
+        head += chunk.slice(0, room);
+        chunk = chunk.slice(room);
+      }
+      if (chunk) tail = (tail + chunk).slice(-KEPT_EACH_END);
+    },
+    get text() {
+      return head + tail;
+    },
+    get omitted() {
+      return total - head.length - tail.length;
+    },
+  };
+}
 
 /** The shell a command runs in: bash, which the tool is named for, where there is one. */
 const SHELL = existsSync('/bin/bash') ? '/bin/bash' : true;
@@ -88,10 +114,10 @@ export function childEnv(env = process.env) {
  * where runners put the failures; the middle is the part worth losing, and the
  * marker says how much went and how to get a narrower answer.
  */
-export function cap(text, max = OUTPUT_CAP_CHARS) {
-  if (text.length <= max) return text;
+export function cap(text, max = OUTPUT_CAP_CHARS, omitted = 0) {
+  if (text.length <= max && omitted === 0) return text;
   const half = Math.floor(max / 2);
-  return `${text.slice(0, half)}\n${cutMark(text.length - 2 * half)}\n${text.slice(-half)}`;
+  return `${text.slice(0, half)}\n${cutMark(text.length - 2 * half + omitted)}\n${text.slice(-half)}`;
 }
 
 const cutMark = (cut) => `[cut ${cut} characters from the middle — narrow the command: tail, grep, or a line range]`;
@@ -101,16 +127,16 @@ const cutMark = (cut) => `[cut ${cut} characters from the middle — narrow the 
  * end that is kept, so a key the cut would split is still whole when it is found — and a flood of output is never
  * scanned whole.
  */
-export function capRedacted(text, max = OUTPUT_CAP_CHARS) {
+export function capRedacted(text, max = OUTPUT_CAP_CHARS, omitted = 0) {
   // Capped after redacting too: what redaction adds — a marker for each hidden character — counts against the cap.
-  if (text.length <= max) {
+  if (text.length <= max && omitted === 0) {
     const out = redact(text).text;
     return out.length <= max ? out : cap(out, max);
   }
   const half = Math.floor(max / 2);
   const head = redact(text.slice(0, half + max)).text.slice(0, half);
   const tail = redact(text.slice(-(half + max))).text.slice(-half);
-  return `${head}\n${cutMark(text.length - 2 * half)}\n${tail}`;
+  return `${head}\n${cutMark(text.length - 2 * half + omitted)}\n${tail}`;
 }
 
 /**
@@ -164,7 +190,8 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null 
     const child = spawn(command, { cwd, shell: SHELL, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     if (child.pid) track(child.pid);
     let drain = null;
-    const streams = { stdout: '', stderr: '' };
+    // Each stream, and both together in the order they came, so an error stays beside the step that printed it.
+    const kept = { stdout: keeper(), stderr: keeper(), output: keeper() };
     let size = 0;
     let stopped = null;
     let unstarted = null;
@@ -178,7 +205,7 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null 
       clearTimeout(drain);
       signal?.removeEventListener('abort', interrupt);
       live.delete(child.pid);
-      resolve({ ...streams, status, signal: killedBy, stopped, error: unstarted });
+      resolve({ stdout: kept.stdout.text, stderr: kept.stderr.text, output: kept.output.text, omitted: kept.output.omitted, status, signal: killedBy, stopped, error: unstarted });
     };
     // What was stopped is not waited for: a child left in the background can hold the pipes open long after the shell is gone.
     const release = (status, killedBy) => {
@@ -196,7 +223,10 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null 
       child[name].on('data', (chunk) => {
         size += chunk.length;
         if (size > MAX_BUFFER_CHARS) kill('overflow');
-        else streams[name] += chunk;
+        else {
+          kept[name].push(chunk);
+          kept.output.push(chunk);
+        }
       });
     }
     child.on('error', (cause) => {
@@ -219,20 +249,20 @@ export async function runBash({ command, restart }, ctx, { signal = null, timeou
   // The tool is specified as one session the model may restart; here every call is its own shell, so there is nothing to restart.
   if (restart) return result('Bash session restarted: every command already runs in a fresh shell, in the project directory');
   if (typeof command !== 'string' || !command.trim()) return result('bash needs a command', true);
-  const refused = guardCommand(command);
+  const refused = guardCommand(command, { cwd: ctx.cwd });
   if (refused) return result(refused, true);
   // The commands that run the project's checks give each check its own limit; one limit over all of them would cut a verdict off half-way.
   const limit = OWN_LIMITS.test(command) ? null : timeoutMs;
   const run = await runCommand(command, { cwd: ctx.cwd, env: ctx.env ?? childEnv(), signal, timeoutMs: limit });
   if (run.error) return result(run.error, true);
   const failed = run.stopped !== null || run.status !== 0;
-  const output = `${run.stdout}${run.stderr}`.trimEnd();
+  const output = run.output.trimEnd();
   const tail =
     run.stopped === 'timeout' ? `\n(stopped: it ran past ${timeoutMs / 60_000} minutes)`
     : run.stopped === 'interrupted' ? `\n(${INTERRUPTED})`
     : run.stopped === 'overflow' ? `\n(stopped: it printed more than ${MAX_BUFFER_CHARS / 1024 / 1024} MB — narrow the command: tail, grep, or a line range)`
     : failed ? `\n(exit ${run.status ?? run.signal})` : '';
-  return result(capRedacted(output) + tail, failed);
+  return result(capRedacted(output, OUTPUT_CAP_CHARS, run.omitted) + tail, failed);
 }
 
 function view(path, range) {
@@ -266,6 +296,14 @@ export function runEditor(input, ctx) {
   }
   try {
     const secret = guardPath(path) ?? guardPath(realAncestor(path));
+    // Every root can be read; only the project (the first) can be written. A job's own folder holds what judges it.
+    if (input.command !== 'view' && ctx.roots.length > 1) {
+      try {
+        jailed(input.path, { cwd: ctx.cwd, roots: ctx.roots.slice(0, 1) });
+      } catch {
+        return result(`${path} can be read, not changed — only files in the project (${ctx.roots[0]}) are edited`, true);
+      }
+    }
     switch (input.command) {
       case 'view':
         if (secret) return result(secret, true);

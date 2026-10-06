@@ -72,3 +72,16 @@ test('a path is shortened with ~ only when it is inside the home directory, not 
     }
   });
 });
+
+test('with the memory writer off, the block tells the model to save what lasts itself', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      assert.doesNotMatch(prime(db), /memory writer is off/);
+      setMeta(db, 'config.scribe.model', 'off');
+      assert.match(prime(db), /The memory writer is off \(scribe\.model\): save what the user states that should last, as it is said, with sumo add\./);
+    } finally {
+      db.close();
+    }
+  });
+});

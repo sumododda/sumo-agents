@@ -5,6 +5,22 @@ import { clip } from './text.mjs';
 
 const MAX_SESSIONS = 5;
 const TURN_MAX = 600;
+/** Each session's share of what fits the local model's context: its latest turns, as many as fit. The writer has filed every one already. */
+const SESSION_CHARS = 8_000;
+
+/** The last of a session's turns that fit its share, each clipped; the rest are counted, not shown. */
+function latestThatFit(turns) {
+  const shown = [];
+  let used = 0;
+  for (const t of [...turns].reverse()) {
+    const line = `[t${t.id}] user: ${clip(t.text, TURN_MAX)}`;
+    if (shown.length > 0 && used + line.length > SESSION_CHARS) break;
+    shown.unshift(line);
+    used += line.length;
+  }
+  const left = turns.length - shown.length;
+  return left > 0 ? [`[${left} earlier turn${left === 1 ? '' : 's'} not shown]`, ...shown] : shown;
+}
 const MAX_MEMORIES = 60;
 
 /**
@@ -31,7 +47,7 @@ function buildBundle(db, sessions) {
   const sections = [];
   for (const session of sessions) {
     sections.push(`--- session started ${session.started_at.slice(0, 16)}`);
-    for (const t of turns.filter((x) => x.session_id === session.id)) sections.push(`[t${t.id}] user: ${clip(t.text, TURN_MAX)}`);
+    sections.push(...latestThatFit(turns.filter((x) => x.session_id === session.id)));
     for (const c of checkpoints.filter((x) => x.session_id === session.id)) sections.push(`[done in ${c.project}]: ${c.done}${c.next_step ? ` → next: ${c.next_step}` : ''}`);
   }
 

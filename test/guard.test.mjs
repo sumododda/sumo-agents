@@ -51,6 +51,16 @@ test('a command that would wipe a tree, throw away history or empty a database i
   }
 });
 
+test('the home and the working directory spelled out in full are guarded as ~ and . are', () => {
+  const where = { cwd: '/work/proj', home: '/Users/me' };
+  for (const command of ['rm -rf /Users/me', 'rm -rf /Users/me/', 'rm -rf "/Users/me/Documents"', 'rm -rf /work/proj', 'rm -rf /work/proj/', 'rm -rf /work/proj/*']) {
+    assert.match(guardCommand(command, where) ?? '', /^Refused: .*whole tree/, command);
+  }
+  for (const command of ['rm -rf /work/proj/node_modules', 'rm -rf /Users/me/proj/dist', 'rm -rf /Users/meadow/x/y']) {
+    assert.equal(guardCommand(command, where), null, `should allow: ${command}`);
+  }
+});
+
 test('ordinary deletes, soft resets, single-file restores and force-pushes go through', () => {
   for (const command of [
     'rm -rf node_modules',
@@ -114,6 +124,16 @@ test('a command that would print a secret file is refused; sourcing it, listing 
     'cat README.md',
     'cat src/environment.ts',
   ]) {
+    assert.equal(guardCommand(command), null, `should allow: ${command}`);
+  }
+});
+
+test('a secret file is a secret in any case and through a redirect, and git\'s stored credentials are one', () => {
+  for (const command of ['cat .ENV', 'grep KEY .Env.local', 'cat <.env', 'echo "$(< .env)"', 'cat ~/.git-credentials', 'head ~/.ssh/ID_RSA', 'cat certs/SERVER.PEM']) {
+    assert.match(guardCommand(command) ?? '', /^Refused: .*secret/i, command);
+  }
+  for (const path of ['/p/.ENV', '/Users/x/.git-credentials']) assert.match(guardPath(path) ?? '', /^Refused: /, path);
+  for (const command of ['cat .ENV.example', 'source .ENV && npm test', 'wc -l < README.md', 'echo "$(< package.json)"']) {
     assert.equal(guardCommand(command), null, `should allow: ${command}`);
   }
 });

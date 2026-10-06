@@ -124,7 +124,8 @@ export async function ensureLocalServer(db, { llama, file }) {
       return current;
     }
   }
-  if (current) stopLocalServer(db);
+  // Only the server judged stale above: another sumo may have replaced it since, and that one is not ours to end.
+  if (current) stopLocalServer(db, current);
   const port = await freePort();
   const { server, dead } = tx(db, () => {
     const again = recorded(db);
@@ -135,10 +136,14 @@ export async function ensureLocalServer(db, { llama, file }) {
   return server;
 }
 
-/** Ends the recorded server, if it is still ours, and forgets it. Setup calls this: the model or the binary may have changed. */
-export function stopLocalServer(db) {
+/**
+ * Ends the recorded server, if it is still ours, and forgets it. Setup calls this: the model or the binary may have changed.
+ * Given `expected`, only that server: a record that has changed since it was read belongs to someone else's call.
+ */
+export function stopLocalServer(db, expected) {
   const current = recorded(db);
   if (!current) return;
+  if (expected && (current.pid !== expected.pid || current.startedAt !== expected.startedAt)) return;
   if (ours(current)) {
     try {
       process.kill(current.pid, 'SIGTERM');

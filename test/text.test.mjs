@@ -108,3 +108,73 @@ test('a password inside a URL is taken out, and the scheme, user and host stay',
     assert.equal(secretShape(plain), null, plain);
   }
 });
+
+test('the env names secrets usually go by are taken out, and so is a key whose END line was cut off', () => {
+  for (const [line, kept] of [
+    ['SECRET_KEY=django-insecure-abc123xyz789', 'SECRET_KEY='],
+    ['SECRET_KEY=django-insecure-a(b)c)d*e!f1234', 'SECRET_KEY='],
+    ['JWT_SECRET_KEY=mysupersecret123', 'JWT_SECRET_KEY='],
+    ['SECRET_KEY_BASE=a3f9b2c1d4e5f6', 'SECRET_KEY_BASE='],
+    ['PRIVATE_KEY="abcdef123456"', 'PRIVATE_KEY='],
+    // Put together here, so no key-shaped literal sits in the source for a scanner to stop.
+    [`STRIPE_KEY=${['sk', 'live', 'Q7mZ2xV9pL4tR8wK1nB6cD3f'].join('_')}`, 'STRIPE_KEY='],
+    [`stripe.api_key = "${['rk', 'test', 'Q7mZ2xV9pL4tR8wK1nB6cD3f'].join('_')}"`, 'stripe.api_key = '],
+  ]) {
+    assert.equal(redact(line).text, `${kept}[redacted]`, line);
+  }
+  for (const plain of [
+    'sort_key = name', 'primary_key: string;', 'const key = cacheKey(user)',
+    'privateKey: KeyObject;', 'private_key: Option<String>,', 'pub client_key: Vec<u8>,', 'secret_key: Vec<u8>,',
+    'self.master_key = master_key', 'encryption_key=settings.ENCRYPTION_KEY', 'masterKey: masterKey,', 'SECRET_KEY = os.environ["X"]',
+  ]) assert.equal(redact(plain).text, plain, plain);
+
+  const head = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1/2+abc/defGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw\nZZZ/yyy+xxx/wwwZZZ/yyy+xxx/wwwZZZ/yyy+xxx/wwwZZZ/yyy+xxx/www0123';
+  assert.equal(redact(`before\n${head}\nafter`).text, 'before\n[redacted]\nafter');
+  // Code that only names the header is code: what follows it is not a key.
+  const detector = "export function isKey(text) {\n  return text.startsWith('-----BEGIN OPENSSH PRIVATE KEY-----');\n}\nexport function add(a, b) {\n  return a + b;\n}";
+  assert.match(redact(detector).text, /export function add\(a, b\) \{\n {2}return a \+ b;\n\}$/);
+});
+
+test('a long dotted run, as minified code is, is looked through in linear time', () => {
+  const start = performance.now();
+  redact('a.'.repeat(50_000));
+  assert.ok(performance.now() - start < 200, `took ${Math.round(performance.now() - start)} ms`);
+});
+
+test('an env secret is taken out quoted with spaces or in YAML, a reference to one is not, and a key is caught through grep -n, nl, or with only its tail left', () => {
+  for (const [line, kept] of [
+    ['SECRET_KEY="my long pass phrase"', 'SECRET_KEY='],
+    ['SECRET_KEY: abc123xyz789', 'SECRET_KEY: '],
+    ['SECRET_KEY = "abcdefgh1234"', 'SECRET_KEY = '],
+  ]) assert.equal(redact(line).text, `${kept}[redacted]`, line);
+  for (const plain of [
+    'SECRET_KEY=${SECRET_KEY:-changeme}', 'SECRET_KEY: ${{ secrets.KEY }}', 'SECRET_KEY: Optional[str] = None',
+    'STRIPE_SECRET_KEY: string;', '{ SECRET_KEY: process.env.SECRET_KEY, PRIVATE_KEY: process.env.PRIVATE_KEY }',
+    'Flask(SECRET_KEY=settings.secret, DEBUG=True)', 'static MASTER_KEY: Lazy<String> = Lazy::new(load);',
+  ]) assert.equal(redact(plain).text, plain, plain);
+  // A key whose last line is short, and code that follows a line naming the header.
+  const pem = 'MIIEowIBAAKCAQEAwJm0q8bz1R3n2Xk7YpLm4Vt6Hq9eFd2GsA5W/cZr8NtYb3Kq1Lm9Pw2X';
+  assert.equal(redact(`${pem}\n${pem}\nabcd/efgh+ij==\n-----END PRIVATE KEY-----\nok`).text, '[redacted]\nok');
+  assert.equal(redact('-----BEGIN PRIVATE KEY-----\nsomeVeryLongIdentifierName\nnext').text, '-----BEGIN PRIVATE KEY-----\nsomeVeryLongIdentifierName\nnext', 'a header with no body under it is code');
+  assert.equal(redact("const HEADER = '-----BEGIN PRIVATE KEY-----';").text, "const HEADER = '-----BEGIN PRIVATE KEY-----';");
+  // grep's context lines, and an encrypted key's headers before its body.
+  assert.equal(redact(`5-${pem}\n6-${pem}\n7------END RSA PRIVATE KEY-----`).text, '[redacted]');
+  assert.equal(redact(`-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,ABC\n\n${pem}\n${pem}`).text, '[redacted]');
+
+  const body = ['MIIEowIBAAKCAQEAwJm0q8bz1R3n2Xk7YpLm4Vt6Hq9eFd2GsA5Wc', 'Zr8NtYb3Kq1Lm9Pw2Xc4Vb6Nm8Qa0Sd2Fg4Hj6Kl8Zx0Cv2Bn4Mq6We8Rt', 'Yu0Io2Pa4Sd6Fg8Hj0Kl2Zx4Cv6Bn8Mq0We2Rt4Yu6Io8Pa0Sd2Fg4Hj6='];
+  const grepped = ['1:-----BEGIN RSA PRIVATE KEY-----', ...body.map((l, i) => `${i + 2}:${l}`)].join('\n');
+  const numbered = ['     1  -----BEGIN RSA PRIVATE KEY-----', ...body.map((l, i) => `     ${i + 2}  ${l}`)].join('\n');
+  const tail = ['[cut 2000 characters from the middle]', ...body.slice(1), '-----END RSA PRIVATE KEY-----', 'done'].join('\n');
+  for (const text of [grepped, numbered, tail]) {
+    const out = redact(text).text;
+    for (const l of body) assert.ok(!out.includes(l.slice(0, 20)), `${l.slice(0, 20)} leaked from:\n${out}`);
+  }
+  assert.match(redact(tail).text, /^\[cut 2000 characters from the middle\]\n\[redacted\]\ndone$/);
+});
+
+test('a long block of base64 or hex is looked through in linear time, whatever it is', () => {
+  const block = Array.from({ length: 16_000 }, (_, i) => (i % 2 ? 'MIIEowIBAAKCAQEAwJm0q8bz1R3n2Xk7YpLm4Vt6Hq9eFd2GsA5W/cZr8NtYb3Kq1Lm9Pw2X' : 'a'.repeat(24) + 'f0'.repeat(20))).join('\n');
+  const start = performance.now();
+  redact(block);
+  assert.ok(performance.now() - start < 500, `took ${Math.round(performance.now() - start)} ms`);
+});

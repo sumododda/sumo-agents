@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+
 /**
  * The guard: a shell command that would wipe a tree, throw away history or
  * empty a database, and any way of reading a secret file, are refused before
@@ -10,12 +12,15 @@
  * history here, and `rm -rf node_modules` is Tuesday.
  */
 
-/** A file whose contents are a secret: reading it is refused, and a change that adds one is never DONE. A glob (`.env*`) names them too. */
+/**
+ * A file whose contents are a secret: reading it is refused, and a change that adds one is never DONE. A glob (`.env*`) names them too.
+ * Any case: the disk a Mac ships with reads `.ENV` as `.env`. A redirect (`<.env`) is a reading too.
+ */
 const SECRET_FILE =
-  /(^|[\s/'"=])(\.env[*?]*(\.(?!example\b|sample\b|template\b)[\w*?-]+)?|\.netrc|\.aws\/credentials|\.ssh\/(?!known_hosts\b|config\b|authorized_keys\b)[\w.-]+(?<!\.pub)|id_(rsa|dsa|ecdsa|ed25519)(?!\.pub)|[\w.-]+\.(pem|key|p12|pfx))(?=$|[\s'"|;&)])/;
+  /(^|[\s/'"=<])(\.env[*?]*(\.(?!example\b|sample\b|template\b)[\w*?-]+)?|\.netrc|\.git-credentials|\.aws\/credentials|\.ssh\/(?!known_hosts\b|config\b|authorized_keys\b)[\w.-]+(?<!\.pub)|id_(rsa|dsa|ecdsa|ed25519)(?!\.pub)|[\w.-]+\.(pem|key|p12|pfx))(?=$|[\s'"|;&)])/i;
 
-/** Anything that would put a file's contents in front of the model. `source .env` is not on it: that sets variables without showing them. */
-const PRINTS = /(^|[\s;&|($`])(cat|head|tail|less|more|bat|grep|rg|egrep|fgrep|sed|awk|cut|strings|xxd|hexdump|od|base64|nl|tac|view|vim?|nano|code|open|pbcopy|jq|yq)\s/;
+/** Anything that would put a file's contents in front of the model, `$(< file)` among them. `source .env` is not on it: that sets variables without showing them. */
+const PRINTS = /(^|[\s;&|($`])(cat|head|tail|less|more|bat|grep|rg|egrep|fgrep|sed|awk|cut|strings|xxd|hexdump|od|base64|nl|tac|view|vim?|nano|code|open|pbcopy|jq|yq)\s|\$\(\s*</;
 
 /** `rm`, its flags, and its targets — up to the end of its command, which a new line is too. Only a recursive spelling of the flags is looked at further. */
 const RM = /(^|[\s;&|(`"'])(?:sudo\s+)?rm((?:\s+-{1,2}[\w-]+)+)\s+([^;&|)`\n]+)/g;
@@ -26,13 +31,21 @@ const ROOT_OR_HOME_OR_HERE = /^(?:\/|~\/?|\$HOME\/?|\$\{HOME\}\/?|\.{1,2}\/?|\*|
 
 const unquote = (word) => word.replace(/^["']|["']$/g, '');
 
+/** The home and the working directory spelled out in full are the same targets as `~` and `.`. */
+function spelledShort(target, { cwd, home }) {
+  const trimmed = target.length > 1 ? target.replace(/\/+$/, '') : target;
+  if (cwd && (trimmed === cwd || trimmed === `${cwd}/*`)) return '.';
+  if (home && (trimmed === home || trimmed.startsWith(`${home}/`))) return `~${trimmed.slice(home.length)}`;
+  return target;
+}
+
 const RULES = [
   {
-    test: (c) => {
+    test: (c, where) => {
       // A line ending in a backslash goes on: its targets are still rm's.
       for (const m of c.replace(/\\\n/g, ' ').matchAll(RM)) {
         if (!RECURSIVE.test(m[2])) continue;
-        const targets = m[3].trim().split(/\s+/).map(unquote);
+        const targets = m[3].trim().split(/\s+/).map(unquote).map((t) => spelledShort(t, where));
         if (targets.some((t) => ROOT_OR_HOME_OR_HERE.test(t))) return true;
       }
       return false;
@@ -52,10 +65,10 @@ const RULES = [
   { test: (c) => PRINTS.test(c) && SECRET_FILE.test(c), why: () => 'it would print a secret file (.env, a private key, credentials). Use `source`/`set -a` to load it without showing it' },
 ];
 
-/** Why a shell command is refused, or null when it may run. */
-export function guardCommand(command) {
+/** Why a shell command is refused, or null when it may run. `cwd` is where it would run, so its full spelling is known too. */
+export function guardCommand(command, { cwd = null, home = homedir() } = {}) {
   for (const rule of RULES) {
-    if (rule.test(command)) return `Refused: ${rule.why(command)}. If it is what the user wants, they run it themselves: \`! ${command}\``;
+    if (rule.test(command, { cwd, home })) return `Refused: ${rule.why(command)}. If it is what the user wants, they run it themselves: \`! ${command}\``;
   }
   return null;
 }

@@ -3,10 +3,10 @@ import { StringDecoder } from 'node:string_decoder';
 import { createInterface } from 'node:readline';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
-import { discoverModels, modelLines, setModel } from './catalog.mjs';
+import { discoverModels, knownModel, MODEL_IDS, modelLines, setModel } from './catalog.mjs';
 import { openDb } from './db.mjs';
 import { dreamStatus, runDream } from './dream.mjs';
-import { backup, exportJson, exportMarkdown } from './export.mjs';
+import { backup, exportJson, exportMarkdown, purgeFromBackups } from './export.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
 import { chat, jobPrinter } from './chat.mjs';
 import { closeJobTab, reportAgent, runHerdr } from './herdr.mjs';
@@ -21,17 +21,18 @@ import * as projects from './projects.mjs';
 import { detail, historyLine, line, scopeLabel } from './render.mjs';
 import { buildBundle, modelStats, outcomeLines, runScribe, scribeStatus } from './scribe.mjs';
 import { searchTurns, taskEndedNudge } from './sessions.mjs';
-import { config, doctor, positiveInteger, setup } from './setup.mjs';
+import { CHAT_EFFORTS, config, doctor, positiveInteger, setup } from './setup.mjs';
 import { colourEnabled, safeForTerminal, styles } from './tty.mjs';
 import { ftsQuery } from './text.mjs';
 import { verdictLines } from './verify.mjs';
 
 const HELP = `sumo — local memory for the sumo-agents process
 
+  sumo chat [--model M] [--effort E]   talk: the chat, with this memory behind it
   sumo search <query> [--project S] [--type T] [--everywhere] [--all] [--turns] [-n N]
   sumo add <type> "<text>" [--project S] [--topic T] [--pin] [--supersedes ID] [--observed]
         types: preference · fact · decision · gotcha
-  sumo learn "<title>" --cue "<action>" [--project S]      workflow steps on stdin
+  sumo learn "<title>" --cue "<action>" [--gate '<regex>'] [--project S]    workflow steps on stdin
   sumo show <id>        sumo history <id>        sumo gate <workflow-id> '<regex>'|off
   sumo supersede <old-id> <new-id>
   sumo forget <id> [--purge]
@@ -39,7 +40,7 @@ const HELP = `sumo — local memory for the sumo-agents process
   sumo memory           the memory as a page in the browser: say yes or no, edit, forget
   sumo project add <path> [--slug S] [--alias A]...   show S · list · rescan S · alias S A · archive S
   sumo job new --project S --title T [--agent scout|worker|reviewer]
-        brief ID · note ID · ask ID · answer ID · baseline ID · verify ID · changes ID
+        brief ID · run ID · watch ID · note ID · ask ID · answer ID · tell ID · baseline ID · verify ID · changes ID
         finish ID --status DONE|FAILED · show ID · list [--all] · abandon ID · retry ID · stats
   sumo prime            the block a session starts with
   sumo scribe run|show|status|stats  sumo dream run|status       the cheap-model passes
@@ -64,6 +65,7 @@ EOF
  * guess at a command is often wrong; the reply has to be enough to get the second one right.
  */
 const USAGE = {
+  chat: 'sumo chat [--model auto|<model>] [--effort <effort>]    (piped: plain lines, the memory block first)',
   search: 'sumo search <query> [--project S] [--type T] [--everywhere] [--all] [--turns] [-n N]',
   add: `sumo add preference|fact|decision|gotcha "<one sentence>" [--project S] [--topic T] [--pin] [--supersedes ID] [--observed]
 a workflow (steps to repeat) is saved with sumo learn instead:
@@ -78,7 +80,7 @@ ${LEARN_USAGE}`,
   reject: 'sumo reject <id>',
   memory: 'sumo memory    (serves the page on this machine and opens it; Ctrl-C stops it)',
   project: `sumo project add <path> [--slug S] [--alias A]...
-sumo project show <name> | list [--all] | rescan <name> | alias <name> <alias> | archive <name>`,
+sumo project show <name> | list [--all] | rescan <name> | alias <name> <alias> | archive <name>   (add it again to bring it back)`,
   job: `sumo job new --project S --title T [--agent scout|worker|reviewer]   (task on stdin)
         [--guide fix|feature|review]     carry guides/<name>.md into the brief
         [--reviews <id>]                 reviewer: judge that job's change (default: what is uncommitted)
@@ -149,6 +151,8 @@ function parse(argv, spec) {
       break;
     }
     const name = nameOf(token);
+    // `-p` is not a word of the query: a short flag nobody here takes is a mistake to say, not text to search for.
+    if (name === null && /^-[A-Za-z]+$/.test(token)) throw new UsageError(`unknown option ${token} — options are spelled out (--project, --type, …); to mean it as text, quote the whole value or put it after --`);
     if (name === null) {
       args.push(token);
     } else if (spec.bool.includes(name)) {
@@ -252,7 +256,11 @@ function runForget(db, { args, flags }) {
   need(args, 1, 'forget');
   const gone = memory.forget(db, memory.parseId(args[0]), { purge: flags.purge });
   if (!flags.purge) return [`forgot ${line(gone)}`];
-  return [gone.source_turn !== null ? `purged m${gone.id} — erased, not recoverable, with the sentence it came from` : `purged m${gone.id} — erased, not recoverable; no sentence of the user's was tied to it — sumo search --turns finds one if it is there`];
+  const { cleaned, failed } = purgeFromBackups(gone);
+  const copies = cleaned > 0 ? `, and from ${cleaned} backup${cleaned === 1 ? '' : 's'}` : '';
+  const lines = [gone.source_turn !== null ? `purged m${gone.id} — erased, not recoverable, with the sentence it came from${copies}` : `purged m${gone.id} — erased, not recoverable${copies}; no sentence of the user's was tied to it — sumo search --turns finds one if it is there`];
+  if (failed.length > 0) lines.push(`still in ${failed.length} backup${failed.length === 1 ? '' : 's'} that could not be cleaned — delete ${failed.length === 1 ? 'it' : 'them'} by hand: ${failed.join(' ')}`);
+  return lines;
 }
 
 function runProject(db, { args, flags }) {
@@ -260,8 +268,9 @@ function runProject(db, { args, flags }) {
   switch (sub) {
     case 'add': {
       need(rest, 1, 'project');
-      const { project, created, changes } = projects.addProject(db, rest[0], { slug: flags.slug, aliases: flags.alias });
-      const summary = created ? `registered ${project.slug}` : `${project.slug} was already registered — rescanned (${changes.added} new, ${changes.updated} changed, ${changes.removed} gone)`;
+      const { project, created, restored, changes } = projects.addProject(db, rest[0], { slug: flags.slug, aliases: flags.alias });
+      const rescanned = `rescanned (${changes.added} new, ${changes.updated} changed, ${changes.removed} gone)`;
+      const summary = created ? `registered ${project.slug}` : restored ? `${project.slug} is back from the archive — ${rescanned}` : `${project.slug} was already registered — ${rescanned}`;
       return [summary, card(db, project.slug)];
     }
     case 'show':
@@ -305,7 +314,7 @@ function createdLines(job, warnings) {
     `created ${jobs.jobLine(job)}`,
     ...warnings,
     `route: ${job.model}/${job.effort} — ${job.route_reason}`,
-    `run it: sumo job run ${job.id}   (append & to carry on without waiting for it)`,
+    `run it: sumo job run ${job.id}   (append & to carry on without waiting for it) — inside the chat: delegate with job ${job.id}`,
   ];
 }
 
@@ -398,7 +407,8 @@ async function runJob(db, { args, flags }) {
   }
   if (sub === 'list') {
     const all = jobs.listJobs(db, { all: flags.all });
-    return all.length > 0 ? all.map(jobs.jobLine) : ['no open jobs'];
+    if (all.length === 0) return ['no open jobs'];
+    return [...all.map(jobs.jobLine), ...(all.more > 0 ? [`… ${all.more} older — sumo job show <id> for one of them`] : [])];
   }
   if (sub === 'stats') {
     return jobs.stats(db, { project: flags.project });
@@ -410,6 +420,11 @@ async function runJob(db, { args, flags }) {
   if (!['brief', 'note', 'ask', 'answer', 'tell', 'finish', 'show', 'abandon', 'baseline', 'verify', 'changes', 'run', 'watch'].includes(sub)) {
     throw new UsageError(`usage: ${USAGE.job}`);
   }
+  if (rawId === undefined) throw new UsageError(`sumo job ${sub} needs a job id, like j17 — sumo job list shows them`);
+  // An answer and a message reach a job as the user's own words: a job's shell, or text it read, never speaks for the user.
+  if ((sub === 'tell' || sub === 'answer') && process.env.SUMO_JOB) {
+    throw new UsageError(`Refused: j${process.env.SUMO_JOB} runs this command, and only the user answers or tells a job. Ask instead: the ask tool.`);
+  }
   const id = jobs.parseJobId(rawId);
   switch (sub) {
     case 'brief':
@@ -420,7 +435,8 @@ async function runJob(db, { args, flags }) {
       if (!resolveAnthropicCredential()) {
         throw new UsageError(`j${id} not started — this shell has no Anthropic credential. Inside the chat, the delegate tool runs it; in a terminal, export CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY first`);
       }
-      const watch = process.stdout.isTTY ? jobPrinter((t) => process.stdout.write(t), styles(colourEnabled())) : {};
+      // What the model and its commands print reaches this terminal as text only: no escape of theirs titles the window or writes the clipboard.
+      const watch = process.stdout.isTTY ? jobPrinter((t) => process.stdout.write(safeForTerminal(t)), styles(colourEnabled())) : {};
       // Ctrl-C stops the run the way Esc stops one in the chat: what it started is stopped, and how it ended is still said.
       const stop = new AbortController();
       const interrupt = () => stop.abort();
@@ -431,7 +447,7 @@ async function runJob(db, { args, flags }) {
       } finally {
         process.off('SIGINT', interrupt);
       }
-      const lines = runLines(outcome);
+      const lines = runLines(outcome).map(safeForTerminal);
       tabEnds(outcome.job, lines[0]);
       return lines;
     }
@@ -482,8 +498,14 @@ async function runJob(db, { args, flags }) {
   }
 }
 
+/** A pass's lines, said where they always were; one that failed also exits 1, so a script or a shell can tell. */
+function passLines(outcome) {
+  const lines = outcomeLines(outcome);
+  return outcome.ok === false && !outcome.skipped ? Object.assign(lines, { exitCode: 1 }) : lines;
+}
+
 async function runScribeCommand(db, { args }) {
-  if (args[0] === 'run') return outcomeLines(await runScribe(db));
+  if (args[0] === 'run') return passLines(await runScribe(db));
   if (args[0] === 'status') return scribeStatus(db);
   if (args[0] === 'stats') return modelStats(db);
   // Exactly what the cheap model would be sent right now — nothing about the writer is hidden from the user.
@@ -492,7 +514,7 @@ async function runScribeCommand(db, { args }) {
 }
 
 async function runDreamCommand(db, { args }) {
-  if (args[0] === 'run') return outcomeLines(await runDream(db, { force: true }));
+  if (args[0] === 'run') return passLines(await runDream(db, { force: true }));
   if (args[0] === 'status') return dreamStatus(db);
   throw new UsageError(`usage: ${USAGE.dream}`);
 }
@@ -502,7 +524,12 @@ function runApply(db, { args, flags }) {
   need(args, 1, 'apply');
   const source = flags.source ?? 'scribe';
   if (source !== 'scribe' && source !== 'dream') throw new UsageError('--source is scribe or dream');
-  const ops = JSON.parse(readFileSync(args[0], 'utf8')).ops;
+  let ops;
+  try {
+    ops = JSON.parse(readFileSync(args[0], 'utf8')).ops;
+  } catch (cause) {
+    throw new UsageError(`${args[0]} is not a JSON file of operations ({"ops": [...]}): ${cause.message.split('\n')[0]}`);
+  }
   const ids = (Array.isArray(ops) ? ops : []).map((op) => Number(op?.turn)).filter(Number.isInteger);
   const rows = ids.length > 0 ? db.prepare(`SELECT * FROM user_turns WHERE id IN (${ids.map(() => '?').join(', ')})`).all(...ids) : [];
   const { applied, dropped } = applyOps(db, ops, { source, turns: new Map(rows.map((t) => [t.id, t])), now: new Date().toISOString() });
@@ -577,6 +604,11 @@ export async function main(argv) {
     }
     if (command === 'chat') {
       const { flags } = parse(rest, { value: ['model', 'effort'], bool: [] });
+      // Said once, before the screen: past here every turn would fail the same way.
+      // A full API id is taken too (claude-opus-5-5), as the chat itself takes one.
+      if (flags.model !== undefined && flags.model !== 'auto' && !Object.values(MODEL_IDS).includes(flags.model)) knownModel(flags.model, ['auto']);
+      if (flags.effort !== undefined && !CHAT_EFFORTS.includes(flags.effort)) throw new UsageError(`no such effort "${flags.effort}" — one of: ${CHAT_EFFORTS.join(', ')}`);
+      if (!resolveAnthropicCredential()) throw new UsageError('the chat needs an Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this shell, then: sumo chat');
       const db = openDb();
       try {
         return await chat(db, { model: flags.model, effort: flags.effort });
@@ -599,10 +631,10 @@ export async function main(argv) {
     try {
       const lines = await spec.run(db, parsed);
       process.stdout.write(`${lines.join('\n')}\n`);
+      return lines.exitCode ?? 0;
     } finally {
       db.close();
     }
-    return 0;
   } catch (cause) {
     process.stderr.write(`sumo: ${cause.message}\n`);
     return cause instanceof UsageError ? 2 : 1;

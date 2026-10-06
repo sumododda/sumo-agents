@@ -1,11 +1,12 @@
 // The local model runs on one llama-server that outlives the call: started on demand, reused while it
 // answers, replaced when the model or the binary it was started for changes, and stopped by setup.
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { getMeta, openDb, setMeta } from '../src/db.mjs';
-import { stopLocalServer } from '../src/local-server.mjs';
+import { ensureLocalServer, stopLocalServer } from '../src/local-server.mjs';
 import { callLocalModel } from '../src/model.mjs';
 import { paths, REPO_ROOT } from '../src/paths.mjs';
 import { CONFIG_DEFAULTS } from '../src/setup.mjs';
@@ -136,6 +137,36 @@ test('a server that died is started again instead of being waited for', async ()
       assert.notEqual(JSON.parse(readFileSync(log, 'utf8')).pid, first);
     } finally {
       stopLocalServer(db);
+      db.close();
+    }
+  });
+});
+
+test('two callers replacing one wedged server end up on one new server: the second never ends the first one\'s', async () => {
+  const home = freshHome();
+  await live(home, {}, async () => {
+    const { db } = arrange(home);
+    const other = openDb();
+    const file = CONFIG_DEFAULTS['model.file'];
+    const llama = getMeta(db, 'llama.path');
+    // Ours by its command line, but /health never answers, and long past its start-up grace.
+    const port = 45000 + Math.floor(Math.random() * 1000);
+    const wedged = spawn(process.execPath, ['-e', `require('http').createServer(()=>{}).listen(${port},'127.0.0.1')`, '--', '--port', String(port)], { stdio: 'ignore' });
+    try {
+      await settle(300);
+      setMeta(db, 'llama.server', JSON.stringify({ pid: wedged.pid, port, file, llama, startedAt: Date.now() - 120_000 }));
+      const first = ensureLocalServer(db, { llama, file }).then((s) => s, (e) => e);
+      await settle(500);
+      const second = await ensureLocalServer(other, { llama, file }).then((s) => s, (e) => e);
+      const a = await first;
+      assert.ok(!(a instanceof Error), a.message);
+      assert.ok(!(second instanceof Error), second.message);
+      assert.equal(second.pid, a.pid);
+      assert.equal(alive(a.pid), true);
+    } finally {
+      stopLocalServer(db);
+      wedged.kill();
+      other.close();
       db.close();
     }
   });

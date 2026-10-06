@@ -48,7 +48,7 @@ const isRead = (tool) => tool === 'read' || tool === 'view';
 
 /** The guard, first and without memory: a destructive command or a secret file is refused on sight. */
 export function earlyRefusal(e) {
-  if (e.toolName === 'bash' && e.command) return guardCommand(e.command) ?? '';
+  if (e.toolName === 'bash' && e.command) return guardCommand(e.command, { cwd: e.cwd }) ?? '';
   if (isRead(e.toolName) && e.path) return guardPath(e.path) ?? '';
   return '';
 }

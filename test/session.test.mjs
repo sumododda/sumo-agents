@@ -656,3 +656,46 @@ test('a purge says what it erased: the sentence a memory came from goes with it,
   const loose = /saved m(\d+) /.exec(s.sumo(['add', 'fact', 'the build needs node twenty-four']).out)[1];
   assert.match(s.sumo(['forget', `m${loose}`, '--purge']).out, /no sentence of the user's was tied to it — sumo search --turns finds one if it is there/);
 });
+
+test('an operation file may name a memory as m12, the way every command does', () => {
+  const s = sandbox();
+  say(s, 'slate uses pnpm');
+  say(s, 'actually slate uses bun now');
+  assert.match(s.sumo(['add', 'fact', 'slate uses pnpm']).out, /saved m1 /);
+  const ops = join(s.root, 'ops.json');
+  writeFileSync(ops, JSON.stringify({ ops: [{ op: 'supersede', old: 'm1', type: 'fact', scope: 'global', body: 'slate uses bun', turn: 2, quote: 'actually slate uses bun now' }] }));
+  const applied = s.sumo(['apply', ops]);
+  assert.equal(applied.code, 0, applied.err);
+  assert.equal(s.sql((db) => db.prepare('SELECT state FROM memories WHERE id = 1').get().state), 'superseded', applied.out);
+});
+
+test('a transcript is read from its end: one past the size a string can hold still answers, at once', async () => {
+  const { contextUse } = await import('../src/sessions.mjs');
+  const { assistantReplies } = await import('../src/transcript.mjs');
+  const { mkdtempSync, writeFileSync: write, appendFileSync, truncateSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const file = join(mkdtempSync(join(tmpdir(), 'sumo-agents-big-')), 't.jsonl');
+  const reply = (n, ts, tokens) => JSON.stringify({ type: 'assistant', timestamp: ts, message: { role: 'assistant', model: 'claude-opus-5-5', usage: { input_tokens: tokens }, content: [{ type: 'text', text: `reply ${n}` }] } });
+  write(file, '');
+  // Sparse: 600 MB on paper, nothing on disk — and more than one string can hold.
+  truncateSync(file, 600 * 1024 * 1024);
+  appendFileSync(file, '\n');
+  for (let i = 1; i <= 8; i++) appendFileSync(file, `${reply(i, `2026-10-02T00:00:0${i}.000Z`, 1000 * i)}\n`);
+  const start = performance.now();
+  assert.deepEqual(contextUse(file), { tokens: 8000, model: 'claude-opus-5-5' });
+  const replies = assistantReplies(file, '2026-10-01T12:00:00.000Z', 6);
+  assert.deepEqual(replies.slice(-6).map((r) => r.text), ['reply 3', 'reply 4', 'reply 5', 'reply 6', 'reply 7', 'reply 8']);
+  assert.ok(performance.now() - start < 1000, `took ${Math.round(performance.now() - start)} ms`);
+});
+
+test('a last reply longer than the first look, with no line end after it, is still read whole', async () => {
+  const { contextUse } = await import('../src/sessions.mjs');
+  const { mkdtempSync, writeFileSync: write } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const file = join(mkdtempSync(join(tmpdir(), 'sumo-agents-long-')), 't.jsonl');
+  const first = JSON.stringify({ type: 'assistant', message: { role: 'assistant', model: 'claude-opus-5-5', usage: { input_tokens: 10 }, content: [] } });
+  // Claude Code writes "message" before "type"; this reply alone is longer than the first look at the file's end.
+  const long = `{"message":{"role":"assistant","model":"claude-opus-5-5","usage":{"input_tokens":5000},"content":[{"type":"text","text":"${'x'.repeat(1_500_000)}"}]},"type":"assistant"}`;
+  write(file, `${first}\n${long}`);
+  assert.deepEqual(contextUse(file), { tokens: 5000, model: 'claude-opus-5-5' });
+});

@@ -29,6 +29,15 @@ test('asking about something never said gets an explicit "nothing", and the miss
   );
 });
 
+test('a search that finds nothing is recorded without the secret in it, and a pasted page is not kept whole', () => {
+  const s = sandbox();
+  s.sumo(['search', 'the token is ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8']);
+  s.sumo(['search', `stack ${'frame '.repeat(5000)}`]);
+  const kept = s.sql((db) => db.prepare('SELECT query FROM search_misses ORDER BY rowid').all()).map((r) => r.query);
+  assert.equal(kept[0], 'the token is [redacted]');
+  assert.ok(kept[1].length <= 200, `kept ${kept[1].length} characters`);
+});
+
 test('superseding keeps the history and hides the old memory by default', () => {
   const s = sandbox();
   s.addProject('simba');
@@ -271,4 +280,34 @@ test('mistakes in how sumo is called exit 2 with a plain message', () => {
     assert.equal(run.code, 2, `${args.join(' ')} → ${run.err}`);
     assert.match(run.err, message);
   }
+});
+
+test('purge reaches every backup: none of them holds the erased words afterwards, not even in its search index', () => {
+  const s = sandbox();
+  const secret = 'zanzibarquux'; // one word: the full-text index keeps it whole
+  assert.match(s.sumo(['add', 'preference', `Always use ${secret} for deploys`]).out, /saved m1 /);
+  s.sumo(['backup']);
+  const purged = s.sumo(['forget', 'm1', '--purge']);
+  assert.match(purged.out, /^purged m1 — erased, not recoverable, and from 1 backup;/m);
+  for (const file of readdirSync(join(s.home, 'backups'))) {
+    assert.equal(readFileSync(join(s.home, 'backups', file)).includes(secret), false, `${file} still holds the purged words`);
+  }
+});
+
+test('a backup that cannot be cleaned whole is left as it was and named, never half-purged', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const s = sandbox();
+  s.hook('prompt', { session_id: 'sess-o', prompt: 'the old vault word is quokkaglimmer, remember that' });
+  s.modelWillSay([{ op: 'add', type: 'fact', scope: 'global', body: 'the old vault word is quokkaglimmer', turn: 1, quote: 'the old vault word is quokkaglimmer' }]);
+  assert.match(s.sumo(['scribe', 'run']).out, /saved m1 /);
+  s.sumo(['backup']);
+  const [file] = readdirSync(join(s.home, 'backups'));
+  const old = new DatabaseSync(join(s.home, 'backups', file));
+  old.exec('DROP TABLE user_turns_fts');
+  old.close();
+  const purged = s.sumo(['forget', 'm1', '--purge']);
+  assert.match(purged.out, /still in 1 backup that could not be cleaned — delete it by hand/);
+  const after = new DatabaseSync(join(s.home, 'backups', file));
+  assert.equal(after.prepare('SELECT COUNT(*) AS n FROM memories WHERE id = 1').get().n, 1, 'the memory is still there, not half-removed');
+  after.close();
 });

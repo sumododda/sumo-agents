@@ -27,7 +27,19 @@ export const colourEnabled = (stream = process.stdout, env = process.env) => Boo
 /** Lines no wider than this read comfortably whatever the window is. */
 export const widthOf = (stream = process.stdout, env = process.env) => Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, (stream.columns || Number(env.COLUMNS) || 80) - 1));
 
-const visible = (t) => t.replace(/\x1b\[[0-9;]*m/g, '').length;
+/** East Asian wide and fullwidth characters, and emoji drawn as pictures: two columns each on a terminal. */
+const WIDE = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{20000}-\u{3FFFD}]|\p{Emoji_Presentation}|\uFE0F/u;
+/** The columns one character takes, an emoji joined from several included. */
+const columnsOf = (ch) => (WIDE.test(ch) ? 2 : 1);
+
+/** The columns text takes on a terminal, colour codes not counted: a wide character is two, so a table around it lines up. */
+const visible = (t) => {
+  const plain = t.replace(/\x1b\[[0-9;]*m/g, '');
+  if (!/[^\x00-\x7e]/.test(plain)) return plain.length;
+  let width = 0;
+  for (const { segment } of GRAPHEMES.segment(plain)) width += columnsOf(segment);
+  return width;
+};
 
 /** Word-wraps styled text to `width`, measuring only what is visible; continuation lines carry `indent`. */
 export function wrap(text, width, indent = '') {
@@ -80,9 +92,14 @@ const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 /** A line cut into pieces no wider than `width`, between characters: an emoji, even one joined from several, stays whole. */
 function cut(line, width) {
   const pieces = [''];
+  let used = 0;
   for (const { segment: ch } of GRAPHEMES.segment(line)) {
-    if (pieces.at(-1) && pieces.at(-1).length + ch.length > width) pieces.push('');
+    if (pieces.at(-1) && used + columnsOf(ch) > width) {
+      pieces.push('');
+      used = 0;
+    }
     pieces[pieces.length - 1] += ch;
+    used += columnsOf(ch);
   }
   return pieces;
 }
@@ -91,7 +108,7 @@ function cut(line, width) {
 function fold(text, width) {
   return wrap(text, width)
     .split('\n')
-    .flatMap((line) => (line.length <= width ? [line] : cut(line, width)));
+    .flatMap((line) => (visible(line) <= width ? [line] : cut(line, width)));
 }
 
 function pad(text, width, align) {
@@ -130,6 +147,12 @@ export function renderTable(rows, s, width) {
  * rendered as soon as it arrives; the tail is kept until it ends or `flush`.
  * The rows of a table are kept too, until the line after it shows it is whole.
  */
+/**
+ * A tab as the spaces it takes. A screen that lays text out counts a tab as one column and the terminal draws up to
+ * eight, so a box's border or a wrapped line would land wherever the tab pushed it.
+ */
+export const untab = (text) => text.replaceAll('\t', '    ');
+
 export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
   let tail = '';
   let fence = false;
@@ -145,7 +168,7 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
   const held = () => (rows.length >= 2 && TABLE_RULE.test(rows[1]) ? renderTable(rows, s, width) : rows.map((r) => renderLine(r, s, { width })).join('\n'));
   return {
     write(chunk) {
-      tail += chunk;
+      tail += untab(chunk);
       let at;
       while ((at = tail.indexOf('\n')) !== -1) {
         const raw = tail.slice(0, at);

@@ -16,6 +16,8 @@ import { UsageError } from './memory.mjs';
 import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
 
 const NODE_REQUIREMENT = '22.19+ or 24.6+';
+// route.mjs's EFFORTS, spelled out: importing it would close a cycle (route → model → setup). A test keeps them equal.
+export const CHAT_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /** The settings `sumo config` accepts, with the value used when none is stored. */
 export const CONFIG_DEFAULTS = {
@@ -117,7 +119,9 @@ async function ensureModel(db, { modelSource } = {}) {
   // part file that a later run mistakes for progress.
   const partPath = `${dest}.${process.pid}.part`;
   try {
-    const head = await fetch(url, { method: 'HEAD' });
+    // fetch refuses a URL with credentials in it, so a token pasted into the source travels as a header instead.
+    const { href, headers } = withoutCredentials(url);
+    const head = await fetch(href, { method: 'HEAD', headers });
     if (!head.ok) throw new Error(`HEAD ${shown} → HTTP ${head.status}`);
     const lengthHeader = head.headers.get('content-length');
     const remoteSize = lengthHeader === null ? null : Number(lengthHeader);
@@ -127,15 +131,28 @@ async function ensureModel(db, { modelSource } = {}) {
     if (localSize !== null && (remoteSize === null || localSize === remoteSize)) {
       return `model     ${dest} (${formatBytes(localSize)}, present)`;
     }
-    const res = await fetch(url);
+    const res = await fetch(href, { headers });
     if (!res.ok) throw new Error(`GET ${shown} → HTTP ${res.status}`);
     await pipeline(Readable.fromWeb(res.body), cappedAt(MAX_MODEL_BYTES), createWriteStream(partPath));
     renameSync(partPath, dest);
     return `model     ${dest} (${formatBytes(statSync(dest).size)}, downloaded)`;
   } catch (cause) {
     rmSync(partPath, { force: true });
-    return `could not download the router model: ${redactUrl(cause.message)}`;
+    const why = redactUrl(cause.message);
+    // Offline, with the model already here: that is a model that could not be checked, not one that is missing.
+    if (existsSync(dest)) return `model     ${dest} (${formatBytes(statSync(dest).size)}, present; not checked against ${shown}: ${why})`;
+    return `could not download the router model from ${shown}: ${why}`;
   }
+}
+
+/** The URL without its `user:token@`, and that pair as a Basic authorization header. */
+function withoutCredentials(raw) {
+  const url = new URL(raw);
+  if (!url.username && !url.password) return { href: url.href, headers: {} };
+  const pair = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`;
+  url.username = '';
+  url.password = '';
+  return { href: url.href, headers: { authorization: `Basic ${Buffer.from(pair).toString('base64')}` } };
 }
 
 /** A source pasted with a token in it (`https://user:token@host/…`) must never reach stdout or a transcript. */
@@ -158,12 +175,32 @@ function cappedAt(limit) {
   });
 }
 
+/** A model source is a web address; anything else is refused before it is stored, since every later setup would fail on it. */
+function sourceOrRefuse(value) {
+  if (!/^https?:\/\/[^\s/]/i.test(value)) throw new UsageError(`"${redactUrl(value)}" is not a web address — a model source looks like https://<host>[/<path>]`);
+  return value;
+}
+
 /** The one question `sumo setup` ever asks, and only when nothing is stored yet and a person is there to answer it. */
 async function askModelSource(defaultSource) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer = await rl.question(`Download the router model from [${defaultSource}]: `);
-    return answer.trim() || defaultSource;
+    // A slip at the prompt is asked again, not the end of setup.
+    for (;;) {
+      // Ctrl-C at the prompt stops setup; Ctrl-D is no answer, so the default. Neither is a stack trace.
+      const answer = (
+        await rl.question(`Download the router model from [${defaultSource}]: `).catch((cause) => {
+          if (cause?.name === 'AbortError') throw new UsageError('setup stopped — nothing was downloaded');
+          return '';
+        })
+      ).trim();
+      if (!answer) return defaultSource;
+      try {
+        return sourceOrRefuse(answer);
+      } catch (cause) {
+        process.stdout.write(`${cause.message}\n`);
+      }
+    }
   } finally {
     rl.close();
   }
@@ -185,7 +222,7 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
   const llama = commandOnPath('llama-server');
   if (llama) setMeta(db, 'llama.path', llama);
 
-  let source = modelSource;
+  let source = modelSource === undefined ? undefined : sourceOrRefuse(modelSource);
   if (source === undefined && !noModel && !getMeta(db, 'config.model.source') && process.stdin.isTTY) {
     source = await askModelSource(CONFIG_DEFAULTS['model.source']);
   }
@@ -210,7 +247,8 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
   renameSync(staged, p.launcher);
 
   const lines = [`home      ${p.home}`, `database  ${p.db}`, `launcher  ${p.launcher}`];
-  if (modelLine) lines.push(modelLine);
+  // What was skipped is said too: the next step depends on it.
+  lines.push(modelLine ?? `model     not fetched (--no-model) — the router needs it: sumo setup`);
   lines.push(modelsLine);
   if (!llama) lines.push('llama-server not found — brew install llama.cpp');
   if (link) {
@@ -221,7 +259,10 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
     } else {
       lines.push(`command   not linked — add this to your shell profile: export PATH="${p.bin}:$PATH"`);
     }
+  } else {
+    lines.push(`command   not linked (--no-link) — run ${p.launcher}, or put ${p.bin} on PATH`);
   }
+  lines.push('next      sumo doctor');
   return lines;
 }
 
@@ -308,7 +349,8 @@ export function doctor() {
   check(launcherOk && launcherRuns(), 'launcher runs the way a hook would call it', 'run: sumo setup');
 
   const herdr = commandOnPath('herdr');
-  check(herdr !== null, 'herdr on PATH (background jobs run in its panes)', 'brew install herdr — or run every job in the chat, without &');
+  // Optional: without it a job still runs in the chat; only the tab that shows it as it works is not opened.
+  check(herdr !== null, 'herdr on PATH (optional: a tab per job, to watch it work)', 'brew install herdr — jobs run without it, unseen until they end; sumo job watch <id> shows one', true);
   const found = commandOnPath('sumo');
   const ours = found !== null && existsSync(p.launcher) && realpathSync(found) === realpathSync(p.launcher);
   check(ours, '`sumo` on PATH is this one', found ? `PATH finds ${found} instead` : 'run: sumo setup');
@@ -365,6 +407,14 @@ export function config(key, value) {
     if (value !== undefined) {
       // A budget that is not a number would be no budget at all: every session's block would carry every preference.
       if (key === 'prime.budget') positiveInteger(value, 'prime.budget needs a positive number');
+      // Sent with every chat turn: a word the API does not take would fail each one, not this command.
+      if (key === 'chat.effort' && !CHAT_EFFORTS.includes(value)) throw new UsageError(`no such effort "${value}" — one of: ${CHAT_EFFORTS.join(', ')}`);
+      // Stored for every later setup: one that is not a URL would fail each of them.
+      if (key === 'model.source') sourceOrRefuse(value);
+      // The file name decides where the bytes land and what the server is asked for: a name, never a path.
+      if (key === 'model.file' && (value !== basename(value) || value === '..' || value === '.' || value === '')) {
+        throw new UsageError(`model.file is a file name, with no path separator: sumo config model.file <name>.gguf`);
+      }
       // A model is one Sumo knows and one that is on; the passes also take `local` and `off`, the chat `auto`.
       if (key === 'chat.model' && value !== 'auto') {
         knownModel(value, ['auto']);

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -12,17 +12,30 @@ import { join } from 'node:path';
 
 const ABOUT_MAX = 200;
 
-const read = (file) => {
+/** More than any README, Makefile or package.json a scan takes a pointer from. */
+const READ_MAX_BYTES = 1024 * 1024;
+
+/**
+ * A file of the repository's own, as text — or null. A link that leads out of the repository (a README that is
+ * really ~/.netrc) is not the repository's to say, and what is not a plain file of sane size (a FIFO, /dev/zero)
+ * would hang the scan or fill memory, while the database waits on it.
+ */
+const read = (root, name) => {
   try {
-    return readFileSync(file, 'utf8');
+    const real = realpathSync(join(root, name));
+    const home = realpathSync(root);
+    if (!real.startsWith(`${home}/`)) return null;
+    const stat = statSync(real);
+    if (!stat.isFile() || stat.size > READ_MAX_BYTES) return null;
+    return readFileSync(real, 'utf8');
   } catch {
     return null;
   }
 };
 
-const readJson = (file) => {
+const readJson = (root, name) => {
   try {
-    return JSON.parse(readFileSync(file, 'utf8'));
+    return JSON.parse(read(root, name));
   } catch {
     return null;
   }
@@ -86,7 +99,7 @@ function recipe(makefile, target) {
  * project itself says what a command runs — a script, a recipe — that is its
  * `definition`, so a job that rewrites it can be told apart from one that does not.
  */
-export function projectCommands(root, pkg = readJson(join(root, 'package.json'))) {
+export function projectCommands(root, pkg = readJson(root, 'package.json')) {
   const found = [];
   if (pkg?.scripts) {
     const pm = nodePackageManager(root);
@@ -96,7 +109,7 @@ export function projectCommands(root, pkg = readJson(join(root, 'package.json'))
       if (script in pkg.scripts) found.push({ name: script, command: run(script), definition: String(pkg.scripts[script]) });
     }
   }
-  const makefile = read(join(root, 'Makefile'));
+  const makefile = read(root, 'Makefile');
   if (makefile) {
     for (const target of ['check', 'test', 'lint', 'build']) {
       if (new RegExp(`^${target}:`, 'm').test(makefile) && !found.some((f) => f.name === target)) {
@@ -107,7 +120,7 @@ export function projectCommands(root, pkg = readJson(join(root, 'package.json'))
   if (found.length === 0) {
     if (existsSync(join(root, 'go.mod'))) found.push({ name: 'test', command: 'go test ./...' });
     if (existsSync(join(root, 'Cargo.toml'))) found.push({ name: 'test', command: 'cargo test' });
-    if (/\bpytest\b/.test(read(join(root, 'pyproject.toml')) ?? '')) found.push({ name: 'test', command: 'pytest' });
+    if (/\bpytest\b/.test(read(root, 'pyproject.toml') ?? '')) found.push({ name: 'test', command: 'pytest' });
   }
   return found;
 }
@@ -142,7 +155,7 @@ function gaps(root, pkg) {
 /** The first real paragraph of the README: not a heading, badge, image, or HTML. */
 function about(root) {
   const name = ['README.md', 'readme.md', 'README', 'README.rst'].find((f) => existsSync(join(root, f)));
-  const text = name ? read(join(root, name)) : null;
+  const text = name ? read(root, name) : null;
   if (!text) return null;
   const paragraph = text
     .split(/\n\s*\n/)
@@ -177,7 +190,7 @@ function ci(root) {
 
 /** Facts in the order the project card should show them. A key with nothing to say is simply absent. */
 export function scan(root) {
-  const pkg = readJson(join(root, 'package.json'));
+  const pkg = readJson(root, 'package.json');
   const facts = [
     ['instructions', instructions(root)],
     ['stack', stack(root, pkg)],

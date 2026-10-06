@@ -1,8 +1,9 @@
+import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
-import { tx } from './db.mjs';
+import { getMeta, setMeta, tx } from './db.mjs';
 import { UsageError } from './memory.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { preferences } from './prime.mjs';
@@ -48,6 +49,14 @@ const readOr = (file) => {
 
 function setStatus(db, id, status, now) {
   db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(status, now, id);
+}
+
+/**
+ * A change of state that holds only while the job is still open. A note or a question is written to disk between the
+ * check and the change: a job abandoned or closed meanwhile stays as it was left, never reopened by a status read earlier.
+ */
+function setOpenStatus(db, id, status, now) {
+  db.prepare(`UPDATE jobs SET status = COALESCE(?, status), updated_at = ? WHERE id = ? AND status IN ('running', 'needs_input')`).run(status, now, id);
 }
 
 function requireOpen(job, verb) {
@@ -120,28 +129,35 @@ ${task.trim()}
 ${change ? `\n## The change to judge\n${change}\n` : ''}${guide ? `\n## How this kind of work is done here\n${guide}\n` : ''}
 ## How to work
 ${job.agent === 'worker' ? workerRules(job, options) : ''}- Worth keeping if you are interrupted — what you found, what you tried, what is left: \`note\`.
-- Blocked on something only the user can decide: \`ask\` (one question), then stop. You will be resumed with the answer.
-- You may read memory: \`search_memory\`. You never write it.
-- If a command is refused, carry on another way (grep, a view of a line range).
 - When finished you must close the job, or nobody knows it ended: ${closing}
 ${REPORT[job.agent]}
-- Every message and report: short lines, facts only. No prose, no preamble, no restating the task.
-- After \`finish\`, stop: the report is your answer, and nothing more is read.
 `;
 }
 
-/** What code has recorded about a job's work: where it began, what already failed, and the last verdict. */
-const readState = (id) => {
+const digest = (text) => createHash('sha256').update(text).digest('hex');
+const stateKey = (id) => `job.${id}.verify`;
+
+/**
+ * What code has recorded about a job's work: where it began, what already failed, and the last verdict.
+ * The job's shell can reach its folder, so the file is checked against the digest sumo kept when it wrote it:
+ * a record changed since — a baseline made to fail, a verdict made to pass — reads as none.
+ */
+const readState = (db, id) => {
   try {
-    return JSON.parse(readFileSync(fileOf(id, 'verify.json'), 'utf8'));
+    const text = readFileSync(fileOf(id, 'verify.json'), 'utf8');
+    const kept = getMeta(db, stateKey(id));
+    if (kept !== null && kept !== digest(text)) return null;
+    return JSON.parse(text);
   } catch {
     return null;
   }
 };
 /** Written whole and then put in place: a run that dies half-way must not leave a record that reads as none. */
-const writeState = (id, state) => {
+const writeState = (db, id, state) => {
+  const text = `${JSON.stringify(state, null, 2)}\n`;
   const whole = fileOf(id, 'verify.json.part');
-  writeFileSync(whole, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(whole, text, { mode: 0o600 });
+  setMeta(db, stateKey(id), digest(text));
   renameSync(whole, fileOf(id, 'verify.json'));
 };
 
@@ -164,7 +180,7 @@ function changeToJudge(db, { project, reviews }) {
   if (reviews !== undefined) {
     const target = getJob(db, reviews);
     if (target.project !== project.slug) throw new UsageError(`j${target.id} belongs to ${target.project}, not ${project.slug}`);
-    snap = readState(target.id)?.snap;
+    snap = readState(db, target.id)?.snap;
     if (!snap) throw new UsageError(`j${target.id} recorded no starting point (not a worker job, or not a git repository) — there is no change to hand over`);
     lines.push(`What was asked: ${fileOf(target.id, 'brief.md')}   (read "## The task")`);
     if (existsSync(fileOf(target.id, 'report.md'))) {
@@ -214,8 +230,18 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
 
   const route = await chooseRoute(db, { agent, project, task, title: title.trim(), retryOf });
 
-  const session = db.prepare('SELECT id FROM sessions ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1').get();
+  // A job's own stand-in session (`job:j3`, see loop.mjs) is no one's conversation: it is never the session a new job belongs to.
+  const session = db.prepare(`SELECT id FROM sessions WHERE id NOT LIKE 'job:%' ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1`).get();
   const job = tx(db, () => {
+    // A database put back from a backup has an older counter than the job folders on disk: the next id must not be one
+    // whose folder is still there, or the new job reads another job's notes and report as its own.
+    const onDisk = existsSync(paths().jobs) ? Math.max(0, ...readdirSync(paths().jobs).filter((name) => /^\d+$/.test(name)).map(Number)) : 0;
+    const counter = db.prepare(`SELECT seq FROM sqlite_sequence WHERE name = 'jobs'`).get()?.seq ?? 0;
+    if (onDisk > counter) {
+      if (db.prepare(`UPDATE sqlite_sequence SET seq = ? WHERE name = 'jobs'`).run(onDisk).changes === 0) {
+        db.prepare(`INSERT INTO sqlite_sequence (name, seq) VALUES ('jobs', ?)`).run(onDisk);
+      }
+    }
     const { lastInsertRowid } = db
       .prepare(
         `INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason, retry_of)
@@ -239,7 +265,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
     }
     // Where a worker starts from, and the checks that judge it there, so what it changed — and only that — can be told apart later.
     // A retry is handed the first attempt's start instead.
-    if (agent === 'worker') writeState(job.id, { ...(start ?? { snap: snapshot(project.path), declared: verifyCommands(project.path), baseline: null }), testsMayChange, verdict: null });
+    if (agent === 'worker') writeState(db, job.id, { ...(start ?? { snap: snapshot(project.path), declared: verifyCommands(project.path), baseline: null }), testsMayChange, verdict: null });
     writeFileSync(fileOf(job.id, 'brief.md'), renderBrief({ job, project, known, rules, task, guide, change, options: { testsMayChange } }), { mode: 0o600 });
   } catch (cause) {
     db.prepare('DELETE FROM jobs WHERE id = ?').run(job.id);
@@ -282,7 +308,7 @@ export async function retry(db, id, { now = new Date().toISOString() } = {}) {
   // What the original was allowed and pointed at travels with the task: a retry of a review judges the same job,
   // and a retry of a worker keeps the permission the first attempt was given.
   const reviews = reviewTargetOf(id) ?? undefined;
-  const state = readState(id);
+  const state = readState(db, id);
   const testsMayChange = Boolean(state?.testsMayChange);
   // A worker's retry is judged from where the first attempt began, so what that attempt left in the tree is still answered for.
   // Its baseline comes too: taken again now, it would call the first attempt's breakage "already there".
@@ -320,7 +346,7 @@ export function brief(db, id) {
   const parts = [readOr(fileOf(id, 'brief.md')).trimEnd()];
   const qa = readOr(fileOf(id, 'qa.md')).trim();
   const notes = readOr(fileOf(id, 'notes.md')).trim();
-  const red = (readState(id)?.baseline ?? []).filter((c) => !c.ok);
+  const red = (readState(db, id)?.baseline ?? []).filter((c) => !c.ok);
   if (red.length > 0) {
     parts.push(`## Already failing before this job began — not yours to fix, and not to be made worse\n${red.map((c) => `- \`${c.command}\` — ${c.file}`).join('\n')}`);
   }
@@ -334,7 +360,7 @@ export function brief(db, id) {
 function checkable(db, id, verb) {
   const job = getJob(db, id);
   requireOpen(job, verb);
-  const state = readState(id);
+  const state = readState(db, id);
   if (job.agent !== 'worker' || !state) throw new UsageError(`j${id} is not a worker job with a recorded start — there is nothing to ${verb === 'verified' ? 'verify' : 'take a baseline of'}`);
   const project = getProject(db, job.project);
   if (!existsSync(project.path)) throw new UsageError(`${project.path} no longer exists`);
@@ -348,7 +374,7 @@ export function baseline(db, id) {
     const taken = takeBaseline(project.path, state.snap, dirOf(id));
     if (taken.refused) return [`no baseline taken: ${taken.refused}.`, 'Every check that fails at the end will count as this job\'s.'];
     // A verdict given before there was a baseline judged against none: it no longer says what DONE would.
-    writeState(id, { ...state, baseline: taken.checks, verdict: null });
+    writeState(db, id, { ...state, baseline: taken.checks, verdict: null });
     state.baseline = taken.checks;
   }
   if (state.baseline.length === 0) return ['this project declares no check, test, lint or typecheck command — there is nothing to take a baseline of'];
@@ -359,14 +385,14 @@ export function baseline(db, id) {
 export function verifyJob(db, id, now = new Date().toISOString()) {
   const { state, project } = checkable(db, id, 'verified');
   const verdict = verify(project.path, state, dirOf(id), now);
-  writeState(id, { ...state, verdict });
+  writeState(db, id, { ...state, verdict });
   return verdict;
 }
 
 /** Everything a job changed, as one file a reviewer can read. */
 export function changes(db, id) {
   const job = getJob(db, id);
-  const snap = readState(id)?.snap;
+  const snap = readState(db, id)?.snap;
   if (!snap) throw new UsageError(`j${id} recorded no starting point (not a worker job, or not a git repository)`);
   return writeChanges(getProject(db, job.project).path, snap, fileOf(id, 'changes.diff'));
 }
@@ -402,14 +428,14 @@ export function note(db, id, text, now = new Date().toISOString()) {
   requireOpen(job, 'noted on');
   if (!text.trim()) throw new UsageError('the note is empty — put it on stdin');
   append(id, 'notes.md', 'note', text, now);
-  setStatus(db, id, job.status, now);
+  setOpenStatus(db, id, null, now);
 }
 
 export function ask(db, id, question, now = new Date().toISOString()) {
   requireOpen(getJob(db, id), 'asked about');
   if (!question.trim()) throw new UsageError('the question is empty — put it on stdin');
   append(id, 'qa.md', 'Question', question, now);
-  setStatus(db, id, 'needs_input', now);
+  setOpenStatus(db, id, 'needs_input', now);
 }
 
 const inboxOf = (id) => fileOf(id, 'inbox');
@@ -468,7 +494,7 @@ export function answer(db, id, text, now = new Date().toISOString()) {
   if (job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — it is not waiting for an answer`);
   if (!text.trim()) throw new UsageError('the answer is empty — put it on stdin');
   append(id, 'qa.md', 'Answer', text, now);
-  setStatus(db, id, 'running', now);
+  setOpenStatus(db, id, 'running', now);
 }
 
 /** The lines under "## Learned" in a report, without bullets, minus the ways of saying "nothing". */
@@ -507,9 +533,9 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
   // The author of the work does not grade it. A worker's DONE rests on what the checks said, not on what the report says.
   // A DONE that cannot be checked is refused, not waved through; --accept is the way to take it anyway, and it is written down.
   const graded = job.agent === 'worker' && status === 'DONE';
-  const state = graded ? readState(id) : null;
+  const state = graded ? readState(db, id) : null;
   const unchecked = (why) => new UsageError(`j${id} cannot be verified — ${why}. To take the work as it stands: sumo job finish ${id} --status DONE --accept "<why>"`);
-  if (graded && accept === undefined && !state) throw unchecked(`the record of where it began (${fileOf(id, 'verify.json')}) cannot be read`);
+  if (graded && accept === undefined && !state) throw unchecked(`the record of where it began (${fileOf(id, 'verify.json')}) cannot be read, or was changed since sumo wrote it`);
   const verdict = state && accept === undefined ? verdictForDone(db, id, state, now) : null;
   // The checks can take minutes: report a job closed in the meantime before interpreting their verdict.
   requireOpen(getJob(db, id), 'finished');
@@ -562,8 +588,14 @@ export function abandon(db, id, now = new Date().toISOString()) {
   setStatus(db, id, 'abandoned', now);
 }
 
+const LISTED = 30;
+
+/** The newest jobs, open ones only unless `all`; `more` is how many older ones the list leaves out. */
 export function listJobs(db, { all = false } = {}) {
-  return db.prepare(`SELECT * FROM jobs ${all ? '' : `WHERE status IN ('running', 'needs_input')`} ORDER BY id DESC LIMIT 30`).all();
+  const where = all ? '' : `WHERE status IN ('running', 'needs_input')`;
+  const rows = db.prepare(`SELECT * FROM jobs ${where} ORDER BY id DESC LIMIT ${LISTED}`).all();
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM jobs ${where}`).get().n;
+  return Object.assign(rows, { more: total - rows.length });
 }
 
 export function jobLine(job) {

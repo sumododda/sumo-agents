@@ -159,3 +159,17 @@ test('asked for by hand, consolidation does not wait for the conversation to end
   assert.match(s.sumo(['dream', 'status']).out, /finished sessions waiting: 0/);
   assert.match(s.sumo(['dream', 'run']).out, /^read 1 sessions/);
 });
+
+test('a long conversation is read by its latest turns, as many as fit, so consolidation never asks for more than the model holds', () => {
+  const s = sandbox();
+  const prompts = Array.from({ length: 20 }, (_, i) => `message ${i}: ${'please keep the release notes short and plain '.repeat(20)}`);
+  finishedSession(s, 'long', prompts);
+  s.modelWillSay([]);
+  assert.equal(s.sumo(['dream', 'run']).code, 0);
+  const prompt = s.modelWasShown().prompt;
+  assert.match(prompt, /\[\d+ earlier turns not shown\]/);
+  assert.match(prompt, /message 19:/, 'the latest turn is read');
+  assert.doesNotMatch(prompt, /message 0:/);
+  const shown = prompt.split('\n').filter((l) => /^\[t\d+\] user:/.test(l)).join('\n');
+  assert.ok(shown.length <= 8_000, `${shown.length} characters of turns`);
+});

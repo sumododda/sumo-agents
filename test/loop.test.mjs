@@ -674,3 +674,71 @@ test('a job routed to a model that is off is refused before anything is sent', a
     }
   });
 });
+
+test('reading code that names the job marker or the accept flag is reading; setting or using them is not', async () => {
+  const { grantsItself } = await import('../src/loop.mjs');
+  for (const command of [
+    'grep -rn "SUMO_JOB=" src',
+    'rg "job finish" -n src && grep -n -- --accept src/cli.mjs',
+    'echo reading about SUMO_JOB is fine',
+    'sed -n 70,80p src/loop.mjs | grep SUMO_JOB',
+    'grep -c "SUMO_JOB=" src/loop.mjs',
+    'sudo apt-get install -y jq',
+    'if [ -z "$SUMO_JOB" ]; then echo outside; fi',
+    'bash -c "npm test"',
+  ]) assert.equal(grantsItself(command), false, command);
+  for (const command of [
+    'sumo job finish 3 --status DONE --accept "trust me"',
+    'sumo job finish 3 --status DONE \\\n  --accept "trust me"',
+    'SUMO_JOB= sumo job finish 3 --status DONE $F',
+    'X=1 SUMO_JOB= sumo job finish 3 --status DONE $F',
+    'cd /p && SUMO_JOB= sumo job finish 3',
+    'export SUMO_JOB=',
+    'env SUMO_JOB= sumo job finish 3',
+    'unset SUMO_JOB; sumo job finish 3 $F',
+    'env -i PATH="$PATH" -u SUMO_JOB sumo job finish 3 --status DONE',
+    'env -u "SUMO_JOB" sumo job finish 3',
+    'if SUMO_JOB= sumo job answer 3 hi; then :; fi',
+    '{ SUMO_JOB= sumo job answer 3 hi; }',
+    'true && { SUMO_JOB= sumo job tell 3; }',
+    '! SUMO_JOB= sumo job tell 3',
+    'time SUMO_JOB= sumo job tell 3',
+    'for i in 1; do SUMO_JOB= sumo job tell 3; done',
+    'sudo SUMO_JOB= sumo job tell 3',
+    'A="x y" SUMO_JOB= sumo job tell 3',
+    "A='x y' SUMO_JOB= sumo job tell 3",
+    'eval "SUMO_JOB= sumo job tell 3"',
+    'bash -c "SUMO_JOB= sumo job tell 3"',
+    "sh -c 'SUMO_JOB= sumo job tell 3'",
+    'unset -v SUMO_JOB; sumo job tell 3',
+    'unset FOO SUMO_JOB; sumo job tell 3',
+    'export -n SUMO_JOB; sumo job tell 3',
+    'declare +x SUMO_JOB; sumo job tell 3',
+    'env --unset=SUMO_JOB sumo job tell 3',
+    'sudo -E SUMO_JOB= sumo job tell 3',
+    'sudo -u root SUMO_JOB= sumo job tell 3',
+    'sudo -u root -E SUMO_JOB=1 sumo job tell 3',
+  ]) assert.equal(grantsItself(command), true, command);
+});
+
+test('a job created where no session had begun meets the workflow gate all the same', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const { id } = seed(db, { agent: 'worker', model: 'sonnet', effort: 'medium' });
+      db.prepare('UPDATE jobs SET session_id = NULL WHERE id = ?').run(id);
+      add(db, { type: 'procedure', title: 'Creating a PR', cue: 'create a PR', gate: 'gh(-axi)? pr create', body: '1. run every check locally\n2. only then open the PR\n', project: 'demo', now: NOW });
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'bash', { command: 'echo gh pr create --fill' })]),
+        reply('end_turn', [{ type: 'text', text: 'done' }]),
+        reply('end_turn', []),
+      ]);
+      await runJob(db, id, { send, now: () => NOW });
+      const held = seen[1].messages.at(-1).content[0];
+      assert.equal(held.is_error, true, held.content);
+      assert.match(held.content, /^Not yet\. The user taught a workflow for exactly this/);
+    } finally {
+      db.close();
+    }
+  });
+});

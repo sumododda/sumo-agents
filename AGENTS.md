@@ -21,10 +21,6 @@ Small or sequential → do it yourself, absolute paths. Big, parallel, context-h
 nudge has fired → the `delegate` tool: `scout` looks, `worker` builds, `reviewer` judges. Several calls
 run at once — read guides/delegation.md first.
 
-## Context
-A line saying how big the context is means: finish the piece in hand, note where you are, and ask the
-user to type /new. The memory block brings the thread back; open jobs resume from their briefs.
-
 ## Coding
 - Before changing code, trace how it works now: the smallest complete slice — signature, callers,
   callees, types, tests. One grep, not a fan-out.

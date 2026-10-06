@@ -101,6 +101,7 @@ function askStandIn(standIn) {
   } catch {
     return { error: (run.stderr || run.stdout).trim().slice(0, 200) || `exit ${run.status}` };
   }
+  if (!answer || typeof answer !== 'object') return { error: `${standIn} answered ${String(run.stdout).trim().slice(0, 80)}, not a list of models` };
   const found = new Set(answer.found ?? []);
   const errors = answer.errors ?? {};
   return Object.fromEntries(MODELS.map((name) => [name, found.has(name) ? 'found' : Object.hasOwn(errors, name) ? String(errors[name]) : 'missing']));
@@ -140,7 +141,9 @@ export async function discoverModels(db, { now = new Date().toISOString() } = {}
   const missing = MODELS.filter((name) => answers[name] === 'missing');
   const errors = Object.fromEntries(MODELS.filter((name) => answers[name] !== 'found' && answers[name] !== 'missing').map((name) => [name, answers[name]]));
   if (found.length === 0) {
-    const error = missing.length === 0 ? Object.values(errors)[0] : 'the API found none of the models Sumo knows — the credential may not be allowed to see them';
+    // Any model that could not be asked says more than the ones that were not there: a connection that failed is not a credential that cannot see.
+    const failed = Object.values(errors);
+    const error = failed.length > 0 ? failed[0] : 'the API found none of the models Sumo knows — the credential may not be allowed to see them';
     return { ok: false, error };
   }
   const states = modelStates(db);

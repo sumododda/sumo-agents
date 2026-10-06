@@ -20,7 +20,7 @@ import { outcomeLines, runScribe } from './scribe.mjs';
 import { currentProject } from './sessions.mjs';
 import { BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
-import { colourEnabled, createRenderer, header, prompt, renderBlock, styles, widthOf } from './tty.mjs';
+import { colourEnabled, createRenderer, header, prompt, renderBlock, safeForTerminal, styles, widthOf } from './tty.mjs';
 
 /**
  * The conversation the user has with Sumo: the same loop a job runs in, with
@@ -45,11 +45,18 @@ const COMMANDS = {
   dream: () => 'Run `sumo dream run` and tell me, in a few lines, what it changed and what it wants me to confirm.',
 };
 
-/** What the command menu shows, in the order it shows it; the models `/model` offers are the ones that are on as it is typed. */
-export function commandList(db) {
+/**
+ * What the command menu shows, in the order it shows it; the models `/model` offers are the ones that are on as it is typed.
+ * The effort a model would keep comes first (`effortNow`), so Enter on the open menu keeps it rather than dropping to the lowest.
+ */
+export function commandList(db, { effortNow = () => null } = {}) {
+  const efforts = () => {
+    const now = effortNow();
+    return EFFORTS.includes(now) ? [now, ...EFFORTS.filter((e) => e !== now)] : EFFORTS;
+  };
   const modelChoices = (given) => {
     const usable = usableModels(db);
-    return given.length === 0 ? ['auto', ...usable] : given.length === 1 && usable.includes(given[0]) && given[0] !== 'haiku' ? EFFORTS : [];
+    return given.length === 0 ? ['auto', ...usable] : given.length === 1 && usable.includes(given[0]) && given[0] !== 'haiku' ? efforts() : [];
   };
   return [
     { name: 'fix', hint: 'fix a bug, by guides/fix.md' },
@@ -157,7 +164,9 @@ function configured(db, key) {
 export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, herdr = runHerdr, env = process.env, route = chooseChatRoute, now = () => new Date().toISOString() } = {}) {
   model ??= configured(db, 'chat.model');
   // A model the user turned off is not chatted on, however the chat came to be on it; auto reads the switches each turn.
-  if (model !== 'auto' && MODELS.includes(model)) assertOn(db, model, 'sumo config chat.model <name>');
+  // A full API id is that model too (claude-opus-5-5 is opus), switched off or on with it.
+  const named = MODELS.find((name) => MODEL_IDS[name] === model) ?? model;
+  if (named !== 'auto' && MODELS.includes(named)) assertOn(db, named, 'sumo config chat.model <name>');
   effort ??= model === 'auto' ? null : configured(db, 'chat.effort');
   // Haiku takes no effort setting, however the chat came to be on it: by flag, by configuration, or by /model.
   if (modelId(model) === MODEL_IDS.haiku) effort = 'none';
@@ -179,7 +188,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   /** The memory page, once /memory has asked for it: the promise of its address. */
   let page = null;
   const ledger = { kind: 'chat', sessionId: null };
-  const commands = commandList(db);
+  // What /model with a model and no effort keeps: the effort in hand, or the configured one.
+  // Worked out as setRoute and parseRoute do: off auto, the effort kept is the user's configured one.
+  const commands = commandList(db, {
+    effortNow: () => {
+      const kept = effort ?? configured(db, 'chat.effort');
+      return kept && kept !== 'none' ? kept : CONFIG_DEFAULTS['chat.effort'];
+    },
+  });
 
   const emit = (text) => out(text);
   /** The conversation as the model in hand can take it: one that takes no operator messages is sent them as text. The history itself is left alone, so a model that does take them still reads it from its cache. */
@@ -366,7 +382,11 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       let chosen;
       try {
         workspace();
-        chosen = await route(db, { project, text });
+        // Esc is heard while the router thinks: the turn ends now, and the router's late answer is let go unread.
+        const routing = route(db, { project, text });
+        routing.catch(() => {});
+        const stopped = new Promise((resolve) => stopper.signal.addEventListener('abort', () => resolve(null), { once: true }));
+        chosen = await Promise.race([routing, stopped]);
       } catch (cause) {
         return { stop: 'error', error: cause.message, text: '' };
       }
@@ -430,11 +450,11 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     stopper = new AbortController();
     const run = await runCommand(command, { cwd: workspace().cwd, env: process.env, signal: stopper.signal });
     const stopped = run.stopped === 'interrupted' ? `\n(${INTERRUPTED})` : '';
-    const output = run.error ?? cap(`${run.stdout}${run.stderr}`.trimEnd()).toWellFormed() + stopped;
+    const output = run.error ?? cap(run.output.trimEnd(), undefined, run.omitted).toWellFormed() + stopped;
     // The user sees what their command printed; the model is given what a tool would have given it — without secrets, and well-formed.
-    const told = run.error ?? capRedacted(`${run.stdout}${run.stderr}`.trimEnd()).toWellFormed() + stopped;
+    const told = run.error ?? capRedacted(run.output.trimEnd(), undefined, run.omitted).toWellFormed() + stopped;
     settleTail();
-    params.messages.push({ role: 'user', content: [{ type: 'text', text: `I ran \`${command}\` myself:\n${told || '(no output)'}` }] });
+    params.messages.push({ role: 'user', content: [{ type: 'text', text: `I ran \`${redact(command).text}\` myself:\n${told || '(no output)'}` }] });
     return output;
   }
 
@@ -522,7 +542,9 @@ export async function chat(db, { model, effort, send, input = process.stdin, out
   const lines = rl[Symbol.asyncIterator]();
   const s = styles(colourEnabled(output));
   const width = widthOf(output);
-  const write = (t) => output.write(t);
+  // Piped in is not piped out: what the model or a command prints may reach a terminal, and only colour gets through to it.
+  // A carriage return redraws a progress bar in place; as plain lines each redraw is a line of its own, not run into the next.
+  const write = (t) => output.write(safeForTerminal(String(t).replace(/\r(?!\n)/g, '\n')));
   const reply = createRenderer(write, s, { width });
   const session = createChat(db, {
     model,

@@ -149,3 +149,28 @@ test('a writer paused before publishing its PID cannot lose its lock', { timeout
     assert.equal(existsSync(lock), false);
   });
 });
+
+test('a backlog of pasted logs is read a batch at a time that fits the local model, never one batch too big to ever pass', async () => {
+  const { openDb } = await import('../src/db.mjs');
+  const { buildBundle } = await import('../src/scribe.mjs');
+  const { ensureSession, markScribed, pendingTurns, recordTurn } = await import('../src/sessions.mjs');
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const now = '2026-10-05T00:00:00.000Z';
+      ensureSession(db, { id: 's1', now });
+      const trace = (i) => `turn ${i} failed:\n${'    at Object.<anonymous> (/srv/app/node_modules/x/index.js:12:34)\n'.repeat(60)}`;
+      for (let i = 0; i < 40; i++) recordTurn(db, { sessionId: 's1', text: trace(i), now });
+      const sizes = [];
+      for (let run = 0; run < 40 && pendingTurns(db).length > 0; run++) {
+        const bundle = buildBundle(db);
+        sizes.push(bundle.prompt.length);
+        markScribed(db, [...bundle.turns.keys()]);
+      }
+      assert.equal(pendingTurns(db).length, 0, 'every turn is read in the end');
+      assert.ok(Math.max(...sizes) < 50_000, `largest batch ${Math.max(...sizes)} characters`);
+    } finally {
+      db.close();
+    }
+  });
+});

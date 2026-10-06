@@ -8,7 +8,7 @@ import { stopReason } from './loop.mjs';
 import { paths } from './paths.mjs';
 import { editor, keysOf, menuOf, paste, press, under } from './editor.mjs';
 import { clipboardImage, droppedImages } from './images.mjs';
-import { colourEnabled, createRenderer, flow, logoLines, messageAt, pickMessage, renderBlock, spinnerMessages, styles, sunset, toolView } from './tty.mjs';
+import { colourEnabled, createRenderer, flow, logoLines, messageAt, pickMessage, renderBlock, spinnerMessages, styles, sunset, toolView, untab } from './tty.mjs';
 
 /**
  * The chat on a real terminal. What is finished scrolls away above — what
@@ -73,7 +73,7 @@ function Tool({ view, failed = false, running = false, nested = false }) {
     { flexDirection: 'column', marginTop: nested ? 0 : 1, marginLeft: nested ? 2 : 0 },
     h(Text, null, h(Text, { color: running ? undefined : failed ? 'red' : 'green', dimColor: running }, '⏺ '), h(Text, { bold: true }, view.title), `(${view.detail})`),
     running ? h(Text, { dimColor: true }, '  ⎿  Running…') : null,
-    ...view.lines.map((line, i) => h(Text, { key: i, ...TONES[line.tone] }, `${i === 0 ? '  ⎿  ' : '     '}${line.text}`)),
+    ...view.lines.map((line, i) => h(Text, { key: i, ...TONES[line.tone] }, `${i === 0 ? '  ⎿  ' : '     '}${untab(line.text)}`)),
   );
 }
 
@@ -98,7 +98,7 @@ function Item({ item }) {
       item.block ? h(Box, { marginTop: 1 }, h(Text, null, item.block)) : null,
     );
   }
-  if (item.kind === 'user') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, '> '), h(Text, { dimColor: true }, item.text));
+  if (item.kind === 'user') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, '> '), h(Text, { dimColor: true }, untab(item.text)));
   if (item.kind === 'text') return h(Reply, item);
   if (item.kind === 'tool') return h(Tool, item);
   if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, null, h(Text, { color: ACCENT }, '⏺ '), h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, h(Text, { dimColor: true }, ` · ${item.where}`)));
@@ -131,7 +131,7 @@ function Input({ state, width }) {
     Box,
     { borderStyle: 'round', borderColor: 'gray', paddingX: 1, width },
     h(Text, null, '> '),
-    h(Box, { flexGrow: 1, flexShrink: 1 }, h(Text, null, text.slice(0, cursor), h(Text, { inverse: true }, shown), after)),
+    h(Box, { flexGrow: 1, flexShrink: 1 }, h(Text, null, untab(text.slice(0, cursor)), h(Text, { inverse: true }, untab(shown)), untab(after))),
   );
 }
 

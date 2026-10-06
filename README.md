@@ -46,8 +46,9 @@ sumo models disable fable                                                       
 ```
 
 Then just talk. Mention a project the way you normally would; the first time, the agent finds it on
-disk, confirms the path with you, and registers it. In the chat: `/fix`, `/feature`, `/review`, `/dream`
-load the matching guide; `/model` says the route and sets it — `/model opus high`, `/model haiku`,
+disk, confirms the path with you, and registers it. In the chat: `/fix`, `/feature`, `/review`
+load the matching guide; `/dream` tidies the memory and says what changed; `/model` says the route
+and sets it — `/model opus high`, `/model haiku`,
 or `/model auto` to have the same local router that routes jobs pick a model and effort for each turn
 from what you typed (the menu offers the choices as you type; a switch costs one uncached turn, and a
 router that cannot answer refuses the turn); `/new` starts a fresh session, the memory block given to
@@ -82,8 +83,9 @@ and `AGENTS.md`.
 
 ## What happens while you talk
 
-Every session runs in Sumo's own loop: one request per turn to the Anthropic Messages API, two tools
-(a shell and a file editor, both Anthropic-defined so no schema is sent), a frozen system prompt that
+Every session runs in Sumo's own loop: one request per turn to the Anthropic Messages API, three tools
+(a shell and a file editor, both Anthropic-defined so no schema is sent, and `delegate`, which hands work
+to a sub-agent), a frozen system prompt that
 caches across turns, and old tool results cleared server-side once the context passes 60k tokens.
 History is never rewritten on the client.
 
