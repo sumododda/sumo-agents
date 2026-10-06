@@ -326,11 +326,24 @@ test('a request is not a statement: quoting it proves nothing, and a guess drawn
   assert.match(out, /dropped — add: a guess from a request, not kept/);
   assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM memories').get().n), 0);
 
+  // Asked inside a sentence that does not open with the request, the quoted request is still one; and a long paste is read in one pass.
+  // Turns are kept to 4000 characters: as many one-word sentences as fit, the worst case for finding the quote's.
+  const pasted = `please tell the scout to describe how the deploy works\n${'ok.\n'.repeat(950)}`;
+  say(s, pasted);
+  s.modelWillSay([
+    { op: 'add', type: 'fact', scope: 'global', body: 'The deploy works by pushing images', turn: 2, quote: 'describe how the deploy works' },
+    // The whole turn as the quote, as a small model does: the sentences it spans are found in one pass, not by trying every run of them.
+    { op: 'add', type: 'fact', scope: 'global', body: 'please tell the scout how the deploy works ok', turn: 2, quote: pasted.trim() },
+  ]);
+  const started = Date.now();
+  assert.match(s.sumo(['scribe', 'run']).out, /dropped — add: the quote is from a sentence that asks for work/);
+  assert.ok(Date.now() - started < 1_500, `a long turn does not stall the writer (${Date.now() - started} ms)`);
+
   // A rule given inside a request is still a rule.
   say(s, 'fix the login bug, and from now on always run the linter first. We deploy staging on Fly.');
   s.modelWillSay([
-    { op: 'add', type: 'preference', scope: 'global', body: 'Always run the linter first', turn: 2, quote: 'from now on always run the linter first' },
-    { op: 'add', type: 'fact', scope: 'global', body: 'Staging is deployed on Fly', turn: 2, quote: 'We deploy staging on Fly' },
+    { op: 'add', type: 'preference', scope: 'global', body: 'Always run the linter first', turn: 3, quote: 'from now on always run the linter first' },
+    { op: 'add', type: 'fact', scope: 'global', body: 'Staging is deployed on Fly', turn: 3, quote: 'We deploy staging on Fly' },
   ]);
   const kept = s.sumo(['scribe', 'run']).out;
   assert.match(kept, /saved m\d+ \[pref·global·stated\] Always run the linter first/);
