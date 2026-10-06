@@ -140,7 +140,7 @@ rules in it — a short frozen system prompt that carries the Coding rules from 
 
 | Role | Model and effort | Tools | For |
 |---|---|---|---|
-| `scout` | Sonnet at low effort — or, while Sonnet is off, the cheapest other model that is on; Haiku only when nothing else is | shell + job tools | finding, tracing, auditing, summarizing — anything reading-heavy |
+| `scout` | chosen per job by the router | shell + job tools | finding, tracing, auditing, summarizing — anything reading-heavy |
 | `worker` | chosen per job by the router | shell + editor + `baseline`/`verify` + job tools | building and fixing |
 | `reviewer` | chosen per job by the router | shell + job tools | judging a change it did not write |
 
@@ -180,9 +180,8 @@ route would have done, and a router shown one keeps choosing it.
 
 If the router is missing, fails, or answers something no job can run on (a model outside the list, or
 no effort for a model that takes one), the command exits with the error and **no job is created**. The
-answer schema pairs Haiku with no effort and every other model with one. The only change made to an
-answer: a scout runs on Sonnet at low effort — or, while Sonnet is off, on the cheapest other model that is on, at low
-effort; on Haiku only when nothing else is.
+answer schema pairs Haiku with no effort and every other model with one. The answer is taken as it is, for
+every role; the router is offered only the models that are on, so `sumo models disable haiku` keeps every job off it.
 `sumo doctor` fails while the router is missing.
 
 Effort is real, not advisory: the route's effort goes on the request as `output_config.effort`, its model as the
