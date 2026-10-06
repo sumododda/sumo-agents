@@ -206,3 +206,16 @@ test('discovery that could not reach the API says so rather than blaming the cre
   assert.match(odd.err, /could not check the models — .* not a list of models/);
   assert.doesNotMatch(odd.err, /Cannot read properties/);
 });
+
+test('discovery never turns back on a model the user turned off by hand: it only says what the API has', () => {
+  const s = sandbox();
+  s.modelsFound(['haiku', 'sonnet', 'opus', 'fable']);
+  s.sumo(['models', 'disable', 'haiku']);
+  const discovered = s.sumo(['models', 'discover']);
+  assert.equal(discovered.code, 0, discovered.err);
+  assert.match(discovered.out, /^haiku\s+off\s+claude-haiku-4-5-20251001\s+turned off \d{4}-\d{2}-\d{2}$/m, discovered.out);
+  assert.match(discovered.out, /^sonnet\s+on\s/m, discovered.out);
+  // Turned on again by hand, it is the API's to judge once more.
+  s.sumo(['models', 'enable', 'haiku']);
+  assert.match(s.sumo(['models', 'discover']).out, /^haiku\s+on\s+claude-haiku-4-5-20251001\s+found /m);
+});

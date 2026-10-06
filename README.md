@@ -198,8 +198,8 @@ Models available to jobs: `haiku`, `sonnet`, `opus`, `fable`. Effort levels: `lo
 Each of the four has a switch on this machine, and nothing assumes the API has all of them. `sumo setup`
 asks the API once which of them this credential can use (one `GET /v1/models/<id>` per model) and turns
 off the ones it does not have; `sumo models` lists them with the API id and the reason for each switch;
-`sumo models discover` asks again and sets the switches from the answer; `sumo models enable|disable
-<name>` sets one by hand. A check that fails — no credential, an error, or an answer with none of them —
+`sumo models discover` asks again and sets the switches from the answer, except that a model turned off by
+hand stays off; `sumo models enable|disable <name>` sets one by hand. A check that fails — no credential, an error, or an answer with none of them —
 changes nothing and says why. A model that is off is outside the router's grammar and prompt, refused by
 `/model` and by `sumo config chat.model` / `scribe.model` / `dream.model`, never retried on by the passes
 (the retry goes to the cheapest model that is on, or nowhere), and a job routed to it before it was
