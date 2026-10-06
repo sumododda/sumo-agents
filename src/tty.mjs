@@ -329,3 +329,9 @@ export function prompt({ route, contextTokens }, s) {
  * or clear the screen of whoever is watching.
  */
 export const safeForTerminal = (text) => String(text).replace(/\x1b\[[0-9;]*m|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, (m) => (m.length > 1 ? m : ''));
+
+/**
+ * Text with every escape sequence and control character taken out, colours too — what goes through redaction must
+ * be what is shown, or a key broken up by an escape would pass redaction and be joined again on the screen.
+ */
+export const plainText = (text) => String(text).replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
