@@ -41,15 +41,18 @@ const normalize = (text) => text.toLowerCase().replace(/[‘’]/g, "'").replace
  * The model picks where a quote starts and ends; what the user was doing in that sentence is not its to trim away.
  */
 function sentencesAround(text, quote) {
-  const sentences = text.split(/(?<=[.!?])\s+|\n+/).filter((s) => s.trim());
-  const wanted = normalize(quote);
-  for (let size = 1; size <= sentences.length; size++) {
-    for (let from = 0; from + size <= sentences.length; from++) {
-      const run = sentences.slice(from, from + size).join(' ');
-      if (normalize(run).includes(wanted)) return run;
-    }
+  const sentences = text.split(/(?<=[.!?])\s+|\n+/).map(normalize).filter(Boolean);
+  // One pass: where each sentence starts in the turn as normalized, then the ones the quote's span touches.
+  const starts = [];
+  let at = 0;
+  for (const s of sentences) {
+    starts.push(at);
+    at += s.length + 1;
   }
-  return text;
+  const from = sentences.join(' ').indexOf(normalize(quote));
+  if (from === -1) return text;
+  const to = from + normalize(quote).length;
+  return sentences.filter((s, i) => starts[i] < to && starts[i] + s.length > from).join(' ');
 }
 
 function resolveScope(db, scope) {
@@ -149,8 +152,10 @@ function addStated(db, op, ctx, { supersedes } = {}) {
   const body = cleanBody(op);
   const { turn, verified, why } = verify(op, body, ctx.turns);
   // The words being the user's is not enough: asked to describe or fix something, the user stated nothing that lasts.
-  // Judged on the whole sentence the words came from, so a quote cut short of its "describe" proves no more than the sentence.
-  if (verified && asksForWork(sentencesAround(turn.text, op.quote))) throw new Rejected('the quote is from a sentence that asks for work or an answer; it states nothing that lasts');
+  // Judged on the quote and on the whole sentence it came from, so a quote cut short of its "delegate" proves no more than the sentence.
+  if (verified && (asksForWork(op.quote) || asksForWork(sentencesAround(turn.text, op.quote)))) {
+    throw new Rejected('the quote is from a sentence that asks for work or an answer; it states nothing that lasts');
+  }
   // A guess costs the user a question; one drawn from a request — describe this, fix that — is the model answering it, not the user saying it.
   if (!verified && turn && asksForWork(turn.text)) throw new Rejected(`a guess from a request, not kept — ${why}`);
   // No scope given: what was said in the middle of work on a project belongs to that project.
