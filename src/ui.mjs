@@ -424,6 +424,8 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       const where = tab?.pane ? 'working in its Herdr tab' : tab?.error ? `no Herdr tab (${tab.error}) — sumo job watch ${job.id}` : `follow it: sumo job watch ${job.id}`;
       record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job), where });
     };
+    // The tab said to show the job stayed empty: why, and how to follow it all the same.
+    const onTabFailed = ({ job, reason }) => record({ kind: 'error', text: `j${job}: ${reason} — follow it here: sumo job watch ${job}` });
     const onJobEnd = ({ job }) => {
       state.jobs.delete(job);
       redraw();
@@ -432,9 +434,9 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       state.tokens = totals.outputTokens;
       redraw();
     };
-    events.on('text', onText).on('tool', onTool).on('result', onResult).on('usage', onUsage).on('job', onJob).on('job-end', onJobEnd);
+    events.on('text', onText).on('tool', onTool).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd);
     return () => {
-      events.off('text', onText).off('tool', onTool).off('result', onResult).off('usage', onUsage).off('job', onJob).off('job-end', onJobEnd);
+      events.off('text', onText).off('tool', onTool).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
     };

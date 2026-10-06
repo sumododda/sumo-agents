@@ -4,11 +4,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFi
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
-import { test } from 'node:test';
+import { describe, it, test } from 'node:test';
 import { chat, createChat, injection } from '../src/chat.mjs';
 import { MODEL_IDS, setModel } from '../src/catalog.mjs';
 import { openDb } from '../src/db.mjs';
-import { reportAgent } from '../src/herdr.mjs';
+import { openWatchTab, reportAgent, startWatcher } from '../src/herdr.mjs';
 import { finish, takeInbox } from '../src/jobs.mjs';
 import { add, UsageError } from '../src/memory.mjs';
 import { paths, REPO_ROOT } from '../src/paths.mjs';
@@ -579,14 +579,16 @@ test('inside Herdr a delegated job also gets a tab that watches it, while it run
       const id = scoutJob(db, 'sumo-agents-chat-tab-');
       const project = db.prepare('SELECT path FROM projects').get().path;
       const calls = [];
-      const answers = [
-        { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:pJ' } } }) },
-        { status: 0, stdout: '' },
-        { error: Object.assign(new Error('spawnSync herdr ENOENT'), { code: 'ENOENT' }) },
-      ];
+      // The first tab opens and its shell runs the watcher once it is typed; when the second is asked for, Herdr is not there.
+      let tabs = 0;
+      let typed = false;
       const herdr = (args) => {
         calls.push(args);
-        return answers.shift();
+        if (args[0] === 'tab' && tabs++ > 0) return { error: Object.assign(new Error('spawnSync herdr ENOENT'), { code: 'ENOENT' }) };
+        if (args[0] === 'tab') return { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:pJ' } } }) };
+        if (args[1] === 'run') return (typed = true), { status: 0, stdout: '' };
+        if (args[1] === 'read') return { status: 0, stdout: '~ >' };
+        return { status: 0, stdout: JSON.stringify({ result: { process_info: { shell_pid: 7, foreground_processes: typed ? [{ pid: 8, cmdline: `node sumo job watch ${id}` }] : [{ pid: 7, cmdline: '-zsh' }] } } }) };
       };
       const watched = [];
       const { send, seen } = canned([
@@ -602,9 +604,10 @@ test('inside Herdr a delegated job also gets a tab that watches it, while it run
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, herdr, env, watch: (e) => watched.push(e), now: () => NOW });
       session.start('startup');
       await session.say('have a scout look, twice');
+      await until(() => typed, 'the watcher typed into its tab');
 
       assert.deepEqual(calls[0], ['tab', 'create', '--workspace', 'w2', '--cwd', project, '--label', `j${id} scout · look`, '--no-focus']);
-      assert.deepEqual(calls[1], ['pane', 'run', 'w2:pJ', `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${paths().home} ${paths().launcher} job watch ${id}`], 'the tab watches; the job is not run there');
+      assert.deepEqual(calls.find((c) => c[1] === 'run'), ['pane', 'run', 'w2:pJ', `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${paths().home} ${paths().launcher} job watch ${id}`], 'the tab watches; the job is not run there');
       const [first, second] = watched.filter((e) => e.type === 'job').map((e) => e.tab);
       assert.deepEqual(first, { pane: 'w2:pJ' });
       assert.deepEqual(second, { error: '`herdr` is not on PATH' });
@@ -1222,5 +1225,64 @@ test('a model named by its full API id is switched off with it', async () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe('the watcher in a job\'s Herdr tab', () => {
+  /** A pane whose shell starts slowly and throws away what is typed before its prompt: `swallow` runs are lost. */
+  const pane = ({ swallow = 0, starts = true } = {}) => {
+    const calls = [];
+    let polls = 0;
+    let running = false;
+    const herdr = (args) => {
+      calls.push(args.slice(0, 2).join(' '));
+      if (args[1] === 'run') {
+        if (swallow > 0) swallow--;
+        else running = starts;
+        return { status: 0, stdout: '' };
+      }
+      polls++;
+      if (args[1] === 'read') return { status: 0, stdout: polls < 6 ? `loading ${polls}` : 'prodsec git:(main) x' };
+      const foreground = running ? [{ pid: 9, cmdline: 'node /x/sumo job watch 32' }] : polls < 6 ? [{ pid: 7, cmdline: '-zsh' }, { pid: 8, cmdline: 'git status' }] : [{ pid: 7, cmdline: '-zsh' }];
+      return { status: 0, stdout: JSON.stringify({ result: { process_info: { shell_pid: 7, foreground_processes: foreground } } }) };
+    };
+    return { herdr, calls };
+  };
+  const sleep = async () => {};
+
+  it('waits for the shell to stand at its prompt before typing, and types once when the watcher starts', async () => {
+    const { herdr, calls } = pane();
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: 32, command: 'sumo job watch 32', sleep }), true);
+    assert.deepEqual(calls.filter((c) => c === 'pane run'), ['pane run']);
+    // The screen shows the shell loading for the first polls, then its prompt twice in a row: only then is the watcher typed.
+    assert.equal(calls.slice(0, calls.indexOf('pane run')).filter((c) => c === 'pane read').length, 4, `typed only once the screen had settled: ${calls.join(', ')}`);
+  });
+
+  it('types the watcher again when the shell threw the first away, and stops once it runs', async () => {
+    const { herdr, calls } = pane({ swallow: 1 });
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: 32, command: 'sumo job watch 32', sleep }), true);
+    assert.equal(calls.filter((c) => c === 'pane run').length, 2);
+  });
+
+  it('gives up after a few tries and says so, instead of claiming a tab that shows nothing', async () => {
+    const { herdr, calls } = pane({ starts: false });
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: 32, command: 'sumo job watch 32', sleep }), false);
+    assert.equal(calls.filter((c) => c === 'pane run').length, 3);
+  });
+
+  it('is not fooled by another job\'s watcher: j3 is not j32', async () => {
+    const { herdr, calls } = pane({ starts: true });
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: 3, command: 'sumo job watch 3', sleep }), false);
+    assert.equal(calls.filter((c) => c === 'pane run').length, 3);
+  });
+
+  it('opens the tab at once and tells the chat later when its watcher never started', async () => {
+    const { herdr } = pane({ starts: false });
+    const opening = (args) => (args[0] === 'tab' ? { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:p1' } } }) } : herdr(args));
+    const failed = [];
+    const tab = openWatchTab(opening, { job: { id: 32, agent: 'reviewer', title: 'Review it' }, project: { path: '/p' }, env: {}, sleep, onFail: (why) => failed.push(why) });
+    assert.equal(tab, 'w2:p1', 'the tab is there before its watcher is');
+    await until(() => failed.length > 0, 'the chat told the watcher never started');
+    assert.deepEqual(failed, ['its Herdr tab never started the watcher']);
   });
 });

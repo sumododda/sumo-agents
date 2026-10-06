@@ -354,10 +354,10 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     }
   }
 
-  /** The job's tab in Herdr, showing its work: its pane, or why there is none — the job runs here either way. */
+  /** The job's tab in Herdr, showing its work: its pane, or why there is none — the job runs here either way. A watcher that never starts in it is said when it gives up. */
   function watchTab(job) {
     try {
-      return { pane: openWatchTab(herdr, { job, project: getProject(db, job.project), env }) };
+      return { pane: openWatchTab(herdr, { job, project: getProject(db, job.project), env, onFail: (reason) => watch({ type: 'tab-failed', job: job.id, reason }) }) };
     } catch (cause) {
       return { error: cause.message };
     }
