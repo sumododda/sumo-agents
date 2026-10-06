@@ -36,6 +36,22 @@ class Rejected extends Error {}
 
 const normalize = (text) => text.toLowerCase().replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, ' ').trim();
 
+/**
+ * The sentences a quote was taken from, whole: the shortest run of the turn's sentences that holds every quoted word.
+ * The model picks where a quote starts and ends; what the user was doing in that sentence is not its to trim away.
+ */
+function sentencesAround(text, quote) {
+  const sentences = text.split(/(?<=[.!?])\s+|\n+/).filter((s) => s.trim());
+  const wanted = normalize(quote);
+  for (let size = 1; size <= sentences.length; size++) {
+    for (let from = 0; from + size <= sentences.length; from++) {
+      const run = sentences.slice(from, from + size).join(' ');
+      if (normalize(run).includes(wanted)) return run;
+    }
+  }
+  return text;
+}
+
 function resolveScope(db, scope) {
   if (scope === 'global' || scope === undefined) return { scope: 'global', project: undefined };
   const match = /^project:(.+)$/.exec(String(scope));
@@ -133,7 +149,8 @@ function addStated(db, op, ctx, { supersedes } = {}) {
   const body = cleanBody(op);
   const { turn, verified, why } = verify(op, body, ctx.turns);
   // The words being the user's is not enough: asked to describe or fix something, the user stated nothing that lasts.
-  if (verified && asksForWork(op.quote)) throw new Rejected('the quote asks for work or an answer; it states nothing that lasts');
+  // Judged on the whole sentence the words came from, so a quote cut short of its "describe" proves no more than the sentence.
+  if (verified && asksForWork(sentencesAround(turn.text, op.quote))) throw new Rejected('the quote is from a sentence that asks for work or an answer; it states nothing that lasts');
   // A guess costs the user a question; one drawn from a request — describe this, fix that — is the model answering it, not the user saying it.
   if (!verified && turn && asksForWork(turn.text)) throw new Rejected(`a guess from a request, not kept — ${why}`);
   // No scope given: what was said in the middle of work on a project belongs to that project.
