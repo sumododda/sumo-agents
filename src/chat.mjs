@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { getMeta } from './db.mjs';
 import { runDream } from './dream.mjs';
-import { getJob, guideFor, newJob, parseJobId, reportOf, tell as tellJob } from './jobs.mjs';
+import { openWatchTab, runHerdr } from './herdr.mjs';
+import { appendLive, endLive, getJob, guideFor, newJob, parseJobId, reportOf, startLive, tell as tellJob } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
 import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, textOf } from './loop.mjs';
 import { assertOn, MODEL_IDS, MODELS, modelId, usableModels } from './catalog.mjs';
@@ -149,10 +150,11 @@ function configured(db, key) {
  * a job run here, the job as it starts, its calls and results (marked with its
  * id), what it says, and its end. `tell(text)` talks to the job running here;
  * `tell(text, id)` to any open job, through its inbox on disk if it runs
- * elsewhere. `route` is the router asked for each turn's model when the model
- * is `auto`.
+ * elsewhere. Inside Herdr (`env`), each job also gets a tab that shows its work,
+ * opened through `herdr` — both swapped in tests. `route` is the router asked
+ * for each turn's model when the model is `auto`.
  */
-export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, route = chooseChatRoute, now = () => new Date().toISOString() } = {}) {
+export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, herdr = runHerdr, env = process.env, route = chooseChatRoute, now = () => new Date().toISOString() } = {}) {
   model ??= configured(db, 'chat.model');
   // A model the user turned off is not chatted on, however the chat came to be on it; auto reads the switches each turn.
   if (model !== 'auto' && MODELS.includes(model)) assertOn(db, model, 'sumo config chat.model <name>');
@@ -274,31 +276,58 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       }
       const inbox = [];
       jobs.set(id, inbox);
+      // Its work is written down as it happens, for `sumo job watch` — in a Herdr tab of its own, or any terminal.
+      const live = jobPrinter((t) => appendLive(id, t), styles(true));
+      let ended = [];
       try {
         const outcome = await runJob(db, id, {
           send: (p) => send(p, { signal }),
           signal,
           inbox: () => inbox.splice(0),
-          onStart: (job) => watch({ type: 'job', job }),
+          onStart: (job) => {
+            startLive(id);
+            live.onStart(job);
+            watch({ type: 'job', job, tab: env.HERDR_ENV ? watchTab(job) : null });
+          },
           onTool: (call) => {
+            live.onTool(call);
             activity(`j${id} ${describeCall(call)}`);
             watch({ type: 'tool', call, job: id });
           },
-          onResult: (call, result) => watch({ type: 'result', call, result, job: id }),
+          onResult: (call, result) => {
+            const first = String(result.content ?? '').split('\n').find((l) => l.trim()) ?? '';
+            appendLive(id, `${styles(true).dim(`    ⎿  ${first.slice(0, 160)}`)}\n`);
+            watch({ type: 'result', call, result, job: id });
+          },
           onTurn: (response) => {
+            live.onTurn(response);
             const text = textOf(response.content);
             if (text) watch({ type: 'said', job: id, text });
           },
         });
+        ended = runLines(outcome);
         const report = reportOf(id);
         // Model-written, like any tool output: redacted before it reaches the chat's context.
-        return { content: capRedacted([...warnings, ...runLines(outcome), ...(report ? ['', report] : [])].join('\n')) };
+        return { content: capRedacted([...warnings, ...ended, ...(report ? ['', report] : [])].join('\n')) };
+      } catch (cause) {
+        ended = [cause.message];
+        throw cause;
       } finally {
         jobs.delete(id);
+        endLive(id, ended);
         watch({ type: 'job-end', job: id });
       }
     } finally {
       if (claimed) workers.delete(claimed);
+    }
+  }
+
+  /** The job's tab in Herdr, showing its work: its pane, or why there is none — the job runs here either way. */
+  function watchTab(job) {
+    try {
+      return { pane: openWatchTab(herdr, { job, project: getProject(db, job.project), env }) };
+    } catch (cause) {
+      return { error: cause.message };
     }
   }
 

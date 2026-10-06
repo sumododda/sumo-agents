@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
@@ -8,7 +8,7 @@ import { dreamStatus, runDream } from './dream.mjs';
 import { backup, exportJson, exportMarkdown } from './export.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
 import { chat, jobPrinter } from './chat.mjs';
-import { reportAgent, runHerdr } from './herdr.mjs';
+import { closeJobTab, reportAgent, runHerdr } from './herdr.mjs';
 import { runHook } from './hooks.mjs';
 import { runJob as runJobLoop, runLines } from './loop.mjs';
 import * as jobs from './jobs.mjs';
@@ -84,6 +84,7 @@ sumo project show <name> | list [--all] | rescan <name> | alias <name> <alias> |
         [--tests-may-change]             worker: this task is allowed to edit tests that already exist
 sumo job brief|show|abandon <id>
 sumo job run <id>             runs the job here, in Sumo's own loop, on its route; it closes itself as its brief says
+sumo job watch <id>           what a job running in the chat is doing, as it does it (a Herdr tab shows this)
 sumo job note|ask|answer|tell <id>                               (text on stdin; tell: a message a running job reads next)
 sumo job baseline <id>        the project's checks, before the work
 sumo job verify <id>          the same checks now, judged against the baseline
@@ -328,6 +329,52 @@ function tabBegins(db, job, print) {
 function tabEnds(job, status) {
   process.stdin.pause();
   reportAgent(runHerdr, process.env, { job, state: job.status === 'needs_input' ? 'blocked' : 'idle', message: status });
+  closeJobTab(runHerdr, process.env, job);
+}
+
+/**
+ * `sumo job watch <id>`: what a job running in the chat is doing, as it does it — what its Herdr tab shows, and
+ * what any terminal can show. A line typed here is said to the job. Ends with how the run ended.
+ */
+async function watchJob(db, id) {
+  const job = jobs.getJob(db, id);
+  if (!existsSync(jobs.liveFile(id)) && job.status !== 'running' && job.status !== 'needs_input') return [`j${id} is ${job.status} — nothing is running`];
+  // The record opens with the job's own line, so nothing is printed for it here.
+  tabBegins(db, job);
+  let at = 0;
+  for (;;) {
+    // Looked at before reading, so nothing written before the end is missed.
+    const ended = existsSync(jobs.endFile(id));
+    at = copyFrom(jobs.liveFile(id), at);
+    if (ended) break;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  const lines = readFileSync(jobs.endFile(id), 'utf8').trimEnd().split('\n');
+  tabEnds(jobs.getJob(db, id), lines[0]);
+  return lines;
+}
+
+/** Writes what a file gained since `at`, and says where it ends now. A file not there yet has gained nothing. */
+function copyFrom(file, at) {
+  let fd;
+  try {
+    fd = openSync(file, 'r');
+  } catch {
+    return at;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    // A run that began again starts its record afresh: read it from the top.
+    const from = size < at ? 0 : at;
+    if (size > from) {
+      const chunk = Buffer.alloc(size - from);
+      readSync(fd, chunk, 0, chunk.length, from);
+      process.stdout.write(chunk);
+    }
+    return size;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 async function runJob(db, { args, flags }) {
@@ -356,7 +403,7 @@ async function runJob(db, { args, flags }) {
     const { job, warnings } = await jobs.retry(db, jobs.parseJobId(rawId));
     return createdLines(job, warnings);
   }
-  if (!['brief', 'note', 'ask', 'answer', 'tell', 'finish', 'show', 'abandon', 'baseline', 'verify', 'changes', 'run'].includes(sub)) {
+  if (!['brief', 'note', 'ask', 'answer', 'tell', 'finish', 'show', 'abandon', 'baseline', 'verify', 'changes', 'run', 'watch'].includes(sub)) {
     throw new UsageError(`usage: ${USAGE.job}`);
   }
   const id = jobs.parseJobId(rawId);
@@ -386,6 +433,8 @@ async function runJob(db, { args, flags }) {
     }
     case 'show':
       return [jobs.show(db, id)];
+    case 'watch':
+      return watchJob(db, id);
     case 'note':
       jobs.note(db, id, stdinText(flags));
       return [`noted on j${id}`];
