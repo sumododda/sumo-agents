@@ -322,3 +322,10 @@ export function prompt({ route, contextTokens }, s) {
   const k = contextTokens >= 1000 ? ` ${Math.round(contextTokens / 1000)}k` : '';
   return `${s.bold(s.green('sumo'))}${s.dim(` ${route}${k}`)}${s.bold('>')} `;
 }
+
+/**
+ * Text from a job — what a model wrote, what a command printed — made safe to put on a terminal: colours are kept,
+ * every other control character and escape is dropped, so nothing in it can write the clipboard, retitle the window
+ * or clear the screen of whoever is watching.
+ */
+export const safeForTerminal = (text) => String(text).replace(/\x1b\[[0-9;]*m|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, (m) => (m.length > 1 ? m : ''));

@@ -189,11 +189,12 @@ test('sumo job watch shows what a job running in the chat does, from the top, an
   s.routerWillSay('haiku', 'none');
   withSimba(s);
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
-  writeFileSync(join(s.home, 'jobs', '1', 'live.log'), '⏺ j1 scout · haiku — look\n  ⏺ $ ls\n');
-  writeFileSync(join(s.home, 'jobs', '1', 'live.end'), 'STATUS: DONE — j1\n1 turn\n');
+  // What a job printed can carry escapes: colours are shown, the clipboard, the title and the screen are left alone.
+  writeFileSync(join(s.home, 'jobs', '1', 'live.log'), '⏺ j1 scout · haiku — look\n  ⏺ $ ls\n\x1b[2mdim\x1b[22m \x1b]52;c;aGk=\x07\x1b[2J\n');
+  writeFileSync(join(s.home, 'jobs', '1', 'live.end'), 'STATUS: DONE — j1\x1b]0;owned\x07\n1 turn\n');
   const watched = s.sumo(['job', 'watch', '1']);
   assert.equal(watched.code, 0, watched.err);
-  assert.equal(watched.out, '⏺ j1 scout · haiku — look\n  ⏺ $ ls\nSTATUS: DONE — j1\n1 turn\n');
+  assert.equal(watched.out, '⏺ j1 scout · haiku — look\n  ⏺ $ ls\n\x1b[2mdim\x1b[22m ]52;c;aGk=[2J\nSTATUS: DONE — j1]0;owned\n1 turn\n');
 
   s.sumo(['job', 'abandon', '1']);
   rmSync(join(s.home, 'jobs', '1', 'live.log'));
