@@ -161,7 +161,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   if (modelId(model) === MODEL_IDS.haiku) effort = 'none';
   /** On auto, the route the last turn ran on; null otherwise. */
   let routed = null;
-  const system = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim();
+  // The guides it names are read from wherever the chat was started: their paths are made absolute, or the model goes looking for them.
+  const system = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim().replaceAll(/(?<![\w/])guides\//g, `${join(REPO_ROOT, 'guides')}/`);
   const tools = [BASH_TOOL, EDITOR_TOOL, DELEGATE_TOOL];
   let sessionId;
   let params;
