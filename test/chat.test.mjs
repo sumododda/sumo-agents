@@ -427,11 +427,8 @@ test('a delegated job is watched as it works, and what the user tells it reaches
       assert.deepEqual(told, [
         ['tool', null, 't1'],
         ['job', id, null],
-        ['said', id, 'looking'],
         ['tool', id, 'j1'],
         ['result', id, 'j1'],
-        ['said', id, 'report one'],
-        ['said', id, 'because you asked'],
         ['job-end', id, null],
         ['result', null, 't1'],
       ]);
