@@ -103,7 +103,7 @@ sumo job list [--all]`,
   export: 'sumo export [--json]',
   backup: 'sumo backup',
   models: `sumo models                    every model Sumo knows: on or off, its API id, and why
-sumo models discover           ask the API which of them this credential can use, and set the switches from the answer
+sumo models discover           ask the API which of them this credential can use, and set the switches from the answer (one turned off by hand stays off)
 sumo models enable|disable <name>`,
   setup: 'sumo setup [--bin-dir DIR] [--no-link] [--model-source URL] [--no-model]',
   doctor: 'sumo doctor',
