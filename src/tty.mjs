@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { join, sep } from 'node:path';
 import { REPO_ROOT } from './paths.mjs';
 import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
 
@@ -313,6 +314,9 @@ function top(lines, max) {
   return lines.length > max ? [...lines.slice(0, max), { text: `… +${lines.length - max} line${lines.length - max === 1 ? '' : 's'}`, tone: 'dim' }] : lines;
 }
 
+/** A path as a person reads it: under the home directory, from `~`. */
+export const tilde = (path, home = homedir()) => (path === home ? '~' : String(path).startsWith(`${home}${sep}`) ? `~${String(path).slice(home.length)}` : String(path));
+
 /** How a delegated job ended, for the line that sums it up: its mark, the word for it, and its colour. */
 const JOB_ENDS = { done: ['✓', 'done', 'add'], failed: ['✗', 'failed', 'error'], needs_input: ['?', 'needs your answer', 'ask'], open: ['○', 'never closed', 'dim'] };
 
@@ -354,7 +358,7 @@ export function toolView(call, result = null, { full = false } = {}) {
   }
   const range = Array.isArray(input.view_range) ? `:${input.view_range.join('-')}` : '';
   const title = input.command === 'view' ? 'Read' : input.command === 'create' ? 'Write' : input.command === 'str_replace' || input.command === 'insert' ? 'Update' : call.name;
-  const detail = `${input.path ?? ''}${range}`;
+  const detail = `${tilde(input.path ?? '')}${range}`;
   if (!result) return { title, detail, lines: [] };
   if (result.isError) return { title, detail, lines: top(toned(result.content, 'error'), full ? Infinity : SHOWN_OUTPUT_LINES) };
   const added = (text) => toned(text, 'add').map((l) => ({ ...l, text: `+ ${l.text}` }));
