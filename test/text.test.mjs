@@ -57,9 +57,12 @@ test('what a tool hands back is well-formed, though the cut in its middle fell i
 test('an assignment is a secret whatever its name is prefixed with, and whether or not the name is quoted', () => {
   assert.equal(redact('DB_PASSWORD=hunter2hunter2').text, 'DB_PASSWORD=[redacted]');
   // A key broken up by anything a reader never sees is still the key: an escape, a control character, a zero-width space, a soft hyphen, a direction mark.
-  for (const breaker of ['\x1b[0m', '\x01', '\u200b', '\u00ad', '\u202e', '\x1b]0;t\x07']) {
-    assert.deepEqual(redact(`key sk-ant-api03-abcdefghijk${breaker}lmnopqrstuvwxyz0123456789 ok`), { text: 'key [redacted] ok', count: 1 }, JSON.stringify(breaker));
+  for (const breaker of ['\x1b[0m', '\x01', '\u200b', '\u00ad', '\u202e', '\x1b]0;t\x07', '\ufe0f', '\u3164', '\u034f']) {
+    assert.deepEqual(redact(`key sk-ant-api03-abcdefghijk${breaker}lmnopqrstuvwxyz0123456789 ok`), { text: 'key [redacted] ok\n[1 hidden character taken out before redacting]', count: 1 }, JSON.stringify(breaker));
   }
+  // With nothing secret, nothing is hidden from the reader: a direction override or an escape is shown, and a stray escape swallows nothing.
+  assert.deepEqual(redact('if (isAdmin\u202e) {\x1b]8;;evil'), { text: 'if (isAdmin⟨U+202E⟩) {⟨U+001B⟩]8;;evil', count: 0 });
+  assert.equal(redact('ok ❤️ and 👩‍💻').text, 'ok ❤️ and 👩‍💻', 'emoji keep their joiners and selectors');
   assert.equal(redact('line one\r\nline two\ttabbed').text, 'line one\nline two\ttabbed', 'lines and tabs stay');
   assert.equal(redact('export GITHUB_TOKEN: abcdef123456').text, 'export GITHUB_TOKEN: [redacted]');
   assert.equal(redact('{ "password": "hunter2-is-secret", "user": "sumo" }').text, '{ "password": [redacted], "user": "sumo" }');
