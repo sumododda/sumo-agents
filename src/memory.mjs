@@ -1,7 +1,11 @@
-import { tx } from './db.mjs';
+import { createHash } from 'node:crypto';
+import { getMeta, setMeta, tx } from './db.mjs';
 import { redact } from './redact.mjs';
-import { ftsQuery, overlap, sharedStems } from './text.mjs';
+import { clip, ftsQuery, overlap, sharedStems } from './text.mjs';
 import { matchWithin } from './workflows.mjs';
+
+/** How much of a search that found nothing is kept as the record of it. */
+const MISS_KEPT = 200;
 
 export const TYPES = ['preference', 'fact', 'decision', 'gotcha', 'procedure'];
 
@@ -60,12 +64,13 @@ export function parseId(raw) {
 }
 
 export function resolveProject(db, nameOrAlias) {
-  const key = nameOrAlias.toLowerCase();
-  const row =
-    db.prepare('SELECT slug FROM projects WHERE slug = ?').get(key) ??
-    db.prepare('SELECT slug FROM project_aliases WHERE alias = ?').get(key);
+  const find = (key) => db.prepare('SELECT slug FROM projects WHERE slug = ?').get(key) ?? db.prepare('SELECT slug FROM project_aliases WHERE alias = ?').get(key);
+  // A project is also known by the name it was registered from, as typed: "My Proj" is my-proj (the slug projects.mjs makes).
+  const row = find(nameOrAlias.toLowerCase()) ?? find(nameOrAlias.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, ''));
   if (!row) {
-    throw new UsageError(`unknown project "${nameOrAlias}" — register it first: sumo project add <path>`);
+    const known = db.prepare(`SELECT slug FROM projects WHERE status = 'active' ORDER BY slug LIMIT 9`).all().map((r) => r.slug);
+    const listed = known.length === 0 ? '' : ` (known: ${known.slice(0, 8).join(', ')}${known.length > 8 ? ', …' : ''})`;
+    throw new UsageError(`unknown project "${nameOrAlias}"${listed} — register it first: sumo project add <path>`);
   }
   return row.slug;
 }
@@ -149,7 +154,22 @@ export function add(db, input) {
   });
 }
 
+/**
+ * A fact read off disk that was retired by anything but the scanner — forgotten, or replaced — stays retired: the next
+ * rescan reads the same text off disk, and must not bring back what was let go. A different text is news, and comes in.
+ */
+const retiredKey = (scope, scanKey) => `scan.retired.${scope}.${scanKey}`;
+// Kept as a digest, never the text: a purge erases the words, and the fact still stays let go.
+const digestOf = (body) => createHash('sha256').update(body).digest('hex');
+function noteRetired(db, id) {
+  const row = db.prepare('SELECT scope, scan_key, body FROM memories WHERE id = ?').get(id);
+  if (row?.scan_key) setMeta(db, retiredKey(row.scope, row.scan_key), digestOf(row.body));
+}
+/** Whether a scanned fact with this text was let go by someone other than the scanner. */
+export const scanRetired = (db, scope, scanKey, body) => getMeta(db, retiredKey(scope, scanKey)) === digestOf(body);
+
 function markSuperseded(db, oldId, newId, now) {
+  noteRetired(db, oldId);
   db.prepare(`UPDATE memories SET state = 'superseded', superseded_by = ?, invalid_at = ? WHERE id = ?`).run(
     newId,
     now,
@@ -265,9 +285,10 @@ export function search(db, query, opts = {}) {
   } else {
     // The record of what memory could not answer: the evidence for whether
     // keyword search is enough or embeddings are ever worth adding.
+    // Kept like everything else here: without secrets, and short — a pasted log is not a question worth keeping whole.
     db.prepare('INSERT INTO search_misses (ts, query, scope) VALUES (?, ?, ?)').run(
       now,
-      query,
+      clip(redact(query).text, MISS_KEPT),
       opts.everywhere ? 'everywhere' : (projectScope ?? 'global'),
     );
   }
@@ -312,6 +333,8 @@ export function forget(db, id, { purge = false, now = new Date().toISOString() }
   if (purge) {
     tx(db, () => {
       eraseFromIndexes(db);
+      // A scanned fact let go for good stays let go: only its digest is kept, never its words.
+      noteRetired(db, id);
       db.prepare('DELETE FROM memories WHERE id = ?').run(id);
       // Erasing the memory but keeping the sentence it came from would not be erasing it.
       if (row.source_turn !== null) db.prepare('DELETE FROM user_turns WHERE id = ?').run(row.source_turn);
@@ -321,6 +344,7 @@ export function forget(db, id, { purge = false, now = new Date().toISOString() }
     return { ...row, state: 'purged' };
   }
   if (row.state === 'invalid') return row;
+  noteRetired(db, id);
   db.prepare(`UPDATE memories SET state = 'invalid', invalid_at = ? WHERE id = ?`).run(now, id);
   return get(db, id);
 }

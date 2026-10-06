@@ -42,3 +42,22 @@ test('a transaction SQLite rolled back by itself fails with the reason it failed
     }
   });
 });
+
+test('the database and the files beside it are private from the first open, whatever the umask', async () => {
+  const { mkdtempSync, statSync, existsSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'sumo-agents-mode-'));
+  const file = join(dir, 'memory.db');
+  const was = process.umask(0o022);
+  try {
+    const db = openDb(file);
+    db.exec(`CREATE TABLE IF NOT EXISTS t (x); INSERT INTO t VALUES (1);`);
+    for (const side of [file, `${file}-wal`, `${file}-shm`]) {
+      if (existsSync(side)) assert.equal(statSync(side).mode & 0o777, 0o600, side);
+    }
+    db.close();
+  } finally {
+    process.umask(was);
+  }
+});

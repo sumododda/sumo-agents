@@ -46,6 +46,8 @@ export async function clipboardImage(read = readMacClipboard) {
   } catch (cause) {
     // Too much to read is an image too big to send, not an empty clipboard.
     if (cause.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw new Error(`that image is too big — the API takes ${MAX_IMAGE_BYTES / 1e6} MB encoded`);
+    // No osascript is no Mac, not an empty clipboard: say what does work here.
+    if (cause.code === 'ENOENT') throw new Error('pasting an image from the clipboard needs macOS — drop the image file on the box instead');
     return null;
   }
   const hex = /«data PNGf([0-9A-Fa-f]+)»/.exec(printed)?.[1];

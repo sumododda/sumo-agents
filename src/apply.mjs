@@ -208,11 +208,14 @@ function reachOf(db, scope) {
   }
 }
 
+/** A memory id as a person or a file writes it — 12 or "m12" — or NaN; the passes' schema gives numbers, `sumo apply` may not. */
+const idOf = (raw) => Number(/^m?(\d+)$/.exec(String(raw ?? '').trim())?.[1] ?? NaN);
+
 const HANDLERS = {
   add: (db, op, ctx) => addStated(db, op, ctx),
 
   supersede(db, op, ctx) {
-    const old = db.prepare('SELECT * FROM memories WHERE id = ?').get(Number(op.old)) ?? null;
+    const old = db.prepare('SELECT * FROM memories WHERE id = ?').get(idOf(op.old)) ?? null;
     const type = STATED_TYPES.includes(op.type) ? op.type : STATED_TYPES.includes(old?.type) ? old.type : 'fact';
     // A real statement aimed at the wrong target — a memory that is gone, or one about something
     // else — is still a real statement. It is kept; it just does not get to replace anything.
@@ -250,7 +253,7 @@ const HANDLERS = {
 
   /** Two memories that cannot both be true. Never resolved here: only the user knows which one is. */
   contradiction(db, op, ctx) {
-    const [a, b] = (Array.isArray(op.ids) ? op.ids : []).map(Number);
+    const [a, b] = (Array.isArray(op.ids) ? op.ids : []).map(idOf);
     if (!a || !b || a === b) throw new Rejected('a contradiction names two different memories');
     for (const id of [a, b]) if (memory.get(db, id).state !== 'active') throw new Rejected(`m${id} is not active`);
     const [lo, hi] = a < b ? [a, b] : [b, a];

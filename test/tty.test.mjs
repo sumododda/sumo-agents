@@ -184,3 +184,36 @@ describe('the chat terminal rendering', () => {
     assert.deepEqual(toolView(create, { content: 'created /p/new.mjs', isError: false }, { full: true }).lines, [{ text: '+ x', tone: 'add' }, { text: '+ y', tone: 'add' }]);
   });
 });
+
+describe('tabs', () => {
+  it('reach the screen as spaces in a reply, so a wrapped line or a box around it is not pushed out of place', () => {
+    const out = [];
+    const reply = createRenderer((t) => out.push(t), styles(false), { width: 80 });
+    reply.write('```\nall:\n\tgo build\n```\n');
+    reply.flush();
+    assert.ok(!out.join('').includes('\t'), JSON.stringify(out.join('')));
+    assert.match(out.join(''), / {4}go build/);
+  });
+});
+
+describe('wide characters', () => {
+  // Two columns for CJK and for an emoji drawn as a picture; one for everything else here.
+  const columns = (line) => [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(line)].reduce((n, { segment }) => n + (/[一-鿿]|\p{Emoji_Presentation}/u.test(segment) ? 2 : 1), 0);
+
+  it('line a table up by the columns they take, whether a cell fits or is folded', () => {
+    const out = [];
+    const r = createRenderer((t) => out.push(t), styles(false), { width: 80 });
+    r.write('| 名前 | 状態 |\n|---|---|\n| 日本語 | ✅ done |\n| ascii | ok |\n\n');
+    r.flush();
+    const rows = out.join('').split('\n').filter((l) => /^[┌│├└]/.test(l));
+    assert.equal(new Set(rows.map(columns)).size, 1, rows.join('\n'));
+
+    const narrow = [];
+    const folded = createRenderer((t) => narrow.push(t), styles(false), { width: 24 });
+    folded.write(`| x | 説明 |\n|---|---|\n| a | ${'漢字'.repeat(12)} |\n\n`);
+    folded.flush();
+    const foldedRows = narrow.join('').split('\n').filter((l) => /^[┌│├└]/.test(l));
+    assert.equal(new Set(foldedRows.map(columns)).size, 1, foldedRows.join('\n'));
+    assert.ok(columns(foldedRows[0]) <= 24, foldedRows.join('\n'));
+  });
+});

@@ -657,3 +657,27 @@ test('a turn that ends because the reply was cut off, or declined, says so on th
     }
   });
 });
+
+test('a tab pasted into the box is drawn as spaces, so the box keeps its border', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: () => assert.fail('never sent'), now: () => NOW });
+      const tty = fakeTty({ columns: 60 });
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', debug: true });
+      try {
+        await tty.type('\x1b[200~all:\n\tgo build ./...\x1b[201~');
+        const box = tty.screen().split('\n').filter((l) => /^[╭│╰]/.test(l));
+        assert.ok(box.some((l) => /go build/.test(l)), tty.screen());
+        assert.ok(!tty.screen().includes('\t'));
+        assert.equal(new Set(box.map((l) => l.length)).size, 1, `every row of the box is as wide:\n${box.join('\n')}`);
+      } finally {
+        ui.unmount();
+        session.end();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});

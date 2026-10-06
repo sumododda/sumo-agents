@@ -20,7 +20,24 @@ const QUIET_MS = 5 * 60_000;
 const TURNS_TO_RUN = 3;
 const MAX_REPLIES_PER_SESSION = 6;
 const MAX_RELATED = 10;
+/**
+ * How much of the user's words one run reads, so a batch always fits the local model's 32k context with room to think
+ * and answer. Counted in characters, which a pasted log turns into more tokens than prose does — the room is left for
+ * that. Thirty stored turns of 4,000 characters each would not fit; what does not fit waits for the next run.
+ */
+const BATCH_CHARS = 40_000;
 
+/** The pending turns one run reads: the oldest first, as many as fit, and always at least one. */
+function batchOf(turns) {
+  const batch = [];
+  let used = 0;
+  for (const t of turns) {
+    if (batch.length > 0 && used + t.text.length > BATCH_CHARS) break;
+    batch.push(t);
+    used += t.text.length;
+  }
+  return batch;
+}
 
 /**
  * Whether the writer should run now. It is batched on purpose: each call
@@ -183,7 +200,7 @@ export function relatedMemories(db, texts, scopes) {
 
 /** What the writer is shown: the user's words, the assistant's replies around them, and nothing else. */
 export function buildBundle(db) {
-  const turns = pendingTurns(db);
+  const turns = batchOf(pendingTurns(db));
   if (turns.length === 0) return null;
 
   const bySession = new Map();
@@ -195,7 +212,7 @@ export function buildBundle(db) {
     const project = currentProject(db, sessionId);
     if (project) scopes.add(`project:${project}`);
     const session = db.prepare('SELECT transcript_path FROM sessions WHERE id = ?').get(sessionId);
-    const replies = session?.transcript_path ? assistantReplies(session.transcript_path, sessionTurns[0].ts).slice(-MAX_REPLIES_PER_SESSION) : [];
+    const replies = session?.transcript_path ? assistantReplies(session.transcript_path, sessionTurns[0].ts, MAX_REPLIES_PER_SESSION).slice(-MAX_REPLIES_PER_SESSION) : [];
 
     const events = [
       ...sessionTurns.map((t) => ({ ts: t.ts, text: `[t${t.id}] user: ${t.text}` })),

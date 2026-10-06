@@ -170,3 +170,101 @@ test('a project is detected in a sentence by whole words only, never by an ordin
   assert.doesNotMatch(s.sumo(['project', 'list']).out, /slate/);
   assert.match(s.sumo(['project', 'list', '--all']).out, /slate .*\[archived\]/);
 });
+
+test('a scanned fact the user forgot or replaced stays let go on a rescan; one that left the disk and came back returns', () => {
+  const s = sandbox();
+  const dir = fixtureRepo(s);
+  s.sumo(['project', 'add', dir, '--alias', 'simba']);
+  const idOf = (key) => s.sql((db) => db.prepare(`SELECT id FROM memories WHERE scan_key = ? AND state = 'active'`).get(key)?.id);
+
+  s.sumo(['forget', String(idOf('stack'))]);
+  assert.match(s.sumo(['project', 'rescan', 'simba']).out, /^rescanned: 0 new, 0 changed, 0 gone/);
+  assert.equal(idOf('stack'), undefined, 'the forgotten stack is not read back in');
+
+  const instructions = idOf('instructions');
+  assert.ok(instructions);
+  const saved = s.sumo(['add', 'fact', 'the rules for this repo live in docs/RULES.md', '--project', 'simba']);
+  const replacement = /saved m(\d+)/.exec(saved.out)[1];
+  assert.equal(s.sumo(['supersede', String(instructions), replacement]).code, 0);
+  s.sumo(['project', 'rescan', 'simba']);
+  assert.equal(idOf('instructions'), undefined, 'the replaced fact does not come back beside its replacement');
+
+  // The disk itself changing is news: the scanner says it.
+  renameSync(join(dir, 'pnpm-lock.yaml'), join(dir, 'bun.lock'));
+  assert.match(s.sumo(['project', 'rescan', 'simba']).out, /stack: TypeScript, React, bun/);
+
+  // A fact the scanner retired because its file went away comes back with the file.
+  const ci = idOf('ci');
+  assert.ok(ci, 'the fixture has a CI fact');
+  renameSync(join(dir, '.github'), join(dir, '.github-away'));
+  s.sumo(['project', 'rescan', 'simba']);
+  assert.equal(idOf('ci'), undefined);
+  renameSync(join(dir, '.github-away'), join(dir, '.github'));
+  s.sumo(['project', 'rescan', 'simba']);
+  assert.ok(idOf('ci'), 'back with its file');
+});
+
+test('adding an archived project again brings it back', () => {
+  const s = sandbox();
+  const dir = fixtureRepo(s);
+  s.sumo(['project', 'add', dir, '--alias', 'simba']);
+  s.sumo(['project', 'archive', 'simba']);
+  assert.doesNotMatch(s.sumo(['project', 'list']).out, /proj-simba/);
+  const again = s.sumo(['project', 'add', dir]);
+  assert.match(again.out, /^proj-simba is back from the archive — rescanned/);
+  assert.match(s.sumo(['project', 'list']).out, /proj-simba/);
+  assert.doesNotMatch(s.sumo(['project', 'show', 'simba']).out, /archived/);
+});
+
+test('a project is found by the name it was registered from as well as its slug, and an unknown one lists the known', () => {
+  const s = sandbox();
+  const dir = fixtureRepo(s, 'My Proj');
+  assert.match(s.sumo(['project', 'add', dir]).out, /^registered my-proj/);
+  const added = s.sumo(['add', 'fact', 'deploys go through the staging branch', '--project', 'My Proj']);
+  assert.equal(added.code, 0, added.err);
+  assert.match(added.out, /proj:my-proj|my-proj/);
+  const unknown = s.sumo(['search', 'deploys', '--project', 'nope']);
+  assert.equal(unknown.code, 2);
+  assert.match(unknown.err, /unknown project "nope" \(known: my-proj\)/);
+});
+
+test('purging a forgotten scanned fact leaves no copy of its words, and the fact stays let go', () => {
+  const s = sandbox();
+  const dir = fixtureRepo(s);
+  s.sumo(['project', 'add', dir, '--alias', 'simba']);
+  const about = () => s.sql((db) => db.prepare(`SELECT id, body FROM memories WHERE scan_key = 'about' AND state = 'active'`).get());
+  const { id, body } = about();
+  s.sumo(['forget', String(id)]);
+  s.sumo(['forget', String(id), '--purge']);
+  const kept = s.sql((db) => db.prepare(`SELECT value FROM meta WHERE key LIKE 'scan.retired.%'`).all()).map((r) => r.value);
+  assert.ok(kept.every((v) => !v.includes(body) && !body.includes(v)), 'only a digest is kept');
+  s.sumo(['project', 'rescan', 'simba']);
+  assert.equal(about(), undefined, 'a purge does not bring the fact back');
+});
+
+test('a scan reads only the repository\'s own plain files: a link out of it, a FIFO or a device is passed over', async () => {
+  const { symlinkSync } = await import('node:fs');
+  const { execFileSync } = await import('node:child_process');
+  const s = sandbox();
+  const dir = join(s.root, 'linked');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(s.root, 'netrc'), 'machine api.internal.example.com login deploybot password Tr0ub4dor-and-3-horses\n');
+  symlinkSync(join(s.root, 'netrc'), join(dir, 'README.md'));
+  symlinkSync('/dev/zero', join(dir, 'Makefile'));
+  execFileSync('mkfifo', [join(dir, 'pyproject.toml')]);
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'linked', scripts: { test: 'vitest' } }));
+  const added = s.sumo(['project', 'add', dir]);
+  assert.equal(added.code, 0, added.err);
+  assert.doesNotMatch(added.out, /Tr0ub4dor|deploybot/);
+  assert.match(added.out, /test `npm (run )?test`/);
+});
+
+test('purging an active scanned fact keeps it let go on the next rescan', () => {
+  const s = sandbox();
+  const dir = fixtureRepo(s);
+  s.sumo(['project', 'add', dir, '--alias', 'simba']);
+  const about = () => s.sql((db) => db.prepare(`SELECT id FROM memories WHERE scan_key = 'about' AND state = 'active'`).get());
+  s.sumo(['forget', String(about().id), '--purge']);
+  assert.match(s.sumo(['project', 'rescan', 'simba']).out, /^rescanned: 0 new/);
+  assert.equal(about(), undefined);
+});

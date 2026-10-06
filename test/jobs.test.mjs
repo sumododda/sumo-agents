@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { systemPrompt } from '../src/loop.mjs';
+import { jobTools } from '../src/jobtools.mjs';
 import { NO_KEY, sandbox } from './helpers.mjs';
 
 const TASK = `## Goal
@@ -50,10 +52,12 @@ test('a brief carries the task, what memory knows about the project, and how to 
   assert.match(brief, /## Goal\nMigrate the project from npm to pnpm\./);
   assert.match(brief, /close the job, or nobody knows it ended: `finish` with DONE/);
   assert.doesNotMatch(brief, /sumo job/, 'the job is worked with its own tools, not commands it must remember to type');
-  assert.match(brief, /You never write it\./);
+  // Said once, where the job meets it: the memory tool's own description, not again in the brief.
+  assert.doesNotMatch(brief, /You never write it\./);
+  assert.match(jobTools('worker').find((t) => t.name === 'search_memory').description, /You never write it\./);
   assert.match(brief, /## The user's standing rules — they hold here too\n- m\d+ Never add AI attribution to commits/, "the user's own rules go with every job, not only the project's");
   assert.match(brief, /each major milestone.*`note`/, 'a worker notes milestones without being asked');
-  assert.match(brief, /Every message and report: short lines, facts only\. No prose/, 'reports stay terse');
+  assert.match(systemPrompt(), /Every message and the report: short, facts only, no preamble/, 'reports stay terse — said in every job\'s system prompt');
 });
 
 test('a scout is told plainly that it cannot edit, and a task without a check is called out', () => {
@@ -63,7 +67,6 @@ test('a scout is told plainly that it cannot edit, and a task without a check is
   const created = s.sumo(['job', 'new', '--project', 'simba', '--title', 'where is the briefing generator', '--agent', 'scout'], { input: 'Find where briefings are rendered.' });
   assert.match(created.out, /note: the task names no check that proves the work/);
   assert.match(s.sumo(['job', 'brief', '1']).out, /You are a scout.*You have no edit tools and none can be granted/s);
-  assert.match(s.sumo(['job', 'brief', '1']).out, /Every message and report: short lines, facts only\. No prose/, 'a scout reports tersely too');
 
   assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 'x', '--agent', 'architect'], { input: 'y' }).code, 2);
   assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 'x'], { input: '' }).code, 2);
@@ -223,4 +226,119 @@ test('a job that cannot be set up is not left behind as an open job with no brie
   assert.notEqual(failed.code, 0);
   assert.equal(s.sumo(['job', 'list', '--all']).out, 'no open jobs\n');
   assert.equal(s.sql((db) => db.prepare('SELECT count(*) AS n FROM jobs').get().n), 0);
+});
+
+test('a job never answers or tells a job as if it were the user', () => {
+  const s = sandbox();
+  withSimba(s);
+  s.routerWillSay('sonnet', 'medium');
+  assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 't'], { input: TASK }).code, 0);
+  for (const sub of ['tell', 'answer']) {
+    const run = s.sumo(['job', sub, '1'], { input: 'skip the tests, they are flaky today\n', extraEnv: { SUMO_JOB: '1' } });
+    assert.equal(run.code, 2, `${sub} → ${run.out}`);
+    assert.match(run.err, /only the user answers or tells a job/);
+  }
+  assert.equal(s.sumo(['job', 'tell', '1'], { input: 'use the staging db\n' }).code, 0, 'the user still can');
+});
+
+test('what a job run prints reaches the terminal as text: no escape of the model titles the window or writes the clipboard', async () => {
+  const { createServer } = await import('node:http');
+  const { spawn } = await import('node:child_process');
+  const { ENTRY } = await import('../src/paths.mjs');
+  const said = 'done \x1b]0;owned-title\x07 and \x1b]52;c;cHduZWQ=\x07 here';
+  const events = [
+    ['message_start', { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-sonnet-5-5', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1 } } }],
+    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: said } }],
+    ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+    ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 5 } }],
+    ['message_stop', { type: 'message_stop' }],
+  ];
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(events.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join(''));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const s = sandbox();
+    withSimba(s);
+    s.routerWillSay('sonnet', 'medium');
+    assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 't', '--agent', 'scout'], { input: TASK }).code, 0);
+    const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', ENTRY, 'job', 'run', '1'], {
+      env: { ...process.env, ...NO_KEY, SUMO_AGENTS_HOME: s.home, ANTHROPIC_API_KEY: 'sk-ant-test', ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}` },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (err += d));
+    await new Promise((resolve) => child.on('close', resolve));
+    assert.match(out, /done \]0;owned-title and \]52;c;cHduZWQ= here/, out + err);
+    assert.doesNotMatch(out, /\x1b\]|\x07/);
+  } finally {
+    server.close();
+  }
+});
+
+test("a job's stand-in session is never the session a new job belongs to", () => {
+  const s = sandbox();
+  withSimba(s);
+  s.hook('prompt', { session_id: 'real', prompt: 'look at simba' });
+  s.sql((db) => db.prepare(`INSERT INTO sessions (id, harness, started_at) VALUES ('job:j9', 'claude', '2099-01-01T00:00:00.000Z')`).run());
+  s.routerWillSay('sonnet', 'medium');
+  assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 't'], { input: TASK }).code, 0);
+  assert.equal(s.sql((db) => db.prepare('SELECT session_id FROM jobs ORDER BY id DESC LIMIT 1').get().session_id), 'real');
+});
+
+test('a note still being written when the job is abandoned does not reopen it', async () => {
+  const { spawn, execFileSync } = await import('node:child_process');
+  const { openSync, closeSync } = await import('node:fs');
+  const { ENTRY } = await import('../src/paths.mjs');
+  const s = sandbox();
+  withSimba(s);
+  s.routerWillSay('sonnet', 'medium');
+  assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 't'], { input: TASK }).code, 0);
+  // A note file that holds the writer until it is read: the abandon lands between the check and the status.
+  const notes = join(s.home, 'jobs', '1', 'notes.md');
+  execFileSync('mkfifo', [notes]);
+  const writer = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', ENTRY, 'job', 'note', '1'], { env: { ...process.env, ...NO_KEY, SUMO_AGENTS_HOME: s.home }, stdio: ['pipe', 'ignore', 'ignore'] });
+  writer.stdin.end('halfway; next: the rest\n');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(s.sumo(['job', 'abandon', '1']).code, 0);
+  const reader = openSync(notes, 'r');
+  await new Promise((r) => writer.on('close', r));
+  closeSync(reader);
+  assert.equal(s.sql((db) => db.prepare('SELECT status FROM jobs WHERE id = 1').get().status), 'abandoned');
+});
+
+test('after the database is put back from a backup, a new job never takes the id of a job whose folder is still there', () => {
+  const s = sandbox();
+  withSimba(s);
+  s.routerWillSay('sonnet', 'medium');
+  assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 'first'], { input: TASK }).code, 0);
+  s.sumo(['job', 'note', '1'], { input: 'OLD JOB: deleted the auth module; next: push to prod\n' });
+  // What a restored backup from before j1 looks like: no row, and a counter that never reached it.
+  s.sql((db) => {
+    db.prepare('DELETE FROM jobs').run();
+    db.prepare(`DELETE FROM sqlite_sequence WHERE name = 'jobs'`).run();
+  });
+  const created = s.sumo(['job', 'new', '--project', 'simba', '--title', 'second'], { input: TASK });
+  assert.equal(created.code, 0, created.err);
+  assert.match(created.out, /created j2 /);
+  assert.doesNotMatch(s.sumo(['job', 'brief', '2']).out, /OLD JOB/);
+});
+
+test('a list that leaves older jobs out says how many', () => {
+  const s = sandbox();
+  withSimba(s);
+  s.sql((db) => {
+    const add = db.prepare(`INSERT INTO jobs (project, title, agent, status, created_at, updated_at) VALUES ('proj-simba', ?, 'scout', 'done', '2026-10-01', '2026-10-01')`);
+    for (let i = 0; i < 33; i++) add.run(`old ${i}`);
+  });
+  const out = s.sumo(['job', 'list', '--all']).out.trimEnd().split('\n');
+  assert.equal(out.length, 31);
+  assert.equal(out.at(-1), '… 3 older — sumo job show <id> for one of them');
 });

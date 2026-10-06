@@ -144,3 +144,44 @@ test('a cheap-model answer cut off or refused is said as such, and what it spent
     server.close();
   }
 });
+
+test('a cheap-model call is tried at most twice, and with no credential it names the variables to set', async () => {
+  let hits = 0;
+  const server = createServer((req, res) => {
+    hits++;
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(529, { 'content-type': 'application/json', 'retry-after-ms': '10' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const standIn = process.env.SUMO_AGENTS_MODEL_CMD;
+  delete process.env.SUMO_AGENTS_MODEL_CMD;
+  try {
+    const schema = { type: 'object' };
+    await withHome(freshHome(), { ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}`, ANTHROPIC_API_KEY: 'sk-ant-test' }, async () => {
+      const db = openDb();
+      try {
+        const busy = await callModel(db, { system: 's', prompt: 'p', schema, model: 'haiku' });
+        assert.equal(busy.ok, false);
+        assert.equal(hits, 2, 'one try and one retry, not the SDK default of three');
+      } finally {
+        db.close();
+      }
+    });
+    await withHome(freshHome(), { ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '' }, async () => {
+      const db = openDb();
+      try {
+        const none = await callModel(db, { system: 's', prompt: 'p', schema, model: 'haiku' });
+        assert.equal(none.ok, false);
+        assert.match(none.error, /no Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN/);
+      } finally {
+        db.close();
+      }
+    });
+  } finally {
+    if (standIn !== undefined) process.env.SUMO_AGENTS_MODEL_CMD = standIn;
+    server.close();
+  }
+});

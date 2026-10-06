@@ -72,7 +72,22 @@ export function jobParams({ job, text, system = systemPrompt() }) {
  * however the command was spelled. Both stop mistakes, not a shell set on getting round them: a job's shell runs
  * with the user's own access.
  */
-const SELF_GRANT = /\bjob\s+finish\b[\s\S]*--accept\b|\b(?:unset|env\b[^;&|\n]*\s-u)\s+SUMO_JOB\b|\bSUMO_JOB=/;
+// Each part is held to one command, and the marker to where a shell would set it, so a search through code that names
+// them (`grep -rn "SUMO_JOB=" src`, `rg "job finish" && grep -- --accept`) is reading, not granting.
+const SELF_GRANT = new RegExp(
+  [
+    /\bjob\s+finish\b[^;&|\n]*--accept\b/.source,
+    // Clearing the marker, however a shell spells it.
+    /\bunset\b[^;&|\n]*\bSUMO_JOB\b/.source,
+    /\benv\b[^;&|\n]*(?:\s-u\s*|\s--unset=)["']?SUMO_JOB\b/.source,
+    /\b(?:export\s+-n|declare\s+\+x|typeset\s+\+x)\b[^;&|\n]*\bSUMO_JOB\b/.source,
+    // Setting it where a command starts: after a separator, a keyword, sudo or eval, inside `sh -c "…"`, behind other assignments.
+    /(?:^|[;&|(`{!\n]|\$\(|\b(?:if|then|else|elif|do|while|until|time|eval|sudo(?:\s+(?:-[ugCDhpRrTt]\s*\S+|-\S+))*)\s|\b(?:ba|z|da|k)?sh\b[^;&|\n]*\s-c\s+["'])\s*(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S)*\s+)*["']?SUMO_JOB=/.source,
+    /\b(?:export|env|declare|typeset|readonly|local)\b[^;&|\n]*?\s["']?SUMO_JOB=/.source,
+  ].join('|'),
+);
+/** Whether a command, as written, takes its own work unverified or clears the marker that would stop it; a line continued with `\` is one line. */
+export const grantsItself = (command) => SELF_GRANT.test(command.replace(/\\\n/g, ' '));
 const SELF_GRANT_REFUSED = "Refused: work is never taken unverified on its author's word. Finish FAILED with what blocks verification, or ask.";
 
 /** Said once to a job that ended its turn with the job still open: it finished the work but never said so. */
@@ -229,9 +244,9 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   const gate = (call) => {
     if (isJobTool(call)) return runJobTool(call, { job, ctx, signal });
     if (call.name !== BASH_TOOL.name) return null;
-    if (SELF_GRANT.test(String(call.input?.command ?? ''))) return { content: SELF_GRANT_REFUSED, isError: true };
-    if (!job.session_id) return null;
-    const held = handleEvent(db, 'pre-tool', { session_id: job.session_id, agent_id: `j${id}`, project: job.project, cwd: project.path, tool_name: 'bash', tool_input: { command: String(call.input?.command ?? '') } }, now?.());
+    if (grantsItself(String(call.input?.command ?? ''))) return { content: SELF_GRANT_REFUSED, isError: true };
+    // A job created where no session had begun is still gated, under a session of its own: it holds no turns, only what was shown.
+    const held = handleEvent(db, 'pre-tool', { session_id: job.session_id ?? `job:j${id}`, agent_id: `j${id}`, project: job.project, cwd: project.path, tool_name: 'bash', tool_input: { command: String(call.input?.command ?? '') } }, now?.());
     return held ? { content: JSON.parse(held).deny, isError: true } : null;
   };
   try {
