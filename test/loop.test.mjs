@@ -11,7 +11,7 @@ import { add, UsageError } from '../src/memory.mjs';
 import { jobPrinter } from '../src/chat.mjs';
 import { getJob, takeInbox, tell } from '../src/jobs.mjs';
 import { converse, jobParams, markTail, runJob, runLines } from '../src/loop.mjs';
-import { paths } from '../src/paths.mjs';
+import { ENTRY, paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { cap, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
 import { styles } from '../src/tty.mjs';
@@ -623,7 +623,8 @@ test('a worker cannot take its own work unverified: the finish tool has no way t
       assert.deepEqual(Object.keys(params.tools.find((t) => t.name === 'finish').input_schema.properties), ['status', 'report']);
       const { send, seen } = canned([
         reply('tool_use', [
-          call('t1', 'bash', { command: `sumo job finish ${id} --status DONE --accept "trust me" <<'EOF'\n## Summary\nok\nEOF` }),
+          // Spelled so no pattern over the command text would see it: the shell joins the quotes and expands the variable.
+          call('t1', 'bash', { command: `F=--acc""ept; '${process.execPath}' --disable-warning=ExperimentalWarning '${ENTRY}' job finish ${id} --status DONE $F "trust me" <<'EOF'\n## Summary\nok\nEOF` }),
           call('t2', 'finish', { status: 'DONE', report: '## Summary\nok', accept: 'trust me' }),
         ]),
         reply('end_turn', []),
@@ -632,7 +633,7 @@ test('a worker cannot take its own work unverified: the finish tool has no way t
       await runJob(db, id, { send, now: () => NOW });
       const [viaShell, viaTool] = seen[1].messages.at(-1).content;
       assert.equal(viaShell.is_error, true);
-      assert.match(viaShell.content, /^Refused: work is never taken unverified on its author's word/);
+      assert.match(viaShell.content, new RegExp(`Refused: j${id} runs this command, and work is never taken unverified on its author's word`));
       // The accept the model slipped in is not passed on: DONE has to be verified, this job cannot be, so it stays open.
       assert.equal(viaTool.is_error, true);
       assert.match(viaTool.content, /cannot be verified/);

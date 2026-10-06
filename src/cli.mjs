@@ -413,6 +413,10 @@ async function runJob(db, { args, flags }) {
       return [`${files} file${files === 1 ? '' : 's'} changed — ${file}`];
     }
     default: {
+      // Taking work unverified is the user's call: never granted from inside a job's own shell, whatever the command looked like.
+      if (flags.accept !== undefined && process.env.SUMO_JOB) {
+        throw new UsageError(`Refused: j${process.env.SUMO_JOB} runs this command, and work is never taken unverified on its author's word. Finish FAILED with what blocks verification, or ask.`);
+      }
       const { job, learned, verdict, unverified } = jobs.finish(db, id, { status: String(flags.status ?? '').toUpperCase(), report: stdinText(flags), accept: flags.accept });
       // A worker's plain DONE means the checks agreed; the verdict is in the report. Only the exceptions are said here.
       return [
