@@ -614,7 +614,7 @@ test('a job closes, notes and reads memory with tools of its own: each runs the 
   });
 });
 
-test('a worker cannot take its own work unverified: the finish tool has no way to, and the shell refuses it', async () => {
+test('a worker cannot take its own work unverified: the finish tool has no way to; the command is held as written, and finish refuses it under the job\'s marker however it was spelled', async () => {
   await withHome(freshHome(), {}, async () => {
     const db = openDb();
     try {
@@ -623,7 +623,10 @@ test('a worker cannot take its own work unverified: the finish tool has no way t
       assert.deepEqual(Object.keys(params.tools.find((t) => t.name === 'finish').input_schema.properties), ['status', 'report']);
       const { send, seen } = canned([
         reply('tool_use', [
-          // Spelled so no pattern over the command text would see it: the shell joins the quotes and expands the variable.
+          call('t0', 'bash', { command: `sumo job finish ${id} --status DONE --accept "trust me" <<'EOF'\n## Summary\nok\nEOF` }),
+          call('t00', 'bash', { command: `env -i PATH="$PATH" -u SUMO_JOB sumo job finish ${id} --status DONE` }),
+          call('t01', 'bash', { command: 'echo reading about SUMO_JOB is fine' }),
+          // Spelled so the pattern over the command text does not see it: the shell joins the quotes and expands the variable.
           call('t1', 'bash', { command: `F=--acc""ept; '${process.execPath}' --disable-warning=ExperimentalWarning '${ENTRY}' job finish ${id} --status DONE $F "trust me" <<'EOF'\n## Summary\nok\nEOF` }),
           call('t2', 'finish', { status: 'DONE', report: '## Summary\nok', accept: 'trust me' }),
         ]),
@@ -631,7 +634,12 @@ test('a worker cannot take its own work unverified: the finish tool has no way t
         reply('end_turn', []),
       ]);
       await runJob(db, id, { send, now: () => NOW });
-      const [viaShell, viaTool] = seen[1].messages.at(-1).content;
+      const [plain, unmarked, reading, viaShell, viaTool] = seen[1].messages.at(-1).content;
+      assert.equal(reading.content, 'reading about SUMO_JOB is fine', 'a command that only names the marker runs');
+      for (const written of [plain, unmarked]) {
+        assert.equal(written.is_error, true);
+        assert.match(written.content, /^Refused: work is never taken unverified on its author's word/, 'the command as written is held first');
+      }
       assert.equal(viaShell.is_error, true);
       assert.match(viaShell.content, new RegExp(`Refused: j${id} runs this command, and work is never taken unverified on its author's word`));
       // The accept the model slipped in is not passed on: DONE has to be verified, this job cannot be, so it stays open.
