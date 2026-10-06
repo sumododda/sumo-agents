@@ -81,13 +81,12 @@ test('a project rule no longer decides — the router does', async () => {
   });
 });
 
-test('a scout is still asked, then runs on sonnet at low effort — the only scout there is', async () => {
+test('a scout is routed like every job: what the router says is what it runs on', async () => {
   await withRouter({ model: 'opus', effort: 'high', reason: 'deep trace' }, async (db, project) => {
-    const route = await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' });
-    assert.deepEqual(route, { model: 'sonnet', effort: 'low', reason: 'router: deep trace; scout runs on sonnet at low effort' });
+    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'opus', effort: 'high', reason: 'router: deep trace' });
   });
   await withRouter({ model: 'haiku', effort: 'none', reason: 'a quick look' }, async (db, project) => {
-    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'sonnet', effort: 'low', reason: 'router: a quick look; scout runs on sonnet at low effort' }, 'not on haiku, even when the router says so');
+    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'haiku', effort: 'none', reason: 'router: a quick look' });
   });
   await withRouter(undefined, async (db, project) => {
     await assert.rejects(chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), /the router failed/);
@@ -246,14 +245,9 @@ test('a model that is off is outside the router\'s grammar and prompt; an answer
   });
 });
 
-test('a scout runs on sonnet while sonnet is on; off, on the cheapest other model that is on; on haiku only when it is all there is', async () => {
-  await withRouter({ model: 'opus', effort: 'high', reason: 'deep trace' }, async (db, project) => {
-    setModel(db, 'sonnet', false, NOW);
-    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'opus', effort: 'low', reason: 'router: deep trace; scout runs on opus at low effort, the cheapest model that is on after haiku' });
-  });
-  // The router is only offered the models that are on, so with haiku alone it answers haiku.
+test('a model that is off is never a job\'s route: the router is not offered it, and an answer naming it is refused', async () => {
   await withRouter({ model: 'haiku', effort: 'none', reason: 'a quick look' }, async (db, project) => {
-    for (const name of ['sonnet', 'opus', 'fable']) setModel(db, name, false, NOW);
-    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'haiku', effort: 'none', reason: 'router: a quick look; scout runs on haiku, the only model that is on' });
+    setModel(db, 'haiku', false, NOW);
+    await assert.rejects(chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), /the router failed: the router answered outside its schema/);
   });
 });
