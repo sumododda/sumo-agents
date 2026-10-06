@@ -89,7 +89,7 @@ export function statsLines(db, { project } = {}) {
   const rows = routeStats(db, { project });
   if (rows.length === 0) return ['no finished jobs yet'];
   return rows.map(
-    (r) => `${r.model}/${r.effort}: ${r.jobs} jobs, ${r.done} done, ${r.failed} failed, ${r.reviewed} reviewed, avg ${r.reviewed > 0 ? r.avgImportant.toFixed(1) : '-'} important`,
+    (r) => `${r.model}/${r.effort}: ${r.jobs} job${r.jobs === 1 ? '' : 's'}, ${r.done} done, ${r.failed} failed, ${r.reviewed} reviewed, avg ${r.reviewed > 0 ? r.avgImportant.toFixed(1) : '-'} important`,
   );
 }
 

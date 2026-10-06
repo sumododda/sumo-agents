@@ -172,7 +172,7 @@ test('routeStats and statsLines group finished jobs by model and effort', async 
 
       const lines = statsLines(db, { project: project.slug });
       assert.deepEqual(lines, [
-        'opus/high: 1 jobs, 1 done, 0 failed, 1 reviewed, avg 1.0 important',
+        'opus/high: 1 job, 1 done, 0 failed, 1 reviewed, avg 1.0 important',
         'sonnet/medium: 3 jobs, 2 done, 1 failed, 1 reviewed, avg 2.0 important',
       ]);
 
