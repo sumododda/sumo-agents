@@ -10,7 +10,7 @@ const off = styles(false);
 
 describe('the chat terminal rendering', () => {
   it('turns markdown marks into weight and indent, and leaves plain text alone when colour is off', () => {
-    assert.equal(renderLine('# Title', on), '\x1b[1mTitle\x1b[22m');
+    assert.equal(renderLine('## Title', on), '\x1b[1mTitle\x1b[22m');
     assert.equal(renderLine('- **Do this.** run `sumo x`', off), '  • Do this. run sumo x');
     assert.equal(renderLine('2. second', off), '  2. second');
     assert.equal(renderLine('nothing special', off), 'nothing special');
@@ -215,5 +215,68 @@ describe('wide characters', () => {
     const foldedRows = narrow.join('').split('\n').filter((l) => /^[┌│├└]/.test(l));
     assert.equal(new Set(foldedRows.map(columns)).size, 1, foldedRows.join('\n'));
     assert.ok(columns(foldedRows[0]) <= 24, foldedRows.join('\n'));
+  });
+});
+
+describe('the markdown a model writes', () => {
+  const rendered = (text, s = off, width = 80) => {
+    const out = [];
+    const r = createRenderer((t) => out.push(t), s, { width });
+    r.write(text);
+    r.flush();
+    return out.join('');
+  };
+
+  it('never leaves a broken escape behind: a link after bold text keeps every code whole', () => {
+    const line = rendered('with **bold**, `code`, and a [link](https://example.com) after.', on);
+    assert.doesNotMatch(line, /\x1b(?!\[)/, JSON.stringify(line));
+    assert.equal(line.replace(/\x1b\[[0-9;]*m/g, ''), 'with bold, code, and a link (https://example.com) after.');
+  });
+
+  it('shows emphasis, strike-through and escapes as the reader means them, and leaves snake_case and arithmetic alone', () => {
+    assert.equal(rendered('*it* and _it_ and __bold__ and ***both*** and ~~gone~~'), 'it and it and bold and both and gone');
+    assert.match(rendered('*it*', on), /\x1b\[3mit\x1b\[23m/);
+    assert.match(rendered('~~gone~~', on), /\x1b\[9mgone\x1b\[29m/);
+    assert.equal(rendered('snake_case_name and 2*3*4 and a * b * c'), 'snake_case_name and 2*3*4 and a * b * c');
+    assert.equal(rendered('\\*not italic\\* and \\`tick\\`'), '*not italic* and `tick`');
+    assert.equal(rendered('`**kept** as _typed_`'), '**kept** as _typed_', 'nothing inside code is read as a mark');
+    assert.equal(rendered('[https://x.dev](https://x.dev) and <https://y.dev>'), 'https://x.dev and https://y.dev', 'a link that is its own text is said once');
+    assert.equal(rendered('odd \uE0007\uE001 text'), 'odd \uE0007\uE001 text', 'text that looks like a stand-in is left as it is');
+  });
+
+  it('draws every kind of bullet, and a task list as boxes ticked or not', () => {
+    assert.equal(rendered('+ plus\n- [ ] open\n- [x] done\n* [X] also done'), '  • plus\n  ☐ open\n  ☑ done\n  ☑ also done');
+  });
+
+  it('keeps a line that continues a list item under its text, not under the marker', () => {
+    assert.equal(rendered('1. first\n   more of the first\n- bullet\n  more of the bullet\nback out'), '  1. first\n     more of the first\n  • bullet\n    more of the bullet\nback out');
+    assert.equal(rendered('10. tenth\n    more of it'), '  10. tenth\n      more of it');
+  });
+
+  it('marks a quote and still reads the marks inside it, and names the language a code block is in', () => {
+    assert.equal(rendered('> a **bold** claim'), '  │ a bold claim');
+    assert.equal(rendered('```js\nconst x = 1;\n```'), '    ┌─ js\n    const x = 1;\n    └─');
+  });
+
+  it('sets a heading apart by its level: the top one underlined as well as bold', () => {
+    assert.equal(renderLine('# Title', on), '\x1b[1m\x1b[4mTitle\x1b[24m\x1b[22m');
+    assert.equal(renderLine('## Part', on), '\x1b[1mPart\x1b[22m');
+    assert.equal(renderLine('### Small', off), 'Small');
+  });
+
+  it('shows a delegated job ended by how it went, what it cost and the top of its report, not the raw status lines', () => {
+    const call = { name: 'delegate', input: { agent: 'scout', title: 'Map it' } };
+    const job = { id: 41, status: 'done', turns: 3, toolCalls: 9, costUsd: 0.0213, model: 'sonnet', effort: 'low', report: 'It lives in tty.mjs.\n- tables\n- lines\n- tools\n- more' };
+    const content = 'STATUS: DONE — j41\n3 turns, 9 tool calls, 48211 tokens in, 1203 out, $0.0213 on sonnet/low\n\nIt lives in tty.mjs.';
+    assert.deepEqual(toolView(call, { content, job }).lines, [
+      { text: '✓ j41 done · 3 turns · 9 tool calls · $0.02 · sonnet/low', tone: 'add' },
+      { text: 'It lives in tty.mjs.', tone: 'plain' },
+      { text: '- tables', tone: 'plain' },
+      { text: '- lines', tone: 'plain' },
+      { text: '… +2 lines', tone: 'dim' },
+    ]);
+    const failed = toolView(call, { content, job: { ...job, status: 'failed', report: '' } }).lines;
+    assert.deepEqual(failed[0], { text: '✗ j41 failed · 3 turns · 9 tool calls · $0.02 · sonnet/low', tone: 'error' });
+    assert.deepEqual(toolView(call, { content, job }, { full: true }).lines.map((l) => l.text), content.split('\n'), 'the full view is everything the model was told');
   });
 });

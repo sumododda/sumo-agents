@@ -58,13 +58,16 @@ The chat is a screen, not a scroll of lines: a box to type in (`\`+Enter, Shift-
 for a new line, Up for what you sent before — the last fifty, kept across sessions — `/` for the command menu;
 Ctrl-V pastes an image from the clipboard, on macOS, and an image file dropped on the box is the image —
 either stands in the box as `[Image #1]` and goes to the model with the message that names it), each tool call with the top
-of its result (Ctrl-O for all of it, and again to fold it back), tables drawn as tables, and a working
-line while the model is busy. Esc stops the turn; a message sent while it works is queued and goes
-next; Ctrl-C twice leaves. A resized window is redrawn to fit. The memory block goes to the model, not
-the screen; only a warning in it is shown. While the conversation is short the box stands at the foot of
-the window, a lion faint behind the room above it, covered as the conversation grows. The words on the
-working line are yours: `spinner.txt`, one a line, a random one to start each turn and the next every five
-seconds; so is the lion, `logo.txt`.
+of its result (Ctrl-O for all of it, and again to fold it back), the reply's markdown drawn as it reads —
+bold, italics, lists and task boxes, quotes, code blocks with their language, tables as tables — and a working
+line while the model is busy. A delegated job stands under the call that started it while it works: how long,
+how many calls, what it runs now; it ends in one line — done or failed, what it cost — over the top of its report.
+Esc stops the turn; a message sent while it works is queued and goes next; Ctrl-C twice leaves. A resized
+window is redrawn to fit. The memory block goes to the model, not the screen; only a warning in it is
+shown. While the conversation is short the box stands at the foot of the window, a lion faint behind the
+room above it, covered as the conversation grows. The words on the working line are yours:
+`spinner.txt`, one a line, a random one to start each turn and the next every five seconds; so is the lion,
+`logo.txt`.
 Piped (`echo … | sumo chat`), it prints plain lines, the memory block first.
 
 ## Update a machine
