@@ -102,7 +102,11 @@ const cutMark = (cut) => `[cut ${cut} characters from the middle — narrow the 
  * scanned whole.
  */
 export function capRedacted(text, max = OUTPUT_CAP_CHARS) {
-  if (text.length <= max) return redact(text).text;
+  // Capped after redacting too: what redaction adds — a marker for each hidden character — counts against the cap.
+  if (text.length <= max) {
+    const out = redact(text).text;
+    return out.length <= max ? out : cap(out, max);
+  }
   const half = Math.floor(max / 2);
   const head = redact(text.slice(0, half + max)).text.slice(0, half);
   const tail = redact(text.slice(-(half + max))).text.slice(-half);
