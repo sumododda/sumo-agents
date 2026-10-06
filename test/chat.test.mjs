@@ -562,7 +562,8 @@ test('a delegated brief becomes a job on the route the router chose, and the rep
       assert.equal(review.is_error, true, 'a review of nothing is refused before a job exists');
       assert.match(nowhere.content, /nowhere/);
       assert.match(seen[2].messages[0].content[0].text, /^# Job j1 — find briefings[\s\S]*You are a scout[\s\S]*find where briefings are sent/, "the brief is the job's first message");
-      assert.equal(seen[2].model, 'claude-haiku-4-5-20251001', 'a scout runs on haiku whatever the router said');
+      assert.equal(seen[2].model, 'claude-sonnet-5-5', 'a scout runs on sonnet whatever the router said');
+      assert.deepEqual(seen[2].output_config, { effort: 'low' });
       const done = seen[3].messages.at(-1).content[0];
       assert.match(done.content, /^STATUS: DONE — j1/);
       assert.match(done.content, /## Summary\nbriefings go out from src\/send\.mjs/, 'the report itself, not a pointer to it');

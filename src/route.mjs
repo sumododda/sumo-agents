@@ -158,16 +158,18 @@ async function askFor(db, system, prompt) {
  * Chooses a job's model and effort by asking the local router — every job, every retry, no exceptions.
  * Its answer is the route; a router that cannot answer refuses the job, with no default to fall back
  * to. A retry tells the router what the previous attempt ran on and how it ended. The one change made
- * to an answer: a scout runs on haiku — or, while haiku is off, on the cheapest model that is on, at low effort.
+ * to an answer: a scout runs on sonnet at low effort — reading a codebase to judge it wants more than haiku — or,
+ * while sonnet is off, on the cheapest other model that is on, at low effort; on haiku only when nothing else is.
  */
 export async function chooseRoute(db, { agent, project, task, title, retryOf }) {
   const routed = await askRouter(db, { agent, project, task, title, retryOf });
   if (!routed.ok) throw new UsageError(`the router failed: ${routed.error} — no job was created`);
   const reason = `router: ${routed.reason}`;
-  if (agent === 'scout' && routed.model !== 'haiku') {
+  if (agent === 'scout') {
     const usable = usableModels(db);
-    if (usable.includes('haiku')) return { model: 'haiku', effort: 'none', reason: `${reason}; scout runs on haiku` };
-    return { model: usable[0], effort: 'low', reason: `${reason}; scout runs on ${usable[0]}, the cheapest model that is on` };
+    const pick = usable.find((name) => name !== 'haiku');
+    if (!pick) return { model: 'haiku', effort: 'none', reason: `${reason}; scout runs on haiku, the only model that is on` };
+    return { model: pick, effort: 'low', reason: `${reason}; scout runs on ${pick} at low effort${pick === 'sonnet' ? '' : ', the cheapest model that is on after haiku'}` };
   }
   return { model: routed.model, effort: routed.effort, reason };
 }
