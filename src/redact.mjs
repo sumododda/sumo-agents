@@ -48,7 +48,16 @@ export function secretShape(line) {
   return null;
 }
 
-export function redact(text) {
+/**
+ * What a reader is left with: escape sequences, control characters and invisible format characters (zero-width
+ * spaces, soft hyphens, direction marks) taken out. Redaction runs on this, never on the raw text — a key broken up
+ * by any of them would otherwise pass, and be read whole by a model or shown whole by a terminal.
+ */
+const ESCAPES = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\p{Cf}/gu;
+export const readable = (text) => String(text).replace(/\r\n?/g, '\n').replace(ESCAPES, '');
+
+export function redact(raw) {
+  const text = readable(raw);
   let count = 0;
   const hit = () => {
     count++;
