@@ -20,7 +20,7 @@ import { outcomeLines, runScribe } from './scribe.mjs';
 import { currentProject } from './sessions.mjs';
 import { BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
-import { colourEnabled, createRenderer, header, prompt, renderBlock, styles, widthOf } from './tty.mjs';
+import { colourEnabled, createRenderer, header, plainText, prompt, renderBlock, styles, widthOf } from './tty.mjs';
 
 /**
  * The conversation the user has with Sumo: the same loop a job runs in, with
@@ -277,9 +277,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       const inbox = [];
       jobs.set(id, inbox);
       // Its work is written down as it happens, for `sumo job watch` — in a Herdr tab of its own, or any terminal —
-      // and without its secrets: what a job typed or printed reaches the disk the way it reaches the model.
-      const record = (t) => appendLive(id, redact(t).text);
-      const live = jobPrinter(record, styles(true));
+      // and without its secrets: plain text first, then redacted, so no escape can hide a key from redaction.
+      const record = (t) => appendLive(id, redact(plainText(t)).text);
+      const live = jobPrinter(record, styles(false));
       let ended = [];
       try {
         const outcome = await runJob(db, id, {
@@ -298,7 +298,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           },
           onResult: (call, result) => {
             const first = String(result.content ?? '').split('\n').find((l) => l.trim()) ?? '';
-            record(`${styles(true).dim(`    ⎿  ${first.slice(0, 160)}`)}\n`);
+            record(`    ⎿  ${first.slice(0, 160)}\n`);
             watch({ type: 'result', call, result, job: id });
           },
           onTurn: (response) => {
@@ -316,7 +316,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         throw cause;
       } finally {
         jobs.delete(id);
-        endLive(id, ended.map((l) => redact(l).text));
+        endLive(id, ended.map((l) => redact(plainText(l)).text));
         watch({ type: 'job-end', job: id });
       }
     } finally {

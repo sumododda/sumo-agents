@@ -597,7 +597,7 @@ test('inside Herdr a delegated job also gets a tab that watches it, while it run
         reply('end_turn', [{ type: 'text', text: 'looked' }]),
         reply('end_turn', []),
         reply('tool_use', [call('t2', 'delegate', { job: id })]),
-        reply('end_turn', [{ type: 'text', text: 'looked again; the key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789' }]),
+        reply('end_turn', [{ type: 'text', text: 'looked again; the key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789, then sk-ant-api03-abcdefghijk\x01lmnopqrstuvwxyz0123456789, then sk-ant-api03-abcdefghijk\x1b[0mlmnopqrstuvwxyz0123456789' }]),
         reply('end_turn', []),
         reply('end_turn', [{ type: 'text', text: 'fine' }]),
       ]);
@@ -614,7 +614,8 @@ test('inside Herdr a delegated job also gets a tab that watches it, while it run
       assert.match(seen[3].messages.at(-1).content[0].content, new RegExp(`STATUS: never closed — j${id}[\\s\\S]*looked`), 'the job ran here, tab or not');
       assert.match(seen[6].messages.at(-1).content[0].content, /looked again/);
       const record = readFileSync(join(paths().jobs, String(id), 'live.log'), 'utf8');
-      assert.match(record, /looked again; the key is \[redacted\]/, 'what a job writes reaches its record without its secrets');
+      assert.match(record, /looked again; the key is \[redacted\], then \[redacted\], then \[redacted\]/, 'what a job writes reaches its record without its secrets — also a key broken up by an escape');
+      assert.doesNotMatch(record, /\x1b|\x01/);
     } finally {
       db.close();
     }
