@@ -32,7 +32,7 @@ test('a ledger from before the cache columns migrates, keeps its rows, and reads
         { ...rows[0], id: undefined },
         { id: undefined, ts: NOW, kind: 'scribe', model: 'haiku', input_tokens: 100, output_tokens: 10, cost_usd: 0.001, ok: 1, note: 'old row', cache_read_tokens: null, cache_creation_tokens: null, job_id: null, session_id: null },
       );
-      assert.deepEqual(modelStats(db), ['scribe: 1 runs (1 ok) · 100 tokens in · 10 out · $0.0010 · cache 0 read · 0 written']);
+      assert.deepEqual(modelStats(db), ['scribe: 1 run (1 ok) · 100 tokens in · 10 out · $0.0010 · cache 0 read · 0 written']);
     } finally {
       db.close();
     }
@@ -117,8 +117,8 @@ test('modelStats prints, per kind, the cache-read and cache-write totals beside 
       run('local', {});
 
       assert.deepEqual(modelStats(db), [
-        'local: 1 runs (1 ok) · 100 tokens in · 10 out · $0.0010 · cache 0 read · 0 written',
-        'worker: 3 runs (3 ok) · 300 tokens in · 30 out · $0.0030 · cache 4000 read · 250 written',
+        'local: 1 run (1 ok) · 100 tokens in · 10 out · $0.0010 · cache 0 read · 0 written',
+        'worker: 3 runs (3 ok) · 300 tokens in · 30 out · $0.0030 · cache 4,000 read · 250 written',
       ]);
     } finally {
       db.close();
