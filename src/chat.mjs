@@ -20,7 +20,7 @@ import { outcomeLines, runScribe } from './scribe.mjs';
 import { currentProject } from './sessions.mjs';
 import { BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
-import { colourEnabled, createRenderer, header, prompt, renderBlock, safeForTerminal, styles, widthOf } from './tty.mjs';
+import { colourEnabled, createRenderer, header, prompt, renderBlock, safeForTerminal, styles, tilde, widthOf } from './tty.mjs';
 
 /**
  * The conversation the user has with Sumo: the same loop a job runs in, with
@@ -92,7 +92,7 @@ const asText = (text) => ({ role: 'user', content: [{ type: 'text', text: `<sumo
 export function describeCall(call) {
   if (call.name === BASH_TOOL.name) return `$ ${String(call.input?.command ?? '').split('\n')[0].slice(0, 120)}`;
   if (call.name === DELEGATE_TOOL.name) return call.input?.job !== undefined ? `delegate j${call.input.job}` : `delegate ${call.input?.agent ?? 'worker'} — ${call.input?.title ?? ''}`;
-  if (call.name === EDITOR_TOOL.name) return `${call.input?.command ?? 'edit'} ${call.input?.path ?? ''}${Array.isArray(call.input?.view_range) ? `:${call.input.view_range.join('-')}` : ''}`;
+  if (call.name === EDITOR_TOOL.name) return `${call.input?.command ?? 'edit'} ${tilde(call.input?.path ?? '')}${Array.isArray(call.input?.view_range) ? `:${call.input.view_range.join('-')}` : ''}`;
   return call.name;
 }
 
@@ -331,11 +331,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
             live.onResult(call, result);
             watch({ type: 'result', call, result, job: id });
           },
-          onTurn: (response) => {
-            live.onTurn(response);
-            const text = textOf(response.content);
-            if (text) watch({ type: 'said', job: id, text });
-          },
+          onTurn: live.onTurn,
         });
         ended = runLines(outcome);
         const report = reportOf(id);

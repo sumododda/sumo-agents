@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { createRenderer, flow, header, logoLines, messageAt, pickMessage, prompt, renderBlock, renderLine, spinnerMessages, styles, sunset, toolView, wrap } from '../src/tty.mjs';
@@ -278,5 +278,14 @@ describe('the markdown a model writes', () => {
     const failed = toolView(call, { content, job: { ...job, status: 'failed', report: '' } }).lines;
     assert.deepEqual(failed[0], { text: '✗ j41 failed · 3 turns · 9 tool calls · $0.02 · sonnet/low', tone: 'error' });
     assert.deepEqual(toolView(call, { content, job }, { full: true }).lines.map((l) => l.text), content.split('\n'), 'the full view is everything the model was told');
+  });
+});
+
+describe('paths', () => {
+  it('are shown from the home directory as ~, so a tool line says where without the long way round', () => {
+    const view = { name: 'str_replace_based_edit_tool', input: { command: 'view', path: join(homedir(), 'proj', 'a.mjs'), view_range: [1, 9] } };
+    assert.equal(toolView(view).detail, '~/proj/a.mjs:1-9');
+    assert.equal(toolView({ ...view, input: { ...view.input, path: '/etc/hosts', view_range: undefined } }).detail, '/etc/hosts');
+    assert.equal(toolView({ ...view, input: { ...view.input, path: `${homedir()}-other/a.mjs`, view_range: undefined } }).detail, `${homedir()}-other/a.mjs`, 'only the home itself, not a name that starts the same');
   });
 });

@@ -1,6 +1,5 @@
 import { Box, render, renderToString, Static, Text, useAnimation, useApp, useBoxMetrics, useInput, usePaste, useStdout, useWindowSize } from 'ink';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createElement as h, useEffect, useReducer, useRef } from 'react';
 import { routeLine, routeOf } from './chat.mjs';
@@ -8,7 +7,7 @@ import { stopReason } from './loop.mjs';
 import { paths } from './paths.mjs';
 import { editor, keysOf, menuOf, paste, press, under } from './editor.mjs';
 import { clipboardImage, droppedImages } from './images.mjs';
-import { colourEnabled, createRenderer, flow, logoLines, messageAt, pickMessage, renderBlock, spinnerMessages, styles, sunset, toolView, untab } from './tty.mjs';
+import { colourEnabled, createRenderer, flow, logoLines, messageAt, pickMessage, renderBlock, spinnerMessages, styles, sunset, tilde, toolView, untab } from './tty.mjs';
 
 /**
  * The chat on a real terminal. What is finished scrolls away above — what
@@ -118,7 +117,6 @@ function Item({ item }) {
   if (item.kind === 'tool') return h(Tool, item);
   // The mark stands apart from the words, so a line that wraps in a narrow window goes on under them, not under it.
   if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, { color: ACCENT }, '⏺ '), h(Text, null, h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, h(Text, { dimColor: true }, ` · ${item.where}`)));
-  if (item.kind === 'said') return h(Box, { marginLeft: 2 }, h(Text, { dimColor: true }, item.text));
   if (item.kind === 'error') return h(Box, { marginTop: 1 }, h(Text, { color: 'red' }, item.text));
   return h(Text, { dimColor: true }, `  ⎿  ${item.text.split('\n').join('\n     ')}`);
 }
@@ -195,7 +193,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
   const { columns, rows } = useWindowSize();
   const [, redraw] = useReducer((n) => n + 1, 0);
   const s = styles(colourEnabled(stdout));
-  const header = (text) => ({ kind: 'header', route: routeLine(session), cwd: cwd.replace(homedir(), '~'), block: text });
+  const header = (text) => ({ kind: 'header', route: routeLine(session), cwd: tilde(cwd), block: text });
   // What the screen holds between draws. Keys and the session's events both write here, in the order they happen, and then ask for a draw.
   // `log` is what happened, as it was said; `items` is the log drawn for this window, and is drawn again when the window or the view changes.
   const st = useRef(null);
