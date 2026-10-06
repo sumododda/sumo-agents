@@ -147,7 +147,9 @@ export async function discoverModels(db, { now = new Date().toISOString() } = {}
     return { ok: false, error };
   }
   const states = modelStates(db);
-  for (const name of found) states[name] = { on: true, note: `found ${day(now)}` };
+  // A model the user turned off stays off: the API says what this credential can use, not what the user wants used.
+  const offByHand = (name) => !states[name].on && /^turned off /.test(states[name].note ?? '');
+  for (const name of found) if (!offByHand(name)) states[name] = { on: true, note: `found ${day(now)}` };
   for (const name of missing) states[name] = { on: false, note: `not found ${day(now)}` };
   for (const [name, error] of Object.entries(errors)) states[name] = { on: states[name].on, note: `not checked — ${error}` };
   writeStates(db, states);
