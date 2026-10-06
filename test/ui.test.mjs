@@ -715,6 +715,8 @@ test('jobs delegated side by side each stand under their own call while they wor
     events.emit('tool', { call: grep, job: 41 });
     await shows(/⏺ Delegate\(scout · Map it\)\n\s+⎿\s+j41 · \d+s · 1 tool call · Bash\(rg -n renderTable src\)\n+⏺ Delegate\(worker · Fix it\)\n\s+⎿\s+j42 · \d+s · 0 tool calls · thinking…/, 'both jobs, each under its own call');
     events.emit('result', { call: grep, result: { content: 'src/tty.mjs:126' }, job: 41 });
+    events.emit('tab-failed', { job: 42, reason: 'its Herdr tab never started the watcher' });
+    await shows(/j42: its Herdr tab never started the watcher — follow it here: sumo job watch 42/, 'why the tab shows nothing, and how to follow it anyway');
     await shows(/j41 · \d+s · 1 tool call · thinking…/, 'the job still there between its calls');
     finish({ stop: 'end_turn' });
     await shows(/^(?![\s\S]*j41 ·)/, 'the job rows gone with the turn');
