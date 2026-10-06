@@ -80,7 +80,7 @@ test('a bad answer changes nothing and the sessions are read again next time', (
   assert.match(s.sumo(['dream', 'run']).out, /^failed — the answer had no list of operations/);
   assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM memories').get().n), 0);
   assert.match(s.sumo(['dream', 'status']).out, /finished sessions waiting: 1/);
-  assert.match(s.sumo(['scribe', 'stats']).out, /dream: 1 runs \(0 ok\)/);
+  assert.match(s.sumo(['scribe', 'stats']).out, /dream: 1 run \(0 ok\)/);
 });
 
 test('a pass that reads a conversation still going on does not close it: what is said in the rest of it is read later', () => {

@@ -172,7 +172,7 @@ test('the writer files what the user really said, holds back what it cannot prov
 
   const run = s.sumo(['scribe', 'run']);
   assert.equal(run.code, 0, run.err);
-  assert.match(run.out, /^read 2 turns \(3400 tokens in, 120 out, \$0\.0040\)/);
+  assert.match(run.out, /^read 2 turns \(3,400 tokens in, 120 out, \$0\.0040\)/);
   assert.match(run.out, /saved m\d+ \[dec·proj-simba·stated\] Never push to main/);
   assert.match(run.out, /saved m\d+ \[pref·proj-simba·stated\] The user reviews the briefing copy/);
   assert.match(run.out, /held for confirmation m\d+ \[pref·global·inferred·unconfirmed\] The user prefers tabs/);
@@ -190,7 +190,7 @@ test('the writer files what the user really said, holds back what it cannot prov
 
   // Filed turns are not read again.
   assert.match(s.sumo(['scribe', 'run']).out, /nothing to do — nothing new was said/);
-  assert.match(s.sumo(['scribe', 'stats']).out, /^scribe: 1 runs \(1 ok\) · 3400 tokens in · 120 out · \$0\.0040/);
+  assert.match(s.sumo(['scribe', 'stats']).out, /^scribe: 1 run \(1 ok\) · 3,400 tokens in · 120 out · \$0\.0040/);
 });
 
 test('the writer is shown the user and the assistant — never tool output, thinking, or sub-agent chatter', () => {

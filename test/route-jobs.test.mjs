@@ -152,7 +152,7 @@ test('sumo job stats groups finished jobs by model and effort', () => {
   assert.equal(s.sumo(['job', 'finish', '2', '--status', 'FAILED'], { input: '## Summary\nno.\n' }).code, 0);
 
   const lines = s.sumo(['job', 'stats', '--project', 'routeproj']).out.trim().split('\n');
-  assert.deepEqual(lines, ['opus/high: 1 jobs, 0 done, 1 failed, 0 reviewed, avg - important', 'sonnet/low: 1 jobs, 1 done, 0 failed, 0 reviewed, avg - important']);
+  assert.deepEqual(lines, ['opus/high: 1 job, 0 done, 1 failed, 0 reviewed, avg - important', 'sonnet/low: 1 job, 1 done, 0 failed, 0 reviewed, avg - important']);
 
   assert.match(s.sumo(['job', 'stats', '--project', 'nope']).err, /unknown project/);
   // No --project: the same two lines, since this sandbox has only the one project.

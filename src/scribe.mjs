@@ -3,6 +3,7 @@ import { appendFileSync, closeSync, openSync, readFileSync, rmSync, statSync, wr
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
+import { ago } from './card.mjs';
 import { MODELS, offLine, usableModels } from './catalog.mjs';
 import { getMeta, openDb, setMeta, tx } from './db.mjs';
 import { localServerStatus } from './local-server.mjs';
@@ -305,12 +306,13 @@ export async function runScribe(db, { now = new Date().toISOString() } = {}) {
 
 export async function scribeStatus(db) {
   const failures = Number(getMeta(db, 'scribe.failures') ?? 0);
+  const last = getMeta(db, 'scribe.last_run');
   const model = getMeta(db, 'config.scribe.model') ?? CONFIG_DEFAULTS['scribe.model'];
   return [
     `model: ${model}`,
     ...(model === 'local' ? [await localServerStatus(db, { file: getMeta(db, 'config.model.file') ?? CONFIG_DEFAULTS['model.file'] })] : []),
     `turns waiting: ${pendingTurns(db, 1000).length}`,
-    `last run: ${getMeta(db, 'scribe.last_run') ?? 'never'}`,
+    `last run: ${last ? `${last} (${ago(last, new Date().toISOString())})` : 'never'}`,
     failures > 0 ? `failing: ${failures} in a row — ${getMeta(db, 'scribe.last_error')}` : 'healthy',
   ];
 }
@@ -324,8 +326,10 @@ export function modelStats(db) {
     )
     .all();
   if (rows.length === 0) return ['no cheap-model runs yet'];
+  // Token counts run to millions: grouped by thousands, they read at a glance.
+  const n = (count) => (count ?? 0).toLocaleString('en-US');
   return rows.map(
-    (r) => `${r.kind}: ${r.runs} runs (${r.ok} ok) · ${r.input} tokens in · ${r.output} out · $${(r.cost ?? 0).toFixed(4)} · cache ${r.cache_read ?? 0} read · ${r.cache_write ?? 0} written`,
+    (r) => `${r.kind}: ${r.runs} run${r.runs === 1 ? '' : 's'} (${r.ok} ok) · ${n(r.input)} tokens in · ${n(r.output)} out · $${(r.cost ?? 0).toFixed(4)} · cache ${n(r.cache_read)} read · ${n(r.cache_write)} written`,
   );
 }
 
@@ -333,7 +337,7 @@ export function modelStats(db) {
 export function outcomeLines(outcome) {
   if (outcome.skipped) return [`nothing to do — ${outcome.skipped}`];
   if (!outcome.ok) return [`failed — ${outcome.error}`];
-  const cost = `${outcome.usage.inputTokens} tokens in, ${outcome.usage.outputTokens} out, $${outcome.usage.costUsd.toFixed(4)}`;
+  const cost = `${outcome.usage.inputTokens.toLocaleString('en-US')} tokens in, ${outcome.usage.outputTokens.toLocaleString('en-US')} out, $${outcome.usage.costUsd.toFixed(4)}`;
   return [
     `read ${outcome.turns ?? outcome.sessions} ${outcome.turns === undefined ? 'sessions' : 'turns'} (${cost})`,
     ...outcome.applied.map((l) => `  ${l}`),

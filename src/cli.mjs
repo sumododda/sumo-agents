@@ -573,8 +573,10 @@ function runBackup(db) {
 
 function runDoctor() {
   const checks = doctor();
+  // On a terminal the mark is coloured, so a failure stands out of a column of oks; piped, it is the same words.
+  const s = styles(colourEnabled());
   for (const c of checks) {
-    const mark = c.ok ? 'ok  ' : c.warn ? 'warn' : 'FAIL';
+    const mark = c.ok ? s.green('ok  ') : c.warn ? s.yellow('warn') : s.red('FAIL');
     process.stdout.write(`${mark}  ${c.label}${c.ok ? '' : ` — ${c.fix}`}\n`);
   }
   return checks.some((c) => !c.ok && !c.warn) ? 1 : 0;
