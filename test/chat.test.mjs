@@ -470,6 +470,7 @@ test('a job is not made or run from the shell: the model is pointed at delegate,
       assert.equal(quoted.content, 'see: sumo job run 7', 'words about a job run are not one');
       assert.match(other.content, /no job j7/, 'other job commands still run in the shell');
       assert.ok(seen[0].tools.some((t) => t.name === 'delegate'), 'the chat model is given the tool');
+      assert.ok(seen[0].system[0].text.includes(`read ${join(REPO_ROOT, 'guides')}/delegation.md first`), 'the guide is named where it is, not where the chat was started');
     } finally {
       db.close();
     }
