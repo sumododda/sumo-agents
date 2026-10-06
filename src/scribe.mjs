@@ -12,7 +12,7 @@ import { aliasesOf, listProjects } from './projects.mjs';
 import { line } from './render.mjs';
 import { currentProject, markScribed, pendingTurns } from './sessions.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
-import { ftsQuery } from './text.mjs';
+import { ftsQuery, looksDurable } from './text.mjs';
 import { assistantReplies } from './transcript.mjs';
 
 const LOCK_STALE_MS = 5 * 60_000;
@@ -21,10 +21,6 @@ const TURNS_TO_RUN = 3;
 const MAX_REPLIES_PER_SESSION = 6;
 const MAX_RELATED = 10;
 
-/** Words that mark a sentence as a standing instruction, which is worth filing right away rather than in the next batch. */
-const DURABLE = /\b(always|never|from now on|going forward|remember|don'?t ever|i (prefer|like|want|hate|use)|we (use|moved|switched|decided)|make sure|by default|every time|stop (doing|using))\b/i;
-
-export const looksDurable = (text) => DURABLE.test(text);
 
 /**
  * Whether the writer should run now. It is batched on purpose: each call

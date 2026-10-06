@@ -70,3 +70,17 @@ export function clip(text, max) {
   const flat = text.replace(/\s+/g, ' ').trim();
   return flat.length <= max ? flat : `${head(flat, max - 1)}…`;
 }
+
+/** Words that mark a sentence as a standing instruction, which is worth filing right away rather than in the next batch. */
+const DURABLE = /\b(always|never|from now on|going forward|remember|don'?t ever|i (prefer|like|want|hate|use)|we (use|moved|switched|decided)|make sure|by default|every time|stop (doing|using))\b/i;
+
+export const looksDurable = (text) => DURABLE.test(text);
+
+/**
+ * A clause that asks for work or an answer — describe this, fix that, delegate, a question — rather than stating
+ * something. Only verbs that are almost never a standing rule: "write tests first" or "keep answers short" are rules.
+ */
+const REQUEST = /(?:^|[.,:;!?)]\s+|\n\s*)(?:(?:please|now|then|also|and|so)\s+)?(?:describe|explain|delegate|fix|find|investigate|look\s+(?:at|into|for)|show\s+me|tell\s+me|give\s+me|summari[sz]e|debug|continue|(?:can|could|would|will)\s+you)\b|\?\s*$/im;
+
+/** Words that ask for work or an answer and state nothing that lasts: nothing in them is a memory. */
+export const asksForWork = (text) => REQUEST.test(String(text ?? '')) && !looksDurable(String(text ?? ''));

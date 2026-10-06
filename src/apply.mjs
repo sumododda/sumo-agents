@@ -2,7 +2,7 @@ import { tx } from './db.mjs';
 import * as memory from './memory.mjs';
 import { line } from './render.mjs';
 import { addCheckpoint, currentProject } from './sessions.mjs';
-import { overlap } from './text.mjs';
+import { asksForWork, overlap } from './text.mjs';
 
 /**
  * The only door through which a model's suggestion becomes a memory.
@@ -132,6 +132,10 @@ function addStated(db, op, ctx, { supersedes } = {}) {
   if (!STATED_TYPES.includes(op.type)) throw new Rejected(`type "${op.type}" cannot come from a model — one of: ${STATED_TYPES.join(', ')}`);
   const body = cleanBody(op);
   const { turn, verified, why } = verify(op, body, ctx.turns);
+  // The words being the user's is not enough: asked to describe or fix something, the user stated nothing that lasts.
+  if (verified && asksForWork(op.quote)) throw new Rejected('the quote asks for work or an answer; it states nothing that lasts');
+  // A guess costs the user a question; one drawn from a request — describe this, fix that — is the model answering it, not the user saying it.
+  if (!verified && turn && asksForWork(turn.text)) throw new Rejected(`a guess from a request, not kept — ${why}`);
   // No scope given: what was said in the middle of work on a project belongs to that project.
   const focus = op.scope === undefined && turn ? currentProject(db, turn.session_id) : null;
   const { scope, project } = resolveScope(db, focus ? `project:${focus}` : op.scope);
