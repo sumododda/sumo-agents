@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { NO_KEY, sandbox } from './helpers.mjs';
@@ -182,6 +182,22 @@ test('a job run in a shell with no Anthropic credential is refused in one line, 
   assert.notEqual(run.code, 0);
   assert.match(run.err, /j1 not started — this shell has no Anthropic credential\. Inside the chat, the delegate tool runs it/);
   assert.match(s.sumo(['job', 'show', '1']).out, /running/, 'the job is left as it was');
+});
+
+test('sumo job watch shows what a job running in the chat does, from the top, and ends with how the run ended', () => {
+  const s = sandbox();
+  s.routerWillSay('haiku', 'none');
+  withSimba(s);
+  s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
+  writeFileSync(join(s.home, 'jobs', '1', 'live.log'), '⏺ j1 scout · haiku — look\n  ⏺ $ ls\n');
+  writeFileSync(join(s.home, 'jobs', '1', 'live.end'), 'STATUS: DONE — j1\n1 turn\n');
+  const watched = s.sumo(['job', 'watch', '1']);
+  assert.equal(watched.code, 0, watched.err);
+  assert.equal(watched.out, '⏺ j1 scout · haiku — look\n  ⏺ $ ls\nSTATUS: DONE — j1\n1 turn\n');
+
+  s.sumo(['job', 'abandon', '1']);
+  rmSync(join(s.home, 'jobs', '1', 'live.log'));
+  assert.match(s.sumo(['job', 'watch', '1']).out, /^j1 is abandoned — nothing is running/);
 });
 
 test('a job that is over, or not there, is refused by name before anything runs', () => {

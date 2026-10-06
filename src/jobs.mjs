@@ -431,6 +431,17 @@ export function tell(db, id, text, now = new Date().toISOString()) {
   renameSync(unnamed, join(inboxOf(id), `${name}.json`));
 }
 
+/** What a job run in the chat is doing, line by line, for whoever watches it; and how the run ended, once it has. */
+export const liveFile = (id) => fileOf(id, 'live.log');
+export const endFile = (id) => fileOf(id, 'live.end');
+/** A run begins with an empty record: a watcher never mistakes how an earlier run ended for this one's end. */
+export function startLive(id) {
+  rmSync(endFile(id), { force: true });
+  writeFileSync(liveFile(id), '', { mode: 0o600 });
+}
+export const appendLive = (id, text) => appendFileSync(liveFile(id), text, { mode: 0o600 });
+export const endLive = (id, lines) => writeFileSync(endFile(id), `${lines.join('\n')}\n`, { mode: 0o600 });
+
 /** What was told to the job since it last looked, taken off the disk so it is read once. A file that is not a message is passed over. */
 export function takeInbox(id) {
   let names;
