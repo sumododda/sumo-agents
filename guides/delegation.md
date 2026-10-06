@@ -3,7 +3,7 @@
 A delegation costs a brief and a fresh context: one `delegate` call. The sub-agent runs on its own route,
 and its report is the result.
 
-**Who.** `scout` (Haiku, or the cheapest model that is on; no edit tools): finding, tracing, auditing — cheapest; tracing, not judging → say
+**Who.** `scout` (Sonnet at low effort; no edit tools): finding, tracing, auditing — cheapest; tracing, not judging → say
 "describe only". `worker`: building and fixing. `reviewer` (no edit tools): judging a change it did not
 write (`reviews`: the worker job; without it, the uncommitted change). The local router picks every route; if it fails, no job exists — tell the user.
 
