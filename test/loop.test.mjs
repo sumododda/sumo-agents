@@ -275,7 +275,7 @@ test('a job told something from outside its process reads it with its next reque
       tell(db, id, 'skip the tests', NOW);
       const { send, seen } = canned([
         reply('tool_use', [{ type: 'text', text: 'looking' }, call('t1', 'bash', { command: 'echo hi' })]),
-        reply('end_turn', [{ type: 'text', text: 'done looking' }]),
+        reply('end_turn', [{ type: 'text', text: 'done **looking**:\n- one\n\n| a | b |\n|---|---|\n| 1 | 2 |' }]),
         reply('end_turn', []),
       ]);
       const printed = [];
@@ -285,7 +285,8 @@ test('a job told something from outside its process reads it with its next reque
       assert.deepEqual(heard.map((b) => b.type), ['tool_result', 'text']);
       assert.match(heard[1].text, /skip the tests/);
       assert.deepEqual(readdirSync(join(paths().jobs, String(id), 'inbox')), [], 'taken off the disk');
-      assert.deepEqual(printed, [`⏺ j${id} scout · haiku — demo job\n`, '  looking\n', '  ⏺ $ echo hi\n', '  done looking\n']);
+      // What it said is drawn as the chat draws a reply, set in under its line; each call has the top of what came back under it.
+      assert.deepEqual(printed, [`⏺ j${id} scout · haiku — demo job\n`, '  looking\n', '  ⏺ $ echo hi\n', '    ⎿  hi\n', '  done looking:\n    • one\n\n  ┌───┬───┐\n  │ a │ b │\n  ├───┼───┤\n  │ 1 │ 2 │\n  └───┴───┘\n']);
 
       db.prepare(`UPDATE jobs SET status = 'done' WHERE id = ?`).run(id);
       assert.throws(() => tell(db, id, 'too late', NOW), /is done — it cannot be told anything/);

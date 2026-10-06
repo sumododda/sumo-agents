@@ -112,7 +112,7 @@ test('the screen: a box to type in, a working line with the user\'s own words, t
         first.open();
         await shows(/⏺ all done/, 'the end of the first turn');
         assert.match(tty.screen(), /⏺ on it/, 'the reply');
-        assert.match(tty.screen(), /⏺ Bash\(echo one; echo two; echo three; echo four\)\n\s+⎿\s+one\n\s+two\n\s+three\n\s+… \+1 lines/, 'the tool call and the top of its output');
+        assert.match(tty.screen(), /⏺ Bash\(echo one; echo two; echo three; echo four\)\n\s+⎿\s+one\n\s+two\n\s+three\n\s+… \+1 line\b/, 'the tool call and the top of its output');
         assert.match(tty.screen(), /⏺ all done\n\s*\n\s+• tidy/, 'markdown is rendered, not shown raw');
 
         await shows(/\n> and then this/, 'the queued message being sent');
@@ -339,15 +339,15 @@ test('Ctrl-O shows every line a tool gave back and puts it away again; a resized
       try {
         await tty.type(`go${ENTER}`);
         await shows(/⏺ These words/, 'the reply');
-        assert.match(latest(), /⎿\s+one\n\s+two\n\s+three\n\s+… \+1 lines/);
+        assert.match(latest(), /⎿\s+one\n\s+two\n\s+three\n\s+… \+1 line\b/);
         assert.equal(latest().includes(long), false, 'sixty columns cannot hold the line');
 
         await tty.type('\x0f');
         await shows(/⎿\s+one\n\s+two\n\s+three\n\s+four\n/, 'the whole output');
-        assert.doesNotMatch(latest(), /… \+1 lines/);
+        assert.doesNotMatch(latest(), /… \+1 line\b/);
         assert.match(latest(), /> go\n/, 'the rest of the conversation is still there');
         await tty.type('\x0f');
-        await shows(/… \+1 lines/, 'the short form again');
+        await shows(/… \+1 line\b/, 'the short form again');
 
         tty.resize(150);
         await shows(new RegExp(long), 'the reply on one line');
@@ -402,6 +402,8 @@ test('a job run in the chat keeps out of it — who it is and where to follow it
         await tty.type(`check simba${ENTER}`);
         await shows(new RegExp(`⏺ j${id} scout · haiku — look · follow it: sumo job watch ${id}`), 'who the job is, and where to follow it');
         assert.match(latest(), new RegExp(`@ message talks to j${id}`), 'how to talk to it, under the box');
+        // While it works, it stands under the call that started it: how long it has run, how many calls, what it is doing now.
+        await shows(new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+j${id} · \\d+s · 0 tool calls · thinking…`), 'the job at work, under its call');
 
         // Typed for the job while it works: sent to it, not queued for the chat.
         await tty.type(`@stay in src${ENTER}`);
@@ -412,7 +414,7 @@ test('a job run in the chat keeps out of it — who it is and where to follow it
         await shows(/⏺ all finished/, 'the end of the turn');
         assert.match(seen[2].messages.at(-1).content.at(-1).text, /stay in src/, 'the job read it with its next request');
         assert.doesNotMatch(latest(), /looking around|Bash\(echo hi\)|report one/, "the job's work stays out of the chat");
-        assert.match(latest(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+STATUS: never closed — j${id}`), 'how the run ended');
+        assert.match(latest(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+○ j${id} never closed · 3 turns · 1 tool call · \\$0\\.00 · haiku`), 'how the run ended, in a line');
         // Its watcher has all of it, and how it ended.
         const watched = readFileSync(join(paths().jobs, String(id), 'live.log'), 'utf8').replace(/\x1b\[[0-9;]*m/g, '');
         assert.match(watched, new RegExp(`^⏺ j${id} scout · haiku — look\\n {2}looking around\\n {2}⏺ \\$ echo hi\\n {4}⎿ {2}hi\\n {2}report one\\n`));
@@ -680,4 +682,43 @@ test('a tab pasted into the box is drawn as spaces, so the box keeps its border'
       db.close();
     }
   });
+});
+
+test('jobs delegated side by side each stand under their own call while they work, and stay there between calls', async () => {
+  const events = new EventEmitter();
+  let finish;
+  const session = {
+    model: 'opus', effort: 'high', routed: null, contextTokens: 0, commands: [],
+    start: () => '',
+    expand: (line) => ({ text: line, said: line }),
+    interrupt() {}, end() {}, tell: () => false,
+    say: () => new Promise((resolve) => (finish = resolve)),
+  };
+  const tty = fakeTty({ columns: 100 });
+  const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
+  const shows = async (pattern, what) => {
+    for (let i = 0; i < 300; i++) {
+      if (pattern.test(tty.screen())) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+  };
+  try {
+    await tty.type('go', ENTER);
+    const scout = { id: 'd1', name: 'delegate', input: { agent: 'scout', title: 'Map it' } };
+    const worker = { id: 'd2', name: 'delegate', input: { agent: 'worker', title: 'Fix it' } };
+    events.emit('tool', { call: scout });
+    events.emit('tool', { call: worker });
+    events.emit('job', { job: { id: 41, agent: 'scout', title: 'Map it', model: 'sonnet', effort: 'low' }, call: 'd1' });
+    events.emit('job', { job: { id: 42, agent: 'worker', title: 'Fix it', model: 'opus', effort: 'high' }, call: 'd2' });
+    const grep = { id: 'j1', name: 'bash', input: { command: 'rg -n renderTable src' } };
+    events.emit('tool', { call: grep, job: 41 });
+    await shows(/⏺ Delegate\(scout · Map it\)\n\s+⎿\s+j41 · \d+s · 1 tool call · Bash\(rg -n renderTable src\)\n+⏺ Delegate\(worker · Fix it\)\n\s+⎿\s+j42 · \d+s · 0 tool calls · thinking…/, 'both jobs, each under its own call');
+    events.emit('result', { call: grep, result: { content: 'src/tty.mjs:126' }, job: 41 });
+    await shows(/j41 · \d+s · 1 tool call · thinking…/, 'the job still there between its calls');
+    finish({ stop: 'end_turn' });
+    await shows(/^(?![\s\S]*j41 ·)/, 'the job rows gone with the turn');
+  } finally {
+    ui.unmount();
+  }
 });

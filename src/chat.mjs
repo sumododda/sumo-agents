@@ -128,14 +128,28 @@ export function parseRoute(args, current, db) {
   return { model, effort: effort ?? kept };
 }
 
-/** What `sumo job run` prints on a terminal while it works — the lines the chat draws, one per thing, for a Herdr pane. */
-export function jobPrinter(write, s) {
+/**
+ * What a job looks like while it works — on the terminal of `sumo job run`, and in the record `sumo job watch` shows:
+ * the job's line, each call with the first line of what came back under it, and what the job says drawn as the chat
+ * draws a reply, set in under its line. `clean` is done to the words before they are drawn: a wrapped line must not
+ * break a secret apart where the redaction after it would no longer see it whole.
+ */
+export function jobPrinter(write, s, { width = 98, clean = (text) => text } = {}) {
   return {
     onStart: (job) => write(`⏺ ${s.bold(`j${job.id}`)} ${job.agent} · ${routeOf(job)} — ${job.title}\n`),
     onTool: (call) => write(`  ⏺ ${describeCall(call)}\n`),
+    onResult: (call, result) => {
+      const first = String(result.content ?? '').split('\n').find((l) => l.trim()) ?? '';
+      write(`    ⎿  ${s.dim(clean(first).slice(0, 160))}\n`);
+    },
     onTurn: (response) => {
       const text = textOf(response.content);
-      if (text) write(`${s.dim(text.split('\n').map((l) => `  ${l}`).join('\n'))}\n`);
+      if (!text) return;
+      const drawn = [];
+      const reply = createRenderer((t) => drawn.push(t), s, { width });
+      reply.write(clean(text));
+      reply.flush();
+      write(`${drawn.join('').split('\n').map((l) => (l ? `  ${l}` : l)).join('\n')}\n`);
     },
   };
 }
@@ -247,7 +261,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
 
   /** The workflow gate, the cheap-model passes and `delegate`; anything else is the tool's own business. */
   async function beforeTool(call) {
-    if (call.name === DELEGATE_TOOL.name) return delegate(call.input ?? {});
+    if (call.name === DELEGATE_TOOL.name) return delegate(call.input ?? {}, call.id);
     if (call.name !== BASH_TOOL.name) return null;
     const command = String(call.input?.command ?? '');
     const gate = event('pre-tool', { tool_name: 'bash', tool_input: { command } });
@@ -265,8 +279,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   /**
    * `delegate`: a job is made from the brief, or an open one picked up, and run here on its own route; the chat waits
    * for its report. Calls in one reply run side by side, but a worker has its project's working tree to itself.
+   * `callId` is the delegate call's own, so a screen can show the job under the call that started it.
    */
-  async function delegate(input) {
+  async function delegate(input, callId = null) {
     const { signal } = stopper;
     let claimed = null;
     const claim = (agent, slug) => {
@@ -295,7 +310,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       // Its work is written down as it happens, for `sumo job watch` — in a Herdr tab of its own, or any terminal —
       // and without its secrets, through the same redaction as what the model sees.
       const record = (t) => appendLive(id, redact(t).text);
-      const live = jobPrinter(record, styles(false));
+      const live = jobPrinter(record, styles(false), { clean: (t) => redact(t).text });
       let ended = [];
       try {
         const outcome = await runJob(db, id, {
@@ -305,7 +320,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           onStart: (job) => {
             startLive(id);
             live.onStart(job);
-            watch({ type: 'job', job, tab: env.HERDR_ENV ? watchTab(job) : null });
+            watch({ type: 'job', job, call: callId, tab: env.HERDR_ENV ? watchTab(job) : null });
           },
           onTool: (call) => {
             live.onTool(call);
@@ -313,8 +328,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
             watch({ type: 'tool', call, job: id });
           },
           onResult: (call, result) => {
-            const first = String(result.content ?? '').split('\n').find((l) => l.trim()) ?? '';
-            record(`    ⎿  ${first.slice(0, 160)}\n`);
+            live.onResult(call, result);
             watch({ type: 'result', call, result, job: id });
           },
           onTurn: (response) => {
@@ -325,8 +339,12 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         });
         ended = runLines(outcome);
         const report = reportOf(id);
-        // Model-written, like any tool output: redacted before it reaches the chat's context.
-        return { content: capRedacted([...warnings, ...ended, ...(report ? ['', report] : [])].join('\n')) };
+        // Model-written, like any tool output: redacted before it reaches the chat's context. `job` is how it went, for the screen only.
+        const { job, turns, totals } = outcome;
+        return {
+          content: capRedacted([...warnings, ...ended, ...(report ? ['', report] : [])].join('\n')),
+          job: { id, status: job.status, turns, toolCalls: totals.toolCalls, costUsd: totals.costUsd, model: job.model, effort: job.effort, report: report ? redact(report).text : '' },
+        };
       } catch (cause) {
         ended = [cause.message];
         throw cause;

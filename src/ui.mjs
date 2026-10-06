@@ -30,7 +30,7 @@ const ACCENT = '#d77757';
 /** The name at the top of the chat, two rows of blocks. */
 const WORDMARK = ['█▀▀ █ █ █▀▄▀█ █▀█', '▄▄█ █▄█ █ ▀ █ █▄█'];
 const FLOW_STEP_MS = 100;
-const TONES = { plain: {}, dim: { dimColor: true }, error: { color: 'red' }, add: { color: 'green' }, del: { color: 'red' } };
+const TONES = { plain: {}, dim: { dimColor: true }, error: { color: 'red' }, add: { color: 'green' }, del: { color: 'red' }, ask: { color: 'yellow' } };
 const LEAVE_WINDOW_MS = 2000;
 const NOTICE_MS = 3000;
 const RESIZE_SETTLE_MS = 120;
@@ -66,15 +66,30 @@ function keepHistory(line) {
 
 const thousands = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
 
-/** A tool call: what ran, and under it what came back. A job's call sits under the job, with no line between. */
-function Tool({ view, failed = false, running = false, nested = false }) {
+/** A tool call: what ran, and under it what came back — or, while it runs, the jobs it started, or that it is running. */
+function Tool({ view, failed = false, running = false, jobs = [] }) {
   return h(
     Box,
-    { flexDirection: 'column', marginTop: nested ? 0 : 1, marginLeft: nested ? 2 : 0 },
+    { flexDirection: 'column', marginTop: 1 },
     h(Text, null, h(Text, { color: running ? undefined : failed ? 'red' : 'green', dimColor: running }, '⏺ '), h(Text, { bold: true }, view.title), `(${view.detail})`),
-    running ? h(Text, { dimColor: true }, '  ⎿  Running…') : null,
+    running && jobs.length === 0 ? h(Text, { dimColor: true }, '  ⎿  Running…') : null,
+    ...jobs.map(([id, job]) => h(JobAtWork, { key: id, id, job })),
     ...view.lines.map((line, i) => h(Text, { key: i, ...TONES[line.tone] }, `${i === 0 ? '  ⎿  ' : '     '}${untab(line.text)}`)),
   );
+}
+
+/** How long something has run: `42s`, `3m 05s`. */
+const elapsed = (ms) => {
+  const seconds = Math.floor(ms / 1000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`;
+};
+
+/** A job at work, in one line under the call that started it: how long, how many calls, and the one running now — or that it is thinking. */
+function JobAtWork({ id, job }) {
+  useAnimation({ interval: 1000 });
+  const now = job.call ? toolView(job.call) : null;
+  const calls = `${job.calls} tool call${job.calls === 1 ? '' : 's'}`;
+  return h(Text, { wrap: 'truncate' }, h(Text, { dimColor: true }, `  ⎿  j${id} · ${elapsed(Date.now() - job.since)} · ${calls} · `), now ? `${now.title}(${now.detail})` : h(Text, { dimColor: true }, 'thinking…'));
 }
 
 /** One line of a reply; the first of a block carries the mark. */
@@ -101,7 +116,8 @@ function Item({ item }) {
   if (item.kind === 'user') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, '> '), h(Text, { dimColor: true }, untab(item.text)));
   if (item.kind === 'text') return h(Reply, item);
   if (item.kind === 'tool') return h(Tool, item);
-  if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, null, h(Text, { color: ACCENT }, '⏺ '), h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, h(Text, { dimColor: true }, ` · ${item.where}`)));
+  // The mark stands apart from the words, so a line that wraps in a narrow window goes on under them, not under it.
+  if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, { color: ACCENT }, '⏺ '), h(Text, null, h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, h(Text, { dimColor: true }, ` · ${item.where}`)));
   if (item.kind === 'said') return h(Box, { marginLeft: 2 }, h(Text, { dimColor: true }, item.text));
   if (item.kind === 'error') return h(Box, { marginTop: 1 }, h(Text, { color: 'red' }, item.text));
   return h(Text, { dimColor: true }, `  ⎿  ${item.text.split('\n').join('\n     ')}`);
@@ -183,7 +199,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
   // What the screen holds between draws. Keys and the session's events both write here, in the order they happen, and then ask for a draw.
   // `log` is what happened, as it was said; `items` is the log drawn for this window, and is drawn again when the window or the view changes.
   const st = useRef(null);
-  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, tokens: 0, running: null, jobs: new Map(), reply: null, fresh: true, leaving: null, gone: false };
+  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, tokens: 0, running: new Map(), jobs: new Map(), reply: null, fresh: true, leaving: null, gone: false };
   const state = st.current;
   state.columns = columns;
   state.rows = rows;
@@ -225,9 +241,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       return [{ ...entry, block: warnings && renderBlock(warnings, s, { width: state.columns - 1 }) }];
     }
     if (entry.kind === 'tool') {
-      const view = toolView(entry.call, entry.result, { full: state.full });
-      // A job makes many calls: each is one line until the full view is asked for.
-      return [{ kind: 'tool', view: entry.job && !state.full ? { ...view, lines: [] } : view, failed: entry.result.isError, nested: Boolean(entry.job) }];
+      return [{ kind: 'tool', view: toolView(entry.call, entry.result, { full: state.full }), failed: entry.result.isError }];
     }
     if (entry.kind !== 'reply') return [entry];
     const lines = [];
@@ -344,7 +358,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       closeReply();
       record({ kind: 'error', text: `error: ${cause.message}` });
     } finally {
-      state.running = null;
+      state.running.clear();
       state.jobs.clear();
       state.working = null;
       redraw();
@@ -389,22 +403,26 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       redraw();
     };
     const onTool = ({ call, job }) => {
-      if (job) state.jobs.set(job, call);
-      else {
+      const at = state.jobs.get(job);
+      if (at) Object.assign(at, { call, calls: at.calls + 1 });
+      else if (!job) {
         closeReply();
-        state.running = call;
+        state.running.set(call.id, call);
       }
       redraw();
     };
     // A job's work is not the chat's: it shows one line while it works, its report when it ends, and the rest where it is watched.
     const onResult = ({ call, result, job }) => {
-      if (job) return state.jobs.has(job) && (state.jobs.set(job, null), redraw());
+      if (job) {
+        if (state.jobs.has(job)) state.jobs.get(job).call = null;
+        return redraw();
+      }
       // Delegated jobs run side by side: one ending leaves the others' calls on the screen.
-      if (state.running?.id === call.id) state.running = null;
+      state.running.delete(call.id);
       record({ kind: 'tool', call, result });
     };
-    const onJob = ({ job, tab = null }) => {
-      state.jobs.set(job.id, null);
+    const onJob = ({ job, call = null, tab = null }) => {
+      state.jobs.set(job.id, { parent: call, call: null, calls: 0, since: Date.now() });
       const where = tab?.pane ? 'working in its Herdr tab' : tab?.error ? `no Herdr tab (${tab.error}) — sumo job watch ${job.id}` : `follow it: sumo job watch ${job.id}`;
       record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job), where });
     };
@@ -509,16 +527,14 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
     { flexDirection: 'column', minHeight: room },
     h(Static, { key: state.epoch, items: state.items }, (item) => h(Item, { key: item.id, item })),
     tail ? h(Reply, { text: tail, first: state.fresh }) : null,
-    state.running ? h(Tool, { view: toolView(state.running), running: true }) : null,
-    // One line per job while it works: which job, and what it is running now. In one box of their own, so the lines
-    // coming and going never move what follows — the working line keeps its clock.
+    // What runs now, and under a delegate call the jobs it started. In one box of their own, so the lines coming and going
+    // never move what follows — the working line keeps its clock.
     h(
       Box,
       { flexDirection: 'column' },
-      ...[...state.jobs].filter(([, call]) => call).map(([id, call]) => {
-        const view = toolView(call);
-        return h(Tool, { key: call.id, view: { ...view, title: `j${id} ${view.title}` }, running: true, nested: true });
-      }),
+      ...[...state.running.values()].map((call) => h(Tool, { key: call.id, view: toolView(call), running: true, jobs: [...state.jobs].filter(([, job]) => job.parent === call.id) })),
+      // A job no call here started — none should be — still shows that it works.
+      ...[...state.jobs].filter(([, job]) => !state.running.has(job.parent)).map(([id, job]) => h(JobAtWork, { key: `j${id}`, id, job })),
     ),
     state.working ? h(Working, { messages, first: state.working, tokens: state.tokens }) : null,
     h(Room, { logo, rows, from: state.used }),

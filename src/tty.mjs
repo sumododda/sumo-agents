@@ -11,7 +11,7 @@ import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
  * terminal or NO_COLOR is set, so a pipe gets plain text.
  */
 
-const CODES = { bold: ['1', '22'], dim: ['2', '22'], cyan: ['36', '39'], yellow: ['33', '39'], red: ['31', '39'], green: ['32', '39'] };
+const CODES = { bold: ['1', '22'], dim: ['2', '22'], italic: ['3', '23'], underline: ['4', '24'], strike: ['9', '29'], cyan: ['36', '39'], yellow: ['33', '39'], red: ['31', '39'], green: ['32', '39'] };
 const MAX_WIDTH = 100;
 const MIN_WIDTH = 40;
 
@@ -58,25 +58,65 @@ export function wrap(text, width, indent = '') {
   return lines.join('\n');
 }
 
-/** Inline markdown on one line: bold, inline code, links shown as their text. */
+/** A character after a backslash is meant as itself, not as a mark. */
+const ESCAPED = /\\([\\`*_~[\]()<>#|!])/g;
+/** A piece already drawn stands in the line behind these until the end, so no later mark reads into it or into its colour codes. */
+const KEPT = /\uE000(\d+)\uE001/g;
+
+/**
+ * Inline markdown on one line: code, links shown as their text and address, bold, italic, struck through, and
+ * a backslash-escaped mark as itself. A mark only counts where markdown would read it: snake_case and 2*3*4 stay.
+ */
 export function inline(line, s) {
-  return line
-    .replace(/`([^`]+)`/g, (_, code) => s.cyan(code))
-    .replace(/\*\*([^*]+)\*\*/g, (_, t) => s.bold(t))
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => `${text} ${s.dim(url)}`);
+  const kept = [];
+  const keep = (text) => `\uE000${kept.push(text) - 1}\uE001`;
+  const out = line
+    .replace(/(?<!\\)`([^`]+)`/g, (_, code) => keep(s.cyan(code)))
+    .replace(ESCAPED, (_, ch) => keep(ch))
+    .replace(/<(https?:\/\/[^>\s]+)>/g, (_, url) => keep(url))
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, text, url) => (text === url ? keep(url) : `${text} ${keep(s.dim(`(${url})`))}`))
+    .replace(/\*\*\*(?!\s)([^*]+?)(?<!\s)\*\*\*/g, (_, t) => s.bold(s.italic(t)))
+    .replace(/\*\*(?!\s)([^*]+?)(?<!\s)\*\*/g, (_, t) => s.bold(t))
+    .replace(/(?<![\w_])__(?!\s)([^_]+?)(?<!\s)__(?![\w_])/g, (_, t) => s.bold(t))
+    .replace(/(?<![\w*])\*(?![\s*])([^*]+?)(?<!\s)\*(?![\w*])/g, (_, t) => s.italic(t))
+    .replace(/(?<![\w_])_(?![\s_])([^_]+?)(?<!\s)_(?![\w_])/g, (_, t) => s.italic(t))
+    .replace(/~~(?!\s)([^~]+?)(?<!\s)~~/g, (_, t) => s.strike(t));
+  // A reply that happens to hold the stand-in characters itself keeps them as they were.
+  const restore = (text) => text.replace(KEPT, (whole, i) => (kept[Number(i)] === undefined ? whole : restore(kept[Number(i)])));
+  return restore(out);
 }
 
-/** One line of a reply: block-level marks replaced by weight and indent, then wrapped with a hanging indent. */
-export function renderLine(line, s, { fence = false, width = MAX_WIDTH } = {}) {
+/** A list item's marker: a bullet, or a number with its stop. */
+const LIST_ITEM = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+
+/**
+ * The indent a line that goes on with a list item is drawn at: under the item's text, not its marker. Null for a
+ * line that is no list item.
+ */
+export function hangOf(line) {
+  const item = LIST_ITEM.exec(line);
+  if (!item) return null;
+  return `${item[1]}${' '.repeat(/\d/.test(item[2]) ? item[2].length + 3 : 4)}`;
+}
+
+/**
+ * One line of a reply: block-level marks replaced by weight and indent, then wrapped with a hanging indent.
+ * `hang` is the indent of the list item a line may go on with: an indented line that is not an item of its own is drawn there.
+ */
+export function renderLine(line, s, { fence = false, width = MAX_WIDTH, hang = null } = {}) {
   if (fence) return `    ${s.dim(line)}`;
   const heading = /^(#{1,6})\s+(.*)$/.exec(line);
-  if (heading) return wrap(s.bold(heading[2]), width);
-  const bullet = /^(\s*)[-*]\s+(.*)$/.exec(line);
-  if (bullet) return wrap(`${bullet[1]}  ${s.dim('•')} ${inline(bullet[2], s)}`, width, `${bullet[1]}    `);
-  const numbered = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(line);
-  if (numbered) return wrap(`${numbered[1]}  ${s.dim(`${numbered[2]}.`)} ${inline(numbered[3], s)}`, width, `${numbered[1]}     `);
-  if (/^\s*>\s?/.test(line)) return s.dim(wrap(`  │ ${line.replace(/^\s*>\s?/, '')}`, width, '  │ '));
-  if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) return s.dim('─'.repeat(40));
+  if (heading) return wrap(heading[1].length === 1 ? s.bold(s.underline(inline(heading[2], s))) : s.bold(inline(heading[2], s)), width);
+  const item = LIST_ITEM.exec(line);
+  if (item && !/\d/.test(item[2])) {
+    const task = /^\[([ xX])\]\s+(.*)$/.exec(item[3]);
+    const mark = task ? (task[1] === ' ' ? s.dim('☐') : s.green('☑')) : s.dim('•');
+    return wrap(`${item[1]}  ${mark} ${inline(task ? task[2] : item[3], s)}`, width, `${item[1]}    `);
+  }
+  if (item) return wrap(`${item[1]}  ${s.dim(`${item[2].slice(0, -1)}.`)} ${inline(item[3], s)}`, width, hangOf(line));
+  if (/^\s*>\s?/.test(line)) return wrap(`  ${s.dim('│')} ${s.italic(inline(line.replace(/^\s*>\s?/, ''), s))}`, width, `  ${s.dim('│')} `);
+  if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) return s.dim('─'.repeat(Math.min(40, width)));
+  if (hang !== null && /^\s+\S/.test(line)) return wrap(`${hang}${inline(line.trim(), s)}`, width, hang);
   return wrap(inline(line, s), width);
 }
 
@@ -157,12 +197,17 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
   let tail = '';
   let fence = false;
   let rows = [];
+  /** The indent of the list item the lines are in, until a line comes out of it. */
+  let hang = null;
   const line = (raw) => {
-    if (/^\s*```/.test(raw)) {
+    const marks = /^\s*```\s*(\S*)/.exec(raw);
+    if (marks) {
       fence = !fence;
-      return s.dim(fence ? '    ┌─' : '    └─');
+      hang = null;
+      return s.dim(fence ? `    ┌─${marks[1] ? ` ${marks[1]}` : ''}` : '    └─');
     }
-    return renderLine(raw, s, { fence, width });
+    if (!fence) hang = hangOf(raw) ?? (/^\s+\S/.test(raw) || raw.trim() === '' ? hang : null);
+    return renderLine(raw, s, { fence, width, hang: hangOf(raw) === null ? hang : null });
   };
   /** The rows held so far: a table once its rule has come, the lines they were otherwise. */
   const held = () => (rows.length >= 2 && TABLE_RULE.test(rows[1]) ? renderTable(rows, s, width) : rows.map((r) => renderLine(r, s, { width })).join('\n'));
@@ -192,10 +237,12 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
       tail = '';
       rows = [];
       fence = false;
+      hang = null;
     },
     /** What has not been written yet, rendered as far as it has got: the rows of a table, and the line still arriving. */
     get tail() {
-      return [rows.length > 0 ? held() : '', tail && !/^\s*```/.test(tail) ? renderLine(tail, s, { fence, width }) : ''].filter(Boolean).join('\n');
+      const going = /^\s+\S/.test(tail) && hangOf(tail) === null ? hang : null;
+      return [rows.length > 0 ? held() : '', tail && !/^\s*```/.test(tail) ? renderLine(tail, s, { fence, width, hang: going }) : ''].filter(Boolean).join('\n');
     },
   };
 }
@@ -263,8 +310,11 @@ const SHOWN_DIFF_LINES = 12;
 
 /** The top of a list of lines, and how many more there were. */
 function top(lines, max) {
-  return lines.length > max ? [...lines.slice(0, max), { text: `… +${lines.length - max} lines`, tone: 'dim' }] : lines;
+  return lines.length > max ? [...lines.slice(0, max), { text: `… +${lines.length - max} line${lines.length - max === 1 ? '' : 's'}`, tone: 'dim' }] : lines;
 }
+
+/** How a delegated job ended, for the line that sums it up: its mark, the word for it, and its colour. */
+const JOB_ENDS = { done: ['✓', 'done', 'add'], failed: ['✗', 'failed', 'error'], needs_input: ['?', 'needs your answer', 'ask'], open: ['○', 'never closed', 'dim'] };
 
 const toned = (text, tone) => String(text).split('\n').map((t) => ({ text: t, tone }));
 const count = (text) => [{ text: `${text === '' ? 0 : text.replace(/\n$/, '').split('\n').length} lines`, tone: 'dim' }];
@@ -287,7 +337,14 @@ export function toolView(call, result = null, { full = false } = {}) {
   if (call.name === DELEGATE_TOOL.name) {
     const detail = input.job !== undefined ? `j${input.job}` : `${input.agent ?? 'worker'} · ${input.title ?? ''}`;
     if (!result) return { title: 'Delegate', detail, lines: [] };
-    return { title: 'Delegate', detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+    if (!result.job || full) return { title: 'Delegate', detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+    // A job that ran: how it went in one line, then the top of what it reported.
+    const { job } = result;
+    const [mark, said, tone] = JOB_ENDS[job.status] ?? JOB_ENDS.open;
+    const route = job.effort && job.effort !== 'none' ? `${job.model}/${job.effort}` : job.model;
+    const summary = `${mark} j${job.id} ${said} · ${job.turns} turn${job.turns === 1 ? '' : 's'} · ${job.toolCalls} tool call${job.toolCalls === 1 ? '' : 's'} · $${job.costUsd.toFixed(2)} · ${route}`;
+    const report = String(job.report ?? '').trim();
+    return { title: 'Delegate', detail, lines: [{ text: summary, tone }, ...(report ? top(toned(report, 'plain'), SHOWN_OUTPUT_LINES) : [])] };
   }
   if (call.name !== EDITOR_TOOL.name) {
     // A job's own tools: what it was given in a line, what came back under it.
