@@ -363,7 +363,7 @@ test('Ctrl-O shows every line a tool gave back and puts it away again; a resized
   });
 });
 
-test('a job run in the chat is shown as it works — who it is, each thing it runs, what it says — and a line starting with @ talks to it', async () => {
+test('a job run in the chat keeps out of it — who it is and where to follow it, then its report — its work goes to its watcher, and a line starting with @ talks to it', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -400,7 +400,7 @@ test('a job run in the chat is shown as it works — who it is, each thing it ru
       };
       try {
         await tty.type(`check simba${ENTER}`);
-        await shows(new RegExp(`⏺ j${id} scout · haiku — look`), 'who the job is');
+        await shows(new RegExp(`⏺ j${id} scout · haiku — look · follow it: sumo job watch ${id}`), 'who the job is, and where to follow it');
         assert.match(latest(), new RegExp(`@ message talks to j${id}`), 'how to talk to it, under the box');
 
         // Typed for the job while it works: sent to it, not queued for the chat.
@@ -411,16 +411,16 @@ test('a job run in the chat is shown as it works — who it is, each thing it ru
 
         await shows(/⏺ all finished/, 'the end of the turn');
         assert.match(seen[2].messages.at(-1).content.at(-1).text, /stay in src/, 'the job read it with its next request');
-        assert.match(latest(), /\n {2}looking around\n {2}⏺ Bash\(echo hi\)\n {2}report one\n/, "the job's words and its call, one line each, set in under it");
+        assert.doesNotMatch(latest(), /looking around|Bash\(echo hi\)|report one/, "the job's work stays out of the chat");
         assert.match(latest(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+STATUS: never closed — j${id}`), 'how the run ended');
+        // Its watcher has all of it, and how it ended.
+        const watched = readFileSync(join(paths().jobs, String(id), 'live.log'), 'utf8').replace(/\x1b\[[0-9;]*m/g, '');
+        assert.match(watched, new RegExp(`^⏺ j${id} scout · haiku — look\\n {2}looking around\\n {2}⏺ \\$ echo hi\\n {4}⎿ {2}hi\\n {2}report one\\n`));
+        assert.match(readFileSync(join(paths().jobs, String(id), 'live.end'), 'utf8'), new RegExp(`^STATUS: never closed — j${id}`));
         assert.doesNotMatch(latest(), /@ message talks to/, 'nobody to talk to once it is over');
 
-        // Ctrl-O opens what the job's command printed.
-        await tty.type('\x0f');
-        await shows(/ {2}⏺ Bash\(echo hi\)\n\s+⎿\s+hi\n/, "the job's output in full");
-
         // With no job running, a line starting with @ is an ordinary message.
-        await tty.type('\x0f', `@nobody${ENTER}`);
+        await tty.type(`@nobody${ENTER}`);
         await shows(/⏺ nobody here by that name/, 'the answer to the ordinary message');
         assert.equal(seen.at(-1).messages.at(-1).content[0].text, '@nobody');
 

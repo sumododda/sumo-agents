@@ -574,6 +574,50 @@ test('a delegated brief becomes a job on the route the router chose, and the rep
   });
 });
 
+test('inside Herdr a delegated job also gets a tab that watches it, while it runs here; a tab Herdr will not open costs the job nothing', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const id = scoutJob(db, 'sumo-agents-chat-tab-');
+      const project = db.prepare('SELECT path FROM projects').get().path;
+      const calls = [];
+      const answers = [
+        { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:pJ' } } }) },
+        { status: 0, stdout: '' },
+        { error: Object.assign(new Error('spawnSync herdr ENOENT'), { code: 'ENOENT' }) },
+      ];
+      const herdr = (args) => {
+        calls.push(args);
+        return answers.shift();
+      };
+      const watched = [];
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'delegate', { job: id })]),
+        reply('end_turn', [{ type: 'text', text: 'looked' }]),
+        reply('end_turn', []),
+        reply('tool_use', [call('t2', 'delegate', { job: id })]),
+        reply('end_turn', [{ type: 'text', text: 'looked again' }]),
+        reply('end_turn', []),
+        reply('end_turn', [{ type: 'text', text: 'fine' }]),
+      ]);
+      const env = { HERDR_ENV: '1', HERDR_WORKSPACE_ID: 'w2' };
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, herdr, env, watch: (e) => watched.push(e), now: () => NOW });
+      session.start('startup');
+      await session.say('have a scout look, twice');
+
+      assert.deepEqual(calls[0], ['tab', 'create', '--workspace', 'w2', '--cwd', project, '--label', `j${id} scout · look`, '--no-focus']);
+      assert.deepEqual(calls[1], ['pane', 'run', 'w2:pJ', `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${paths().home} ${paths().launcher} job watch ${id}`], 'the tab watches; the job is not run there');
+      const [first, second] = watched.filter((e) => e.type === 'job').map((e) => e.tab);
+      assert.deepEqual(first, { pane: 'w2:pJ' });
+      assert.deepEqual(second, { error: '`herdr` is not on PATH' });
+      assert.match(seen[3].messages.at(-1).content[0].content, new RegExp(`STATUS: never closed — j${id}[\\s\\S]*looked`), 'the job ran here, tab or not');
+      assert.match(seen[6].messages.at(-1).content[0].content, /looked again/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 test('@j<id> reaches a job this chat is not running through its inbox on disk, and a job that is not there is said back', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();

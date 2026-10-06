@@ -101,7 +101,7 @@ function Item({ item }) {
   if (item.kind === 'user') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, '> '), h(Text, { dimColor: true }, item.text));
   if (item.kind === 'text') return h(Reply, item);
   if (item.kind === 'tool') return h(Tool, item);
-  if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, null, h(Text, { color: ACCENT }, '⏺ '), h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`));
+  if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, null, h(Text, { color: ACCENT }, '⏺ '), h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, h(Text, { dimColor: true }, ` · ${item.where}`)));
   if (item.kind === 'said') return h(Box, { marginLeft: 2 }, h(Text, { dimColor: true }, item.text));
   if (item.kind === 'error') return h(Box, { marginTop: 1 }, h(Text, { color: 'red' }, item.text));
   return h(Text, { dimColor: true }, `  ⎿  ${item.text.split('\n').join('\n     ')}`);
@@ -396,17 +396,18 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       }
       redraw();
     };
+    // A job's work is not the chat's: it shows one line while it works, its report when it ends, and the rest where it is watched.
     const onResult = ({ call, result, job }) => {
-      if (job) state.jobs.set(job, null);
+      if (job) return state.jobs.has(job) && (state.jobs.set(job, null), redraw());
       // Delegated jobs run side by side: one ending leaves the others' calls on the screen.
-      else if (state.running?.id === call.id) state.running = null;
-      record({ kind: 'tool', call, result, job });
+      if (state.running?.id === call.id) state.running = null;
+      record({ kind: 'tool', call, result });
     };
-    const onJob = ({ job }) => {
+    const onJob = ({ job, tab = null }) => {
       state.jobs.set(job.id, null);
-      record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job) });
+      const where = tab?.pane ? 'working in its Herdr tab' : tab?.error ? `no Herdr tab (${tab.error}) — sumo job watch ${job.id}` : `follow it: sumo job watch ${job.id}`;
+      record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job), where });
     };
-    const onSaid = ({ text }) => record({ kind: 'said', text });
     const onJobEnd = ({ job }) => {
       state.jobs.delete(job);
       redraw();
@@ -415,9 +416,9 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       state.tokens = totals.outputTokens;
       redraw();
     };
-    events.on('text', onText).on('tool', onTool).on('result', onResult).on('usage', onUsage).on('job', onJob).on('said', onSaid).on('job-end', onJobEnd);
+    events.on('text', onText).on('tool', onTool).on('result', onResult).on('usage', onUsage).on('job', onJob).on('job-end', onJobEnd);
     return () => {
-      events.off('text', onText).off('tool', onTool).off('result', onResult).off('usage', onUsage).off('job', onJob).off('said', onSaid).off('job-end', onJobEnd);
+      events.off('text', onText).off('tool', onTool).off('result', onResult).off('usage', onUsage).off('job', onJob).off('job-end', onJobEnd);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
     };
@@ -509,7 +510,16 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
     h(Static, { key: state.epoch, items: state.items }, (item) => h(Item, { key: item.id, item })),
     tail ? h(Reply, { text: tail, first: state.fresh }) : null,
     state.running ? h(Tool, { view: toolView(state.running), running: true }) : null,
-    ...[...state.jobs.values()].filter(Boolean).map((call) => h(Tool, { key: call.id, view: toolView(call), running: true, nested: true })),
+    // One line per job while it works: which job, and what it is running now. In one box of their own, so the lines
+    // coming and going never move what follows — the working line keeps its clock.
+    h(
+      Box,
+      { flexDirection: 'column' },
+      ...[...state.jobs].filter(([, call]) => call).map(([id, call]) => {
+        const view = toolView(call);
+        return h(Tool, { key: call.id, view: { ...view, title: `j${id} ${view.title}` }, running: true, nested: true });
+      }),
+    ),
     state.working ? h(Working, { messages, first: state.working, tokens: state.tokens }) : null,
     h(Room, { logo, rows, from: state.used }),
     h(
