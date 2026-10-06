@@ -49,15 +49,31 @@ export function secretShape(line) {
 }
 
 /**
- * What a reader is left with: escape sequences, control characters and invisible format characters (zero-width
- * spaces, soft hyphens, direction marks) taken out. Redaction runs on this, never on the raw text — a key broken up
- * by any of them would otherwise pass, and be read whole by a model or shown whole by a terminal.
+ * Characters a reader never sees as themselves: control characters, escape sequences, and invisible format,
+ * filler and selector characters. Secrets are looked for with all of them taken out, so a key broken up by one is
+ * still the key. An escape sequence goes whole, but only one that is short and properly ended, so a stray escape
+ * can never swallow the text after it.
  */
-const ESCAPES = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\p{Cf}/gu;
-export const readable = (text) => String(text).replace(/\r\n?/g, '\n').replace(ESCAPES, '');
+const HIDDEN = /\x1b\[[0-?]{0,32}[ -/]{0,8}[@-~]|\x1b\][^\x07\x1b\n]{0,256}(?:\x07|\x1b\\)|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+/** Of those, the ones that are shown as markers when nothing secret is found: everything but the joiners and selectors emoji are made of. */
+const SHOWN = /(?![\u200d\ufe00-\ufe0f])[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\p{Cf}]/gu;
+const marker = (ch) => `⟨U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}⟩`;
 
+/**
+ * Secrets out of text, judged on the text as it reads. Nothing is hidden from the reader: with no secret, every
+ * hidden character stays and is shown as a marker (⟨U+202E⟩), so a model reviewing code sees a direction override
+ * for what it is; with a secret, the text is given as it reads, with the secret out and a line saying how many
+ * hidden characters were taken out with it.
+ */
 export function redact(raw) {
-  const text = readable(raw);
+  const text = String(raw).replace(/\r\n?/g, '\n');
+  const hidden = text.match(HIDDEN)?.length ?? 0;
+  const found = redactReadable(hidden ? text.replace(HIDDEN, '') : text);
+  if (found.count === 0) return { text: text.replace(SHOWN, marker), count: 0 };
+  return { text: hidden ? `${found.text}\n[${hidden} hidden character${hidden === 1 ? '' : 's'} taken out before redacting]` : found.text, count: found.count };
+}
+
+function redactReadable(text) {
   let count = 0;
   const hit = () => {
     count++;
