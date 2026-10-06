@@ -1,4 +1,5 @@
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import { createInterface } from 'node:readline';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
@@ -21,7 +22,7 @@ import { detail, historyLine, line, scopeLabel } from './render.mjs';
 import { buildBundle, modelStats, outcomeLines, runScribe, scribeStatus } from './scribe.mjs';
 import { searchTurns, taskEndedNudge } from './sessions.mjs';
 import { config, doctor, positiveInteger, setup } from './setup.mjs';
-import { colourEnabled, styles } from './tty.mjs';
+import { colourEnabled, safeForTerminal, styles } from './tty.mjs';
 import { ftsQuery } from './text.mjs';
 import { verdictLines } from './verify.mjs';
 
@@ -342,20 +343,22 @@ async function watchJob(db, id) {
   // The record opens with the job's own line, so nothing is printed for it here.
   tabBegins(db, job);
   let at = 0;
+  // A character split across two reads is held until its other half arrives.
+  const decoder = new StringDecoder('utf8');
   for (;;) {
     // Looked at before reading, so nothing written before the end is missed.
     const ended = existsSync(jobs.endFile(id));
-    at = copyFrom(jobs.liveFile(id), at);
+    at = copyFrom(jobs.liveFile(id), at, decoder);
     if (ended) break;
     await new Promise((r) => setTimeout(r, 250));
   }
-  const lines = readFileSync(jobs.endFile(id), 'utf8').trimEnd().split('\n');
+  const lines = safeForTerminal(readFileSync(jobs.endFile(id), 'utf8')).trimEnd().split('\n');
   tabEnds(jobs.getJob(db, id), lines[0]);
   return lines;
 }
 
 /** Writes what a file gained since `at`, and says where it ends now. A file not there yet has gained nothing. */
-function copyFrom(file, at) {
+function copyFrom(file, at, decoder) {
   let fd;
   try {
     fd = openSync(file, 'r');
@@ -369,7 +372,8 @@ function copyFrom(file, at) {
     if (size > from) {
       const chunk = Buffer.alloc(size - from);
       readSync(fd, chunk, 0, chunk.length, from);
-      process.stdout.write(chunk);
+      // What a job wrote is shown, never obeyed: colours pass, every other escape is dropped.
+      process.stdout.write(safeForTerminal(decoder.write(chunk)));
     }
     return size;
   } finally {

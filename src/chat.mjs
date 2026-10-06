@@ -276,8 +276,10 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       }
       const inbox = [];
       jobs.set(id, inbox);
-      // Its work is written down as it happens, for `sumo job watch` — in a Herdr tab of its own, or any terminal.
-      const live = jobPrinter((t) => appendLive(id, t), styles(true));
+      // Its work is written down as it happens, for `sumo job watch` — in a Herdr tab of its own, or any terminal —
+      // and without its secrets: what a job typed or printed reaches the disk the way it reaches the model.
+      const record = (t) => appendLive(id, redact(t).text);
+      const live = jobPrinter(record, styles(true));
       let ended = [];
       try {
         const outcome = await runJob(db, id, {
@@ -296,7 +298,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           },
           onResult: (call, result) => {
             const first = String(result.content ?? '').split('\n').find((l) => l.trim()) ?? '';
-            appendLive(id, `${styles(true).dim(`    ⎿  ${first.slice(0, 160)}`)}\n`);
+            record(`${styles(true).dim(`    ⎿  ${first.slice(0, 160)}`)}\n`);
             watch({ type: 'result', call, result, job: id });
           },
           onTurn: (response) => {
@@ -314,7 +316,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         throw cause;
       } finally {
         jobs.delete(id);
-        endLive(id, ended);
+        endLive(id, ended.map((l) => redact(l).text));
         watch({ type: 'job-end', job: id });
       }
     } finally {
