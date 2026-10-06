@@ -310,6 +310,26 @@ test('nothing is saved twice, a rejected guess is not proposed again, and one ba
   assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM memories').get().n), 2);
 });
 
+test('a request is not a statement: quoting it proves nothing, and a guess drawn from it is not put to the user', () => {
+  const s = sandbox();
+  say(s, 'In the sumo-agents project, delegate a scout to describe how the scribe decides what becomes memory');
+  s.modelWillSay([
+    // The words are the user's and overlap the body, but they ask; they do not state.
+    { op: 'add', type: 'fact', scope: 'global', body: 'The scribe decides what becomes memory by analyzing the context', turn: 1, quote: 'describe how the scribe decides what becomes memory' },
+    // No quote at all: the model answering the question itself.
+    { op: 'add', type: 'fact', scope: 'global', body: 'The router selects a model by task type and priority', turn: 1 },
+  ]);
+  const out = s.sumo(['scribe', 'run']).out;
+  assert.match(out, /dropped — add: the quote asks for work or an answer; it states nothing that lasts/);
+  assert.match(out, /dropped — add: a guess from a request, not kept/);
+  assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM memories').get().n), 0);
+
+  // A rule given inside a request is still a rule.
+  say(s, 'fix the login bug, and from now on always run the linter first');
+  s.modelWillSay([{ op: 'add', type: 'preference', scope: 'global', body: 'Always run the linter first', turn: 2, quote: 'from now on always run the linter first' }]);
+  assert.match(s.sumo(['scribe', 'run']).out, /saved m\d+ \[pref·global·stated\] Always run the linter first/);
+});
+
 test('when the writer fails, nothing is lost and the user is told after the third time', () => {
   const s = sandbox();
   say(s, 'always run the linter before committing');
