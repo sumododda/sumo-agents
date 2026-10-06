@@ -13,7 +13,7 @@ import { getJob, takeInbox, tell } from '../src/jobs.mjs';
 import { converse, jobParams, markTail, runJob, runLines } from '../src/loop.mjs';
 import { ENTRY, paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { cap, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
+import { cap, capRedacted, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
 import { styles } from '../src/tty.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
@@ -484,6 +484,12 @@ test('a secret is redacted before the output is cut, so a key the cut splits doe
   const out = await runBash({ command: 'cat key.txt' }, ctx);
   assert.match(out.content, /\[redacted\]/);
   assert.doesNotMatch(out.content, /MIIEvQIBADANBgkqhkiG9w0|BKcwggSjAgEAAoIBAQC7/);
+});
+
+test('output full of hidden characters stays within the cap once each is shown as a marker', () => {
+  const out = capRedacted('\x01'.repeat(16_000));
+  assert.ok(out.length < 16_500, `${out.length} characters`);
+  assert.match(out, /⟨U\+0001⟩/);
 });
 
 test('a command stopped for printing too much says so, and how to ask for less', async () => {
