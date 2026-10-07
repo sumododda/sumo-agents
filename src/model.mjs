@@ -1,9 +1,8 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { jsonSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/json-schema';
 import { spawnSync } from 'node:child_process';
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { anthropicClientOptions, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
+import { anthropicClient, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
 import { describeApiError, modelId } from './catalog.mjs';
 import { getMeta } from './db.mjs';
 import { ensureLocalServer, LOCAL_REASONING_BUDGET, modelIdOf } from './local-server.mjs';
@@ -124,7 +123,7 @@ export async function callModel(db, { system, prompt, schema, model, kind }) {
   try {
     const credential = resolveAnthropicCredential();
     if (!credential) return failure('no Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that runs sumo');
-    const client = new Anthropic({ ...anthropicClientOptions(TIMEOUT_MS, credential), maxRetries: MAX_RETRIES });
+    const client = anthropicClient({ timeout: TIMEOUT_MS, maxRetries: MAX_RETRIES }, credential);
     const request = authenticatedRequest(requestFor({ system, prompt, schema, model }), credential);
     // Not the SDK's parse(): it throws on an answer that is not JSON before the stop reason or the usage can be read,
     // so a cut-off or refused answer would be misnamed and what it spent never logged. The answer is parsed below instead.

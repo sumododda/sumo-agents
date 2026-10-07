@@ -1,3 +1,5 @@
+import Anthropic from '@anthropic-ai/sdk';
+
 /** The request identity Anthropic requires when a Claude Code OAuth token calls the Messages API directly. */
 export const CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
 export const CLAUDE_CODE_BETAS = ['claude-code-20250219', 'oauth-2025-04-20'];
@@ -23,6 +25,23 @@ export function resolveAnthropicCredential(env = process.env) {
   const bearer = env.ANTHROPIC_AUTH_TOKEN?.trim();
   if (bearer) return { type: 'bearer', token: bearer, source: 'ANTHROPIC_AUTH_TOKEN' };
   return null;
+}
+
+/**
+ * One client per credential and per way of calling: the SDK keeps a connection pool, its retry state and its logger on the
+ * client, so a request made on a fresh one every time opens a new connection every time. A credential that changes — the
+ * shell exported another — gets a client of its own; the old one is simply not asked again.
+ */
+const clients = new Map();
+export function anthropicClient({ timeout, maxRetries = undefined } = {}, credential = resolveAnthropicCredential(), env = process.env) {
+  // The base URL is read from the shell when a client is made: one made for another is not this one.
+  const key = JSON.stringify([credential?.type ?? null, credential?.token ?? null, timeout ?? null, maxRetries ?? null, env.ANTHROPIC_BASE_URL ?? null]);
+  let client = clients.get(key);
+  if (!client) {
+    client = new Anthropic({ ...anthropicClientOptions(timeout, credential), ...(maxRetries === undefined ? {} : { maxRetries }) });
+    clients.set(key, client);
+  }
+  return client;
 }
 
 /** Anthropic SDK constructor options for an API key, generic bearer token, or Claude Code OAuth token. */

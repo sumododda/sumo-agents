@@ -509,6 +509,48 @@ test('a job run in the chat keeps out of it — who it is and where to follow it
   });
 });
 
+test('what the model is thinking shows under the working line until it acts, and a request sent again is said on the screen', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const thinking = gate();
+      const { send } = transport([{ reply: reply('end_turn', [{ type: 'text', text: 'the answer' }]), gate: thinking }]);
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty();
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', debug: true });
+      const latest = () => tty.screen().slice(tty.screen().lastIndexOf(MARK));
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 300; i++) {
+          if (pattern.test(latest())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${latest()}`);
+      };
+      try {
+        await tty.type(`what is in the tests${ENTER}`);
+        await shows(/Working…/, 'the working line');
+        // The thinking as it comes: the last line of it, under the working line.
+        events.emit('thinking', { text: 'First I will look at the test files.\nThen the fixtures they share.' });
+        await shows(/Working…[^\n]*\n\s+⎿\s+Then the fixtures they share\./, 'the last line of the thinking');
+        events.emit('thinking', { text: 'First I will look at the test files.\nThen the fixtures they share.\nThe loop test is the one.' });
+        await shows(/⎿\s+The loop test is the one\./, 'the thinking as it grows');
+        // A request sent again: a line that says so, where the work shows.
+        events.emit('retry', { attempt: 2, limit: 6, delayMs: 4000, reason: '529 overloaded_error Overloaded' });
+        await shows(/retrying in 4s \(2 of 6\) — 529 overloaded_error Overloaded/, 'the retry');
+        thinking.open();
+        await shows(/⏺ the answer/, 'the reply');
+        assert.doesNotMatch(latest(), /The loop test is the one/, 'the thinking goes when the reply comes');
+        await tty.type('\x04');
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
 test('Up recalls what was typed, across sessions, the last fifty; /model changes the route in the footer and says a bad one back', async () => {
   const home = freshHome();
   await withHome(home, { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {

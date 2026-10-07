@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { CREDENTIAL_NAMES } from './auth.mjs';
 import { guardCommand, guardPath } from './guard.mjs';
 import { redact } from './redact.mjs';
@@ -122,14 +122,16 @@ export function cap(text, max = OUTPUT_CAP_CHARS, omitted = 0) {
   return `${text.slice(0, half)}\n${cutMark(text.length - 2 * half + omitted)}\n${text.slice(-half)}`;
 }
 
-const cutMark = (cut) => `[cut ${cut} characters from the middle — narrow the command: tail, grep, or a line range]`;
+/** The cut, and the way to what was cut: the file holding the output when there is one, else a narrower command. */
+const cutMark = (cut, kept = null) =>
+  `[cut ${cut} characters from the middle — ${kept ? `the first and last ${KEPT_EACH_END / 1024} KB of the output are in ${kept}: read a range of it, or ` : ''}narrow the command: tail, grep, or a line range]`;
 
 /**
  * cap(), with the secrets taken out of what survives it. They are looked for before the cut, in a margin around each
  * end that is kept, so a key the cut would split is still whole when it is found — and a flood of output is never
- * scanned whole.
+ * scanned whole. `kept` names the file the whole of it went to, when it went somewhere.
  */
-export function capRedacted(text, max = OUTPUT_CAP_CHARS, omitted = 0) {
+export function capRedacted(text, max = OUTPUT_CAP_CHARS, omitted = 0, kept = null) {
   // Capped after redacting too: what redaction adds — a marker for each hidden character — counts against the cap.
   if (text.length <= max && omitted === 0) {
     const out = redact(text).text;
@@ -138,7 +140,32 @@ export function capRedacted(text, max = OUTPUT_CAP_CHARS, omitted = 0) {
   const half = Math.floor(max / 2);
   const head = redact(text.slice(0, half + max)).text.slice(0, half);
   const tail = redact(text.slice(-(half + max))).text.slice(-half);
-  return `${head}\n${cutMark(text.length - 2 * half + omitted)}\n${tail}`;
+  return `${head}\n${cutMark(text.length - 2 * half + omitted, kept)}\n${tail}`;
+}
+
+/** How long a saved output is kept: long enough to be read back by a run picked up tomorrow, not a disk full of old logs. */
+const SPILL_KEEP_MS = 7 * 24 * 3_600_000;
+let spilled = 0;
+
+/**
+ * What was kept of an output too long to show — its two ends, the gap between them said — written where the model can
+ * read a range of it instead of running the command again: the job's folder, or the logs. Without its secrets, like
+ * everything that leaves a command; older files there go. Nowhere to write it is no file, and the cut says so.
+ */
+function spill(dir, output, omitted) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    for (const name of readdirSync(dir)) {
+      const old = join(dir, name);
+      if (Date.now() - statSync(old).mtimeMs > SPILL_KEEP_MS) rmSync(old, { force: true });
+    }
+    const file = join(dir, `${Date.now()}-${process.pid}-${spilled++}.txt`);
+    const text = omitted > 0 ? `${output.slice(0, KEPT_EACH_END)}\n[… ${omitted} characters between here and the end were not kept …]\n${output.slice(KEPT_EACH_END)}` : output;
+    writeFileSync(file, redact(text).text.toWellFormed(), { mode: 0o600 });
+    return file;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -264,12 +291,20 @@ export async function runBash({ command, restart }, ctx, { signal = null, timeou
     : run.stopped === 'interrupted' ? `\n(${INTERRUPTED})`
     : run.stopped === 'overflow' ? `\n(stopped: it printed more than ${MAX_BUFFER_CHARS / 1024 / 1024} MB — narrow the command: tail, grep, or a line range)`
     : failed ? `\n(exit ${run.status ?? run.signal})` : '';
-  return result(capRedacted(output, OUTPUT_CAP_CHARS, run.omitted) + tail, failed);
+  // Output the model is shown only the ends of is kept whole — as much as was held — where it can read a range of it.
+  const kept = ctx.spill && (output.length > OUTPUT_CAP_CHARS || run.omitted > 0) ? spill(ctx.spill, output, run.omitted) : null;
+  return result(capRedacted(output, OUTPUT_CAP_CHARS, run.omitted, kept) + tail, failed);
 }
+
+/** How much of a file is looked at to tell a binary from text: a NUL byte in its first pages is one. */
+const BINARY_PROBE_BYTES = 8192;
 
 function view(path, range) {
   if (statSync(path).isDirectory()) return result(cap(readdirSync(path).join('\n')));
-  const lines = readFileSync(path, 'utf8').split('\n');
+  const bytes = readFileSync(path);
+  // A binary shown as text is pages of nonsense, every page billed: say what it is instead.
+  if (bytes.subarray(0, BINARY_PROBE_BYTES).includes(0)) return result(`${path} is a binary file (${bytes.length} bytes) — not shown; use a tool that reads its kind, or \`file\` and \`xxd | head\` for a look`, true);
+  const lines = bytes.toString('utf8').split('\n');
   let [from, to] = Array.isArray(range) && range.length === 2 ? range : [1, lines.length];
   from = Math.max(1, from);
   to = to === -1 ? lines.length : Math.min(lines.length, to);
@@ -286,6 +321,48 @@ function view(path, range) {
   const cut = to - (from - 1 + shown.length);
   const body = shown.join('\n');
   return result(cut > 0 ? `${body}\n[${cut} more lines up to ${to} — view a smaller range]` : body);
+}
+
+/**
+ * Where old_str is in a file: exactly; else with the file's own line endings; else line by line without trailing spaces;
+ * else without the indentation too, in which case the replacement is set in at the file's indentation. One place, with how
+ * it was found, or how many places it was found in — a looser match is still held to being the only one. A model that
+ * copies a line with a space missing at its end, or at the wrong depth, otherwise spends a turn on "not found".
+ */
+function locate(text, oldStr) {
+  const exact = (needle, how = null) => {
+    const hits = [];
+    for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + needle.length)) hits.push(at);
+    return hits.length === 0 ? null : { hits: hits.length, start: hits[0], end: hits[0] + needle.length, how };
+  };
+  const found = exact(oldStr) ?? (text.includes('\r\n') && !oldStr.includes('\r') ? exact(oldStr.replaceAll('\n', '\r\n'), "with the file's line endings") : null);
+  if (found) return found;
+  const lines = text.split('\n');
+  const starts = [];
+  for (let at = 0, i = 0; i < lines.length; i++) {
+    starts.push(at);
+    at += lines[i].length + 1;
+  }
+  const wanted = oldStr.replace(/\r\n/g, '\n').split('\n');
+  const byLines = (same, how) => {
+    const hits = [];
+    for (let i = 0; i + wanted.length <= lines.length; i++) if (wanted.every((w, j) => same(lines[i + j], w))) hits.push(i);
+    if (hits.length === 0) return null;
+    const [i] = hits;
+    const last = i + wanted.length - 1;
+    // The span ends before a carriage return the line keeps: the replacement is given the file's line endings itself.
+    return { hits: hits.length, start: starts[i], end: starts[last] + lines[last].replace(/\r$/, '').length, how, line: i };
+  };
+  const trimmed = byLines((a, b) => a.trimEnd() === b.trimEnd(), 'without trailing spaces');
+  if (trimmed) return trimmed;
+  const loose = byLines((a, b) => a.trim() === b.trim(), 'without its indentation');
+  if (!loose) return null;
+  // The depth the model wrote at, moved to the depth the file has: every line of the replacement indented like the old one is re-indented.
+  const indentOf = (line) => /^[ \t]*/.exec(line)[0];
+  const was = indentOf(wanted[0]);
+  const is = indentOf(lines[loose.line]);
+  if (was !== is) loose.reindent = (replacement) => replacement.split('\n').map((l) => (l.startsWith(was) ? `${is}${l.slice(was.length)}` : l)).join('\n');
+  return loose;
 }
 
 /** The text editor's four commands, each inside the jail; secret files are neither shown nor written. */
@@ -319,11 +396,18 @@ export function runEditor(input, ctx) {
       case 'str_replace': {
         if (secret) return result(secret, true);
         if (!input.old_str) return result('str_replace needs old_str', true);
+        if (input.new_str !== undefined && input.old_str === input.new_str) return result('old_str and new_str are the same — nothing would change', true);
         const text = readFileSync(path, 'utf8');
-        const hits = text.split(input.old_str).length - 1;
-        if (hits !== 1) return result(hits === 0 ? `old_str was not found in ${path}` : `old_str appears ${hits} times in ${path} — include more context so it is unique`, true);
-        writeFileSync(path, text.replace(input.old_str, () => String(input.new_str ?? '')));
-        return result(`edited ${path}`);
+        const where = locate(text, input.old_str);
+        if (!where) return result(`old_str was not found in ${path}`, true);
+        if (where.hits !== 1) return result(`old_str appears ${where.hits} times in ${path} — include more context so it is unique`, true);
+        let replacement = String(input.new_str ?? '');
+        if (where.how) {
+          if (text.includes('\r\n')) replacement = replacement.replace(/\r?\n/g, '\r\n');
+          if (where.reindent) replacement = where.reindent(replacement);
+        }
+        writeFileSync(path, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`);
+        return result(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`);
       }
       case 'insert': {
         if (secret) return result(secret, true);

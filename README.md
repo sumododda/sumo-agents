@@ -94,13 +94,21 @@ Every session runs in Sumo's own loop: one request per turn to the Anthropic Mes
 to a sub-agent) plus the tools of any MCP servers you configured, deferred behind a search tool so
 none of their schemas sits in the context until it is needed (see *MCP servers*), a frozen system prompt that
 caches across turns, and old tool results cleared server-side once the context passes 60k tokens.
-History is never rewritten on the client.
+History is never rewritten on the client. A request the API or the connection lets down — an overload, a
+rate limit, a stream that breaks half-way — is sent again, up to six times with a wait that doubles from a
+second to thirty (or what the API asked for), each try said on the screen and written to the ledger; a
+request the API refuses as wrong is not. A turn the API pauses of its own accord goes on. The same call made
+with the same answer three times in a row is said to the model; five times, and the turn is stopped. The turn
+before the last of a run carries a warning, so a job that hits the turn limit still closes. Every model but
+Haiku is asked to say what it is thinking in summary, and the last line of it shows under the working line.
 
 | When | What runs | Cost to the model you chat with |
 |---|---|---|
 | Session starts | The first user turn is the core block: your global preferences, workflows, projects, where you left off, open jobs, things to confirm. Default cap 800 tokens (`prime.budget`); overflow is reachable by search. | ≤ 800 tokens by default, once |
 | You send a message | It is stored word for word (secrets redacted). First mention of a project adds its card — path, stack, commands, your rules for it, gotchas — as an operator message after the cached prefix. | 0, or ≤ 200 once per project |
-| A shell command matches a destructive or secret-reading guard (`rm -rf ~`, `git reset --hard`, `git clean -f`, `DROP TABLE`, `cat .env` …), or the editor tries to access a secret file | Refused in plain code before it runs, and the refusal says why. No memory is consulted. The way through is you: `! <command>` runs it yourself. A force-push is not on the list — it is an accepted way of cleaning up history here. | 0 |
+| A shell command matches a destructive or secret-reading guard (`rm -rf ~` — by any path, escaped, behind `sudo`, `env`, `nice`, `timeout` or `xargs`, flags before or after the target — `git reset --hard`, `git clean -f`, `DROP TABLE`, `cat .env` …), or the editor tries to access a secret file | Refused in plain code before it runs, and the refusal says why. No memory is consulted. The way through is you: `! <command>` runs it yourself. A force-push is not on the list — it is an accepted way of cleaning up history here. | 0 |
+| A command prints more than the model is shown (16k characters) | The two ends are shown, and the first and last 64 KB are written — without secrets — to the job's folder (or `~/.sumo-agents/logs/output/` for the chat), named in the cut, so the model reads a range of the file instead of running the command again. Kept a week. | 0 |
+| An edit's `old_str` is not in the file exactly as written | It is matched again with the file's line endings, then line by line without trailing spaces, then without its indentation too — the replacement set in at the file's depth — and the result says how it matched. A looser match is still refused unless it is the only one. | 0 |
 | The editor reaches for a path outside the project | Refused: the editor is jailed to the project (symlinks followed). Shell commands start in the project directory but can access other paths, and run with your environment — every token you exported, so a probe or a smoke test can use it — minus Sumo's own Anthropic credential. A command whose only job is to print the whole environment (`env`, `printenv`, bare `export` or `set`) is refused; a `.env` is loaded with `set -a; source .env; set +a`, never printed. | 0 |
 | The agent is about to run a shell command a taught workflow gates (`gh pr create`, for a workflow taught with `--gate 'gh(-axi)? pr create'`) | The command is held back once and the agent is handed the workflow's steps. It follows them, then runs the command. The same steps ride in with your message when you ask for the thing yourself. | 0 until it fires |
 | The agent ends a turn on a question | Memory is searched with the question's own words, in plain code. If something close is there, the agent is handed it once and carries on instead of waiting for you; if nothing is, the question reaches you untouched. | 0 unless memory answers |
@@ -372,6 +380,15 @@ new session. So:
   `/resume` brings it back whole, for the price of one uncached turn, for thirty days.
 - **Old tool output goes first.** Past 60k tokens the API clears the oldest tool results from what
   the model reads, keeping the last five; the conversation itself stays intact.
+- **A job that outgrows the context is summarized, not stopped.** At 150k tokens, at the end of a tool
+  round, the job's conversation so far is summarized server-side — told what to keep: the task, the
+  decisions, what was tried, what is done, the next step, the exact names and errors — and the job goes
+  on from the summary, with `sumo job brief <id>` named for whatever it left out. Not again within three
+  turns; a summary that cannot be had costs nothing but its request. The chat keeps its nudges: a new task
+  gets a new session.
+- **A resumed session carries no thinking.** A thinking block is bound to the exact history it was made
+  in, and a saved session had its secrets redacted and its pictures taken out — so `/resume` sends the
+  words and the calls, not the thinking, and the first reply reasons afresh.
 
 ## What a project card tells you about hygiene
 
