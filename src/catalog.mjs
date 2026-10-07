@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { spawnSync } from 'node:child_process';
-import { anthropicClientOptions, resolveAnthropicCredential } from './auth.mjs';
+import { anthropicClient, resolveAnthropicCredential } from './auth.mjs';
 import { getMeta, setMeta } from './db.mjs';
 import { UsageError } from './memory.mjs';
 
@@ -113,7 +113,7 @@ async function askApi() {
   if (standIn) return askStandIn(standIn);
   const credential = resolveAnthropicCredential();
   if (!credential) return { error: 'no Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this shell' };
-  const client = new Anthropic(anthropicClientOptions(TIMEOUT_MS, credential));
+  const client = anthropicClient({ timeout: TIMEOUT_MS }, credential);
   const options = credential.type === 'oauth' ? { headers: { 'anthropic-beta': OAUTH_BETA } } : {};
   const entries = await Promise.all(
     MODELS.map(async (name) => {

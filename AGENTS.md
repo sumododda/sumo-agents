@@ -33,4 +33,5 @@ run at once — read guides/delegation.md first.
 - Two failed attempts at the same fix → stop and rethink from the evidence. No third variation.
 - Fix, feature or review → read guides/<that>.md first.
 - No new dependency. A secret is used from the environment, or loaded with `set -a; source .env; set +a; <cmd>` in one call; never put in a file or printed.
-- Output: failures, not whole logs. No preamble, no restating the request.
+- Output: failures, not whole logs. No preamble, no restating the request. Only you see a command's output (the
+  screen shows one line): say what the user needs. Edit the lines that change, never a whole file.
