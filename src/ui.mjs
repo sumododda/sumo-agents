@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createElement as h, useEffect, useReducer, useRef } from 'react';
 import { routeLine, routeOf } from './chat.mjs';
 import { stopReason } from './loop.mjs';
+import { compactInput } from './mcp.mjs';
 import { paths } from './paths.mjs';
 import { editor, keysOf, menuOf, paste, press, under } from './editor.mjs';
 import { clipboardImage, droppedImages } from './images.mjs';
@@ -89,6 +90,12 @@ function JobAtWork({ id, job }) {
   const now = job.call ? toolView(job.call) : null;
   const calls = `${job.calls} tool call${job.calls === 1 ? '' : 's'}`;
   return h(Text, { wrap: 'truncate' }, h(Text, { dimColor: true }, `  ⎿  j${id} · ${elapsed(Date.now() - job.since)} · ${calls} · `), now ? `${now.title}(${now.detail})` : h(Text, { dimColor: true }, 'thinking…'));
+}
+
+/** A call waiting on the user's word: who asks, what would run with what, and the keys that answer. */
+function Ask({ ask }) {
+  const who = ask.job ? `j${ask.job}: ` : '';
+  return h(Box, { marginTop: 1, flexDirection: 'column' }, h(Text, { color: 'yellow' }, `⚠ ${who}allow ${ask.server} · ${ask.tool}(${compactInput(ask.input)})?`), h(Text, { dimColor: true }, '  y once · a always · n no · esc stop'));
 }
 
 /** One line of a reply; the first of a block carries the mark. */
@@ -187,7 +194,7 @@ function Room({ logo, rows, from }) {
   );
 }
 
-function App({ session, events, messages, cwd, block, logo, clipboard }) {
+function App({ session, events, messages, cwd, block, opening, logo, clipboard }) {
   const { exit } = useApp();
   const { stdout, write } = useStdout();
   const { columns, rows } = useWindowSize();
@@ -197,7 +204,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
   // What the screen holds between draws. Keys and the session's events both write here, in the order they happen, and then ask for a draw.
   // `log` is what happened, as it was said; `items` is the log drawn for this window, and is drawn again when the window or the view changes.
   const st = useRef(null);
-  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, tokens: 0, running: new Map(), jobs: new Map(), reply: null, fresh: true, leaving: null, gone: false };
+  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, tokens: 0, running: new Map(), jobs: new Map(), asks: [], reply: null, fresh: true, leaving: null, gone: false };
   const state = st.current;
   state.columns = columns;
   state.rows = rows;
@@ -255,7 +262,9 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
   };
   if (state.log.length === 0) {
     state.log.push(header(block));
-    place(drawn(state.log[0]));
+    // A chat opened on a saved session says which, under the header, where a fresh one shows the block's warnings.
+    if (opening) state.log.push({ kind: 'note', text: opening });
+    for (const entry of state.log) place(drawn(entry));
   }
 
   /** The reply so far is whole: its last line is drawn, it joins the log, and the next text starts a new block. */
@@ -289,6 +298,14 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
     state.queue = [];
     if (state.working) session.interrupt();
     else exit();
+  };
+
+  /** The user's answer to a call waiting on it; one answered already — by Esc, say — is left alone. */
+  const settle = (ask, answer) => {
+    if (!state.asks.includes(ask)) return;
+    state.asks = state.asks.filter((a) => a !== ask);
+    ask.resolve(answer);
+    redraw();
   };
 
   /** Said under the box for a moment, in place of the hints: why a key did nothing. */
@@ -337,9 +354,24 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
         refresh();
         return record(header(block));
       }
-      if (control === 'model' || control === 'memory') {
+      if (control === 'resume') {
         record({ kind: 'user', text: line });
-        return record({ kind: 'note', text: control === 'model' ? session.route(args) : await session.memoryPage() });
+        if (!args) {
+          const saved = session.saved();
+          return record({ kind: 'note', text: saved.length > 0 ? saved.join('\n') : 'no saved sessions' });
+        }
+        // Refused — no such session, or one open elsewhere — nothing changes, and the refusal is shown below like any other error.
+        const said = session.resume(args);
+        state.log = [];
+        state.images = state.images.map(() => null);
+        refresh();
+        record(header(''));
+        return record({ kind: 'note', text: said });
+      }
+      if (control === 'model' || control === 'memory' || control === 'mcp') {
+        record({ kind: 'user', text: line });
+        const text = control === 'model' ? session.route(args) : control === 'mcp' ? (await session.mcp()).join('\n') : await session.memoryPage();
+        return record({ kind: 'note', text });
       }
       record({ kind: 'user', text: line });
       state.working = pickMessage(messages);
@@ -356,6 +388,8 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       closeReply();
       record({ kind: 'error', text: `error: ${cause.message}` });
     } finally {
+      // A question the turn left standing has no call behind it any more.
+      for (const ask of state.asks.splice(0)) ask.resolve('no');
       state.running.clear();
       state.jobs.clear();
       state.working = null;
@@ -434,9 +468,20 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       state.tokens = totals.outputTokens;
       redraw();
     };
-    events.on('text', onText).on('tool', onTool).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd);
+    // A call waiting on the user's word: shown under the work until a key answers it; Esc stops the turn, which declines it.
+    const onApprove = (ask) => {
+      state.asks.push(ask);
+      ask.signal?.addEventListener('abort', () => settle(ask, 'no'), { once: true });
+      redraw();
+    };
+    // An MCP server that is not there is the user's to see; the model is simply not offered its tools.
+    const onMcp = ({ servers, error }) => {
+      if (error) record({ kind: 'error', text: `mcp: ${error}` });
+      for (const server of servers.filter((s) => !s.ok)) record({ kind: 'error', text: `mcp ${server.name}: ${server.error} — sumo mcp shows every server` });
+    };
+    events.on('text', onText).on('tool', onTool).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('approve', onApprove).on('mcp', onMcp);
     return () => {
-      events.off('text', onText).off('tool', onTool).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd);
+      events.off('text', onText).off('tool', onTool).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('approve', onApprove).off('mcp', onMcp);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
     };
@@ -466,6 +511,13 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
     // The terminal's answer to Ink's keyboard-protocol query, when it comes after Ink stopped waiting for it.
     if (/^\[\?\d+u$/.test(input)) return;
     for (const [one, oneKey] of keysOf(input, key)) {
+      // A question standing takes the key: an answer, or Esc and Ctrl-C, which go on to stop the turn; nothing lands in the box.
+      if (state.asks.length > 0 && !oneKey.escape && !(oneKey.ctrl && (one === 'c' || one === 'd'))) {
+        const answer = { y: 'once', a: 'always', n: 'no' }[one];
+        if (answer) settle(state.asks[0], answer);
+        else notify('y allows it once · a always · n refuses it · esc stops the turn');
+        continue;
+      }
       if (oneKey.escape || (oneKey.ctrl && one === 'c')) {
         if (state.working) session.interrupt();
         else if (oneKey.escape) continue;
@@ -537,6 +589,7 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
       ...[...state.jobs].filter(([, job]) => !state.running.has(job.parent)).map(([id, job]) => h(JobAtWork, { key: `j${id}`, id, job })),
     ),
     state.working ? h(Working, { messages, first: state.working, tokens: state.tokens }) : null,
+    state.asks.length > 0 ? h(Ask, { ask: state.asks[0] }) : null,
     h(Room, { logo, rows, from: state.used }),
     h(
       Box,
@@ -549,12 +602,14 @@ function App({ session, events, messages, cwd, block, logo, clipboard }) {
 }
 
 /** Starts the session and draws it. The returned instance's `waitUntilExit()` settles when the user leaves. */
-export function runUi({ session, events, stdin = process.stdin, stdout = process.stdout, messages = spinnerMessages(), cwd = process.cwd(), logo = logoLines(), clipboard = clipboardImage, debug = false }) {
-  const block = session.start('startup');
+export function runUi({ session, events, resume = null, stdin = process.stdin, stdout = process.stdout, messages = spinnerMessages(), cwd = process.cwd(), logo = logoLines(), clipboard = clipboardImage, debug = false }) {
+  // Opened on a saved session (`sumo chat --resume`), the chat picks it up before the screen is drawn; a fresh one starts and is shown its block.
+  const opening = resume === null ? null : session.resume(resume);
+  const block = opening ? '' : session.start('startup');
   // Ink asks the terminal whether it speaks the kitty keyboard protocol before the screen turns raw mode on. In cooked
   // mode the terminal's answer is echoed and held back until a newline — and lands in the box as `[?0u`. Raw mode first.
   if (stdin.isTTY) stdin.setRawMode(true);
   // The chat starts at the top of a wiped window, not under the shell line that started it: the room and the box are placed from its top.
   if (stdout.isTTY) stdout.write(CLEAR);
-  return render(h(App, { session, events, messages, cwd, block, logo, clipboard }), { stdin, stdout, debug, exitOnCtrlC: false, kittyKeyboard: { mode: 'auto' } });
+  return render(h(App, { session, events, messages, cwd, block, opening, logo, clipboard }), { stdin, stdout, debug, exitOnCtrlC: false, kittyKeyboard: { mode: 'auto' } });
 }

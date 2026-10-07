@@ -22,6 +22,14 @@ const SECRET_FILE =
 /** Anything that would put a file's contents in front of the model, `$(< file)` among them. `source .env` is not on it: that sets variables without showing them. */
 const PRINTS = /(^|[\s;&|($`])(cat|head|tail|less|more|bat|grep|rg|egrep|fgrep|sed|awk|cut|strings|xxd|hexdump|od|base64|nl|tac|view|vim?|nano|code|open|pbcopy|jq|yq)\s|\$\(\s*</;
 
+/** Where one simple command ends and the next begins: a separator, a pipe, a new line, a subshell or a substitution. */
+const SEPARATORS = /[;&|\n()`]|\$\(/;
+/**
+ * A command whose only job is to print the whole environment, secrets and all: `env`, `printenv`, `export`, `set`, `declare`
+ * or `typeset` with nothing but flags and redirections after it. `env FOO=1 cmd`, `set -e`, `export FOO=1` and `printenv HOME` are not that.
+ */
+const DUMPS_ENV = /^\s*(?:sudo\s+)?(?:(?:env|printenv|declare|typeset)(?:\s+(?:-\S+|\d*[<>&]+\S*))*|export(?:\s+-p)?|set)\s*$/;
+
 /** `rm`, its flags, and its targets — up to the end of its command, which a new line is too. Only a recursive spelling of the flags is looked at further. */
 const RM = /(^|[\s;&|(`"'])(?:sudo\s+)?rm((?:\s+-{1,2}[\w-]+)+)\s+([^;&|)`\n]+)/g;
 const RECURSIVE = /(^|\s)(?:-[a-zA-Z]*[rR]|--recursive)/;
@@ -63,6 +71,7 @@ const RULES = [
     why: () => 'that statement empties or drops a table or database',
   },
   { test: (c) => PRINTS.test(c) && SECRET_FILE.test(c), why: () => 'it would print a secret file (.env, a private key, credentials). Use `source`/`set -a` to load it without showing it' },
+  { test: (c) => c.replace(/\\\n/g, ' ').split(SEPARATORS).some((part) => DUMPS_ENV.test(part)), why: () => 'it would print the whole environment, secrets included. A variable is for the command that needs it, never for printing' },
 ];
 
 /** Why a shell command is refused, or null when it may run. `cwd` is where it would run, so its full spelling is known too. */

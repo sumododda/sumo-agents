@@ -5,6 +5,9 @@ export const CLAUDE_CODE_BETAS = ['claude-code-20250219', 'oauth-2025-04-20'];
 // Pin the protocol version so authentication does not depend on a local Claude installation.
 const CLAUDE_CODE_VERSION = '2.1.280';
 
+/** The names a credential is read from — and the only names a command run for the model goes without. */
+export const CREDENTIAL_NAMES = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'];
+
 /** Resolve one credential without ever copying it into a child process or output. API keys keep their documented precedence. */
 export function resolveAnthropicCredential(env = process.env) {
   const apiKey = env.ANTHROPIC_API_KEY?.trim();

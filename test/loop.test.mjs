@@ -11,7 +11,8 @@ import { add, UsageError } from '../src/memory.mjs';
 import { jobPrinter } from '../src/chat.mjs';
 import { getJob, takeInbox, tell } from '../src/jobs.mjs';
 import { converse, jobParams, markTail, runJob, runLines } from '../src/loop.mjs';
-import { ENTRY, paths } from '../src/paths.mjs';
+import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
+import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { cap, capRedacted, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
 import { styles } from '../src/tty.mjs';
@@ -69,7 +70,7 @@ test('a run: tool calls go through the guard, the jail and the cap; every respon
     try {
       const { root, id } = seed(db);
       const { send, seen } = canned([
-        reply('tool_use', [{ type: 'text', text: 'looking' }, call('t1', 'bash', { command: 'printf hi; env | grep -c ANTHROPIC_API_KEY' })]),
+        reply('tool_use', [{ type: 'text', text: 'looking' }, call('t1', 'bash', { command: 'printf hi; printenv ANTHROPIC_API_KEY | grep -c .' })]),
         reply('tool_use', [call('t2', 'bash', { command: 'rm -rf ~' }), call('t3', 'str_replace_based_edit_tool', { command: 'view', path: join(root, '.env') })]),
         reply('tool_use', [call('t4', 'str_replace_based_edit_tool', { command: 'view', path: '/etc/hosts' }), call('t5', 'str_replace_based_edit_tool', { command: 'str_replace', path: 'a.txt', old_str: 'two', new_str: '2' })]),
         reply('end_turn', [{ type: 'text', text: 'done' }], { input_tokens: 500, cache_read_input_tokens: 2000, output_tokens: 20 }),
@@ -144,8 +145,8 @@ test('the tools on their own: cap keeps both ends, the jail follows symlinks, se
   assert.ok(capped.startsWith('a'.repeat(20)) && capped.endsWith('b'.repeat(20)) && /cut 66 characters/.test(capped), capped);
 
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-jail-'));
-  const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH, ANTHROPIC_API_KEY: 'k', GITHUB_TOKEN: 't', HOME: '/h' }) };
-  assert.deepEqual(Object.keys(ctx.env).sort(), ['HOME', 'PATH']);
+  const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH, ANTHROPIC_API_KEY: 'k', ANTHROPIC_AUTH_TOKEN: 'b', CLAUDE_CODE_OAUTH_TOKEN: 'o', GITHUB_TOKEN: 't', HOME: '/h' }) };
+  assert.deepEqual(Object.keys(ctx.env).sort(), ['GITHUB_TOKEN', 'HOME', 'PATH'], "the user's own tokens reach a command; Sumo's credentials never do");
   assert.equal(jailed('new/dir/file.txt', ctx), join(root, 'new/dir/file.txt'), 'a file that does not exist yet is judged by its nearest real ancestor');
   assert.throws(() => jailed('../elsewhere', ctx), /outside the project/);
   assert.throws(() => jailed('/etc/passwd', ctx), /outside the project/);
@@ -312,6 +313,17 @@ test('a refused reply is not kept, nor any call it made before the refusal: the 
       db.close();
     }
   });
+});
+
+test('a command may use a secret from the shell or a .env, never sees Sumo\'s own credential, and is refused the whole environment', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-secrets-'));
+  writeFileSync(join(root, '.env'), 'SMOKE_SECRET=from-the-file\n');
+  const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH, SMOKE_TOKEN: 'from-the-shell', ANTHROPIC_API_KEY: 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789' }) };
+  assert.equal((await runBash({ command: 'echo "${SMOKE_TOKEN:-unset}"' }, ctx)).content, 'from-the-shell', 'a token the user exported is there for a probe');
+  assert.equal((await runBash({ command: 'set -a; source .env; set +a; echo "${SMOKE_SECRET:-unset}"' }, ctx)).content, 'from-the-file', 'a .env is loaded, not printed');
+  assert.equal((await runBash({ command: 'echo "${ANTHROPIC_API_KEY:-unset}"' }, ctx)).content, 'unset');
+  assert.match((await runBash({ command: 'env | sort' }, ctx)).content, /^Refused: .*whole environment/);
+  assert.match((await runBash({ command: 'cat .env' }, ctx)).content, /^Refused: .*secret file/);
 });
 
 test('a password inside a URL a command prints does not reach the model, though the variable holding it is not named like a secret', async () => {
@@ -579,11 +591,12 @@ test('a job\'s shell never sees the credential, checked with one actually in the
     const db = openDb();
     try {
       const { id } = seed(db, { agent: 'scout', model: 'haiku', effort: 'none' });
-      const { send, seen } = canned([reply('tool_use', [call('t1', 'bash', { command: 'env' })]), reply('end_turn', [{ type: 'text', text: 'done' }]), reply('end_turn', [])]);
+      const { send, seen } = canned([reply('tool_use', [call('t1', 'bash', { command: 'echo "PATH=$PATH"; echo "key=${ANTHROPIC_API_KEY:-unset} oauth=${CLAUDE_CODE_OAUTH_TOKEN:-unset}"' })]), reply('end_turn', [{ type: 'text', text: 'done' }]), reply('end_turn', [])]);
       await runJob(db, id, { send, now: () => NOW });
       const env = seen[1].messages.at(-1).content[0].content;
-      assert.match(env, /^PATH=/m, 'the command ran and printed its environment');
-      assert.doesNotMatch(env, /ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|not-a-real/);
+      assert.match(env, /^PATH=/m, 'the command ran with an environment');
+      assert.match(env, /key=unset oauth=unset/, 'without the credential');
+      assert.doesNotMatch(env, /not-a-real/);
     } finally {
       db.close();
     }
@@ -739,6 +752,60 @@ test('a job created where no session had begun meets the workflow gate all the s
       assert.equal(held.is_error, true, held.content);
       assert.match(held.content, /^Not yet\. The user taught a workflow for exactly this/);
     } finally {
+      db.close();
+    }
+  });
+});
+
+test('a job gets the MCP tools too, deferred behind tool search and named in its prompt; a call not on the allow list is refused when nobody can be asked, and asked about — with the job named — when somebody can', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      mkdirSync(paths().home, { recursive: true, mode: 0o700 });
+      writeConfig({ mcpServers: { demo: { command: process.execPath, args: [join(REPO_ROOT, 'test', 'fixtures', 'fake-mcp-server.mjs')] } } });
+      const { id } = seed(db, { agent: 'scout', model: 'haiku', effort: 'none' });
+
+      // Run from a terminal: nobody is there to ask, and the refusal says how the user allows it.
+      const alone = canned([
+        reply('tool_use', [call('t1', 'mcp__demo__echo', { text: 'hi' })]),
+        reply('end_turn', [{ type: 'text', text: 'could not' }]),
+        reply('end_turn', []),
+      ]);
+      await runJob(db, id, { send: alone.send, now: () => NOW });
+      const request = alone.seen[0];
+      assert.deepEqual(request.tools.map((t) => t.name).slice(0, 6), ['bash', 'note', 'ask', 'search_memory', 'finish', 'tool_search_tool_regex'], 'the role\'s tools first, then the search tool');
+      const deferred = request.tools.slice(6);
+      assert.equal(deferred.length, 9);
+      assert.ok(deferred.every((t) => t.defer_loading === true && t.name.startsWith('mcp__demo__')), 'every MCP tool is deferred');
+      assert.match(request.system[0].text, /demo \(9 tools\)/, 'the job is told which servers there are');
+      const refused = alone.seen[1].messages.at(-1).content[0];
+      assert.equal(refused.is_error, true);
+      assert.match(refused.content, /needs the user's approval[\s\S]*sumo mcp allow demo echo/);
+
+      // Run inside the chat: the question reaches the screen with the job's id on it, and "always" is kept.
+      const asked = [];
+      const attended = canned([
+        reply('tool_use', [call('t2', 'mcp__demo__echo', { text: 'hi' })]),
+        reply('tool_use', [call('t3', 'mcp__demo__echo', { text: 'again' })]),
+        reply('end_turn', [{ type: 'text', text: 'done' }]),
+        reply('end_turn', []),
+      ]);
+      await runJob(db, id, {
+        send: attended.send,
+        now: () => NOW,
+        approve: async (ask) => {
+          asked.push(ask);
+          return 'always';
+        },
+      });
+      assert.equal(attended.seen[1].messages.at(-1).content[0].content, 'you said: hi');
+      assert.equal(attended.seen[2].messages.at(-1).content[0].content, 'you said: again');
+      assert.equal(asked.length, 1, 'asked once; the second call was allowed by the first answer');
+      assert.equal(asked[0].job, id);
+      assert.equal(asked[0].tool, 'echo');
+      assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo']);
+    } finally {
+      await closeMcp();
       db.close();
     }
   });

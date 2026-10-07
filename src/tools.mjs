@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { CREDENTIAL_NAMES } from './auth.mjs';
 import { guardCommand, guardPath } from './guard.mjs';
 import { redact } from './redact.mjs';
 
@@ -86,7 +87,8 @@ export const killGroup = (pid) => {
     // Nothing left to kill.
   }
 };
-function track(pid) {
+/** A child of this process whose whole group goes when this process does: a command's, or an MCP server's. */
+export function trackGroup(pid) {
   live.add(pid);
   if (watching) return;
   watching = true;
@@ -101,12 +103,12 @@ function track(pid) {
 /** What a command's output ends with when the user stopped it. */
 export const INTERRUPTED = 'stopped: interrupted by the user';
 
-/** Environment names whose values are secrets. The tool's child processes never see them, so `env` cannot print them. */
-const SECRET_ENV = /KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL/i;
-
-/** The environment a tool's child process gets: everything except the secrets. */
+/**
+ * The environment a tool's child process gets: the user's own, without Sumo's credential. The tokens the user exported
+ * are theirs to use — a smoke test needs one — while the guard refuses printing the lot, and a secret printed is redacted.
+ */
 export function childEnv(env = process.env) {
-  return Object.fromEntries(Object.entries(env).filter(([name]) => !SECRET_ENV.test(name)));
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !CREDENTIAL_NAMES.includes(name)));
 }
 
 /**
@@ -188,7 +190,7 @@ const result = (content, isError = false) => ({ content: redact(String(content))
 export function runCommand(command, { cwd, env, signal = null, timeoutMs = null }) {
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, shell: SHELL, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
-    if (child.pid) track(child.pid);
+    if (child.pid) trackGroup(child.pid);
     let drain = null;
     // Each stream, and both together in the order they came, so an error stays beside the step that printed it.
     const kept = { stdout: keeper(), stderr: keeper(), output: keeper() };

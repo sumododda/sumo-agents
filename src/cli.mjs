@@ -12,6 +12,7 @@ import { chat, jobPrinter } from './chat.mjs';
 import { closeJobTab, reportAgent, runHerdr } from './herdr.mjs';
 import { runHook } from './hooks.mjs';
 import { runJob as runJobLoop, runLines } from './loop.mjs';
+import { addServer, allowedBy, closeMcp, connect, mcpLines, mcpReady, readConfig, removeServer, setAllow } from './mcp.mjs';
 import * as jobs from './jobs.mjs';
 import * as memory from './memory.mjs';
 import { UsageError } from './memory.mjs';
@@ -20,7 +21,7 @@ import { prime } from './prime.mjs';
 import * as projects from './projects.mjs';
 import { detail, historyLine, line, scopeLabel } from './render.mjs';
 import { buildBundle, modelStats, outcomeLines, runScribe, scribeStatus } from './scribe.mjs';
-import { searchTurns, taskEndedNudge } from './sessions.mjs';
+import { findSaved, searchTurns, taskEndedNudge } from './sessions.mjs';
 import { CHAT_EFFORTS, config, doctor, positiveInteger, setup } from './setup.mjs';
 import { colourEnabled, safeForTerminal, styles } from './tty.mjs';
 import { ftsQuery } from './text.mjs';
@@ -28,7 +29,7 @@ import { verdictLines } from './verify.mjs';
 
 const HELP = `sumo — local memory for the sumo-agents process
 
-  sumo chat [--model M] [--effort E]   talk: the chat, with this memory behind it
+  sumo chat [--model M] [--effort E] [--resume [id]]   talk: the chat, with this memory behind it
   sumo search <query> [--project S] [--type T] [--everywhere] [--all] [--turns] [-n N]
   sumo add <type> "<text>" [--project S] [--topic T] [--pin] [--supersedes ID] [--observed]
         types: preference · fact · decision · gotcha
@@ -46,6 +47,8 @@ const HELP = `sumo — local memory for the sumo-agents process
   sumo scribe run|show|status|stats  sumo dream run|status       the cheap-model passes
   sumo export [--json]  sumo backup
   sumo models [discover | enable <name> | disable <name>]     the API models: which are here, which are on
+  sumo mcp [add <name> -- <command> [args…] | add <name> --url U | remove N | tools N | allow N <tool>|all | revoke N <tool>|all]
+        MCP servers: their tools reach the chat and every job; a tool not allowed asks first
   sumo setup            sumo doctor          sumo config [key [value]]
 
 Scope is global plus --project; other projects stay hidden without --everywhere.
@@ -65,7 +68,7 @@ EOF
  * guess at a command is often wrong; the reply has to be enough to get the second one right.
  */
 const USAGE = {
-  chat: 'sumo chat [--model auto|<model>] [--effort <effort>]    (piped: plain lines, the memory block first)',
+  chat: 'sumo chat [--model auto|<model>] [--effort <effort>] [--resume [id]]    (piped: plain lines, the memory block first; --resume picks a saved session up, the newest without an id)',
   search: 'sumo search <query> [--project S] [--type T] [--everywhere] [--all] [--turns] [-n N]',
   add: `sumo add preference|fact|decision|gotcha "<one sentence>" [--project S] [--topic T] [--pin] [--supersedes ID] [--observed]
 a workflow (steps to repeat) is saved with sumo learn instead:
@@ -105,6 +108,13 @@ sumo job list [--all]`,
   models: `sumo models                    every model Sumo knows: on or off, its API id, and why
 sumo models discover           ask the API which of them this credential can use, and set the switches from the answer (one turned off by hand stays off)
 sumo models enable|disable <name>`,
+  mcp: `sumo mcp                        every configured server: where it is, its tools or why it failed, what may run unasked
+sumo mcp add <name> [--env K=V]... -- <command> [args...]     a server run as a process (stdio)
+sumo mcp add <name> --url <url> [--header K=V]...             a server reached over HTTP
+        \${NAME} in a value is filled from the shell when the server starts: the file never holds a token
+sumo mcp remove <name>
+sumo mcp tools <name>           the server's tools, one a line
+sumo mcp allow <name> <tool>|all      let it run without asking      sumo mcp revoke <name> <tool>|all`,
   setup: 'sumo setup [--bin-dir DIR] [--no-link] [--model-source URL] [--no-model]',
   doctor: 'sumo doctor',
   config: 'sumo config [key [value]]',
@@ -136,6 +146,7 @@ const COMMANDS = {
   export: { value: [], bool: ['json', 'md'], run: runExport },
   backup: { value: [], bool: [], run: runBackup },
   models: { value: [], bool: [], run: runModels },
+  mcp: { value: ['url'], multi: ['env', 'header'], bool: [], run: runMcp },
 };
 
 function parse(argv, spec) {
@@ -562,6 +573,73 @@ async function runModels(db, { args }) {
   throw new UsageError(`usage: ${USAGE.models}`);
 }
 
+/** `NAME=value` pairs from the command line, as an object. The values are stored as typed: `${NAME}` is filled from the shell when the server starts. */
+function pairs(list = [], flag) {
+  return Object.fromEntries(
+    list.map((pair) => {
+      const at = pair.indexOf('=');
+      if (at < 1) throw new UsageError(`${flag} takes NAME=value, not "${pair}"`);
+      return [pair.slice(0, at), pair.slice(at + 1)];
+    }),
+  );
+}
+
+/** MCP servers: configured here, connected by every chat and job; what may run without asking is set here too. */
+async function runMcp(db, { args, flags }) {
+  const [sub = 'list', name, ...rest] = args;
+  switch (sub) {
+    case 'list': {
+      const registry = await mcpReady();
+      try {
+        return mcpLines(registry);
+      } finally {
+        await closeMcp();
+      }
+    }
+    case 'add': {
+      if (!name) throw new UsageError(`usage: ${USAGE.mcp}`);
+      let spec;
+      if (flags.url) {
+        if (rest.length > 0) throw new UsageError('a server is a command or a --url, not both');
+        spec = { url: flags.url, ...(flags.header ? { headers: pairs(flags.header, '--header') } : {}) };
+      } else if (rest.length > 0) {
+        spec = { command: rest[0], args: rest.slice(1), ...(flags.env ? { env: pairs(flags.env, '--env') } : {}) };
+      } else {
+        throw new UsageError('a server is a command (after --) or a --url:\nsumo mcp add <name> -- <command> [args...]   |   sumo mcp add <name> --url <url>');
+      }
+      addServer(name, spec);
+      return [`added ${name} (${spec.url ? `http: ${spec.url}` : `stdio: ${[spec.command, ...spec.args].join(' ')}`})`, `next: sumo mcp — connects to it and lists its tools; sumo mcp allow ${name} <tool>|all — lets them run without asking`];
+    }
+    case 'remove':
+      if (!name) throw new UsageError(`usage: ${USAGE.mcp}`);
+      removeServer(name);
+      return [`removed ${name}`];
+    case 'tools': {
+      if (!name) throw new UsageError(`usage: ${USAGE.mcp}`);
+      const spec = readConfig().mcpServers[name];
+      if (!spec) throw new UsageError(`no MCP server called ${name} — sumo mcp lists them`);
+      const session = await connect(name, spec);
+      try {
+        if (session.tools.length === 0) return [`${name} offers no tools`];
+        const wide = Math.max(...session.tools.map((t) => t.name.length)) + 2;
+        return session.tools.map((t) => `  ${t.name.padEnd(wide)}${allowedBy(spec, t.name) ? '(allowed)  ' : ''}${String(t.description ?? '').split('\n')[0]}`);
+      } finally {
+        await session.close();
+      }
+    }
+    case 'allow':
+    case 'revoke': {
+      const tool = rest[0];
+      if (!name || !tool) throw new UsageError(`usage: ${USAGE.mcp}`);
+      setAllow(name, tool, sub === 'allow');
+      if (tool === 'all') return [sub === 'allow' ? `${name}: every tool may run without asking` : `${name}: every call asks first`];
+      return [sub === 'allow' ? `${name}: ${tool} may run without asking` : `${name}: ${tool} asks first`];
+    }
+    default:
+      throw new UsageError(`usage: ${USAGE.mcp}`);
+  }
+}
+
 function runExport(db, { flags }) {
   return [flags.json ? JSON.stringify(exportJson(db), null, 2) : exportMarkdown(db)];
 }
@@ -605,7 +683,9 @@ export async function main(argv) {
       return 0;
     }
     if (command === 'chat') {
-      const { flags } = parse(rest, { value: ['model', 'effort'], bool: [] });
+      const { args: given, flags } = parse(rest, { value: ['model', 'effort'], bool: ['resume'] });
+      // `--resume` alone is the newest saved session; with an id, or the start of one, that session.
+      const resume = flags.resume ? (given[0] ?? 'last') : null;
       // Said once, before the screen: past here every turn would fail the same way.
       // A full API id is taken too (claude-opus-5-5), as the chat itself takes one.
       if (flags.model !== undefined && flags.model !== 'auto' && !Object.values(MODEL_IDS).includes(flags.model)) knownModel(flags.model, ['auto']);
@@ -613,7 +693,9 @@ export async function main(argv) {
       if (!resolveAnthropicCredential()) throw new UsageError('the chat needs an Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this shell, then: sumo chat');
       const db = openDb();
       try {
-        return await chat(db, { model: flags.model, effort: flags.effort });
+        // A session that is not there to resume is said here too, before the screen.
+        if (resume !== null) findSaved(db, resume, { now: new Date().toISOString() });
+        return await chat(db, { model: flags.model, effort: flags.effort, resume });
       } finally {
         db.close();
       }

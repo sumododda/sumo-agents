@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { anthropicClientOptions, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
 import { modelId, MODELS, usableModels } from './catalog.mjs';
@@ -7,6 +7,8 @@ import { tx } from './db.mjs';
 import { handleEvent } from './hooks.mjs';
 import { brief, getJob, takeInbox } from './jobs.mjs';
 import { isJobTool, jobTools, runJobTool } from './jobtools.mjs';
+import { takeLock } from './lock.mjs';
+import { gateMcp, isMcpTool, mcpReady, runMcpTool, TOOL_SEARCH } from './mcp.mjs';
 import { UsageError } from './memory.mjs';
 import { costOf, logRun, usageOf } from './model.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
@@ -61,10 +63,15 @@ export function paramsFor({ model, effort, tools, text, system }) {
   return params;
 }
 
-/** The request for a job: tools by role, effort by route, the brief as the one user turn. */
-export function jobParams({ job, text, system = systemPrompt() }) {
-  return paramsFor({ model: job.model, effort: job.effort, tools: [...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent)], text, system });
+/** The request for a job: tools by role, the MCP tools behind them, effort by route, the brief as the one user turn. */
+export function jobParams({ job, text, system = systemPrompt(), mcp = [] }) {
+  return paramsFor({ model: job.model, effort: job.effort, tools: withMcp([...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent)], mcp), text, system });
 }
+
+/** A conversation's own tools with the MCP ones after them, behind the search tool that finds them; just its own when there are none. */
+export const withMcp = (own, mcp) => (mcp.length > 0 ? [...own, TOOL_SEARCH, ...mcp] : own);
+/** A system prompt with the line that names the MCP servers, when there are any to name. */
+export const withServers = (system, registry) => (registry?.hasTools ? `${system}\n\n${registry.describe()}` : system);
 
 /**
  * The first of two guards on a job taking its own work unverified: the command as written — `--accept` on a finish,
@@ -186,7 +193,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
       onTool?.(call);
       let out;
       try {
-        out = (await beforeTool?.(call)) ?? (await runTool(call, ctx, { signal }));
+        out = (await beforeTool?.(call)) ?? (isMcpTool(call.name) ? await runMcpTool(call, { signal }) : await runTool(call, ctx, { signal }));
       } catch (cause) {
         // A call that is not answered makes the next request invalid; a failure is an answer.
         out = { content: `the tool failed: ${cause.message}`, isError: true };
@@ -225,9 +232,11 @@ export function contextFor(project, { jobId = null } = {}) {
  * `onStart` is told the job once it is known to be runnable; the other
  * callbacks and `inbox` are the conversation's own, for a caller that watches.
  * What `sumo job tell` left on disk is read with the caller's inbox, so a job
- * can be spoken to from any shell wherever it runs.
+ * can be spoken to from any shell wherever it runs. `approve` is how an MCP
+ * call not on the allow list reaches the user; without one, such a call is
+ * refused with the way to allow it.
  */
-export async function runJob(db, id, { send = sendToApi, now, signal = null, onStart = null, onTool = null, onResult = null, onTurn = null, inbox = null } = {}) {
+export async function runJob(db, id, { send = sendToApi, now, signal = null, onStart = null, onTool = null, onResult = null, onTurn = null, inbox = null, approve = null } = {}) {
   const job = getJob(db, id);
   if (job.status !== 'running' && job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — only a running job can be run`);
   if (!job.model) throw new UsageError(`j${id} has no route — it was created before routing existed; create it again`);
@@ -235,7 +244,9 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
     throw new UsageError(`j${id} is routed to ${job.model}, which is off — sumo models enable ${job.model}, or abandon it and create it again`);
   }
   const project = getProject(db, job.project);
-  const params = jobParams({ job, text: brief(db, id) });
+  // The MCP servers of this process are the job's too: their tools behind the search tool, their names in its prompt.
+  const registry = await mcpReady();
+  const params = jobParams({ job, text: brief(db, id), system: withServers(systemPrompt(), registry), mcp: registry.tools() });
   const lock = tx(db, () => takeRunLock(id));
   const heard = () => [...(inbox?.() ?? []), ...takeInbox(id)];
   const ctx = contextFor(project, { jobId: id });
@@ -243,6 +254,7 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   // and with the job's own project in scope whether or not its card came up in the session.
   const gate = (call) => {
     if (isJobTool(call)) return runJobTool(call, { job, ctx, signal });
+    if (isMcpTool(call.name)) return gateMcp(call, { approve, signal, job: id });
     if (call.name !== BASH_TOOL.name) return null;
     if (grantsItself(String(call.input?.command ?? ''))) return { content: SELF_GRANT_REFUSED, isError: true };
     // A job created where no session had begun is still gated, under a session of its own: it holds no turns, only what was shown.
@@ -265,43 +277,8 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   }
 }
 
-/**
- * One run per job: two would drive two agents over the same tree. The lock names the process that holds it, so one
- * left behind by a run that died is seen for what it is and taken over.
- */
-function takeRunLock(id) {
-  const lock = join(paths().jobs, String(id), 'run.lock');
-  for (let attempt = 0; ; attempt++) {
-    try {
-      writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
-      return lock;
-    } catch (cause) {
-      if (cause.code !== 'EEXIST' || attempt > 0) throw cause;
-      const holder = holderOf(lock);
-      if (holder && alive(holder)) throw new UsageError(`j${id} is already being run (process ${holder}) — wait for it, or stop it there`);
-      rmSync(lock, { force: true });
-    }
-  }
-}
-
-/** The process a lock names; none when the run that held it ended between taking a look and reading it. */
-const holderOf = (lock) => {
-  try {
-    return Number(readFileSync(lock, 'utf8'));
-  } catch (cause) {
-    if (cause.code === 'ENOENT') return 0;
-    throw cause;
-  }
-};
-
-const alive = (pid) => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (cause) {
-    return cause.code === 'EPERM';
-  }
-};
+/** One run per job: two would drive two agents over the same tree. */
+const takeRunLock = (id) => takeLock(join(paths().jobs, String(id), 'run.lock'), (holder) => `j${id} is already being run (process ${holder}) — wait for it, or stop it there`);
 
 /** Why a conversation ended, when it was neither the model finishing nor the user stopping it nor an error; null otherwise. Said to a chat as to a job. */
 export function stopReason(stop) {

@@ -10,7 +10,7 @@ import { detect, touch } from './projects.mjs';
 import { closingQuestions, recallBeforeAsking } from './recall.mjs';
 import { line } from './render.mjs';
 import { shouldRun, spawnDetached } from './scribe.mjs';
-import { clearInjections, contextBand, contextNudge, contextUse, currentProject, endSession, ensureSession, injectedSlugs, markInjected, recordTurn, sessionsAwaitingDream } from './sessions.mjs';
+import { clearInjections, contextBand, contextNudge, contextUse, currentProject, endSession, ensureSession, injectedSlugs, markInjected, pruneStates, recordTurn, sessionsAwaitingDream } from './sessions.mjs';
 import { claim, renderWorkflow, withoutSumoCalls } from './workflows.mjs';
 
 /**
@@ -97,6 +97,12 @@ const HANDLERS = {
         setMeta(db, 'backup.failed', String(cause.message).slice(0, 200));
       }
     }
+    try {
+      pruneStates(now);
+    } catch (cause) {
+      // Housekeeping too: a saved session that cannot be let go stays, and is said in the hook log, never to the session starting.
+      logFailure('session-start prune', cause);
+    }
 
     return prime(db, { now });
   },
@@ -176,6 +182,16 @@ export function handleEvent(db, event, payload, now = new Date().toISOString()) 
   return handler(db, e, now);
 }
 
+/** What went wrong, in logs/hook.log. If even the log cannot be written there is nothing left to do but stay out of the way. */
+function logFailure(what, cause) {
+  try {
+    mkdirSync(paths().logs, { recursive: true, mode: 0o700 });
+    appendFileSync(join(paths().logs, 'hook.log'), `${new Date().toISOString()} ${what}: ${cause.stack ?? cause}\n`);
+  } catch {
+    // Said above.
+  }
+}
+
 /**
  * One event from outside the process, JSON on stdin. It never throws and never
  * exits non-zero: memory is a convenience, and a convenience that can break the
@@ -192,12 +208,7 @@ export function runHook(event, stdin) {
     db = openDb();
     return handleEvent(db, event, payload);
   } catch (cause) {
-    try {
-      mkdirSync(paths().logs, { recursive: true, mode: 0o700 });
-      appendFileSync(join(paths().logs, 'hook.log'), `${new Date().toISOString()} ${event}: ${cause.stack ?? cause}\n`);
-    } catch {
-      // If even the log cannot be written there is nothing left to do but stay out of the way.
-    }
+    logFailure(event, cause);
     return '';
   } finally {
     db?.close();

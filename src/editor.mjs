@@ -21,10 +21,12 @@ export function menuFor(text, commands) {
   const given = m[2].split(/\s+/).filter(Boolean);
   const typing = /\s$/.test(m[2]) || m[2] === '' ? '' : given.pop();
   const head = `/${command.name} ${given.map((w) => `${w} `).join('')}`;
+  // A choice is a word, or a word with a hint beside it (`{ name, hint }`).
   return command
     .choices(given)
-    .filter((choice) => choice.startsWith(typing))
-    .map((choice) => ({ name: choice, label: choice, hint: '', complete: `${head}${choice} ` }));
+    .map((choice) => (typeof choice === 'string' ? { name: choice, hint: '' } : choice))
+    .filter((choice) => choice.name.startsWith(typing))
+    .map((choice) => ({ name: choice.name, label: choice.name, hint: choice.hint, complete: `${head}${choice.name} ` }));
 }
 
 /** The menu for the text being written; a recalled entry has none, so the arrows keep walking history. */
