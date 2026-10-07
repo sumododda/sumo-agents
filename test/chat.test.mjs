@@ -14,7 +14,7 @@ import { add, UsageError } from '../src/memory.mjs';
 import { paths, REPO_ROOT } from '../src/paths.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { addProject } from '../src/projects.mjs';
-import { lockFile, pruneStates, stateFile } from '../src/sessions.mjs';
+import { lockFile, pruneStates, stateFile, withoutThinking } from '../src/sessions.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const NOW = '2026-09-30T12:00:00.000Z';
@@ -1108,8 +1108,8 @@ test('a session is saved after every turn, without its pictures or secrets, and 
       writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
       addProject(db, root, { slug: 'simba', now: NOW });
       const { send } = canned([
-        reply('tool_use', [{ type: 'text', text: 'looking' }, call('t1', 'bash', { command: 'echo looked' })]),
-        reply('end_turn', [{ type: 'text', text: 'done' }], { input_tokens: 42_000, output_tokens: 10 }),
+        reply('tool_use', [{ type: 'thinking', thinking: 'first I look', signature: 'sig1' }, { type: 'text', text: 'looking' }, call('t1', 'bash', { command: 'echo looked' })]),
+        reply('end_turn', [{ type: 'thinking', thinking: 'and now I say', signature: 'sig2' }, { type: 'text', text: 'done' }], { input_tokens: 42_000, output_tokens: 10 }),
       ]);
       const first = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
       first.start('startup');
@@ -1123,6 +1123,7 @@ test('a session is saved after every turn, without its pictures or secrets, and 
       assert.equal(state.version, 1);
       assert.deepEqual([state.model, state.effort, state.contextTokens, state.cwd], ['opus', 'high', 42_010, '/']);
       assert.equal(state.messages.length, first.params.messages.length, 'the whole conversation: the block, the turn, the card, the calls and their results');
+      assert.equal(state.messages.flatMap((m) => m.content).filter((b) => b.type === 'thinking').length, 2, 'the thinking is kept as it was, signatures and all');
       assert.equal(JSON.stringify(state).includes('ghp_abc'), false, 'the token the user pasted is not in the file');
       assert.equal(JSON.stringify(state).includes('"image"'), false, 'the picture is not in the file');
       assert.match(state.messages[1].content[1].text, /^\[a picture was here/);
@@ -1138,7 +1139,10 @@ test('a session is saved after every turn, without its pictures or secrets, and 
       assert.equal(line, `resumed ${short} · 3h ago · simba · “[Image #1] fix the briefing bug in simba with [redacted]” · 1 turn · 42k tokens — the first reply pays one uncached turn`);
       assert.equal(second.sessionId, id);
       assert.deepEqual([second.model, second.effort, second.contextTokens], ['opus', 'high', 42_010]);
-      assert.deepEqual(second.params.messages, state.messages, 'the conversation as it was kept');
+      // Without the model's thinking: a thinking block is bound to the exact history it was made in, and this one was redacted and had its picture taken out.
+      assert.deepEqual(second.params.messages, withoutThinking(state.messages), 'the conversation as it was kept, less the thinking');
+      assert.equal(second.params.messages.flatMap((m) => m.content).some((b) => b.type === 'thinking'), false);
+      assert.deepEqual(second.params.messages.map((m) => m.role), state.messages.map((m) => m.role), 'every message is still there: each had words or a call beside its thinking');
       assert.equal(db.prepare('SELECT ended_at FROM sessions WHERE id = ?').get(id).ended_at, null, 'the session is open again');
       await second.say('and the next bit');
       const sent = seen[0].messages;

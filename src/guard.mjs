@@ -30,9 +30,14 @@ const SEPARATORS = /[;&|\n()`]|\$\(/;
  */
 const DUMPS_ENV = /^\s*(?:sudo\s+)?(?:(?:env|printenv|declare|typeset)(?:\s+(?:-\S+|\d*[<>&]+\S*))*|export(?:\s+-p)?|set)\s*$/;
 
-/** `rm`, its flags, and its targets — up to the end of its command, which a new line is too. Only a recursive spelling of the flags is looked at further. */
-const RM = /(^|[\s;&|(`"'])(?:sudo\s+)?rm((?:\s+-{1,2}[\w-]+)+)\s+([^;&|)`\n]+)/g;
-const RECURSIVE = /(^|\s)(?:-[a-zA-Z]*[rR]|--recursive)/;
+/**
+ * `rm` — by any path (`/bin/rm`), escaped (`\rm`), behind sudo, env, nice, timeout or xargs — and everything up to the
+ * end of its command, which a new line is too. Its flags may come before or after its targets; only a recursive spelling
+ * of them is looked at further.
+ */
+const RM = /(^|[\s;&|(`"'])(?:(?:sudo|env|nice|timeout|xargs|command)(?:\s+-?\S+)*?\s+)?\\?(?:\/\S*\/)?rm\s+([^;&|)`\n]+)/g;
+const RECURSIVE = /(^|\s)(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=\s|$)/;
+const FLAG = /^-{1,2}[\w-]+$/;
 
 /** A target that is the whole machine, the home, the working directory, or one level below any of them. */
 const ROOT_OR_HOME_OR_HERE = /^(?:\/|~\/?|\$HOME\/?|\$\{HOME\}\/?|\.{1,2}\/?|\*|\.{1,2}\/\*|(?:\/|~\/|\$HOME\/|\$\{HOME\}\/)(?:[^/\s*]+\/?|\*))$/;
@@ -52,8 +57,12 @@ const RULES = [
     test: (c, where) => {
       // A line ending in a backslash goes on: its targets are still rm's.
       for (const m of c.replace(/\\\n/g, ' ').matchAll(RM)) {
-        if (!RECURSIVE.test(m[2])) continue;
-        const targets = m[3].trim().split(/\s+/).map(unquote).map((t) => spelledShort(t, where));
+        const words = m[2].trim().split(/\s+/);
+        // `--` ends the flags: what follows is a target, however it is spelled.
+        const end = words.indexOf('--');
+        const flags = (end === -1 ? words : words.slice(0, end)).filter((w) => FLAG.test(w));
+        if (!RECURSIVE.test(flags.join(' '))) continue;
+        const targets = (end === -1 ? words.filter((w) => !FLAG.test(w)) : words.slice(end + 1)).map(unquote).map((t) => spelledShort(t, where));
         if (targets.some((t) => ROOT_OR_HOME_OR_HERE.test(t))) return true;
       }
       return false;

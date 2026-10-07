@@ -10,7 +10,8 @@ import { openDb } from '../src/db.mjs';
 import { add, UsageError } from '../src/memory.mjs';
 import { jobPrinter } from '../src/chat.mjs';
 import { getJob, takeInbox, tell } from '../src/jobs.mjs';
-import { converse, jobParams, markTail, runJob, runLines } from '../src/loop.mjs';
+import Anthropic from '@anthropic-ai/sdk';
+import { converse, jobParams, markTail, RETRY, retryable, retryDelay, runJob, runLines, stopReason } from '../src/loop.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
@@ -95,10 +96,10 @@ test('a run: tool calls go through the guard, the jail and the cap; every respon
       assert.match(results(3)[0].content, /outside the project/);
       assert.match(results(3)[1].content, /^edited /);
 
-      // Each turn re-sends the whole history with one breakpoint on its tail, and the system prompt keeps its own.
+      // Each turn re-sends the whole history with a breakpoint on its tail and the one the turn before left; the system prompt keeps its own.
       assert.equal(seen[3].messages.length, 7);
       assert.deepEqual(seen[3].messages.at(-1).content.at(-1).cache_control, { type: 'ephemeral' });
-      assert.equal(seen[3].messages.slice(0, -1).flatMap((m) => m.content).filter((b) => b.cache_control).length, 0);
+      assert.deepEqual(seen[3].messages.slice(0, -1).flatMap((m) => m.content).filter((b) => b.cache_control), [seen[2].messages.at(-1).content.at(-1)], 'the previous tail keeps its mark, nothing older does');
       assert.deepEqual(seen[3].system[0].cache_control, { type: 'ephemeral' });
 
       const rows = db.prepare('SELECT kind, model, input_tokens, cache_read_tokens, job_id, session_id, note FROM model_runs ORDER BY id').all();
@@ -181,6 +182,45 @@ test('a command leaves the process free while it runs, and stops when the user s
   assert.match(out.content, /^begun\n\(stopped: interrupted by the user\)$/);
 });
 
+test('an edit whose old_str is off by trailing spaces, line endings or indentation still lands — once, and said how — and a no-op edit is refused', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-edit-'));
+  const ctx = { cwd: root, roots: [root] };
+
+  // Trailing spaces the model did not copy.
+  writeFileSync(join(root, 'a.js'), 'function f() {  \n  return 1;   \n}\n');
+  const trimmed = runEditor({ command: 'str_replace', path: 'a.js', old_str: 'function f() {\n  return 1;\n}', new_str: 'function f() {\n  return 2;\n}' }, ctx);
+  assert.equal(trimmed.isError, false, trimmed.content);
+  assert.equal(trimmed.content, `edited ${join(root, 'a.js')} (old_str matched without trailing spaces)`);
+  assert.equal(readFileSync(join(root, 'a.js'), 'utf8'), 'function f() {\n  return 2;\n}\n');
+
+  // A file with Windows line endings keeps them.
+  writeFileSync(join(root, 'b.txt'), 'one\r\ntwo\r\nthree\r\n');
+  const crlf = runEditor({ command: 'str_replace', path: 'b.txt', old_str: 'one\ntwo', new_str: 'uno\ndos' }, ctx);
+  assert.equal(crlf.isError, false, crlf.content);
+  assert.match(crlf.content, /matched with the file's line endings/);
+  assert.equal(readFileSync(join(root, 'b.txt'), 'utf8'), 'uno\r\ndos\r\nthree\r\n');
+
+  // The wrong depth: the replacement is set in at the file's.
+  writeFileSync(join(root, 'c.py'), 'class A:\n    def f(self):\n        return 1\n');
+  const indented = runEditor({ command: 'str_replace', path: 'c.py', old_str: 'def f(self):\n    return 1', new_str: 'def f(self):\n    return 2' }, ctx);
+  assert.equal(indented.isError, false, indented.content);
+  assert.match(indented.content, /matched without its indentation/);
+  assert.equal(readFileSync(join(root, 'c.py'), 'utf8'), 'class A:\n    def f(self):\n        return 2\n');
+
+  // Looser is not laxer: two places that match without their spaces are still two places.
+  writeFileSync(join(root, 'd.txt'), 'x = 1 \ny = 2\nx = 1\n');
+  const twice = runEditor({ command: 'str_replace', path: 'd.txt', old_str: 'x = 1', new_str: 'x = 3' }, ctx);
+  assert.equal(twice.isError, true);
+  assert.match(twice.content, /appears 2 times/);
+  assert.equal(readFileSync(join(root, 'd.txt'), 'utf8'), 'x = 1 \ny = 2\nx = 1\n', 'nothing was written');
+  // An exact match is taken as before, and said plainly.
+  assert.equal(runEditor({ command: 'str_replace', path: 'd.txt', old_str: 'y = 2', new_str: 'y = 3' }, ctx).content, `edited ${join(root, 'd.txt')}`);
+
+  const same = runEditor({ command: 'str_replace', path: 'd.txt', old_str: 'y = 3', new_str: 'y = 3' }, ctx);
+  assert.equal(same.isError, true);
+  assert.match(same.content, /nothing would change/);
+});
+
 test('create preserves an existing file', () => {
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-editor-alias-'));
   const ctx = { cwd: root, roots: [root] };
@@ -259,8 +299,15 @@ test('the cache breakpoint lands on the last message that can carry one, so a tu
 
   messages.push({ role: 'assistant', content: [text('on it')] }, { role: 'user', content: [text('thanks')] });
   markTail(messages);
+  const marked = () => messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => b.cache_control);
   assert.deepEqual(messages.at(-1).content[0].cache_control, { type: 'ephemeral' });
-  assert.equal(messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => b.cache_control).length, 1, 'and there is only ever the one');
+  assert.deepEqual(marked(), [messages[2].content[0], messages[5].content[0]], 'the tail and the tail before it: what the last turn wrote is read for certain');
+
+  messages.push({ role: 'assistant', content: [text('welcome')] }, { role: 'user', content: [text('more')] });
+  markTail(messages);
+  assert.deepEqual(marked(), [messages[5].content[0], messages[7].content[0]], 'never more than two: the API takes four, and the system prompt has one');
+  markTail(messages);
+  assert.deepEqual(marked(), [messages[5].content[0], messages[7].content[0]], 'marking the same tail again changes nothing');
 });
 
 test('a job told something from outside its process reads it with its next request, once; a closed job cannot be told; the terminal printer says what the chat shows', async () => {
@@ -338,15 +385,222 @@ test('a conversation that never stops calling tools ends at the turn limit, and 
     try {
       const { id } = seed(db, { agent: 'scout', model: 'haiku', effort: 'none' });
       let calls = 0;
-      const send = async () => reply('tool_use', [call(`t${++calls}`, 'bash', { command: 'true' })]);
+      const seen = [];
+      // Each command is new, so this is a run that goes on and on, not one going round in a circle.
+      const send = async (params) => {
+        seen.push(structuredClone(params.messages.at(-1)));
+        return reply('tool_use', [call(`t${++calls}`, 'bash', { command: `echo ${calls}` })]);
+      };
       const outcome = await runJob(db, id, { send, now: () => NOW });
       assert.equal(outcome.turns, 150);
       assert.equal(outcome.stop, 'max_turns');
       assert.ok(runLines(outcome).includes('stopped: 150 turns without closing the job'));
+      // The request before the last carried the warning, and no other did.
+      assert.match(seen[149].content.at(-1).text, /^This is the last request of this run/);
+      assert.equal(seen.filter((m) => m.content.some((b) => b.type === 'text' && /last request of this run/.test(b.text))).length, 1);
     } finally {
       db.close();
     }
   });
+});
+
+test('a request the API or the connection let down is sent again, with a wait that grows, said to whoever watches, and written to the ledger; one the request itself got wrong is not', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-retry-'));
+      const ctx = { cwd: root, roots: [root], env: childEnv() };
+      const headers = (extra = {}) => new Headers({ 'request-id': 'req_1', ...extra });
+      const overloaded = () => Anthropic.APIError.generate(529, { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }, undefined, headers());
+      // What the API sends down a stream that is already open: no status, only the type of what went wrong.
+      const midStream = () => new Anthropic.APIError(undefined, { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }, undefined, undefined, 'overloaded_error');
+      const dropped = () => new Anthropic.APIConnectionError({ message: 'Connection error.' });
+      const refused = () => Anthropic.APIError.generate(400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages: too long' } }, undefined, headers());
+
+      for (const [cause, verdict] of [[overloaded(), true], [midStream(), true], [dropped(), true], [refused(), false], [new Anthropic.APIUserAbortError(), false], [new Error('the API answered 529: overloaded'), false]]) {
+        assert.equal(retryable(cause), verdict, cause.message);
+      }
+      // The wait: what the API asked for when it said, else doubling from the base under the cap, with some jitter.
+      assert.equal(retryDelay(Anthropic.APIError.generate(429, { type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } }, undefined, headers({ 'retry-after-ms': '1500' })), 1, RETRY), 1500);
+      assert.equal(retryDelay(Anthropic.APIError.generate(429, {}, undefined, headers({ 'retry-after': '2' })), 1, RETRY), 2000);
+      assert.equal(retryDelay(overloaded(), 1, RETRY, () => 0.5), 1000);
+      assert.equal(retryDelay(overloaded(), 3, RETRY, () => 0.5), 4000);
+      assert.equal(retryDelay(overloaded(), 9, RETRY, () => 0.5), 30_000, 'under the cap');
+      assert.equal(retryDelay(overloaded(), 2, RETRY, () => 0), 1500, 'a quarter under');
+      assert.equal(retryDelay(overloaded(), 2, RETRY, () => 1), 2500, 'a quarter over');
+
+      // Two failures, then an answer: one turn, three requests, the two tries written down and said.
+      const failures = [overloaded(), midStream()];
+      let sends = 0;
+      const send = async () => {
+        sends++;
+        if (failures.length > 0) throw failures.shift();
+        return reply('end_turn', [{ type: 'text', text: 'made it' }]);
+      };
+      const retries = [];
+      const params = jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' });
+      const outcome = await converse(db, params, { send, ctx, ledger: { kind: 'scout' }, now: () => NOW, retry: { limit: 6, baseMs: 1, capMs: 2 }, onRetry: (r) => retries.push(r) });
+      assert.equal(outcome.stop, 'end_turn');
+      assert.equal(outcome.text, 'made it');
+      assert.equal(outcome.turns, 1);
+      assert.equal(sends, 3);
+      assert.deepEqual(retries.map((r) => [r.attempt, r.limit]), [[1, 6], [2, 6]]);
+      assert.equal(retries[0].reason, '529 overloaded_error Overloaded', "the API's own words, not the JSON they came in");
+      assert.equal(retries[1].reason, 'overloaded_error Overloaded');
+      const notes = db.prepare('SELECT ok, note FROM model_runs ORDER BY id').all();
+      assert.deepEqual(notes.map((r) => r.ok), [0, 0, 1]);
+      assert.match(notes[0].note, /^turn 1: try 1 of 6 again in \d+ ms — 529 overloaded_error Overloaded$/);
+      assert.match(notes[1].note, /^turn 1: try 2 of 6 again in \d+ ms — overloaded_error Overloaded$/);
+      assert.equal(params.messages.length, 2, 'nothing of a failed try is kept');
+
+      // Out of tries: the error, as before. A request the API refused is not tried again at all.
+      const spent = await converse(db, jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' }), { send: async () => { throw overloaded(); }, ctx, ledger: { kind: 'scout' }, now: () => NOW, retry: { limit: 2, baseMs: 1, capMs: 1 } });
+      assert.deepEqual([spent.stop, spent.status], ['error', 529]);
+      let asked = 0;
+      const bad = await converse(db, jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' }), { send: async () => { asked++; throw refused(); }, ctx, ledger: { kind: 'scout' }, now: () => NOW, retry: { limit: 6, baseMs: 1, capMs: 1 } });
+      assert.deepEqual([bad.stop, bad.status, asked], ['error', 400, 1]);
+
+      // Esc while waiting for the next try ends the turn then and there.
+      const stop = new AbortController();
+      let tries = 0;
+      const waiting = converse(db, jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' }), { send: async () => { tries++; throw overloaded(); }, ctx, ledger: { kind: 'scout' }, now: () => NOW, signal: stop.signal, retry: { limit: 6, baseMs: 60_000, capMs: 60_000 } });
+      setTimeout(() => stop.abort(), 50);
+      assert.equal((await waiting).stop, 'interrupted');
+      assert.equal(tries, 1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('the API pausing a turn of its own accord is not the end of it; the ledger names the model that answered; a call made over and over with the same answer is said and then stopped', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-pause-'));
+      const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }) };
+      const params = jobParams({ job: { agent: 'scout', model: 'opus', effort: 'high' }, text: 'look', system: 'rules' });
+      assert.deepEqual(params.thinking, { type: 'adaptive', display: 'summarized' }, 'every model but haiku is asked to say what it thinks');
+      assert.equal('thinking' in jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' }), false);
+
+      const { send, seen } = canned([
+        { ...reply('pause_turn', [{ type: 'text', text: 'half way' }]), model: 'claude-opus-4-8' },
+        reply('end_turn', [{ type: 'text', text: 'there' }]),
+      ]);
+      const outcome = await converse(db, params, { send, ctx, ledger: { kind: 'scout' }, now: () => NOW });
+      assert.equal(outcome.stop, 'end_turn');
+      assert.equal(seen.length, 2);
+      assert.deepEqual(seen[1].messages.map((m) => m.role), ['user', 'assistant'], 'the paused reply goes back as it came, and the turn goes on');
+      assert.deepEqual(db.prepare('SELECT model FROM model_runs ORDER BY id').all().map((r) => r.model), ['claude-opus-4-8', 'claude-opus-5-5'], 'the model that answered, not only the one asked');
+
+      let n = 0;
+      const same = async () => reply('tool_use', [call(`t${++n}`, 'bash', { command: 'echo same' })]);
+      const circling = jobParams({ job: { agent: 'scout', model: 'opus', effort: 'high' }, text: 'look', system: 'rules' });
+      const looped = await converse(db, circling, { send: same, ctx, ledger: { kind: 'scout' }, now: () => NOW });
+      assert.equal(looped.stop, 'loop');
+      assert.equal(looped.turns, 5);
+      const answers = circling.messages.filter((m) => m.role === 'user').slice(1).map((m) => m.content[0].content);
+      assert.deepEqual(answers.slice(0, 2), ['same', 'same']);
+      assert.match(answers[2], /^same\n\[sumo: this is the same call with the same answer, 3 times in a row/);
+      assert.match(answers[3], /4 times in a row/);
+      assert.equal(answers[4], 'same', 'the fifth is answered and the run stops');
+      assert.equal(stopReason('loop'), 'stopped: the same call was made 5 times with the same answer');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a job that outgrows the context is summarized server-side at the end of a tool round and goes on from the summary; a summary that cannot be had costs the run nothing', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const { id } = seed(db, { agent: 'scout', model: 'opus', effort: 'high' });
+      const big = { input_tokens: 160_000, output_tokens: 100 };
+      const summary = { stop_reason: 'compaction', content: [{ type: 'compaction', content: 'what happened so far', encrypted_content: 'opaque', signature: 'sig' }], usage: { input_tokens: 160_000, output_tokens: 600 } };
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'bash', { command: 'echo one' })], big),
+        summary,
+        reply('tool_use', [call('t2', 'bash', { command: 'echo two' })], big),
+        // Too big again at once: not summarized again this soon.
+        reply('tool_use', [call('t3', 'bash', { command: 'echo three' })], big),
+        reply('end_turn', [{ type: 'text', text: 'closed' }]),
+        reply('end_turn', []),
+      ]);
+      const compacted = [];
+      const outcome = await runJob(db, id, { send, now: () => NOW, onCompact: (c) => compacted.push(c) });
+      assert.equal(outcome.stop, 'end_turn');
+
+      // The compaction request: the same conversation, the context edits and the answer's own settings left off, the summary asked for.
+      const asked = seen[1];
+      assert.deepEqual(asked.compaction, { type: 'summarize', instructions: asked.compaction.instructions });
+      assert.match(asked.compaction.instructions, /^Write a hand-off for a model/);
+      assert.equal('context_management' in asked, false, 'the API takes context edits or a compaction, not both');
+      assert.ok(asked.betas.includes('compact-2026-09-04'));
+      assert.equal(asked.messages.length, 3, 'the brief, the call, its result: the whole round, then the summary');
+      assert.deepEqual(asked.messages.at(-1).content.map((b) => b.type), ['tool_result']);
+
+      // What follows: the summary first, as it came, then a line that says to carry on — and the brief is on disk for the rest.
+      const next = seen[2];
+      assert.deepEqual(next.messages.map((m) => m.role), ['assistant', 'user']);
+      assert.deepEqual(next.messages[0].content.map(({ cache_control: _c, ...b }) => b), summary.content);
+      assert.match(next.messages[1].content[0].text, new RegExp(`^The conversation before this point was summarized above[\\s\\S]*sumo job brief ${id}$`));
+      assert.ok('context_management' in next, 'the context edits are back for the answers');
+      assert.equal('compaction' in next, false);
+      assert.deepEqual(compacted.map((c) => [c.turns, c.before, c.summary]), [[1, 160_100, 'what happened so far']]);
+      assert.equal(seen.length, 6, 'and not summarized again within three turns of the last');
+      assert.equal(seen[4].messages.length, 6, 'the turns since the summary ride on it');
+
+      const rows = db.prepare('SELECT ok, note, output_tokens FROM model_runs ORDER BY id').all();
+      assert.deepEqual([rows[1].ok, rows[1].note, rows[1].output_tokens], [1, 'turn 1 compaction', 600], 'the summary has a ledger row of its own');
+
+      // A summary that does not come: the run goes on as it was, and the ledger says why.
+      const other = Number(
+        db.prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('demo', 'again', 'scout', 'running', 's1', ?, ?, 'opus', 'high', 'test')`).run(NOW, NOW).lastInsertRowid,
+      );
+      mkdirSync(join(paths().jobs, String(other)), { recursive: true });
+      writeFileSync(join(paths().jobs, String(other), 'brief.md'), `# Job j${other} — again\n\n## The task\nlook again\n`);
+      const failing = canned([
+        reply('tool_use', [call('t1', 'bash', { command: 'echo one' })], big),
+        null, // the compaction request throws
+        reply('end_turn', [{ type: 'text', text: 'done' }]),
+        reply('end_turn', []),
+      ]);
+      const sendOrThrow = async (params, options) => {
+        const answer = await failing.send(params, options);
+        if (answer === null) throw new Error('529 overloaded');
+        return answer;
+      };
+      const went = await runJob(db, other, { send: sendOrThrow, now: () => NOW });
+      assert.equal(went.stop, 'end_turn');
+      assert.equal(failing.seen[2].messages.length, 3, 'the conversation as it was');
+      assert.match(db.prepare('SELECT note FROM model_runs WHERE ok = 0 ORDER BY id DESC LIMIT 1').get().note, /^turn 1 compaction: 529 overloaded/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('output too long to show is kept whole where the model can read a range of it, without its secrets, and the cut names the file', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-spill-'));
+  const spillDir = join(root, 'out');
+  const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }), spill: spillDir };
+  const out = await runBash({ command: `printf 'token ghp_abcdefghijklmnopqrstuvwxyz0123456789\\n'; for i in $(seq 1 2000); do echo "line $i of the output"; done` }, ctx);
+  const named = /are in (\S+): read a range of it/.exec(out.content);
+  assert.ok(named, out.content.slice(0, 400));
+  const [, file] = named;
+  assert.ok(file.startsWith(`${spillDir}/`));
+  const saved = readFileSync(file, 'utf8');
+  assert.match(saved, /^token \[redacted\]\nline 1 of the output\n/, 'the whole output, the secret taken out');
+  assert.match(saved, /\nline 2000 of the output$/);
+  assert.doesNotMatch(saved, /ghp_abc/);
+  assert.equal(readdirSync(spillDir).length, 1);
+
+  // Short output goes nowhere; a cut with nowhere to go says only how to narrow the command.
+  await runBash({ command: 'echo short' }, ctx);
+  assert.equal(readdirSync(spillDir).length, 1);
+  const unkept = await runBash({ command: 'for i in $(seq 1 2000); do echo "line $i of the output"; done' }, { ...ctx, spill: undefined });
+  assert.match(unkept.content, /\[cut \d+ characters from the middle — narrow the command/);
 });
 
 test('a view is capped like a command, and never has a hole in it: the window ends at a whole line, and only one enormous line is cut', () => {
@@ -376,6 +630,12 @@ test('a view is capped like a command, and never has a hole in it: the window en
   // Short lines are bounded by the line count, as before.
   writeFileSync(join(root, 'long.txt'), Array.from({ length: 500 }, (_, i) => `line ${i + 1}`).join('\n'));
   assert.match(runEditor({ command: 'view', path: 'long.txt' }, ctx).content, /^1\tline 1\n[\s\S]*\n400\tline 400\n\[100 more lines up to 500 — view a smaller range\]$/);
+
+  // A binary is not pages of nonsense: it is said to be one.
+  writeFileSync(join(root, 'blob.bin'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52]));
+  const binary = runEditor({ command: 'view', path: 'blob.bin' }, ctx);
+  assert.equal(binary.isError, true);
+  assert.match(binary.content, /is a binary file \(12 bytes\) — not shown/);
 });
 
 test('nothing told to a job is lost for arriving while the job takes what came before; a file that is not a message is passed over', async () => {

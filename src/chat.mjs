@@ -9,7 +9,7 @@ import { runDream } from './dream.mjs';
 import { openWatchTab, runHerdr } from './herdr.mjs';
 import { appendLive, endLive, getJob, guideFor, newJob, parseJobId, reportOf, startLive, tell as tellJob } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
-import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, textOf, withMcp, withServers } from './loop.mjs';
+import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, textOf, thinkingFor, withMcp, withServers } from './loop.mjs';
 import { closeMcp, compactInput, gateMcp, isMcpTool, mcpLines, mcpReady, splitMcpName } from './mcp.mjs';
 import { assertOn, MODEL_IDS, MODELS, modelId, usableModels } from './catalog.mjs';
 import { takeLock } from './lock.mjs';
@@ -20,7 +20,7 @@ import { getProject } from './projects.mjs';
 import { redact } from './redact.mjs';
 import { chooseChatRoute, EFFORTS } from './route.mjs';
 import { outcomeLines, runScribe } from './scribe.mjs';
-import { currentProject, describeSaved, findSaved, loadState, lockFile, saveState, savedSessions, sessionLine, shortId } from './sessions.mjs';
+import { currentProject, describeSaved, findSaved, loadState, lockFile, saveState, savedSessions, sessionLine, shortId, withoutThinking } from './sessions.mjs';
 import { BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { colourEnabled, createRenderer, header, prompt, renderBlock, safeForTerminal, styles, tilde, widthOf } from './tty.mjs';
@@ -147,6 +147,8 @@ export function jobPrinter(write, s, { width = 98, clean = (text) => text } = {}
   return {
     onStart: (job) => write(`⏺ ${s.bold(`j${job.id}`)} ${job.agent} · ${routeOf(job)} — ${job.title}\n`),
     onTool: (call) => write(`  ⏺ ${describeCall(call)}\n`),
+    onRetry: (r) => write(`  ${s.dim(retryLine(r))}\n`),
+    onCompact: (c) => write(`  ${s.dim(compactLine(c))}\n`),
     onResult: (call, result) => {
       const first = String(result.content ?? '').split('\n').find((l) => l.trim()) ?? '';
       write(`    ⎿  ${s.dim(clean(first).slice(0, 160))}\n`);
@@ -162,6 +164,11 @@ export function jobPrinter(write, s, { width = 98, clean = (text) => text } = {}
     },
   };
 }
+
+/** A request being sent again, in one line: which try, how long until it, and why. */
+export const retryLine = ({ attempt, limit, delayMs, reason }) => `retrying in ${Math.max(1, Math.round(delayMs / 1000))}s (${attempt} of ${limit}) — ${reason}`;
+/** A conversation summarized to make room, in one line: how big it had grown. */
+export const compactLine = ({ before }) => `the conversation was summarized at ${Math.round(before / 1000)}k tokens to make room, and goes on from the summary`;
 
 /** The session log, one JSON line per message, the shape the scribe reads assistant replies from and the gauge reads usage from. */
 function logLine(file, entry) {
@@ -269,7 +276,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     }
     params = paramsFor({ model: model === 'auto' ? (routed?.model ?? CONFIG_DEFAULTS['chat.model']) : model, effort: model === 'auto' ? routed?.effort : effort, tools: toolsNow(), system: systemNow(), text: saved ? undefined : block });
     if (saved) {
-      params.messages = saved.messages;
+      params.messages = withoutThinking(saved.messages);
       note = `resumed: this session was saved ${ago(saved.savedAt, now())} and picked up again now, in ${cwd}. Carry on where it stopped; memory may have changed since this session's first block — search it before assuming.`;
     }
     return block;
@@ -302,11 +309,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     }
   }
 
-  /** The request from here on goes to this model at this effort; the conversation so far stays. */
+  /** The request from here on goes to this model at this effort, thinking as that model does; the conversation so far stays. */
   function apply({ model: m, effort: e }) {
     params.model = modelId(m);
     if (e && e !== 'none') params.output_config = { effort: e };
     else delete params.output_config;
+    const thinking = thinkingFor(m);
+    if (thinking) params.thinking = thinking;
+    else delete params.thinking;
   }
 
   /**
@@ -409,6 +419,15 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
             watch({ type: 'result', call, result, job: id });
           },
           onTurn: live.onTurn,
+          onThinking: (_delta, snapshot) => watch({ type: 'thinking', job: id, text: snapshot }),
+          onRetry: (r) => {
+            live.onRetry(r);
+            watch({ type: 'retry', job: id, ...r });
+          },
+          onCompact: (c) => {
+            live.onCompact(c);
+            watch({ type: 'compact', job: id, ...c });
+          },
         });
         ended = runLines(outcome);
         const report = reportOf(id);
@@ -523,6 +542,11 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         concurrent: (call) => call.name === DELEGATE_TOOL.name,
         signal: stopper.signal,
         onText: emit,
+        onThinking: (_delta, snapshot) => watch({ type: 'thinking', text: snapshot }),
+        onRetry: (r) => {
+          activity(retryLine(r));
+          watch({ type: 'retry', ...r });
+        },
         onTool: (call) => {
           activity(describeCall(call));
           watch({ type: 'tool', call });
@@ -687,6 +711,7 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
     },
     // Piped, nobody answers a question: an MCP call not on the allow list is refused, and a server that failed is said.
     watch: (e) => {
+      if (e.type === 'retry' && e.job === undefined) return write(`${s.dim(`  › ${retryLine(e)}`)}\n`);
       if (e.type !== 'mcp') return;
       if (e.error) write(`${s.red(`mcp: ${e.error}`)}\n`);
       for (const server of e.servers.filter((x) => !x.ok)) write(`${s.red(`mcp ${server.name}: ${server.error}`)}\n`);

@@ -219,6 +219,18 @@ export function keepable(messages) {
   return messages.map((m) => ({ role: m.role, content: typeof m.content === 'string' ? redact(m.content).text : m.content.map(keepBlock) }));
 }
 
+/**
+ * The conversation without the model's thinking blocks: what a resumed session sends first. A block's signature is bound
+ * to the exact history it was made in — the system prompt, the tools, every message before it — and a saved session has
+ * had its secrets redacted and its pictures taken out, while AGENTS.md and the MCP servers may have changed since; on the
+ * current models such a block is refused, not ignored. The text and the calls stay; a reply that was only thinking goes.
+ */
+export function withoutThinking(messages) {
+  return messages
+    .map((m) => (m.role === 'assistant' && Array.isArray(m.content) ? { ...m, content: m.content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking') } : m))
+    .filter((m) => !(Array.isArray(m.content) && m.content.length === 0));
+}
+
 /** Writes the session's state whole, then moves it into place: a crash while writing leaves the last good one. */
 export function saveState({ id, messages, model, effort, routed, cwd, contextTokens, now }) {
   mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });

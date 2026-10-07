@@ -2,7 +2,7 @@ import { Box, render, renderToString, Static, Text, useAnimation, useApp, useBox
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createElement as h, useEffect, useReducer, useRef } from 'react';
-import { routeLine, routeOf } from './chat.mjs';
+import { compactLine, retryLine, routeLine, routeOf } from './chat.mjs';
 import { stopReason } from './loop.mjs';
 import { compactInput } from './mcp.mjs';
 import { paths } from './paths.mjs';
@@ -84,12 +84,16 @@ const elapsed = (ms) => {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`;
 };
 
-/** A job at work, in one line under the call that started it: how long, how many calls, and the one running now — or that it is thinking. */
+/** The last line of what the model has thought so far, as one line of the screen. */
+const lastThought = (text) => String(text ?? '').trim().split('\n').filter((l) => l.trim()).at(-1)?.replace(/\s+/g, ' ') ?? '';
+
+/** A job at work, in one line under the call that started it: how long, how many calls, and the one running now — or what it is thinking. */
 function JobAtWork({ id, job }) {
   useAnimation({ interval: 1000 });
   const now = job.call ? toolView(job.call) : null;
   const calls = `${job.calls} tool call${job.calls === 1 ? '' : 's'}`;
-  return h(Text, { wrap: 'truncate' }, h(Text, { dimColor: true }, `  ⎿  j${id} · ${elapsed(Date.now() - job.since)} · ${calls} · `), now ? `${now.title}(${now.detail})` : h(Text, { dimColor: true }, 'thinking…'));
+  const thought = lastThought(job.thought);
+  return h(Text, { wrap: 'truncate' }, h(Text, { dimColor: true }, `  ⎿  j${id} · ${elapsed(Date.now() - job.since)} · ${calls} · `), now ? `${now.title}(${now.detail})` : h(Text, { dimColor: true }, thought ? `thinking: ${thought}` : 'thinking…'));
 }
 
 /** A call waiting on the user's word: who asks, what would run with what, and the keys that answer. */
@@ -128,16 +132,20 @@ function Item({ item }) {
   return h(Text, { dimColor: true }, `  ⎿  ${item.text.split('\n').join('\n     ')}`);
 }
 
-/** The line that says it is working: your words, the next of them every few seconds, a sunset flowing through them; how long, how much, and how to stop it. */
-function Working({ messages, first, tokens }) {
+/**
+ * The line that says it is working: your words, the next of them every few seconds, a sunset flowing through them; how
+ * long, how much, and how to stop it. Under it, while the model thinks, the last line of what it has thought so far.
+ */
+function Working({ messages, first, tokens, thought = '' }) {
   const { frame, time } = useAnimation({ interval: FLOW_STEP_MS });
   const words = `${messageAt(messages, first, time)}…`;
   const spent = tokens > 0 ? ` · ↓ ${thousands(tokens)} tokens` : '';
+  const line = lastThought(thought);
   return h(
     Box,
-    { marginTop: 1 },
-    h(Text, null, ...[...words].map((ch, i) => h(Text, { key: i, color: flow(i, frame) }, ch)), ' '),
-    h(Text, { dimColor: true }, `(${Math.floor(time / 1000)}s${spent} · esc to interrupt)`),
+    { marginTop: 1, flexDirection: 'column' },
+    h(Box, null, h(Text, null, ...[...words].map((ch, i) => h(Text, { key: i, color: flow(i, frame) }, ch)), ' '), h(Text, { dimColor: true }, `(${Math.floor(time / 1000)}s${spent} · esc to interrupt)`)),
+    line ? h(Text, { dimColor: true, wrap: 'truncate' }, `  ⎿  ${line}`) : null,
   );
 }
 
@@ -204,7 +212,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard }
   // What the screen holds between draws. Keys and the session's events both write here, in the order they happen, and then ask for a draw.
   // `log` is what happened, as it was said; `items` is the log drawn for this window, and is drawn again when the window or the view changes.
   const st = useRef(null);
-  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, tokens: 0, running: new Map(), jobs: new Map(), asks: [], reply: null, fresh: true, leaving: null, gone: false };
+  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, tokens: 0, thought: '', running: new Map(), jobs: new Map(), asks: [], reply: null, fresh: true, leaving: null, gone: false };
   const state = st.current;
   state.columns = columns;
   state.rows = rows;
@@ -393,6 +401,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard }
       state.running.clear();
       state.jobs.clear();
       state.working = null;
+      state.thought = '';
       redraw();
       if (state.gone) exit();
     }
@@ -430,14 +439,28 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard }
 
   useEffect(() => {
     const onText = (chunk) => {
+      // The reply has begun: what was thought before it is no longer the news.
+      state.thought = '';
       state.raw += chunk;
       state.reply?.write(chunk);
       redraw();
     };
+    // What the model — or a job's — is thinking, so far: shown under the working line, or on the job's line, until it acts.
+    const onThinking = ({ text, job }) => {
+      if (job) {
+        const at = state.jobs.get(job);
+        if (at) at.thought = text;
+      } else state.thought = text;
+      redraw();
+    };
+    // A request being sent again, or a job's conversation summarized to make room: said where the work shows, with the job's id.
+    const onRetry = (r) => record({ kind: 'note', text: `${r.job ? `j${r.job}: ` : ''}${retryLine(r)}` });
+    const onCompact = (c) => record({ kind: 'note', text: `${c.job ? `j${c.job}: ` : ''}${compactLine(c)}` });
     const onTool = ({ call, job }) => {
       const at = state.jobs.get(job);
-      if (at) Object.assign(at, { call, calls: at.calls + 1 });
+      if (at) Object.assign(at, { call, calls: at.calls + 1, thought: '' });
       else if (!job) {
+        state.thought = '';
         closeReply();
         state.running.set(call.id, call);
       }
@@ -454,7 +477,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard }
       record({ kind: 'tool', call, result });
     };
     const onJob = ({ job, call = null, tab = null }) => {
-      state.jobs.set(job.id, { parent: call, call: null, calls: 0, since: Date.now() });
+      state.jobs.set(job.id, { parent: call, call: null, calls: 0, since: Date.now(), thought: '' });
       const where = tab?.pane ? 'working in its Herdr tab' : tab?.error ? `no Herdr tab (${tab.error}) — sumo job watch ${job.id}` : `follow it: sumo job watch ${job.id}`;
       record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job), where });
     };
@@ -479,9 +502,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard }
       if (error) record({ kind: 'error', text: `mcp: ${error}` });
       for (const server of servers.filter((s) => !s.ok)) record({ kind: 'error', text: `mcp ${server.name}: ${server.error} — sumo mcp shows every server` });
     };
-    events.on('text', onText).on('tool', onTool).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('approve', onApprove).on('mcp', onMcp);
+    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('approve', onApprove).on('mcp', onMcp);
     return () => {
-      events.off('text', onText).off('tool', onTool).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('approve', onApprove).off('mcp', onMcp);
+      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('approve', onApprove).off('mcp', onMcp);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
     };
@@ -588,7 +611,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard }
       // A job no call here started — none should be — still shows that it works.
       ...[...state.jobs].filter(([, job]) => !state.running.has(job.parent)).map(([id, job]) => h(JobAtWork, { key: `j${id}`, id, job })),
     ),
-    state.working ? h(Working, { messages, first: state.working, tokens: state.tokens }) : null,
+    state.working ? h(Working, { messages, first: state.working, tokens: state.tokens, thought: state.thought }) : null,
     state.asks.length > 0 ? h(Ask, { ask: state.asks[0] }) : null,
     h(Room, { logo, rows, from: state.used }),
     h(
