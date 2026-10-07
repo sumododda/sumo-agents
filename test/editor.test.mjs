@@ -139,6 +139,13 @@ describe('the chat input box', () => {
     assert.deepEqual(menuFor('/model sonnet high ', all), []);
     assert.deepEqual(menuFor('/fix ', all), [], 'a command without choices has no menu once its arguments start');
     assert.deepEqual(menuFor('/mo', all).map((c) => c.label), ['/model']);
+    // A choice may bring a hint of its own, shown beside it as a command's is.
+    const resume = { name: 'resume', hint: 'pick one up', choices: () => [{ name: 'a1b2c3d4', hint: '3h ago · simba' }, 'bare'] };
+    assert.deepEqual(menuFor('/resume ', [resume]), [
+      { name: 'a1b2c3d4', label: 'a1b2c3d4', hint: '3h ago · simba', complete: '/resume a1b2c3d4 ' },
+      { name: 'bare', label: 'bare', hint: '', complete: '/resume bare ' },
+    ]);
+    assert.deepEqual(menuFor('/resume a1', [resume]).map((c) => c.label), ['a1b2c3d4']);
 
     const tabbed = k(type(editor(), '/model s'), { tab: true });
     assert.deepEqual([tabbed.text, tabbed.cursor], ['/model sonnet ', 14]);

@@ -1,6 +1,6 @@
 // The chat session: the memory block first, the policy raised in process, delegated jobs run inside the process, the session log.
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -12,7 +12,9 @@ import { openWatchTab, reportAgent, startWatcher } from '../src/herdr.mjs';
 import { finish, takeInbox } from '../src/jobs.mjs';
 import { add, UsageError } from '../src/memory.mjs';
 import { paths, REPO_ROOT } from '../src/paths.mjs';
+import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { addProject } from '../src/projects.mjs';
+import { lockFile, pruneStates, stateFile } from '../src/sessions.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const NOW = '2026-09-30T12:00:00.000Z';
@@ -1086,11 +1088,123 @@ test('the commands of the menu work from inside a project: the guide comes with 
       const fix = session.expand('/fix the login bug');
       assert.match(fix.text, /Make it fail on demand/, 'the guide itself, not a path the tools cannot reach from the project');
       assert.match(fix.text, /for this: the login bug$/);
-      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /new /exit');
+      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /new /exit');
 
       const dream = session.expand('/dream');
       await session.say(dream.text, dream.said);
       assert.match(seen[1].messages.at(-1).content[0].content, /^nothing to do — |^read \d+ sessions/, 'the pass ran in this process');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a session is saved after every turn, without its pictures or secrets, and picked up where it stopped — by one terminal at a time', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const LATER = '2026-09-30T15:00:00.000Z';
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-chat-'));
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
+      addProject(db, root, { slug: 'simba', now: NOW });
+      const { send } = canned([
+        reply('tool_use', [{ type: 'text', text: 'looking' }, call('t1', 'bash', { command: 'echo looked' })]),
+        reply('end_turn', [{ type: 'text', text: 'done' }], { input_tokens: 42_000, output_tokens: 10 }),
+      ]);
+      const first = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
+      first.start('startup');
+      const id = first.sessionId;
+      const short = id.slice(0, 8);
+      assert.equal(existsSync(lockFile(id)), true, 'an open session holds its lock');
+      assert.equal(existsSync(stateFile(id)), false, 'a session nobody has spoken to is not kept');
+
+      await first.say('[Image #1] fix the briefing bug in simba with ghp_abcdefghijklmnopqrstuvwxyz0123456789', undefined, [{ label: '[Image #1]', mediaType: 'image/png', data: 'aGk=' }]);
+      const state = JSON.parse(readFileSync(stateFile(id), 'utf8'));
+      assert.equal(state.version, 1);
+      assert.deepEqual([state.model, state.effort, state.contextTokens, state.cwd], ['opus', 'high', 42_010, '/']);
+      assert.equal(state.messages.length, first.params.messages.length, 'the whole conversation: the block, the turn, the card, the calls and their results');
+      assert.equal(JSON.stringify(state).includes('ghp_abc'), false, 'the token the user pasted is not in the file');
+      assert.equal(JSON.stringify(state).includes('"image"'), false, 'the picture is not in the file');
+      assert.match(state.messages[1].content[1].text, /^\[a picture was here/);
+      assert.equal(state.messages[1].content[0].text, '[Image #1]', 'its label stays, so the words that name it still make sense');
+      assert.equal(JSON.stringify(state).includes('cache_control'), false);
+      first.end();
+      assert.equal(existsSync(lockFile(id)), false, 'the lock goes with the session');
+
+      // Picked up in a new chat, with no route of its own: the saved one comes back, the size too, and the model is told once.
+      const { send: send2, seen } = canned([reply('end_turn', [{ type: 'text', text: 'carrying on' }])]);
+      const second = createChat(db, { cwd: '/work', send: send2, now: () => LATER });
+      const line = second.resume(short);
+      assert.equal(line, `resumed ${short} · 3h ago · simba · “[Image #1] fix the briefing bug in simba with [redacted]” · 1 turn · 42k tokens — the first reply pays one uncached turn`);
+      assert.equal(second.sessionId, id);
+      assert.deepEqual([second.model, second.effort, second.contextTokens], ['opus', 'high', 42_010]);
+      assert.deepEqual(second.params.messages, state.messages, 'the conversation as it was kept');
+      assert.equal(db.prepare('SELECT ended_at FROM sessions WHERE id = ?').get(id).ended_at, null, 'the session is open again');
+      await second.say('and the next bit');
+      const sent = seen[0].messages;
+      assert.equal(sent.length, state.messages.length + 2, 'the whole history, the new turn, and the note');
+      assert.equal(sent.at(-2).content[0].text, 'and the next bit');
+      assert.match(sent.at(-1).content, /^resumed: this session was saved 3h ago and picked up again now, in \/work\. Carry on where it stopped/);
+      assert.equal(sent.filter((m) => m.role === 'system' && /^<project simba>/.test(m.content)).length, 1, 'the card shown before is not shown again');
+      assert.equal(seen[0].messages.at(-1).content.includes('resumed:'), true);
+      assert.equal(JSON.parse(readFileSync(stateFile(id), 'utf8')).messages.length, sent.length + 1, 'saved again after the turn, reply included');
+
+      // Held here, it cannot be picked up elsewhere; the refusal changes nothing there. A route the chat was started with holds over the saved one.
+      const third = createChat(db, { model: 'sonnet', effort: 'low', cwd: '/', send: () => assert.fail('nothing here talks to the model'), now: () => LATER });
+      third.start('startup');
+      const own = third.sessionId;
+      assert.throws(() => third.resume(short), new RegExp(`^Error: session ${short} is open in another terminal \\(process ${process.pid}\\)$`));
+      assert.equal(third.sessionId, own);
+      assert.match(third.saved().join('\n'), new RegExp(`^${short} · .* · open in another terminal \\(process ${process.pid}\\)$`));
+      assert.throws(() => third.resume('zzz'), new RegExp(`^Error: no saved session starts with "zzz" — one of: ${short}$`));
+      second.end();
+      third.resume(short);
+      assert.deepEqual([third.sessionId, third.model, third.effort], [id, 'sonnet', 'low']);
+      assert.equal(third.saved().length, 0, 'a session does not offer itself');
+      third.end();
+
+      // Kept for thirty days; the hook that opens a session lets older ones go, and leaves the log the dream pass reads.
+      const old = new Date(Date.parse(NOW) - 31 * 24 * 3_600_000);
+      utimesSync(stateFile(id), old, old);
+      assert.equal(pruneStates(NOW), 1);
+      assert.equal(existsSync(stateFile(id)), false);
+      assert.equal(existsSync(join(paths().logs, 'sessions', `${id}.jsonl`)), true);
+      assert.equal(pruneStates(NOW), 0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('piped, /resume alone lists the saved sessions and /resume <id> picks one up; a refused one is said and the chat goes on', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const { send: before } = canned([reply('end_turn', [{ type: 'text', text: 'noted' }])]);
+      const earlier = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send: before, now: () => NOW });
+      earlier.start('startup');
+      await earlier.say('plan the briefing redesign');
+      earlier.end();
+      const short = earlier.sessionId.slice(0, 8);
+
+      const { send, seen } = canned([reply('end_turn', [{ type: 'text', text: 'as we said' }])]);
+      const printed = [];
+      const output = new Writable({
+        write(chunk, _encoding, done) {
+          printed.push(String(chunk));
+          done();
+        },
+      });
+      assert.equal(await chat(db, { model: 'opus', effort: 'high', send, input: Readable.from(['/resume\n', '/resume nope\n', `/resume ${short}\n`, 'go on\n']), output }), 0);
+      const all = printed.join('');
+      // The piped chat keeps real time, so how long ago is whatever it is today.
+      assert.match(all, new RegExp(`>   ${short} · (?:just now|\\d+[hd] ago) · no project · “plan the briefing redesign” · 1 turn · \\d+k tokens\n`), 'the list');
+      assert.match(all, /no saved session starts with "nope" — one of: /);
+      assert.match(all, new RegExp(`⎿  resumed ${short} · (?:just now|\\d+[hd] ago) · no project`));
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].messages[1].content[0].text, 'plan the briefing redesign', 'the model reads the earlier conversation');
+      assert.equal(seen[0].messages.at(-2).content[0].text, 'go on');
+      assert.match(all, /as we said/);
     } finally {
       db.close();
     }
@@ -1284,5 +1398,127 @@ describe('the watcher in a job\'s Herdr tab', () => {
     assert.equal(tab, 'w2:p1', 'the tab is there before its watcher is');
     await until(() => failed.length > 0, 'the chat told the watcher never started');
     assert.deepEqual(failed, ['its Herdr tab never started the watcher']);
+  });
+});
+
+/** The fake MCP server, and a server that is not there, configured in the home in hand. */
+function mcpServers() {
+  mkdirSync(paths().home, { recursive: true, mode: 0o700 });
+  writeConfig({ mcpServers: { demo: { command: process.execPath, args: [join(REPO_ROOT, 'test', 'fixtures', 'fake-mcp-server.mjs')] }, broken: { command: '/no/such/server' } } });
+}
+
+test('the chat offers the MCP tools behind tool search, names the servers to the model, tells the screen which failed, and holds every call to the allow list: asked each time until the user says always', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      mcpServers();
+      const watched = [];
+      const asked = [];
+      const answers = ['no', 'always'];
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'mcp__demo__echo', { text: 'one' })]),
+        reply('tool_use', [call('t2', 'mcp__demo__echo', { text: 'two' })]),
+        reply('tool_use', [call('t3', 'mcp__demo__echo', { text: 'three' })]),
+        reply('end_turn', [{ type: 'text', text: 'done' }]),
+      ]);
+      const approve = async (ask) => {
+        asked.push(ask);
+        return answers.shift();
+      };
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, watch: (e) => watched.push(e), approve, now: () => NOW });
+      session.start('startup');
+      await session.say('echo things');
+
+      const first = seen[0];
+      assert.deepEqual(first.tools.map((t) => t.name).slice(0, 4), ['bash', 'str_replace_based_edit_tool', 'delegate', 'tool_search_tool_regex']);
+      assert.equal(first.tools.length, 4 + 9);
+      assert.ok(first.tools.slice(4).every((t) => t.defer_loading === true && t.name.startsWith('mcp__demo__')), 'the MCP tools are deferred, so none of them sits in the context');
+      assert.match(first.system[0].text, /demo \(9 tools\)/, 'the model is told which servers there are');
+      assert.doesNotMatch(first.system[0].text, /broken/);
+      const told = watched.find((e) => e.type === 'mcp');
+      assert.deepEqual(told.servers.filter((s) => !s.ok).map((s) => s.name), ['broken'], 'the screen is told what failed');
+      const result = (i) => seen[i].messages.at(-1).content[0];
+      assert.equal(result(1).is_error, true);
+      assert.match(result(1).content, /declined/);
+      assert.equal(result(2).content, 'you said: two');
+      assert.equal(result(3).content, 'you said: three');
+      assert.deepEqual(asked.map((a) => a.tool), ['echo', 'echo'], 'asked about the first two calls; the third ran on the answer to the second');
+      assert.equal(asked[0].job, null, 'the chat\'s own call, no job');
+      assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo']);
+
+      // A fresh session keeps the tools and the line about them.
+      session.end();
+      session.start('new');
+      assert.ok(session.params.tools.some((t) => t.name === 'tool_search_tool_regex'));
+      assert.match(session.params.system[0].text, /demo \(9 tools\)/);
+
+      // /mcp says what is connected and what may run unasked, as `sumo mcp` does.
+      assert.deepEqual(session.expand('/mcp'), { control: 'mcp', args: '' });
+      const shown = (await session.mcp()).join('\n');
+      assert.match(shown, /demo\s+stdio: [\s\S]*9 tools · allowed: echo/);
+      assert.match(shown, /broken\s+stdio: \/no\/such\/server\n\s+failed: /);
+
+      // Nobody to ask — piped in, say — and a tool that is not allowed is refused with the way to allow it.
+      const piped = canned([reply('tool_use', [call('t4', 'mcp__demo__shout', {})]), reply('end_turn', [{ type: 'text', text: 'could not' }])]);
+      const quiet = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send: piped.send, now: () => NOW });
+      quiet.start('startup');
+      await quiet.say('shout');
+      const refused = piped.seen[1].messages.at(-1).content[0];
+      assert.equal(refused.is_error, true);
+      assert.match(refused.content, /needs the user's approval[\s\S]*sumo mcp allow demo shout/);
+
+      // Piped, /mcp prints the same lines under the mark a command's result gets.
+      const printed = [];
+      const output = new Writable({
+        write(chunk, _encoding, done) {
+          printed.push(String(chunk));
+          done();
+        },
+      });
+      await chat(db, { model: 'opus', effort: 'high', send: () => assert.fail('nothing is asked of the model'), input: Readable.from(['/mcp\n']), output });
+      assert.match(printed.join(''), /⎿  demo\s+stdio: [\s\S]*9 tools · allowed: echo/);
+    } finally {
+      await closeMcp();
+      db.close();
+    }
+  });
+});
+
+test('a job delegated from the chat asks on the chat\'s screen when it wants an MCP tool, with its own id on the question', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      mcpServers();
+      const id = scoutJob(db, 'sumo-agents-chat-mcp-');
+      const asked = [];
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'delegate', { job: id })]),
+        reply('tool_use', [call('t2', 'mcp__demo__echo', { text: 'from the job' })]),
+        reply('end_turn', [{ type: 'text', text: 'looked' }]),
+        reply('end_turn', []),
+        reply('end_turn', [{ type: 'text', text: 'fine' }]),
+      ]);
+      const session = createChat(db, {
+        model: 'opus',
+        effort: 'high',
+        cwd: '/',
+        send,
+        approve: async (ask) => {
+          asked.push(ask);
+          return 'once';
+        },
+        now: () => NOW,
+      });
+      session.start('startup');
+      await session.say('have the scout echo');
+      assert.equal(asked.length, 1);
+      assert.equal(asked[0].job, id);
+      assert.equal(asked[0].name, 'mcp__demo__echo');
+      assert.equal(seen[2].messages.at(-1).content[0].content, 'you said: from the job', 'the job got its answer');
+      assert.equal(readConfig().mcpServers.demo.allow, undefined, 'once is not kept');
+    } finally {
+      await closeMcp();
+      db.close();
+    }
   });
 });

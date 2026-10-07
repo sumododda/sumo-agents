@@ -1,5 +1,11 @@
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { ago } from './card.mjs';
+import { heldBy } from './lock.mjs';
+import { UsageError } from './memory.mjs';
+import { paths } from './paths.mjs';
 import { redact } from './redact.mjs';
-import { head } from './text.mjs';
+import { clip, head } from './text.mjs';
 import { readBackwards } from './transcript.mjs';
 
 const TURN_MAX_CHARS = 4000;
@@ -167,4 +173,184 @@ export function taskEndedNudge(db) {
   const use = contextUse(path);
   if (!use || !contextBand(use.tokens)) return null;
   return `this session is at ${inK(use.tokens)} tokens and the task just ended — a good moment for /new; the memory block brings the thread back.`;
+}
+
+/**
+ * A chat session saved to be picked up again: the whole conversation as the model was sent it, written after every
+ * turn beside the session's log, so a closed terminal or a crash loses one turn at most. The API is stateless, so
+ * resuming is sending the same messages again; what it costs is one cold cache write.
+ */
+
+const sessionsDir = () => join(paths().logs, 'sessions');
+export const stateFile = (id) => join(sessionsDir(), `${id}.state.json`);
+export const lockFile = (id) => join(sessionsDir(), `${id}.lock`);
+/** A session id as it is shown and typed: the first eight characters, which no two sessions share in practice. */
+export const shortId = (id) => id.slice(0, 8);
+/** How long a saved session is kept to be resumed. */
+const STATE_KEEP_MS = 30 * 24 * 3_600_000;
+/** How much of a state file holds its summary: what comes before the messages. */
+const SUMMARY_BYTES = 4096;
+const NO_PICTURE = '[a picture was here; pictures are not kept when a session is saved]';
+const TITLE_MAX = 60;
+
+const redactValues = (value) => {
+  if (typeof value === 'string') return redact(value).text;
+  if (Array.isArray(value)) return value.map(redactValues);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactValues(v)]));
+  return value;
+};
+
+/**
+ * One block as it is kept: a picture becomes a line saying there was one; the words — the user's, the model's, a
+ * tool's input and what it printed — are redacted, since the user's were sent raw and no secret lands in a file. Ids,
+ * types, names and a thinking block's signature are left exactly as they are: the API matches on them.
+ */
+function keepBlock(block) {
+  if (block.type === 'image') return { type: 'text', text: NO_PICTURE };
+  const { cache_control: _dropped, ...kept } = block;
+  if (typeof kept.text === 'string') kept.text = redact(kept.text).text;
+  if (kept.type === 'tool_result') kept.content = typeof kept.content === 'string' ? redact(kept.content).text : Array.isArray(kept.content) ? kept.content.map(keepBlock) : kept.content;
+  if (kept.type === 'tool_use') kept.input = redactValues(kept.input);
+  return kept;
+}
+
+/** The conversation as it is kept on disk: no pictures, no secrets, no cache markers (they are placed again when it is sent). */
+export function keepable(messages) {
+  return messages.map((m) => ({ role: m.role, content: typeof m.content === 'string' ? redact(m.content).text : m.content.map(keepBlock) }));
+}
+
+/** Writes the session's state whole, then moves it into place: a crash while writing leaves the last good one. */
+export function saveState({ id, messages, model, effort, routed, cwd, contextTokens, now }) {
+  mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
+  const file = stateFile(id);
+  // The summary first, so a listing can read it without the messages behind it; the route's reason last, since it is prose of any length.
+  const state = { version: 1, id, savedAt: now, contextTokens, model, effort, cwd, messages: keepable(messages), routed };
+  writeFileSync(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 });
+  renameSync(`${file}.tmp`, file);
+  return file;
+}
+
+/** A saved session, whole; null when there is none by this id. One that cannot be read or is of another shape is said. */
+export function loadState(id) {
+  let state;
+  try {
+    state = JSON.parse(readFileSync(stateFile(id), 'utf8'));
+  } catch (cause) {
+    if (cause.code === 'ENOENT') return null;
+    throw new UsageError(`the saved session ${shortId(id)} cannot be read: ${cause.message}`);
+  }
+  if (state?.version !== 1 || !Array.isArray(state.messages)) throw new UsageError(`the saved session ${shortId(id)} is not one this version can resume`);
+  return state;
+}
+
+/** What a state file says about itself, read from its head: everything before the messages. Null when it cannot be read. */
+function summaryOf(file) {
+  try {
+    const fd = openSync(file, 'r');
+    let text;
+    try {
+      const buffer = Buffer.alloc(SUMMARY_BYTES);
+      text = buffer.toString('utf8', 0, readSync(fd, buffer, 0, SUMMARY_BYTES, 0));
+    } finally {
+      closeSync(fd);
+    }
+    const cut = text.indexOf(',"messages":');
+    return JSON.parse(cut === -1 ? readFileSync(file, 'utf8') : `${text.slice(0, cut)}}`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The sessions that can be picked up, newest first — every one still on disk, the heavy ones marked. `except` is the
+ * session asking, which cannot resume itself.
+ */
+export function savedSessions(db, { now, except = null } = {}) {
+  let names;
+  try {
+    names = readdirSync(sessionsDir());
+  } catch (cause) {
+    if (cause.code === 'ENOENT') return [];
+    throw cause;
+  }
+  const firstTurn = db.prepare('SELECT text FROM user_turns WHERE session_id = ? ORDER BY id LIMIT 1');
+  const turns = db.prepare('SELECT COUNT(*) AS n FROM user_turns WHERE session_id = ?');
+  const row = db.prepare('SELECT last_turn_at FROM sessions WHERE id = ?');
+  return names
+    .filter((name) => name.endsWith('.state.json'))
+    .map((name) => name.slice(0, -'.state.json'.length))
+    .filter((id) => id !== except)
+    .map((id) => {
+      const summary = summaryOf(stateFile(id));
+      if (!summary?.savedAt) return null;
+      const tokens = summary.contextTokens ?? 0;
+      return {
+        id,
+        savedAt: summary.savedAt,
+        lastTurnAt: row.get(id)?.last_turn_at ?? summary.savedAt,
+        cwd: summary.cwd ?? null,
+        project: currentProject(db, id),
+        title: firstTurn.get(id)?.text ?? '',
+        turns: turns.get(id).n,
+        tokens,
+        heavy: contextBand(tokens) === 'act',
+        openElsewhere: heldBy(lockFile(id)),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => (a.savedAt < b.savedAt ? 1 : a.savedAt > b.savedAt ? -1 : 0));
+}
+
+/** The saved session `ref` names: `last` for the newest, otherwise the one id that starts with it. Anything else is said. */
+export function findSaved(db, ref, options) {
+  const all = savedSessions(db, options);
+  if (ref === 'last') {
+    if (all.length === 0) throw new UsageError('no saved session to resume');
+    return all[0];
+  }
+  const hits = all.filter((s) => s.id.startsWith(ref));
+  if (hits.length === 1) return hits[0];
+  if (hits.length === 0) throw new UsageError(`no saved session starts with "${ref}"${all.length > 0 ? ` — one of: ${all.map((s) => shortId(s.id)).join(', ')}` : ''}`);
+  throw new UsageError(`"${ref}" could be ${hits.map((s) => shortId(s.id)).join(' or ')} — give more of the id`);
+}
+
+/** How a saved session is described, without its id: when, what about, how big, and what stands in the way of picking it up. */
+export function describeSaved(s, now) {
+  const title = clip(s.title, TITLE_MAX);
+  const parts = [ago(s.lastTurnAt, now), s.project ?? 'no project', title ? `“${title}”` : '(nothing said)', `${s.turns} turn${s.turns === 1 ? '' : 's'}`, `${inK(s.tokens)} tokens`];
+  if (s.heavy) parts.push('heavy: the gauge said to start fresh');
+  if (s.openElsewhere) parts.push(`open in another terminal (process ${s.openElsewhere})`);
+  return parts.join(' · ');
+}
+
+export const sessionLine = (s, now) => `${shortId(s.id)} · ${describeSaved(s, now)}`;
+
+/**
+ * Saved sessions older than the keep are let go — a save a crash cut short with them — and so is a lock a session
+ * died holding; the logs beside them stay, the dream pass reads those. Returns how many went.
+ */
+export function pruneStates(now, keepMs = STATE_KEEP_MS) {
+  let names;
+  try {
+    names = readdirSync(sessionsDir());
+  } catch (cause) {
+    if (cause.code === 'ENOENT') return 0;
+    throw cause;
+  }
+  let gone = 0;
+  for (const name of names) {
+    const file = join(sessionsDir(), name);
+    try {
+      if (name.endsWith('.lock')) {
+        if (heldBy(file)) continue;
+      } else if (!/\.state\.json(?:\.tmp)?$/.test(name) || Date.parse(now) - statSync(file).mtimeMs <= keepMs) {
+        continue;
+      }
+      unlinkSync(file);
+      gone++;
+    } catch (cause) {
+      if (cause.code !== 'ENOENT') throw cause;
+    }
+  }
+  return gone;
 }

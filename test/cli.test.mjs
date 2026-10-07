@@ -67,6 +67,8 @@ test('the chat refuses up front what would fail every turn: no credential, a mod
     [['chat'], {}, /the chat needs an Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN/],
     [['chat', '--model', 'gpt'], { ANTHROPIC_API_KEY: 'sk-ant-test' }, /no such model "gpt"/],
     [['chat', '--effort', 'ultra'], { ANTHROPIC_API_KEY: 'sk-ant-test' }, /no such effort "ultra"/],
+    [['chat', '--resume'], { ANTHROPIC_API_KEY: 'sk-ant-test' }, /no saved session to resume/],
+    [['chat', '--resume', 'nope'], { ANTHROPIC_API_KEY: 'sk-ant-test' }, /no saved session starts with "nope"/],
   ]) {
     const run = s.sumo(args, { input: 'hi\n', extraEnv });
     assert.equal(run.code, 2, `${args.join(' ')} → ${run.out}`);

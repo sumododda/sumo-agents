@@ -52,7 +52,10 @@ and sets it — `/model opus high`, `/model haiku`,
 or `/model auto` to have the same local router that routes jobs pick a model and effort for each turn
 from what you typed (the menu offers the choices as you type; a switch costs one uncached turn, and a
 router that cannot answer refuses the turn); `/new` starts a fresh session, the memory block given to
-the model again, on a cleared screen; `/memory` opens the memory in your browser; `! <command>` runs a command yourself, where the agent would be refused; `/exit` (or `/quit`) ends it.
+the model again, on a cleared screen; `/resume` picks a saved session up where it stopped — every
+session is saved after each turn, whole but for its pictures and with secrets redacted, the menu lists
+them newest first with the heavy ones marked, a session open in another terminal is refused, and
+`sumo chat --resume [id]` opens one from the shell (the newest without an id); `/memory` opens the memory in your browser; `/mcp` lists the MCP servers — connected or not, their tools, what may run unasked; `! <command>` runs a command yourself, where the agent would be refused; `/exit` (or `/quit`) ends it.
 
 The chat is a screen, not a scroll of lines: a box to type in (`\`+Enter, Shift-Enter or Option-Enter
 for a new line, Up for what you sent before — the last fifty, kept across sessions — `/` for the command menu;
@@ -88,7 +91,8 @@ and `AGENTS.md`.
 
 Every session runs in Sumo's own loop: one request per turn to the Anthropic Messages API, three tools
 (a shell and a file editor, both Anthropic-defined so no schema is sent, and `delegate`, which hands work
-to a sub-agent), a frozen system prompt that
+to a sub-agent) plus the tools of any MCP servers you configured, deferred behind a search tool so
+none of their schemas sits in the context until it is needed (see *MCP servers*), a frozen system prompt that
 caches across turns, and old tool results cleared server-side once the context passes 60k tokens.
 History is never rewritten on the client.
 
@@ -97,7 +101,7 @@ History is never rewritten on the client.
 | Session starts | The first user turn is the core block: your global preferences, workflows, projects, where you left off, open jobs, things to confirm. Default cap 800 tokens (`prime.budget`); overflow is reachable by search. | ≤ 800 tokens by default, once |
 | You send a message | It is stored word for word (secrets redacted). First mention of a project adds its card — path, stack, commands, your rules for it, gotchas — as an operator message after the cached prefix. | 0, or ≤ 200 once per project |
 | A shell command matches a destructive or secret-reading guard (`rm -rf ~`, `git reset --hard`, `git clean -f`, `DROP TABLE`, `cat .env` …), or the editor tries to access a secret file | Refused in plain code before it runs, and the refusal says why. No memory is consulted. The way through is you: `! <command>` runs it yourself. A force-push is not on the list — it is an accepted way of cleaning up history here. | 0 |
-| The editor reaches for a path outside the project | Refused: the editor is jailed to the project (symlinks followed). Shell commands start in the project directory but can access other paths. The child environment omits variables whose names indicate credentials. | 0 |
+| The editor reaches for a path outside the project | Refused: the editor is jailed to the project (symlinks followed). Shell commands start in the project directory but can access other paths, and run with your environment — every token you exported, so a probe or a smoke test can use it — minus Sumo's own Anthropic credential. A command whose only job is to print the whole environment (`env`, `printenv`, bare `export` or `set`) is refused; a `.env` is loaded with `set -a; source .env; set +a`, never printed. | 0 |
 | The agent is about to run a shell command a taught workflow gates (`gh pr create`, for a workflow taught with `--gate 'gh(-axi)? pr create'`) | The command is held back once and the agent is handed the workflow's steps. It follows them, then runs the command. The same steps ride in with your message when you ask for the thing yourself. | 0 until it fires |
 | The agent ends a turn on a question | Memory is searched with the question's own words, in plain code. If something close is there, the agent is handed it once and carries on instead of waiting for you; if nothing is, the question reaches you untouched. | 0 unless memory answers |
 | A turn ends | The **scribe** is scheduled when a pending turn contains a standing instruction, three turns are waiting, or its last run was at least five minutes ago (or it has never run). Session start and end also sweep up pending turns. A detached call to the local model proposes memories; code checks each against what you actually typed. | 0 |
@@ -159,6 +163,47 @@ its next request; a job running elsewhere is reached on disk, as with `sumo job 
 answers, reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today can be
 picked up tomorrow: `delegate` with only its `job` id, or `sumo job run <id>` in a terminal. One worker per
 project at a time — they share a working tree.
+
+## MCP servers
+
+Sumo talks to the MCP servers you configure — Azure DevOps, Slack, whatever you use — and nothing is set up
+by default. They live in `~/.sumo-agents/mcp.json`, in the shape Claude Code uses, so a config you already
+have pastes in; `sumo mcp add` writes it for you:
+
+```sh
+sumo mcp add azure-devops -- npx -y @azure-devops/mcp <your-org>        # run as a process (stdio); it signs in through `az login`
+sumo mcp add slack --env 'SLACK_TOKEN=${SLACK_TOKEN}' -- npx -y <the slack server>   # a token the server needs, named — never written
+sumo mcp add remote --url https://host/mcp --header 'Authorization=Bearer ${TOKEN}'   # reached over streamable HTTP
+sumo mcp                                  # every server: where it is, its tools or why it failed, what may run unasked (/mcp in the chat)
+sumo mcp tools azure-devops               # one server's tools
+sumo mcp allow azure-devops wit_get_work_item   # let it run without asking — `all` for the whole server; `revoke` undoes it
+```
+
+`${NAME}` in a value is filled from the shell when the server starts, so the file never holds a token, and a
+name nothing fills refuses that server with the reason. A stdio server gets your environment without Sumo's
+own credential, plus the entries you name — so a server that reads its token from a variable you exported just
+works, and `env` is for one it wants under another name — and the node that runs Sumo first on its PATH, so
+`npx` is found. Give commands and paths in full: a server starts where Sumo was.
+
+The model sees the tools of every connected server, deferred behind Anthropic's tool search: none of their
+schemas enters the context until the model searches for one by name or description, so forty Azure DevOps
+tools cost nothing per turn until one is used, and the cached prefix is untouched. The system prompt names
+the servers and how many tools each has. The chat and every job get them alike — a job started from a
+terminal too.
+
+Every call is held to an allow list. A tool not on it stops and asks on the chat's screen — `y` runs it
+once, `a` always, `n` refuses it, Esc stops the turn — and `a` is written to the file. A job delegated from
+the chat asks on the same screen, with its id on the question. `sumo job run` in a terminal, or the chat
+piped, has nobody to ask, so the call is refused with the `sumo mcp allow` line that would allow it. A
+refusal is final for that call: the model is told not to try it again.
+
+What comes back passes through the same cap and redaction as any tool output; a picture or a file is
+described, not sent. A server that dies is started again on the next call; one that fails to connect is
+said on screen and simply absent for that session. Servers connect once per `sumo chat` process; a change
+to the file is picked up by the next one.
+
+Not in this version: the old HTTP+SSE transport, signing in to a remote server (give it a token in a
+header), pictures to the model, MCP resources and prompts.
 
 ## Which model and effort a job gets
 
@@ -323,7 +368,8 @@ new session. So:
 - **A boundary nudge.** `sumo job finish` and `sumo job abandon` end with a `/new` line when the session
   is already heavy, because a task boundary is the cheapest place to start over.
 - **Nothing is lost.** The end of a turn records where you left off, and the next session's first
-  block brings it back. Open jobs resume from their briefs.
+  block brings it back. Open jobs resume from their briefs. The session itself is still there too:
+  `/resume` brings it back whole, for the price of one uncached turn, for thirty days.
 - **Old tool output goes first.** Past 60k tokens the API clears the oldest tool results from what
   the model reads, keeping the last five; the conversation itself stays intact.
 
@@ -345,9 +391,10 @@ in for test and lint. `sumo project rescan <slug>` after setting one up.
 | a taught workflow's steps before a gated shell command | the nudge to start a new session |
 | no job, no run | |
 | matched destructive and secret-reading shell commands are refused; editor paths stay inside the project and exclude secret files | shell commands stay inside the project |
-| environment variables with credential names are omitted; recognized secrets in output are redacted | |
+| Sumo's own credential is withheld from every command; a command that prints the whole environment is refused; recognized secrets in output are redacted | |
 | a key or token in a worker's change blocks DONE | |
 | a job's model and effort, set on the request from its route | |
+| an MCP tool not on the allow list waits for the user's key, and `always` is written to the file; with nobody to ask it is refused | |
 
 The split is deliberate: a line in a prompt is a request, and the things that are cheap to check by
 running something are checked by running something.
@@ -438,6 +485,7 @@ prompts/             agent.md — the system prompt of a job; scribe.md, dream.m
 guides/              read on demand: memory · projects · workflows · delegation · fix · feature · review
 bin/sumo.mjs  src/    the `sumo` CLI — Node, the Anthropic SDK, SQLite full-text search
 src/loop.mjs         the loop every conversation runs in; src/tools.mjs the shell and editor with their policy
+src/mcp.mjs          the MCP servers: their configuration, the two transports, the allow list, `sumo mcp`
 src/chat.mjs         the chat; src/hooks.mjs the session policy as events
 src/ui.mjs           the chat's screen (Ink, loaded only by `sumo chat`); src/editor.mjs the box you type in
 spinner.txt          the words the chat shows while it works — edit them; logo.txt the lion behind the screen

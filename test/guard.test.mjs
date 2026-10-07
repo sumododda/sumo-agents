@@ -51,6 +51,29 @@ test('a command that would wipe a tree, throw away history or empty a database i
   }
 });
 
+test('a command whose only job is to print the whole environment is refused; one that uses, sets or loads a variable goes through', () => {
+  for (const command of ['env', 'env | grep TOKEN', 'printenv', 'export', 'export -p', 'set', 'declare -x', 'typeset -p', 'env -0', 'echo $(env)', 'sudo env', 'env 2>/dev/null | sort', 'cd /tmp && env', 'env\n']) {
+    assert.match(guardCommand(command) ?? '', /^Refused: .*whole environment/, `should refuse: ${command}`);
+  }
+  for (const command of [
+    'env FOO=1 ./smoke.sh',
+    'env -i node x.mjs',
+    'set -e',
+    'set -o pipefail',
+    'set -a; source .env; set +a; ./smoke.sh',
+    'printenv HOME',
+    'export FOO=1',
+    'declare -x FOO=1',
+    'declare -a arr',
+    'curl -H "Authorization: Bearer $API_TOKEN" https://api.example.com/health',
+    'echo "$HOME"',
+    'environment-check',
+    'envsubst < tpl',
+  ]) {
+    assert.equal(guardCommand(command), null, `should allow: ${command}`);
+  }
+});
+
 test('the home and the working directory spelled out in full are guarded as ~ and . are', () => {
   const where = { cwd: '/work/proj', home: '/Users/me' };
   for (const command of ['rm -rf /Users/me', 'rm -rf /Users/me/', 'rm -rf "/Users/me/Documents"', 'rm -rf /work/proj', 'rm -rf /work/proj/', 'rm -rf /work/proj/*']) {

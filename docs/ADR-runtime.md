@@ -158,7 +158,7 @@ inside the model's reach; the human override is the human's own terminal.
 | Destructive command refusal (`rm -rf ~`, `git reset --hard`, `DROP TABLE` …) | `guardCommand` on every `bash` call | same code, in-process |
 | Secret-file read refusal (`.env`, keys, `~/.aws/credentials`) | `guardPath` on `view`, on `bash` prints, and on `create`/`str_replace` targets | extended to writes |
 | Path jail | `realpath` of every path and the bash `cwd` must sit under the job's project path or `~/.sumo-agents/jobs/<id>` | replaces `additionalDirectories` |
-| Key never enters the sandbox | child processes get a filtered env: `ANTHROPIC_API_KEY` and anything matching the secret shape are dropped | new; without it `env` in bash prints the key |
+| Key never enters the sandbox | child processes get a filtered env: `ANTHROPIC_API_KEY` and anything matching the secret shape are dropped. *2026-10-06: narrowed to Sumo's own credential — the user's tokens are theirs to use for probes and smoke tests; `env` and its kin are refused instead* | new; without it `env` in bash prints the key |
 | Tool-result redaction | `redact.mjs` on every tool result | new; today only user turns are redacted |
 | Workflow gate | `claim` before a gated command, once per session per agent | same |
 | Recall before asking | on `ask_user` and on a closing question | same |
@@ -237,6 +237,8 @@ loop, and it is generic by construction because the only knobs are global.
   Phase 1 shows the real per-call cost before anything else moves.
 - **Losing Claude Code's surface.** MCP servers, browser tools, plugins and its TUI are not replaced.
   The REPL is deliberately last, and `.claude/` stays until it has carried a week of real work.
+  *2026-10-06: MCP servers are back, as an in-process client (`src/mcp.mjs`, stdio and streamable HTTP, no
+  dependency), their tools deferred behind Anthropic's tool search so the prefix stays small; see the README.*
 - **Rate limits and long turns.** Fable 5.1 turns can run minutes; stream everything, keep `max_tokens`
   high, let the SDK's retries handle 429/5xx, and keep the 1-hour TTL off unless the ledger shows
   5–60 minute gaps between requests that share a prefix.
