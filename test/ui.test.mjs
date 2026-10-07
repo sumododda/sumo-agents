@@ -10,6 +10,8 @@ import { openDb, setMeta } from '../src/db.mjs';
 import { add } from '../src/memory.mjs';
 import { takeInbox } from '../src/jobs.mjs';
 import { paths } from '../src/paths.mjs';
+import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
+import { REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { runUi } from '../src/ui.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
@@ -140,6 +142,71 @@ test('the screen: a box to type in, a working line with the user\'s own words, t
       } finally {
         // A failed look at the screen must not leave it drawing: the run would never end.
         ui.unmount();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('/resume lists the saved sessions, refuses one that is not there, and picks one up on a cleared screen; --resume opens the chat on it', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const earlier = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: async () => reply('end_turn', [{ type: 'text', text: 'noted' }]), now: () => NOW });
+      earlier.start('startup');
+      await earlier.say('plan the briefing redesign');
+      earlier.end();
+      const id = earlier.sessionId;
+      const short = id.slice(0, 8);
+
+      const open = (session, options = {}) => {
+        const tty = fakeTty({ columns: 150 });
+        const ui = runUi({ session, events: new EventEmitter(), stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', debug: true, ...options });
+        const shows = async (pattern, what) => {
+          for (let i = 0; i < 300; i++) {
+            if (pattern.test(tty.screen())) return;
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+        };
+        return { tty, ui, shows };
+      };
+      const leave = async ({ tty, ui }) => {
+        await tty.type('\x03');
+        await tty.type('\x03');
+        await leaves(ui);
+      };
+
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: () => assert.fail('nothing here talks to the model'), now: () => NOW });
+      const first = open(session);
+      try {
+        await first.shows(/█▀▀ █ █ █▀▄▀█ █▀█/, 'the header');
+        await first.tty.type(`/resume${ENTER}`);
+        await first.shows(new RegExp(`⎿  ${short} · just now · no project · “plan the briefing redesign” · 1 turn · 0k tokens`), 'the list');
+        await first.tty.type(`/resume nope${ENTER}`);
+        await first.shows(/error: no saved session starts with "nope" — one of: /, 'the refusal');
+        assert.notEqual(session.sessionId, id, 'a refused /resume changes nothing');
+        await first.tty.type(`/resume ${short}${ENTER}`);
+        await first.shows(new RegExp(`^(?![\\s\\S]*nope)[\\s\\S]*⎿  resumed ${short} · just now · no project`), 'a cleared screen that says what was picked up');
+        assert.equal(session.sessionId, id);
+        assert.equal(first.tty.screen().split(MARK).length, 2, 'one header');
+        await leave(first);
+      } finally {
+        first.ui.unmount();
+        session.end();
+      }
+
+      // Opened on it from the shell: the header, then the line, before anything is typed.
+      const again = createChat(db, { cwd: tmpdir(), send: () => assert.fail('nothing here talks to the model'), now: () => NOW });
+      const second = open(again, { resume: short });
+      try {
+        await second.shows(new RegExp(`⎿  resumed ${short} · just now`), 'the opening line');
+        assert.deepEqual([again.sessionId, again.model, again.effort], [id, 'opus', 'high'], 'the saved route comes back with it');
+        await leave(second);
+      } finally {
+        second.ui.unmount();
+        again.end();
       }
     } finally {
       db.close();
@@ -723,4 +790,67 @@ test('jobs delegated side by side each stand under their own call while they wor
   } finally {
     ui.unmount();
   }
+});
+
+test('an MCP call that needs the user\'s word asks on the screen; a key answers it, `a` keeps the answer, and Esc declines', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      mkdirSync(paths().home, { recursive: true, mode: 0o700 });
+      writeConfig({ mcpServers: { demo: { command: process.execPath, args: [join(REPO_ROOT, 'test', 'fixtures', 'fake-mcp-server.mjs')] } } });
+      const { send, seen } = transport([
+        { reply: reply('tool_use', [call('t1', 'mcp__demo__echo', { text: 'hello' })]) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'echoed' }]) },
+        { reply: reply('tool_use', [call('t2', 'mcp__demo__shout', {})]) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'never said' }]) },
+      ]);
+      const events = new EventEmitter();
+      const session = createChat(db, {
+        model: 'opus',
+        effort: 'high',
+        cwd: tmpdir(),
+        send,
+        out: (t) => events.emit('text', t),
+        watch: (e) => events.emit(e.type, e),
+        approve: (ask) => new Promise((resolve) => events.emit('approve', { ...ask, resolve })),
+        now: () => NOW,
+      });
+      const tty = fakeTty({ columns: 120 });
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 300; i++) {
+          if (pattern.test(tty.screen())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+      };
+      try {
+        await tty.type(`echo hello${ENTER}`);
+        await shows(/allow demo · echo\(\{"text":"hello"\}\)\?\s+y once · a always · n no/, 'the question');
+        await tty.type('x');
+        assert.match(tty.screen(), /│ > \s+│/, 'a key that is no answer does not land in the box');
+        await tty.type('a');
+        await shows(/⏺ demo\(echo\(\{"text":"hello"\}\)\)\n\s+⎿\s+you said: hello/, 'the call and its answer');
+        await shows(/⏺ echoed/, 'the end of the turn');
+        assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo'], 'kept for next time');
+        assert.equal(seen[1].messages.at(-1).content[0].content, 'you said: hello');
+        await tty.type(`/mcp${ENTER}`);
+        await shows(/⎿  demo\s+stdio: [\s\S]*9 tools · allowed: echo/, 'the servers, their tools and what may run unasked');
+
+        await tty.type(`shout${ENTER}`);
+        await shows(/allow demo · shout\(\{\}\)\?/, 'the next question');
+        await tty.type(ESC);
+        await shows(/Interrupted/, 'the turn stopped at the question');
+        assert.equal(seen.length, 3, 'nothing more was sent');
+        assert.equal(readConfig().mcpServers.demo.allow.length, 1);
+        await tty.type('\x04');
+        await leaves(ui);
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      await closeMcp();
+      db.close();
+    }
+  });
 });

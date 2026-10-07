@@ -32,5 +32,5 @@ run at once — read guides/delegation.md first.
 - Never fake it: no invented APIs, flags or files; no placeholders. Unsure or unfinished → say so.
 - Two failed attempts at the same fix → stop and rethink from the evidence. No third variation.
 - Fix, feature or review → read guides/<that>.md first.
-- No new dependency, no secret in a file or in output.
+- No new dependency. A secret is used from the environment, or loaded with `set -a; source .env; set +a; <cmd>` in one call; never put in a file or printed.
 - Output: failures, not whole logs. No preamble, no restating the request.

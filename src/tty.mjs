@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, sep } from 'node:path';
+import { compactInput, isMcpTool, splitMcpName } from './mcp.mjs';
 import { REPO_ROOT } from './paths.mjs';
 import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
 
@@ -349,6 +350,13 @@ export function toolView(call, result = null, { full = false } = {}) {
     const summary = `${mark} j${job.id} ${said} · ${job.turns} turn${job.turns === 1 ? '' : 's'} · ${job.toolCalls} tool call${job.toolCalls === 1 ? '' : 's'} · $${job.costUsd.toFixed(2)} · ${route}`;
     const report = String(job.report ?? '').trim();
     return { title: 'Delegate', detail, lines: [{ text: summary, tone }, ...(report ? top(toned(report, 'plain'), SHOWN_OUTPUT_LINES) : [])] };
+  }
+  if (isMcpTool(call.name)) {
+    // A server's tool: the server as the title, the tool with its input as the detail, what came back under it.
+    const { server, tool } = splitMcpName(call.name);
+    const detail = `${tool}(${compactInput(input)})`;
+    if (!result) return { title: server, detail, lines: [] };
+    return { title: server, detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
   }
   if (call.name !== EDITOR_TOOL.name) {
     // A job's own tools: what it was given in a line, what came back under it.
