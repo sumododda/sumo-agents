@@ -13,7 +13,7 @@ import { paths } from '../src/paths.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { inView, runUi } from '../src/ui.mjs';
+import { inView, replayOf, runUi } from '../src/ui.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 import { fakeTty } from './fixtures/fake-tty.mjs';
 
@@ -217,6 +217,8 @@ test('/resume lists the saved sessions, refuses one that is not there, and picks
         assert.notEqual(session.sessionId, id, 'a refused /resume changes nothing');
         await first.tty.type(`/resume ${short}${ENTER}`);
         await first.shows(new RegExp(`^(?![\\s\\S]*nope)[\\s\\S]*⎿  resumed ${short} · just now · no project`), 'a cleared screen that says what was picked up');
+        // Where it stopped is in front of the user again, not only the model: what was said, and what was answered.
+        assert.match(first.tty.screen(), new RegExp(`┃ plan the briefing redesign\\n\\n⏺ noted\\n\\s+⎿  resumed ${short}`), 'the saved conversation, drawn again above the line that says so');
         assert.equal(session.sessionId, id);
         assert.equal(first.tty.screen().split(MARK).length, 2, 'one header');
         await leave(first);
@@ -230,6 +232,7 @@ test('/resume lists the saved sessions, refuses one that is not there, and picks
       const second = open(again, { resume: short });
       try {
         await second.shows(new RegExp(`⎿  resumed ${short} · just now`), 'the opening line');
+        assert.match(second.tty.screen(), /┃ plan the briefing redesign\n\n⏺ noted\n/, 'opened on it from the shell, the conversation is drawn too');
         assert.deepEqual([again.sessionId, again.model, again.effort], [id, 'opus', 'high'], 'the saved route comes back with it');
         await leave(second);
       } finally {
@@ -409,7 +412,7 @@ test('an image dropped on the box or pasted with Ctrl-V stands in it as a marker
   });
 });
 
-test('Ctrl-O shows every line a tool gave back and puts it away again; a resized window is redrawn at its new width', async () => {
+test('Ctrl-O hands the whole conversation to the pager — every line a tool gave back, the command whole — and wipes nothing; a resized window is redrawn at its new width', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -421,8 +424,13 @@ test('Ctrl-O shows every line a tool gave back and puts it away again; a resized
       const events = new EventEmitter();
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
       const tty = fakeTty({ columns: 60 });
-      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', debug: true });
-      // Everything is drawn again after a change of view; the last drawing is the one on the screen.
+      // The pager that is not there: what it was given to show, read while it "runs".
+      const paged = [];
+      const written = [];
+      const write = tty.stdout.write;
+      tty.stdout.write = (frame) => written.push(String(frame)) && write(frame);
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', debug: true, run: async (program, file) => paged.push({ program, file, text: readFileSync(file, 'utf8') }) });
+      // Everything is drawn again after a change of size; the last drawing is the one on the screen.
       const latest = () => tty.screen().slice(tty.screen().lastIndexOf(MARK));
       const shows = async (pattern, what) => {
         for (let i = 0; i < 300; i++) {
@@ -442,13 +450,23 @@ test('Ctrl-O shows every line a tool gave back and puts it away again; a resized
         assert.match(latest(), /\n⏺ Bash\(echo one; [^\n]*\n {2}\S/, 'the second row of the command, set in');
         assert.equal(latest().includes(long), false, 'sixty columns cannot hold the line');
 
+        // Ctrl-O: the pager is given the conversation whole, and the screen is left as it was — nothing wiped, nothing drawn again.
+        const before = latest();
+        const cleared = written.filter((w) => w.includes('\x1b[3J')).length;
         await tty.type('\x0f');
-        await shows(/⎿\s+one\n\s+two\n\s+three\n\s+four\n\s+five\n\s+six\n\s+seven\n\s+FAILED\n/, 'the whole output');
-        assert.doesNotMatch(latest(), /… \+3 lines\b/);
-        assert.equal(tails(), 12, 'and the whole command: nothing else on the screen says what ran');
-        assert.match(latest(), /┃ go\n/, 'the rest of the conversation is still there');
-        await tty.type('\x0f');
-        await shows(/… \+3 lines\b/, 'the short form again');
+        for (let i = 0; i < 200 && paged.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+        assert.equal(paged.length, 1, 'the pager was run');
+        assert.equal(paged[0].program, process.env.PAGER || 'less -R +G');
+        const page = paged[0].text.replace(/\x1b\[[0-9;]*m/g, '');
+        assert.match(page, /^┃ go\n\n⏺ Bash\(echo one; echo two;/, 'from the first thing said');
+        assert.match(page, /⎿ {2}one\n {5}two\n {5}three\n {5}four\n {5}five\n {5}six\n {5}seven\n {5}FAILED\n/, 'every line the command printed');
+        assert.equal(page.match(/a very long tail/g).length, 12, 'and the whole command: nothing else says what ran');
+        assert.ok(page.includes(long) === false && page.replace(/\n {2}/g, ' ').includes(long), 'the reply, folded to the window');
+        assert.match(paged[0].text, /\x1b\[1mBash/, 'in the terminal\'s colours');
+        assert.equal(statSync(paged[0].file, { throwIfNoEntry: false }), undefined, 'what the pager was shown is not kept');
+        await shows(/… \+3 lines\b/, 'the screen as it was');
+        assert.equal(latest(), before);
+        assert.equal(written.filter((w) => w.includes('\x1b[3J')).length, cleared, 'no scrollback was wiped for it');
 
         tty.resize(150);
         await shows(new RegExp(long), 'the reply on one line');
@@ -722,8 +740,8 @@ test('the logo is the background of the empty window: faint and centred in it, t
         // Output that fills the window: the box straight under it, as before.
         await tty.type(`! seq 1 60${ENTER}`);
         await until(() => /\n\s+… \+55 lines\n\s+58\n\s+59\n\s+60\n/.test(latest()) && atFoot(30), 'both ends of the output, the box still at the foot');
-        await tty.type('\x0f');
-        await until(() => /\b60\n\n╭─+╮\n│ > /.test(latest()), 'the box straight under the output that filled the window');
+        for (let i = 0; i < 5; i++) await tty.type(`! seq ${i} ${i + 4}${ENTER}`);
+        await until(() => /\n {5}8\n\n╭─+╮\n│ > /.test(latest()), 'the box straight under the output that filled the window');
         assert.ok(gone());
         await tty.type('\x04');
         await leaves(ui);
@@ -848,7 +866,7 @@ test('jobs delegated side by side each stand under their own call while they wor
     model: 'opus', effort: 'high', routed: null, contextTokens: 0, commands: [],
     start: () => '',
     expand: (line) => ({ text: line, said: line }),
-    interrupt() {}, end() {}, tell: () => false, steer() {}, unsteer: () => false,
+    interrupt() {}, end() {}, tell: () => false, steer() {}, unsteer: () => false, running: () => [], waiting: () => 0,
     where: () => ({ cwd: '/work/here', name: 'here', branch: null }), spent: () => 0,
     say: () => new Promise((resolve) => (finish = resolve)),
   };
@@ -1161,4 +1179,174 @@ test('the part of a long text the box draws is the rows around the cursor', () =
   // One line with no end to it is rows too: as much of it as the box is wide to each.
   const one = inView({ text: 'x'.repeat(1000), cursor: 1000 }, 50, 10);
   assert.deepEqual([one.above, one.below, one.text.length, one.cursor], [10, 0, 500, 500]);
+});
+
+test('a job in the background: the turn that delegates ends and the box is free; the job stands above it while it works; the chat answers other things meanwhile; and when the job reports, the turn that reads the report starts by itself', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-ui-bg-'));
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
+      addProject(db, root, { slug: 'simba', now: NOW });
+      const id = Number(db.prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('simba', 'look', 'scout', 'running', null, ?, ?, 'haiku', 'none', 'test')`).run(NOW, NOW).lastInsertRowid);
+      mkdirSync(join(paths().jobs, String(id)), { recursive: true });
+      writeFileSync(join(paths().jobs, String(id), 'brief.md'), '# Job\n\n## The task\nlook around\n');
+
+      // The chat's requests and the job's are answered from their own lists: side by side, their order is not one list's.
+      const working = gate();
+      const answers = {
+        chat: [
+          reply('tool_use', [call('t1', 'delegate', { job: id })]),
+          reply('end_turn', [{ type: 'text', text: 'the scout is looking' }]),
+          reply('end_turn', [{ type: 'text', text: 'four' }]),
+          reply('end_turn', [{ type: 'text', text: 'the scout found a and b' }]),
+        ],
+        job: [reply('end_turn', [{ type: 'text', text: 'a and b' }]), reply('end_turn', [])],
+      };
+      const seen = [];
+      const send = async (params, { onText } = {}) => {
+        const who = params.tools.some((t) => t.name === 'finish') ? 'job' : 'chat';
+        if (who === 'job' && answers.job.length === 2) await working.promise;
+        const next = answers[who].shift();
+        if (who === 'chat') seen.push(structuredClone(params));
+        for (const b of next.content) if (b.type === 'text' && onText) onText(b.text);
+        return next;
+      };
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, background: true, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty({ columns: 110 });
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 300; i++) {
+          if (pattern.test(tty.screen())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+      };
+      try {
+        await tty.type(`check simba${ENTER}`);
+        // The turn ends with the job still at work: no working line, the box free, the job on a line of its own above it.
+        await shows(/⏺ the scout is looking/, 'the end of the turn that delegated');
+        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*\\n⏺ j${id} in the background · \\d+s · 0 tool calls · thinking…\\n`), 'the job above the box, and no turn at work');
+        assert.match(tty.screen(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+j${id} is running in the background`), 'what the call answered');
+        assert.match(tty.screen(), new RegExp(`@ message talks to j${id} · /stop stops it`));
+
+        // A session that starts over cannot take the report with it.
+        await tty.type(`/new${ENTER}`);
+        await shows(new RegExp(`j${id} still at work in the background — wait for the report, or /stop first`), 'the refusal');
+
+        // Meanwhile the chat is the user's: another turn, start to finish, with the job still going.
+        await tty.type(`what is two and two${ENTER}`);
+        await shows(/⏺ four/, 'the answer to something else');
+        assert.match(tty.screen(), new RegExp(`⏺ j${id} in the background`), 'the job still at work');
+        assert.equal(seen.length, 3);
+
+        // It reports: how it went is drawn, and the turn that reads the report starts with nobody typing.
+        working.open();
+        await shows(/⏺ the scout found a and b/, 'the reply to the report');
+        assert.match(tty.screen(), new RegExp(`⏺ four[\\s\\S]*⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+○ j${id} never closed · \\d+s · 2 turns · 0 tool calls[\\s\\S]*⏺ the scout found a and b`), 'the report\'s line, then the reply to it');
+        assert.match(seen[3].messages.at(-1).content[0].text, new RegExp(`^<sumo>\\nAn automated event, not a message from the user: j${id} has reported\\.`));
+        await shows(new RegExp(`^(?![\\s\\S]*j${id} in the background)(?![\\s\\S]*esc to interrupt)`), 'the job gone from above the box, and no turn at work');
+        assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['check simba', 'what is two and two'], 'nobody typed the report');
+
+        await tty.type(`/stop${ENTER}`);
+        await shows(/no job is at work in the background/, 'nothing to stop');
+        await tty.type('\x04');
+        await leaves(ui);
+      } finally {
+        ui.unmount();
+        await session.settle();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a saved conversation is drawn again as what was said, answered and done — the last turns of it, and none of what was only the model\'s to read', () => {
+  const tool = (id, name, input) => ({ type: 'tool_use', id, name, input });
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: '<sumo-memory>\nPreferences: …\n</sumo-memory>' }] },
+    { role: 'user', content: [{ type: 'text', text: '[Image #1]' }, { type: 'image', source: {} }, { type: 'text', text: 'fix the total, see [Image #1]' }] },
+    { role: 'system', content: '<project shop> …' },
+    { role: 'assistant', content: [{ type: 'thinking', thinking: '…' }, { type: 'text', text: 'Looking.' }, tool('t1', 'bash', { command: 'npm test' })] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'FAIL cart', is_error: true }, { type: 'text', text: 'The user says, while you work: use the quantity\n<sumo>\n<project shop> …\n</sumo>' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'Fixed.' }] },
+    { role: 'user', content: [{ type: 'text', text: '<sumo>\nAn automated event, not a message from the user: j4 has reported.\nSTATUS: DONE\n</sumo>' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'The scout agrees.' }] },
+  ];
+  assert.deepEqual(replayOf(messages), [
+    { kind: 'user', text: 'fix the total, see [Image #1]' },
+    { kind: 'reply', raw: 'Looking.' },
+    { kind: 'tool', call: tool('t1', 'bash', { command: 'npm test' }), result: { content: 'FAIL cart', isError: true } },
+    { kind: 'user', text: 'use the quantity' },
+    { kind: 'reply', raw: 'Fixed.' },
+    { kind: 'reply', raw: 'The scout agrees.' },
+  ]);
+  // A long session: its last turns, and a line for the rest.
+  const long = Array.from({ length: 8 }, (_, i) => [{ role: 'user', content: [{ type: 'text', text: `question ${i + 1}` }] }, { role: 'assistant', content: [{ type: 'text', text: `answer ${i + 1}` }] }]).flat();
+  const drawn = replayOf(long, 3);
+  assert.deepEqual(drawn[0], { kind: 'note', text: '5 earlier turns not drawn again — the model has all of them' });
+  assert.deepEqual(drawn.slice(1).map((e) => e.text ?? e.raw), ['question 6', 'answer 6', 'question 7', 'answer 7', 'question 8', 'answer 8']);
+});
+
+test('a file is named with @: the menu offers the project\'s files, Enter puts the path in, Esc shuts the menu and keeps the words; Ctrl-G writes the message in the editor', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const { send, seen } = transport([{ reply: reply('end_turn', [{ type: 'text', text: 'read it' }]) }]);
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty({ columns: 100 });
+      const asked = [];
+      const edited = [];
+      const ui = runUi({
+        session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true,
+        listFiles: async (cwd) => asked.push(cwd) && ['README.md', 'src/cart.js', 'src/cart.test.js', 'src/checkout/cart-total.js', 'docs/carts.md', 'package.json'],
+        // The editor that is not there: it is given the message as a file, and saves another.
+        run: async (program, file) => {
+          edited.push({ program, was: readFileSync(file, 'utf8') });
+          writeFileSync(file, 'look at src/cart.js\nand say why the total is wrong\n');
+        },
+      });
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 300; i++) {
+          if (pattern.test(tty.screen())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+      };
+      try {
+        await shows(/opus · high/, 'the footer');
+        await tty.type('why is @car');
+        // The names that start with what was typed come first, the shorter path first; then the paths that hold it.
+        await shows(/│ > why is @car\s+│\n╰─+╯\n {2}src\/cart\.js\s*\n {2}docs\/carts\.md\s*\n {2}src\/cart\.test\.js\s*\n {2}src\/checkout\/cart-total\.js/, 'the files it could mean');
+        assert.deepEqual(asked, [tmpdir()].map((d) => session.where().cwd), 'the list is the project\'s, asked for once');
+        await tty.type('\x1b[B', ENTER);
+        await shows(/│ > why is docs\/carts\.md\s+│/, 'the path of the one picked, where the mention was');
+        assert.equal(seen.length, 0, 'Enter on the menu picks; it does not send');
+        // Esc shuts a menu of files and loses nothing typed.
+        await tty.type('and @pack');
+        await shows(/\n {2}package\.json/, 'the menu again');
+        await tty.type(ESC);
+        await shows(/^(?![\s\S]*package\.json)[\s\S]*│ > why is docs\/carts\.md and @pack\s+│/, 'the menu shut, the words still there');
+        await tty.type('\x03');
+
+        // Ctrl-G: the box's text goes to the editor, and what is saved there comes back.
+        await tty.type('a first draft');
+        await tty.type('\x07');
+        await shows(/│ > look at src\/cart\.js\s+│\n│ {3}and say why the total is wrong\s+│/, 'what the editor saved, in the box');
+        assert.deepEqual(edited, [{ program: process.env.VISUAL || process.env.EDITOR || 'vi', was: 'a first draft' }]);
+        await tty.type(ENTER);
+        await shows(/⏺ read it/, 'the reply');
+        assert.equal(seen[0].messages.at(-1).content.at(-1).text ?? seen[0].messages.at(-2).content.at(-1).text, 'look at src/cart.js\nand say why the total is wrong');
+        await tty.type('\x04');
+        await leaves(ui);
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      db.close();
+    }
+  });
 });

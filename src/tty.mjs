@@ -430,6 +430,35 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
   return { title, detail: diff.at === null ? detail : `${detail}:${diff.at}`, stat: diff.stat, lines: diff.lines };
 }
 
+/**
+ * The conversation as text for a pager: every entry of the chat's log in full — the whole command, all a tool gave back,
+ * a reply as it is drawn — in the terminal's colours. What the screen folds, this does not; a pager scrolls and searches it.
+ */
+export function transcript(log, s, { width = MAX_WIDTH, cwd = null } = {}) {
+  const tones = { plain: (t) => t, dim: s.dim, error: s.red, add: s.green, del: s.red, ask: s.yellow };
+  const under = (lines) => lines.map((line, i) => `${i === 0 ? '  ⎿  ' : '     '}${(tones[line.tone] ?? tones.plain)(untab(line.text))}`);
+  const out = [];
+  for (const entry of log) {
+    if (entry.kind === 'user') out.push('', ...untab(entry.text).split('\n').map((line) => `${s.yellow('┃')} ${line}`));
+    else if (entry.kind === 'reply') {
+      const drawn = [];
+      const reply = createRenderer((text) => drawn.push(text), s, { width: Math.max(MIN_WIDTH, width - 3) });
+      reply.write(entry.raw);
+      reply.flush();
+      out.push('', ...drawn.join('').replace(/\n$/, '').split('\n').map((line, i) => `${i === 0 ? '⏺ ' : '  '}${line}`));
+    } else if (entry.kind === 'tool') {
+      const view = toolView(entry.call, entry.result, { full: true, cwd });
+      const stat = view.stat ? ` ${s.green(`+${view.stat.added}`)} ${s.red(`−${view.stat.removed}`)}` : '';
+      out.push('', `${entry.result.isError ? s.red('⏺') : s.green('⏺')} ${s.bold(view.title)}(${untab(view.detail).split('\n').join('\n  ')})${stat}`, ...under(view.lines));
+    } else if (entry.kind === 'shell') out.push(...under(toolView({ name: BASH_TOOL.name }, entry.result, { full: true }).lines));
+    else if (entry.kind === 'job') out.push('', `⏺ ${s.bold(`j${entry.id}`)} ${entry.agent} · ${entry.route} — ${entry.title}`);
+    else if (entry.kind === 'error') out.push('', s.red(entry.text));
+    else if (entry.kind === 'footer') out.push('', s.dim(`  ${entry.text}`));
+    else if (entry.kind === 'note') out.push(s.dim(`  ⎿  ${entry.text.split('\n').join('\n     ')}`));
+  }
+  return `${out.join('\n').replace(/^\n/, '')}\n`;
+}
+
 const kindOf = (raw) => (/^Ask the user/.test(raw) ? 'ask' : /^Warning/.test(raw) ? 'warning' : /^Left off/.test(raw) ? 'left' : /^- m\d+ /.test(raw) ? 'item' : raw);
 
 /**

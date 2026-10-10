@@ -1,5 +1,6 @@
 import { Box, render, renderToString, Static, Text, useAnimation, useApp, useBoxMetrics, useInput, usePaste, useStdout, useWindowSize } from 'ink';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFile, spawn } from 'node:child_process';
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createElement as h, useEffect, useReducer, useRef } from 'react';
 import { compactLine, retryLine, routeLine, routeOf } from './chat.mjs';
@@ -8,10 +9,10 @@ import { compactInput } from './mcp.mjs';
 import { paths } from './paths.mjs';
 import { redact } from './redact.mjs';
 import { elapsed } from './text.mjs';
-import { editor, keysOf, menuOf, paste, press, under } from './editor.mjs';
+import { editor, keysOf, matchFiles, menuOf, paste, press, under } from './editor.mjs';
 import { clipboardImage, copyText, droppedImages } from './images.mjs';
-import { BASH_TOOL, EDITOR_TOOL } from './tools.mjs';
-import { colourEnabled, createRenderer, flow, logoLines, messageAt, pathFrom, pickMessage, renderBlock, safeForTerminal, spinnerMessages, styles, sunset, tilde, toolView, untab, wrap } from './tty.mjs';
+import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
+import { colourEnabled, createRenderer, flow, logoLines, messageAt, pathFrom, pickMessage, renderBlock, safeForTerminal, spinnerMessages, styles, sunset, tilde, toolView, transcript, untab, wrap } from './tty.mjs';
 
 /**
  * The chat on a real terminal. What is finished scrolls away above — what
@@ -30,7 +31,10 @@ import { colourEnabled, createRenderer, flow, logoLines, messageAt, pathFrom, pi
  * shows what it prints while it runs; a message sent while the model works is
  * read with its next request; a turn ends on a line that says how long it took,
  * what it changed and what it cost, and — when the window is not the one in
- * front — on a bell. All of it is drawing; the session in chat.mjs does the work.
+ * front — on a bell. A job delegated in the background does not hold the turn:
+ * it stands above the box while it works, the chat goes on, and when it reports
+ * the screen starts the turn that reads the report. All of it is drawing; the
+ * session in chat.mjs does the work.
  */
 
 const ACCENT = '#d77757';
@@ -64,6 +68,75 @@ const LIVE_DRAW_MS = 100;
 /** The most rows of the box, and of a message once sent, that are drawn: a long paste must not push the screen past the window. */
 const INPUT_ROWS = 10;
 const ECHO_LINES = 10;
+/** How long the list of a project's files is good for, while a file is being named with `@`. */
+const FILES_FRESH_MS = 15_000;
+/** How many of a resumed session's turns are drawn again: enough to see where it stopped. */
+const REPLAY_TURNS = 5;
+
+/**
+ * A program given the terminal — an editor, a pager — until it exits. The program is the user's own setting, so a shell
+ * reads it: `code -w`, `less -R`. It is given the terminal opened afresh, not this process's own three descriptors: a
+ * child that inherits those has them set to block, for this process too, and the first read after it has gone would
+ * hold everything here until a key was pressed.
+ */
+const inTerminal = (program, file) =>
+  new Promise((resolve, reject) => {
+    let own = null;
+    try {
+      own = openSync('/dev/tty', 'r+');
+    } catch {
+      // No terminal to open by name: the program has this process's, as it would from a shell.
+    }
+    const done = (settle) => (value) => {
+      if (own !== null) closeSync(own);
+      own = null;
+      settle(value);
+    };
+    const child = spawn('sh', ['-c', `${program} "$0"`, file], { stdio: own === null ? 'inherit' : [own, own, own] });
+    child.on('error', done(reject));
+    child.on('close', done(resolve));
+  });
+
+/** The files of the project at `cwd` as git knows them, the untracked ones it does not ignore included; none where there is no repository. */
+const gitFiles = (cwd) =>
+  new Promise((resolve) => {
+    execFile('git', ['ls-files', '-co', '--exclude-standard'], { cwd, maxBuffer: 32 * 1024 * 1024 }, (error, out) => resolve(error ? [] : out.split('\n').filter(Boolean)));
+  });
+
+/**
+ * A saved conversation as the entries the screen draws, for a session picked up again: the last `turns` things the user
+ * said, each with what was answered and done after it. The memory block, the operator's words and a job's report are the
+ * model's to read, not the user's to see again; a message read mid-turn is shown as what was said.
+ */
+export function replayOf(messages, turns = REPLAY_TURNS) {
+  const entries = [];
+  const starts = [];
+  const calls = new Map();
+  for (const message of messages) {
+    if (message.role === 'system') continue;
+    const blocks = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content;
+    if (message.role === 'assistant') {
+      const raw = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
+      if (raw) entries.push({ kind: 'reply', raw });
+      for (const b of blocks) if (b.type === 'tool_use') calls.set(b.id, b);
+      continue;
+    }
+    for (const b of blocks) {
+      if (b.type === 'tool_result' && calls.has(b.tool_use_id)) {
+        const content = typeof b.content === 'string' ? b.content : (b.content ?? []).map((c) => c.text ?? '').join('\n');
+        entries.push({ kind: 'tool', call: calls.get(b.tool_use_id), result: { content, isError: Boolean(b.is_error) } });
+      } else if (b.type === 'text') {
+        const said = /^The user says, while you work: ([\s\S]*)$/.exec(b.text)?.[1].replace(/\n<sumo>[\s\S]*$/, '') ?? b.text;
+        if (/^<sumo[->]|^An automated event|^\[Image #\d+\]$/.test(said)) continue;
+        starts.push(entries.length);
+        entries.push({ kind: 'user', text: said });
+      }
+    }
+  }
+  if (starts.length <= turns) return entries;
+  const hidden = starts.length - turns;
+  return [{ kind: 'note', text: `${hidden} earlier turn${hidden === 1 ? '' : 's'} not drawn again — the model has all of them` }, ...entries.slice(starts.at(-turns))];
+}
 
 /** What Up recalls across sessions: the last lines typed, one a line, in the home. */
 const HISTORY_KEPT = 50;
@@ -159,21 +232,23 @@ function thoughtEnd(text, room) {
 }
 
 /** A job at work, in one line under the call that started it: how long, how many calls, and the one running now — or what it is thinking. */
-function JobAtWork({ id, job }) {
+function JobAtWork({ id, job, alone = false }) {
   useAnimation({ interval: 1000 });
   const { columns } = useWindowSize();
   const now = job.call ? toolView(job.call) : null;
   const calls = `${job.calls} tool call${job.calls === 1 ? '' : 's'}`;
-  const lead = `  ⎿  j${id} · ${elapsed(Date.now() - job.since)} · ${calls} · `;
+  // Under the call that waits for it, or — at work in the background, with no call standing over it — on a line of its own.
+  const lead = `${alone ? '⏺ ' : '  ⎿  '}j${id}${alone ? ' in the background' : ''} · ${elapsed(Date.now() - job.since)} · ${calls} · `;
   // The line is one row: of a thought longer than what is left of it, the end is what shows.
   const thought = thoughtEnd(job.thought, columns - lead.length - 'thinking: '.length - 1);
   return h(Text, { wrap: 'truncate' }, h(Text, { dimColor: true }, lead), now ? `${now.title}(${now.detail.split('\n')[0]})` : h(Text, { dimColor: true }, thought ? `thinking: ${thought}` : 'thinking…'));
 }
 
 /** A call waiting on the user's word: who asks, what would run with what, and the keys that answer. */
-function Ask({ ask }) {
+function Ask({ ask, aside = false }) {
   const who = ask.job ? `j${ask.job}: ` : '';
-  return h(Box, { marginTop: 1, flexDirection: 'column' }, h(Text, { color: 'yellow' }, `⚠ ${who}allow ${ask.server} · ${ask.tool}(${compactInput(ask.input)})?`), h(Text, { dimColor: true }, '  y once · a always · n no · esc stop'));
+  // Esc stops the turn the call is part of; for a job at work in the background there is no such turn, and Esc refuses the call.
+  return h(Box, { marginTop: 1, flexDirection: 'column' }, h(Text, { color: 'yellow' }, `⚠ ${who}allow ${ask.server} · ${ask.tool}(${compactInput(ask.input)})?`), h(Text, { dimColor: true }, `  y once · a always · n no · esc ${aside ? 'no' : 'stop'}`));
 }
 
 /** One line of a reply; the first of a block carries the mark. */
@@ -285,12 +360,12 @@ function Menu({ menu, pick }) {
 /** A sum of money for a margin: nothing until it is a cent. */
 const dollars = (cost) => (cost >= 0.005 ? `$${cost.toFixed(2)}` : '');
 
-function Status({ session, leaving, notice, full, jobs, where, spent, waiting, columns }) {
+function Status({ session, leaving, notice, jobs, aside = [], where, spent, waiting, columns }) {
   const size = session.contextTokens >= 1000 ? ` · ${Math.round(session.contextTokens / 1000)}k context` : '';
   const cost = dollars(spent) && ` · ${dollars(spent)}`;
   // Where the tools run: the project and the branch it is on. The header that says it scrolls away; this does not.
   const place = where ? `${where.name}${where.branch ? ` (${where.branch})` : ''}` : '';
-  const hint = leaving ? 'Ctrl-C again to leave' : notice ? notice : jobs.length > 0 ? `${jobs.length === 1 ? `@ message talks to j${jobs[0]}` : '@j<id> message talks to that job'} · ctrl-o ${full ? 'to fold' : 'full output'}` : waiting ? '↑ takes back what is waiting' : full ? 'full output · ctrl-o to fold' : '/ commands · /help · ctrl-o full output';
+  const hint = leaving ? `Ctrl-C again to leave${aside.length > 0 ? ` — it stops ${aside.map((id) => `j${id}`).join(', ')}, to be picked up again later` : ''}` : notice ? notice : jobs.length > 0 ? `${jobs.length === 1 ? `@ message talks to j${jobs[0]}` : '@j<id> message talks to that job'} · ${aside.length > 0 ? '/stop stops it' : 'ctrl-o full output'}` : waiting ? '↑ takes back what is waiting' : '/ commands · /help · ctrl-o full output';
   // In a narrow window the hints give way, then the place — unless the line has something to say just now, which the place
   // gives way to; the model, the size of the context and the cost never fold.
   const route = `${routeLine(session)}${size}${cost}`;
@@ -315,7 +390,9 @@ function helpText(commands) {
     ['Up · Down', 'between the lines of the text, then through what you sent before; on an empty box, Up takes back a message that is waiting'],
     ['Esc', 'stop the turn (first closes the command menu); what was waiting comes back to the box'],
     ['Ctrl-C', 'clear the box; on an empty one, stop the turn, or twice to leave — Ctrl-D leaves too'],
-    ['Ctrl-O', 'every tool call in full: the whole command, all its output, the file read or written — and again to fold'],
+    ['Ctrl-O', 'the whole conversation in your pager ($PAGER, or less): every command and all its output, to scroll and search'],
+    ['Ctrl-G', 'write the message in your editor ($VISUAL or $EDITOR); what you save comes back to the box'],
+    ['@ and a few letters', 'name a file of the project: the menu offers the ones they could mean, and Enter or Tab puts the path in'],
     ['Ctrl-V', 'paste an image from the clipboard; an image file dropped on the box is the image'],
     ['Ctrl-A · Ctrl-E', 'the start and the end of the line'],
     ['Ctrl-U · Ctrl-K', 'cut to the start, or to the end, of the line'],
@@ -357,8 +434,8 @@ function Room({ logo, rows, from }) {
   );
 }
 
-function App({ session, events, messages, cwd, block, opening, logo, clipboard, copy, notify: alerts, notifyAfterMs, quietAfterMs }) {
-  const { exit } = useApp();
+function App({ session, events, messages, cwd, block, opening, logo, clipboard, copy, notify: alerts, notifyAfterMs, quietAfterMs, run, listFiles }) {
+  const { exit, suspendTerminal } = useApp();
   const { stdout, write } = useStdout();
   const { columns, rows } = useWindowSize();
   const [, redraw] = useReducer((n) => n + 1, 0);
@@ -369,7 +446,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   const st = useRef(null);
   // `live` is what each running command has printed so far and since when; `heard`, when the model last said or did anything;
   // `turn`, what the turn in hand has done; `talking`, that the model — not a `!` command — is what the screen is working on.
-  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, full: false, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, talking: false, tokens: 0, thought: '', heard: 0, running: new Map(), live: new Map(), drawSoon: null, jobs: new Map(), asks: [], reply: null, fresh: true, leaving: null, gone: false, focused: true, title: null, turn: null, where: session.where(), spent: session.spent() };
+  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, raw: '', ed: editor(readHistory()), images: [], notice: null, queue: [], working: null, talking: false, tokens: 0, thought: '', heard: 0, running: new Map(), live: new Map(), drawSoon: null, jobs: new Map(), asks: [], reply: null, fresh: true, leaving: null, gone: false, focused: true, title: null, turn: null, where: session.where(), spent: session.spent(), files: { cwd: null, at: 0, list: [] }, away: false };
   const state = st.current;
   state.columns = columns;
   state.rows = rows;
@@ -411,12 +488,12 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       return [{ ...entry, block: warnings && renderBlock(warnings, s, { width: state.columns - 1 }) }];
     }
     if (entry.kind === 'tool') {
-      return [{ kind: 'tool', view: toolView(entry.call, entry.result, { full: state.full, cwd: state.where.cwd }), failed: entry.result.isError }];
+      return [{ kind: 'tool', view: toolView(entry.call, entry.result, { cwd: state.where.cwd }), failed: entry.result.isError }];
     }
     // What the user's own command printed: drawn as a tool's output is, under the line they typed.
-    if (entry.kind === 'shell') return [{ kind: 'output', lines: toolView({ name: BASH_TOOL.name }, entry.result, { full: state.full }).lines }];
+    if (entry.kind === 'shell') return [{ kind: 'output', lines: toolView({ name: BASH_TOOL.name }, entry.result).lines }];
     // A long message — a paste — is drawn by its top; all of it went to the model, and Ctrl-O shows it.
-    if (entry.kind === 'user' && !state.full) {
+    if (entry.kind === 'user') {
       const lines = entry.text.split('\n');
       if (lines.length > ECHO_LINES) return [{ ...entry, text: lines.slice(0, ECHO_LINES).join('\n'), more: lines.length - ECHO_LINES }];
     }
@@ -434,8 +511,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   };
   if (state.log.length === 0) {
     state.log.push(header(block));
-    // A chat opened on a saved session says which, under the header, where a fresh one shows the block's warnings.
-    if (opening) state.log.push({ kind: 'note', text: opening });
+    // A chat opened on a saved session shows where it stopped and says which, under the header, where a fresh one shows the block's warnings.
+    if (opening) state.log.push(...replayOf(session.params.messages), { kind: 'note', text: opening });
     for (const entry of state.log) place(drawn(entry));
   }
 
@@ -448,8 +525,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   };
 
   /**
-   * Everything again, from the log: after the window changed size, or the view changed between short and full — the window
-   * and its scrollback wiped, since what they hold is drawn again. A session that starts over has nothing to draw again:
+   * Everything again, from the log, after the window changed size — the window and its scrollback wiped, since what they
+   * hold is drawn again. A session that starts over has nothing to draw again:
    * `clear` then only scrolls the old one away, where it can still be read.
    */
   const refresh = (clear = CLEAR) => {
@@ -534,6 +611,12 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   /** One thing the user sent, start to finish; whatever goes wrong inside is shown, never thrown at the terminal. */
   async function turn(line, images) {
     try {
+      // A session that starts over cannot take a job's report with it: the job is waited for, or stopped, first.
+      const { control: wanted, args: given } = line.startsWith('!') ? {} : session.expand(line);
+      if ((wanted === 'new' || (wanted === 'resume' && given)) && session.running().length > 0) {
+        record({ kind: 'user', text: line });
+        return record({ kind: 'error', text: `${session.running().map((id) => `j${id}`).join(', ')} still at work in the background — wait for the report, or /stop first` });
+      }
       if (line.startsWith('!')) {
         record({ kind: 'user', text: line });
         state.working = pickMessage(messages);
@@ -568,6 +651,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         state.spent = session.spent();
         refresh(scrolledClear(state.rows));
         record(header(''));
+        // Where it stopped, drawn again: the last few turns, so what is picked up is in front of the user and not only the model.
+        for (const entry of replayOf(session.params.messages)) record(entry);
         return record({ kind: 'note', text: said });
       }
       if (control === 'copy') {
@@ -594,49 +679,99 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         return record({ kind: 'note', text });
       }
       record({ kind: 'user', text: line });
-      state.working = pickMessage(messages);
-      state.talking = true;
-      state.tokens = 0;
-      state.fresh = true;
-      state.heard = Date.now();
-      state.turn = { calls: 0, edited: new Set() };
-      state.reply = replyTo((item) => show([item]));
-      redraw();
-      const began = Date.now();
-      const before = session.spent();
-      let outcome;
-      try {
-        outcome = await session.say(text, said, images);
-      } catch (cause) {
-        closeReply();
-        record({ kind: 'error', text: `error: ${cause.message}` });
-        return closeTurn(began, before, 'stopped on an error');
-      }
-      closeReply();
-      if (outcome.stop === 'interrupted') record({ kind: 'note', text: 'Interrupted' });
-      if (outcome.stop === 'error') record({ kind: 'error', text: `error: ${outcome.error}` });
-      if (stopReason(outcome.stop)) record({ kind: 'note', text: stopReason(outcome.stop) });
-      closeTurn(began, before, outcome.stop === 'error' ? 'stopped on an error' : outcome.stop === 'interrupted' ? 'interrupted' : 'done');
+      await modelTurn(() => session.say(text, said, images));
     } catch (cause) {
       closeReply();
       record({ kind: 'error', text: `error: ${cause.message}` });
     } finally {
-      // A question the turn left standing has no call behind it any more.
-      for (const ask of state.asks.splice(0)) ask.resolve('no');
-      state.running.clear();
-      state.live.clear();
-      state.jobs.clear();
-      state.working = null;
-      state.talking = false;
-      state.thought = '';
-      redraw();
-      if (state.gone) exit();
+      endTurn();
     }
+  }
+
+  /** The model at work, for a message or for a report: the working line, the reply as it comes, and the line the turn ends on. */
+  async function modelTurn(run) {
+    state.working = pickMessage(messages);
+    state.talking = true;
+    state.tokens = 0;
+    state.fresh = true;
+    state.heard = Date.now();
+    state.turn = { calls: 0, edited: new Set() };
+    state.reply = replyTo((item) => show([item]));
+    redraw();
+    const began = Date.now();
+    const before = session.spent();
+    let outcome;
+    try {
+      outcome = await run();
+    } catch (cause) {
+      closeReply();
+      record({ kind: 'error', text: `error: ${cause.message}` });
+      return closeTurn(began, before, 'stopped on an error');
+    }
+    closeReply();
+    // Nothing was waiting after all: no turn was run.
+    if (!outcome) return undefined;
+    if (outcome.stop === 'interrupted') record({ kind: 'note', text: 'Interrupted' });
+    if (outcome.stop === 'error') record({ kind: 'error', text: `error: ${outcome.error}` });
+    if (stopReason(outcome.stop)) record({ kind: 'note', text: stopReason(outcome.stop) });
+    return closeTurn(began, before, outcome.stop === 'error' ? 'stopped on an error' : outcome.stop === 'interrupted' ? 'interrupted' : 'done');
+  }
+
+  /** What every turn leaves behind it, however it ended. A job still at work in the background, and a question of its, are not the turn's to clear. */
+  function endTurn() {
+    const aside = session.running();
+    // A question the turn left standing has no call behind it any more.
+    for (const ask of state.asks.filter((a) => !aside.includes(a.job))) settle(ask, 'no');
+    state.running.clear();
+    state.live.clear();
+    for (const id of [...state.jobs.keys()]) if (!aside.includes(id)) state.jobs.delete(id);
+    state.working = null;
+    state.talking = false;
+    state.thought = '';
+    redraw();
+    if (state.gone) exit();
+  }
+
+  /** A turn nobody typed: what the background jobs reported, read by the model as soon as it is free to. */
+  async function wakeTurn() {
+    try {
+      await modelTurn(() => session.wake());
+    } catch (cause) {
+      closeReply();
+      record({ kind: 'error', text: `error: ${cause.message}` });
+    } finally {
+      endTurn();
+    }
+  }
+
+  /** Once nothing is at work: what was typed meanwhile goes first, then what the background jobs reported. */
+  async function drain() {
+    while (!state.working && !state.gone) {
+      if (state.queue.length > 0) {
+        const next = state.queue.shift();
+        redraw();
+        await turn(next.line, next.images);
+      } else if (session.waiting() > 0) await wakeTurn();
+      else break;
+    }
+  }
+
+  /** `/stop`: a job at work in the background is stopped now, whatever else is going on — it is not a turn, and waits for none. */
+  function stopJob(line, given) {
+    record({ kind: 'user', text: line });
+    const ids = session.running();
+    if (ids.length === 0) return record({ kind: 'error', text: 'no job is at work in the background' });
+    const id = given ? Number(/^j?(\d+)$/.exec(given)?.[1]) : ids.length === 1 ? ids[0] : NaN;
+    if (!ids.includes(id)) return record({ kind: 'error', text: `which one — ${ids.map((j) => `/stop j${j}`).join(' or ')}` });
+    session.stop(id);
+    return record({ kind: 'note', text: `stopping j${id} — it can be picked up again: ask for it by its id` });
   }
 
   /** What was typed: now if nothing is running, after the turn in hand if something is. */
   async function submit(line) {
     keepHistory(line);
+    const asked = line.startsWith('/') ? session.expand(line) : {};
+    if (asked.control === 'stop') return stopJob(line, asked.args);
     // For a job, not for the chat: `@j31 …` reaches that job wherever it runs, a bare `@…` the one running here.
     // A job that cannot be told anything — closed by now, or never there — is said back, whichever way it was named.
     const named = /^@j?(\d+)\s+(\S[\s\S]*)$/.exec(line);
@@ -661,12 +796,84 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       return redraw();
     }
     await turn(line, images);
-    while (state.queue.length > 0 && !state.working && !state.gone) {
-      const next = state.queue.shift();
-      redraw();
-      await turn(next.line, next.images);
-    }
+    await drain();
   }
+
+  /**
+   * The files a mention could mean, from the project the tools run in. The list is git's, fetched when a file is first
+   * named and again once it has gone stale; until it has come, nothing is offered. At the start of the line `@` is the
+   * way to a job at work, so no file is offered there while one is.
+   */
+  const files = (query, from) => {
+    if (from === 0 && state.jobs.size > 0) return [];
+    const at = state.where.cwd;
+    if (state.files.cwd !== at || Date.now() - state.files.at > FILES_FRESH_MS) {
+      state.files = { cwd: at, at: Date.now(), list: state.files.cwd === at ? state.files.list : [] };
+      listFiles(at).then((list) => {
+        if (state.files.cwd !== at) return;
+        state.files.list = list;
+        redraw();
+      });
+    }
+    return matchFiles(state.files.list, query);
+  };
+
+  /**
+   * The terminal handed to a program of the user's — their editor, their pager — until it exits: the screen stops
+   * drawing and stops reading keys, the work behind it goes on, and everything is drawn again when the program is done.
+   */
+  const handOver = async (program, file, what) => {
+    if (state.away) return false;
+    state.away = true;
+    try {
+      tell(FOCUS_OFF);
+      await suspendTerminal(() => run(program, file));
+      return true;
+    } catch (cause) {
+      notify(`${what} could not be opened: ${cause.message}`);
+      return false;
+    } finally {
+      tell(FOCUS_ON);
+      state.away = false;
+      redraw();
+    }
+  };
+
+  /** Ctrl-G: the message in the box, written in the user's editor; what is saved there is what the box holds after. */
+  const openEditor = async () => {
+    const file = join(paths().home, `message-${process.pid}.md`);
+    try {
+      mkdirSync(paths().home, { recursive: true, mode: 0o700 });
+      writeFileSync(file, state.ed.text, { mode: 0o600 });
+      if (!(await handOver(process.env.VISUAL || process.env.EDITOR || 'vi', file, 'the editor'))) return;
+      const text = readFileSync(file, 'utf8').replace(/\r\n?/g, '\n').replace(/\n+$/, '');
+      state.ed = { ...editor(state.ed.history), text, cursor: text.length };
+    } catch (cause) {
+      notify(cause.message);
+    } finally {
+      rmSync(file, { force: true });
+      redraw();
+    }
+  };
+
+  /**
+   * Ctrl-O: the whole conversation in the user's pager — every command, all its output, each file read or written —
+   * to scroll and to search. Nothing on the screen is wiped or drawn again for it: the pager has a screen of its own.
+   */
+  const openPager = async () => {
+    const file = join(paths().logs, `conversation-${process.pid}.txt`);
+    try {
+      mkdirSync(paths().logs, { recursive: true, mode: 0o700 });
+      const live = state.raw ? [{ kind: 'reply', raw: state.raw }] : [];
+      writeFileSync(file, transcript([...state.log, ...live], s, { width: state.columns, cwd: state.where.cwd }), { mode: 0o600 });
+      // Opened at its end: what was asked about is nearly always the last thing that happened.
+      await handOver(process.env.PAGER || 'less -R +G', file, 'the pager');
+    } catch (cause) {
+      notify(cause.message);
+    } finally {
+      rmSync(file, { force: true });
+    }
+  };
 
   /** What is waiting — to be read at the next step, or sent after the turn — back in the box, ahead of what is typed there; the model reads none of it. */
   const takeBack = (entries) => {
@@ -752,6 +959,13 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       const where = tab?.pane ? 'working in its Herdr tab' : tab?.error ? `no Herdr tab (${tab.error}) — sumo job watch ${job.id}` : `follow it: sumo job watch ${job.id}`;
       record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job), where });
     };
+    // A job in the background has reported: how it went is drawn where the conversation has got to, and the model reads the
+    // report with its next request — or, when nothing is at work, in a turn started here for it. One the user stopped starts none.
+    const onJobReport = ({ job, result }) => {
+      record({ kind: 'tool', call: { id: `report-${job}`, name: DELEGATE_TOOL.name, input: { job } }, result });
+      alert(`${state.where.name}: j${job} has reported`);
+      if (!state.working) drain();
+    };
     // The tab said to show the job stayed empty: why, and how to follow it all the same.
     const onTabFailed = ({ job, reason }) => record({ kind: 'error', text: `j${job}: ${reason} — follow it here: sumo job watch ${job}` });
     const onJobEnd = ({ job }) => {
@@ -776,9 +990,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       if (error) record({ kind: 'error', text: `mcp: ${error}` });
       for (const server of servers.filter((s) => !s.ok)) record({ kind: 'error', text: `mcp ${server.name}: ${server.error} — sumo mcp shows every server` });
     };
-    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('approve', onApprove).on('mcp', onMcp);
+    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('mcp', onMcp);
     return () => {
-      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('approve', onApprove).off('mcp', onMcp);
+      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('mcp', onMcp);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
       clearTimeout(state.drawSoon);
@@ -831,10 +1045,17 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         else notify('y allows it once · a always · n refuses it · esc stops the turn');
         continue;
       }
+      // A question from a job in the background: Esc refuses that one call, and stops nothing.
+      if (oneKey.escape && state.asks.length > 0 && session.running().includes(state.asks[0].job)) {
+        settle(state.asks[0], 'no');
+        continue;
+      }
       if (oneKey.escape || (oneKey.ctrl && one === 'c')) {
         // What is nearest goes first: Ctrl-C clears what is typed, Esc closes the menu, and only then is the turn stopped.
+        // A menu of files is shut without a word of the message lost; a command half typed is all there is to lose.
+        const open = oneKey.escape ? menuOf(state.ed, session.commands, files) : [];
         if (oneKey.ctrl && state.ed.text) state.ed = editor(state.ed.history);
-        else if (oneKey.escape && menuOf(state.ed, session.commands).length > 0) state.ed = editor(state.ed.history);
+        else if (open.length > 0) state.ed = open[0].file ? { ...state.ed, shut: state.ed.text } : editor(state.ed.history);
         else if (state.working) {
           // Stopping the turn stops what was waiting on it too: it comes back to the box, to be sent again or not.
           takeBack([...state.queue]);
@@ -854,8 +1075,11 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         continue;
       }
       if (oneKey.ctrl && one === 'o') {
-        state.full = !state.full;
-        refresh();
+        openPager();
+        continue;
+      }
+      if (oneKey.ctrl && one === 'g') {
+        openEditor();
         continue;
       }
       // Cmd-V pastes only text from a terminal; an image on the clipboard is fetched here.
@@ -874,7 +1098,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         takeBack([state.queue.at(-1)]);
         continue;
       }
-      const pressed = press(state.ed, one, oneKey, session.commands);
+      const pressed = press(state.ed, one, oneKey, session.commands, files);
       state.ed = pressed.state;
       if (pressed.submit !== undefined) submit(pressed.submit);
     }
@@ -893,9 +1117,10 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     redraw();
   });
 
-  const menu = menuOf(state.ed, session.commands);
+  const menu = menuOf(state.ed, session.commands, files);
   const tail = state.reply?.tail ?? '';
-  const atWork = [...state.jobs.keys()].map((id) => `j${id}`);
+  // The jobs the turn waits on: the ones whose call is still out. A job in the background holds nothing up.
+  const atWork = [...state.jobs].filter(([, job]) => state.running.has(job.parent)).map(([id]) => `j${id}`);
   const reading = atWork.length === 0 ? 'next step' : `when ${atWork.join(', ')} report${atWork.length === 1 ? 's' : ''}`;
   // Ink adds a line under the frame; a frame that reached the last row would be drawn as a full screen.
   const room = state.unmeasured.length > 0 ? 0 : Math.max(0, rows - state.used - 1);
@@ -911,11 +1136,12 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       { flexDirection: 'column' },
       ...[...state.running.values()].map((call) => h(Tool, { key: call.id, view: toolView(call, null, { cwd: state.where.cwd }), running: true, live: state.live.get(call.id), jobs: [...state.jobs].filter(([, job]) => job.parent === call.id) })),
       // A job no call here started — none should be — still shows that it works.
-      ...[...state.jobs].filter(([, job]) => !state.running.has(job.parent)).map(([id, job]) => h(JobAtWork, { key: `j${id}`, id, job })),
     ),
     // The silence that is said is the model's: while a command, a job or a question is in hand, the wait is not on it.
     state.working ? h(Working, { messages, first: state.working, tokens: state.tokens, thought: state.thought, quietAfterMs, heard: state.talking && state.running.size === 0 && state.jobs.size === 0 && state.asks.length === 0 ? state.heard : 0 }) : null,
-    state.asks.length > 0 ? h(Ask, { ask: state.asks[0] }) : null,
+    state.asks.length > 0 ? h(Ask, { ask: state.asks[0], aside: session.running().includes(state.asks[0].job) }) : null,
+    // The jobs at work in the background, under everything the turn is doing: they go on whether or not there is a turn.
+    h(Box, { flexDirection: 'column', marginTop: [...state.jobs].some(([, job]) => !state.running.has(job.parent)) ? 1 : 0 }, ...[...state.jobs].filter(([, job]) => !state.running.has(job.parent)).map(([id, job]) => h(JobAtWork, { key: `j${id}`, id, job, alone: true }))),
     // The logo is the empty room's: once something has been said, the room is the conversation's.
     h(Room, { logo: state.log.some((entry) => entry.kind === 'user') ? [] : logo, rows, from: state.used }),
     h(
@@ -924,13 +1150,13 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       // A message for the model is read with its next request — which, while it waits on a delegated job, is when that job reports.
       ...state.queue.map(({ line, steer }, i) => h(Text, { key: i, dimColor: true, wrap: 'truncate' }, `  ${steer ? reading : 'queued'}: ${line.split('\n')[0]}${line.includes('\n') ? ' …' : ''}`)),
       h(Input, { state: state.ed, width: columns, rows }),
-      menu.length > 0 ? h(Menu, { menu, pick: state.ed.pick }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, full: state.full, jobs: [...state.jobs.keys()], where: state.where, spent: state.spent, waiting: state.queue.length > 0, columns }),
+      menu.length > 0 ? h(Menu, { menu, pick: state.ed.pick }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, jobs: [...state.jobs.keys()], aside: session.running(), where: state.where, spent: state.spent, waiting: state.queue.length > 0, columns }),
     ),
   );
 }
 
 /** Starts the session and draws it. The returned instance's `waitUntilExit()` settles when the user leaves. */
-export function runUi({ session, events, resume = null, stdin = process.stdin, stdout = process.stdout, messages = spinnerMessages(), cwd = process.cwd(), logo = logoLines(), clipboard = clipboardImage, copy = copyText, notify = true, notifyAfterMs = NOTIFY_AFTER_MS, quietAfterMs = QUIET_AFTER_MS, debug = false }) {
+export function runUi({ session, events, resume = null, stdin = process.stdin, stdout = process.stdout, messages = spinnerMessages(), cwd = process.cwd(), logo = logoLines(), clipboard = clipboardImage, copy = copyText, notify = true, notifyAfterMs = NOTIFY_AFTER_MS, quietAfterMs = QUIET_AFTER_MS, run = inTerminal, listFiles = gitFiles, debug = false }) {
   // Opened on a saved session (`sumo chat --resume`), the chat picks it up before the screen is drawn; a fresh one starts and is shown its block.
   const opening = resume === null ? null : session.resume(resume);
   const block = opening ? '' : session.start('startup');
@@ -941,5 +1167,5 @@ export function runUi({ session, events, resume = null, stdin = process.stdin, s
   // What the window showed is scrolled up, not wiped: the terminal's scrollback from before the chat is still there to read.
   if (stdout.isTTY) stdout.write(scrolledClear(stdout.rows || 24));
   if (stdout.isTTY) stdout.write(`${TITLE_KEEP}${FOCUS_ON}`);
-  return render(h(App, { session, events, messages, cwd, block, opening, logo, clipboard, copy, notify, notifyAfterMs, quietAfterMs }), { stdin, stdout, debug, exitOnCtrlC: false, kittyKeyboard: { mode: 'auto' } });
+  return render(h(App, { session, events, messages, cwd, block, opening, logo, clipboard, copy, notify, notifyAfterMs, quietAfterMs, run, listFiles }), { stdin, stdout, debug, exitOnCtrlC: false, kittyKeyboard: { mode: 'auto' } });
 }

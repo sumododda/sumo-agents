@@ -243,7 +243,8 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
   let compactedAt = -Infinity;
   // The ledger names the model that answered: with a fallback that is not always the one asked for.
   const log = (result, note, model = params.model) => logRun(db, { kind: ledger.kind, model, result, note, now: now(), jobId: ledger.jobId ?? null, sessionId: ledger.sessionId ?? null });
-  const heard = () => (inbox?.() ?? []).map((said) => ({ type: 'text', text: `The user says, while you work: ${said}` }));
+  // What the inbox hands over is the user's words — or, as `{ event }`, something that happened and is nobody's words: said as it is.
+  const heard = () => (inbox?.() ?? []).map((said) => ({ type: 'text', text: typeof said === 'string' ? `The user says, while you work: ${said}` : said.event }));
   const interrupted = () => {
     log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns}: interrupted`);
     return { turns, stop: 'interrupted', error: null, text, totals };
