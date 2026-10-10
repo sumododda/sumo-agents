@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { ago } from './card.mjs';
 import { getMeta } from './db.mjs';
@@ -70,6 +70,8 @@ export function commandList(db, { effortNow = () => null, saved = () => [] } = {
     { name: 'memory', hint: 'see the memory in the browser: say yes or no, edit, forget' },
     { name: 'mcp', hint: 'the MCP servers: connected or not, their tools, what may run unasked' },
     { name: 'resume', hint: 'pick a saved session up where it stopped', choices: (given) => (given.length === 0 ? saved().map((s) => ({ name: shortId(s.id), hint: s.hint })) : []) },
+    { name: 'copy', hint: 'the last reply to the clipboard, as it was written; `code` for its last code block', choices: (given) => (given.length === 0 ? ['code'] : []) },
+    { name: 'help', hint: 'the commands and the keys' },
     { name: 'new', hint: 'start a fresh session' },
     { name: 'exit', hint: 'leave' },
   ];
@@ -103,6 +105,23 @@ export function describeCall(call) {
     return `${server} · ${tool}(${compactInput(call.input)})`;
   }
   return call.name;
+}
+
+/**
+ * The branch a directory's repository is on, read from its HEAD — no process is started for it. A worktree's `.git` is a
+ * file that names where its HEAD is. A detached head is the start of its commit; a directory in no repository has none.
+ */
+export function branchOf(dir) {
+  for (let at = resolve(dir); ; at = dirname(at)) {
+    const git = join(at, '.git');
+    try {
+      const home = statSync(git).isDirectory() ? git : resolve(at, /^gitdir: (.+)$/m.exec(readFileSync(git, 'utf8'))[1]);
+      const head = readFileSync(join(home, 'HEAD'), 'utf8').trim();
+      return /^ref: refs\/heads\/(.+)$/.exec(head)?.[1] ?? head.slice(0, 8);
+    } catch {
+      if (dirname(at) === at) return null;
+    }
+  }
 }
 
 /** The session's route for the screen's margins: `opus · high`, `haiku`, or on auto what the router last chose. */
@@ -232,6 +251,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   const jobs = new Map();
   /** The projects a worker is running in: two in one working tree overwrite each other. */
   const workers = new Set();
+  /** What the user said to the chat while it worked, not read yet: it goes in with the model's next request of the same turn. */
+  const steers = [];
   /** The memory page, once /memory has asked for it: the promise of its address. */
   let page = null;
   const ledger = { kind: 'chat', sessionId: null };
@@ -393,6 +414,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       }
       const inbox = [];
       jobs.set(id, inbox);
+      const began = Date.now();
       // Its work is written down as it happens, for `sumo job watch` — in a Herdr tab of its own, or any terminal —
       // and without its secrets, through the same redaction as what the model sees.
       const record = (t) => appendLive(id, redact(t).text);
@@ -435,7 +457,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         const { job, turns, totals } = outcome;
         return {
           content: capRedacted([...warnings, ...ended, ...(report ? ['', report] : [])].join('\n')),
-          job: { id, status: job.status, turns, toolCalls: totals.toolCalls, costUsd: totals.costUsd, model: job.model, effort: job.effort, report: report ? redact(report).text : '' },
+          job: { id, status: job.status, seconds: Math.round((Date.now() - began) / 1000), turns, toolCalls: totals.toolCalls, costUsd: totals.costUsd, model: job.model, effort: job.effort, report: report ? redact(report).text : '' },
         };
       } catch (cause) {
         ended = [cause.message];
@@ -486,9 +508,37 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
    * `images` go before the words, each under the label the text names it by: `{ label, mediaType, data }`, the data in base64.
    */
   async function say(text, said = text, images = []) {
-    const outcome = await turn(text, said, images);
-    persist();
-    return outcome;
+    try {
+      const outcome = await turn(text, said, images);
+      persist();
+      return outcome;
+    } finally {
+      // What was said too late to be read in this turn is the caller's to send as a turn of its own, not this one's to keep.
+      steers.length = 0;
+    }
+  }
+
+  /**
+   * What was said while the turn worked, handed to the model with its next request. Each is the user's own words, so it is
+   * kept as a turn is — stored, logged, and able to bring a project's card in with it — and whoever watches is told it was read.
+   */
+  function heard() {
+    const said = steers.splice(0);
+    if (said.length === 0) return [];
+    watch({ type: 'heard', said });
+    return said.map((text) => {
+      const brought = event('prompt', { prompt: text, context_tokens: lastContext });
+      logLine(transcript, { type: 'user', message: { role: 'user', content: redact(text).text } });
+      return brought ? `${text}\n<sumo>\n${brought}\n</sumo>` : text;
+    });
+  }
+
+  /** Takes back something said while the turn worked, if the model has not read it yet. */
+  function unsteer(text) {
+    const at = steers.lastIndexOf(text);
+    if (at === -1) return false;
+    steers.splice(at, 1);
+    return true;
   }
 
   async function turn(text, said, images) {
@@ -541,6 +591,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         beforeTool,
         concurrent: (call) => call.name === DELEGATE_TOOL.name,
         signal: stopper.signal,
+        inbox: heard,
+        onOutput: (call, chunk) => watch({ type: 'output', call, chunk }),
         onText: emit,
         onThinking: (_delta, snapshot) => watch({ type: 'thinking', text: snapshot }),
         onRetry: (r) => {
@@ -599,7 +651,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     const [, name, args = ''] = m;
     if (name === 'exit' || name === 'quit') return { control: 'quit' };
     if (name === 'new' || name === 'memory') return { control: name };
-    if (name === 'model' || name === 'resume' || name === 'mcp') return { control: name, args: args.trim() };
+    if (name === 'model' || name === 'resume' || name === 'mcp' || name === 'copy' || name === 'help') return { control: name, args: args.trim() };
     const make = Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
     return make ? { text: make(args.trim()), said: args.trim() } : { error: `no such command /${name} — one of: ${commands.map((c) => `/${c.name}`).join(' ')}` };
   }
@@ -621,6 +673,15 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return `your memory, in the browser: ${url}`;
   }
 
+  /** Where the work is, for the screen's margin: the directory the tools run in, the project's name for it, and the branch it is on. */
+  function where() {
+    const { cwd: at } = workspace();
+    return { cwd: at, name: project?.slug ?? basename(at), branch: branchOf(at) };
+  }
+
+  /** What this session's requests have cost so far, the jobs it delegated included: the ledger's own sum. */
+  const spent = () => (sessionId ? db.prepare('SELECT COALESCE(SUM(cost_usd), 0) AS cost FROM model_runs WHERE session_id = ?').get(sessionId).cost : 0);
+
   function end() {
     event('session-end', {});
     if (lock) rmSync(lock, { force: true });
@@ -631,6 +692,11 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     start,
     say,
     interrupt: () => stopper?.abort(),
+    /** Said to the chat while it works: read with the model's next request of this turn. */
+    steer: (text) => void steers.push(text),
+    unsteer,
+    where,
+    spent,
     tell,
     shell,
     expand,
@@ -676,7 +742,7 @@ async function screen(db, { model, effort, resume }) {
     approve: (ask) => new Promise((resolve) => events.emit('approve', { ...ask, resolve })),
   });
   try {
-    await runUi({ session, events, resume }).waitUntilExit();
+    await runUi({ session, events, resume, notify: configured(db, 'chat.notify') !== 'off' }).waitUntilExit();
   } finally {
     session.end();
     await closeMcp();

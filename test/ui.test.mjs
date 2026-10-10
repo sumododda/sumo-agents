@@ -1,7 +1,7 @@
 // The chat on screen: the box you type in, the line that says it is working, the work as it happens, and the keys that stop it.
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -13,7 +13,7 @@ import { paths } from '../src/paths.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { runUi } from '../src/ui.mjs';
+import { inView, runUi } from '../src/ui.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 import { fakeTty } from './fixtures/fake-tty.mjs';
 
@@ -83,7 +83,8 @@ test('the screen: a box to type in, a working line with the user\'s own words, t
 
         // Opening: who is answering and a bordered box to type in. The memory goes to the model, not to the top of every chat.
         await shows(/opus · high/, 'the footer');
-        assert.equal(written[0], '\x1b[2J\x1b[3J\x1b[H', 'the window wiped first: the chat starts at its top, not under the shell line that started it');
+        assert.equal(written[0], `\x1b[40;1H${'\n'.repeat(40)}\x1b[H`, 'the window scrolled clear first: the chat starts at its top, and what the terminal showed is above it in the scrollback, not wiped');
+        assert.ok(!written.some((w) => w.includes('\x1b[3J')), 'nothing so far has wiped the scrollback');
         assert.match(tty.screen(), /^\n█▀▀ █ █ █▀▄▀█ █▀█ +opus · high\n▄▄█ █▄█ █ ▀ █ █▄█ +\/work\/here$/m, 'a row of air, then the name in blocks, who is answering and where beside it');
         assert.doesNotMatch(tty.screen(), /Always squash before merging/, 'the memory block is not printed');
         assert.match(tty.screen(), /╭─+╮\n│ > .*│\n╰─+╯/, 'the input box');
@@ -101,36 +102,63 @@ test('the screen: a box to type in, a working line with the user\'s own words, t
           assert.ok(line.startsWith('Salting the ring… ('), `the words where they were: ${line}`);
           await new Promise((r) => setTimeout(r, 50));
         }
-        assert.match(tty.screen(), /> fix it/);
+        assert.match(tty.screen(), /\n┃ fix it\n/, 'what was typed, a bar down its side');
         assert.match(tty.screen(), /esc to interrupt/);
         assert.equal(seen[0].messages.at(-1).content[0].text, 'fix it');
         assert.match(JSON.stringify(seen[0]), /Always squash before merging/, 'the model still starts from the memory');
 
-        // Typed while it works: held in a queue, shown, and sent when the turn ends.
+        // Typed while it works: it stands above the box, and the model reads it with its next request — in this turn, not after it.
         await tty.type(`and then this${ENTER}`);
-        await shows(/queued: and then this/, 'the queued message');
-        assert.equal(seen.length, 1, 'nothing is sent while a turn is running');
+        await shows(/next step: and then this/, 'the message waiting for the next step');
+        assert.equal(seen.length, 1, 'nothing is sent while a request is out');
 
         first.open();
         await shows(/⏺ all done/, 'the end of the first turn');
         assert.match(tty.screen(), /⏺ on it/, 'the reply');
-        assert.match(tty.screen(), /⏺ Bash\(echo one; echo two; echo three; echo four\)\n\s+⎿\s+one\n\s+two\n\s+three\n\s+… \+1 line\b/, 'the tool call and the top of its output');
+        assert.match(tty.screen(), /⏺ Bash\(echo one; echo two; echo three; echo four\)\n\s+⎿\s+one\n\s+two\n\s+three\n\s+four\n/, 'the tool call and what it printed');
         assert.match(tty.screen(), /⏺ all done\n\s*\n\s+• tidy/, 'markdown is rendered, not shown raw');
+        assert.equal(seen[1].messages.at(-1).content.at(-1).text, 'The user says, while you work: and then this', 'read behind the tool results of the same turn');
+        assert.match(tty.screen(), /four\n\n┃ and then this\n\n⏺ all done/, 'and from then on part of the conversation, where it was read');
+        assert.doesNotMatch(tty.screen(), /next step:/);
+        // The turn ends on a line that says what it took.
+        await shows(/\n {2}\d+s · 1 call · \$0\.\d\d\n/, 'the turn\'s footer');
+        await shows(/opus · high · 12k context · \$0\.\d\d/, 'the size of the context and the cost of the session under the box');
 
-        await shows(/\n> and then this/, 'the queued message being sent');
-        await shows(/opus · high · 12k/, 'the size of the context under the box');
-        assert.doesNotMatch(tty.screen(), /queued:/);
-        assert.equal(seen[2].messages.at(-1).content[0].text, 'and then this');
-        second.open();
-        await shows(/⏺ the queued one is answered/, 'the answer to the queued message');
-        await shows(/^(?![\s\S]*esc to interrupt)/, 'the working line gone once the work is done');
-
-        // Esc stops a turn.
+        // A command typed while it works is not for the model: it waits for the turn to end, and Up takes back what waits.
         await tty.type('long one', ENTER);
         await shows(/esc to interrupt/, 'the working line again');
+        await tty.type(`/model${ENTER}`);
+        await shows(/queued: \/model/, 'the queued command');
+        await tty.type(`not this${ENTER}`);
+        await shows(/next step: not this[\s\S]*↑ takes back what is waiting/, 'the message waiting, and how to take it back');
+        await tty.type('\x1b[A');
+        await shows(/^(?![\s\S]*next step:)[\s\S]*│ > not this/, 'the message back in the box');
+        await tty.type('\x03');
+        await shows(/│ > \s+│/, 'the box cleared by Ctrl-C, the turn still going');
+        assert.match(tty.screen(), /esc to interrupt/);
+        second.open();
+        await shows(/⏺ the queued one is answered/, 'the answer');
+        await shows(/┃ \/model\n\s+⎿\s+opus\/high/, 'the queued command, run when the turn ended');
+        await shows(/^(?![\s\S]*esc to interrupt)/, 'the working line gone once the work is done');
+        assert.doesNotMatch(JSON.stringify(seen[2].messages), /not this/, 'what was taken back was never read');
+
+        // Esc stops a turn, and what was waiting on it comes back to the box instead of being sent.
+        await tty.type('another long one', ENTER);
+        await shows(/esc to interrupt/, 'the working line again');
+        await tty.type(`wait for me${ENTER}`);
+        await shows(/next step: wait for me/, 'the message waiting');
+        // An open menu is what Esc closes first.
+        await tty.type('/mo');
+        await shows(/\/model\s+the route/, 'the menu');
+        await tty.type(ESC);
+        await shows(/│ > \s+│/, 'the menu closed');
+        assert.match(tty.screen(), /esc to interrupt/, 'and the turn still going');
         await tty.type(ESC);
         await shows(/Interrupted/, 'the interruption');
-        assert.equal(seen.length, 4);
+        await shows(/│ > wait for me/, 'what was waiting, back in the box');
+        assert.equal(seen.length, 4, 'and not sent');
+        await tty.type('\x03');
+        await shows(/│ > \s+│/, 'an empty box');
 
         // The command menu, and the way out.
         await tty.type('/');
@@ -240,7 +268,7 @@ test('the screen is as wide as the window; Ctrl-C clears what is typed, then ask
         await shows(/Keep every line/, 'the wide line');
         assert.ok(tty.screen().includes(wide), `a wide window is used to its edge, not wrapped at a fixed column:\n${tty.screen()}`);
         await tty.type(`! echo from the shell${ENTER}`);
-        await shows(/> ! echo from the shell\n\s+⎿\s+from the shell/, 'the shell line and what it printed');
+        await shows(/┃ ! echo from the shell\n\s+⎿\s+from the shell/, 'the shell line and what it printed');
         const before = session.sessionId;
         await tty.type(`/new${ENTER}`);
         await shows(/^(?![\s\S]*from the shell)[\s\S]*█▀▀ █ █ █▀▄▀█ █▀█/, 'a cleared screen with the new header');
@@ -387,7 +415,7 @@ test('Ctrl-O shows every line a tool gave back and puts it away again; a resized
     try {
       const long = 'These words are one line of a reply that a narrow window has to fold and a wide window does not';
       const { send } = transport([
-        { reply: reply('tool_use', [call('t1', 'bash', { command: 'echo one; echo two; echo three; echo four' })]) },
+        { reply: reply('tool_use', [call('t1', 'bash', { command: `echo one; echo two; echo three; echo four; echo five; echo six; echo seven; echo FAILED # ${'a very long tail of a command '.repeat(12)}` })]) },
         { reply: reply('end_turn', [{ type: 'text', text: long }]) },
       ]);
       const events = new EventEmitter();
@@ -406,15 +434,21 @@ test('Ctrl-O shows every line a tool gave back and puts it away again; a resized
       try {
         await tty.type(`go${ENTER}`);
         await shows(/⏺ These words/, 'the reply');
-        assert.match(latest(), /⎿\s+one\n\s+two\n\s+three\n\s+… \+1 line\b/);
+        // Folded: both ends of what the command printed — how it went is in its last lines — and the start of a long command.
+        assert.match(latest(), /⎿\s+one\n\s+two\n\s+… \+3 lines\n\s+six\n\s+seven\n\s+FAILED\n/);
+        const tails = () => latest().match(/a very long tail/g)?.length ?? 0;
+        assert.ok(tails() > 0 && tails() < 12 && / …\)/.test(latest()), `the command cut, and said to be: ${tails()}`);
+        // A command too long for one row goes on under its own words, not under the mark.
+        assert.match(latest(), /\n⏺ Bash\(echo one; [^\n]*\n {2}\S/, 'the second row of the command, set in');
         assert.equal(latest().includes(long), false, 'sixty columns cannot hold the line');
 
         await tty.type('\x0f');
-        await shows(/⎿\s+one\n\s+two\n\s+three\n\s+four\n/, 'the whole output');
-        assert.doesNotMatch(latest(), /… \+1 line\b/);
-        assert.match(latest(), /> go\n/, 'the rest of the conversation is still there');
+        await shows(/⎿\s+one\n\s+two\n\s+three\n\s+four\n\s+five\n\s+six\n\s+seven\n\s+FAILED\n/, 'the whole output');
+        assert.doesNotMatch(latest(), /… \+3 lines\b/);
+        assert.equal(tails(), 12, 'and the whole command: nothing else on the screen says what ran');
+        assert.match(latest(), /┃ go\n/, 'the rest of the conversation is still there');
         await tty.type('\x0f');
-        await shows(/… \+1 line\b/, 'the short form again');
+        await shows(/… \+3 lines\b/, 'the short form again');
 
         tty.resize(150);
         await shows(new RegExp(long), 'the reply on one line');
@@ -474,14 +508,21 @@ test('a job run in the chat keeps out of it — who it is and where to follow it
 
         // Typed for the job while it works: sent to it, not queued for the chat.
         await tty.type(`@stay in src${ENTER}`);
-        await shows(new RegExp(`> @j${id} stay in src`), 'what was said to the job');
+        await shows(new RegExp(`┃ @j${id} stay in src`), 'what was said to the job');
         assert.doesNotMatch(latest(), /queued:/);
+        // Typed for the chat while its job works: the chat's model reads nothing until the job reports, and the line says so
+        // instead of promising the next step.
+        await tty.type(`then run the tests${ENTER}`);
+        await shows(new RegExp(`when j${id} reports: then run the tests`), 'when the message will be read');
+        assert.doesNotMatch(latest(), /next step:/);
         working.open();
 
         await shows(/⏺ all finished/, 'the end of the turn');
         assert.match(seen[2].messages.at(-1).content.at(-1).text, /stay in src/, 'the job read it with its next request');
+        assert.equal(seen[4].messages.at(-1).content.at(-1).text, 'The user says, while you work: then run the tests', 'and the chat read its own with the job\'s report');
+        assert.match(latest(), /┃ then run the tests\n\n⏺ all finished/, 'where it joined the conversation');
         assert.doesNotMatch(latest(), /looking around|Bash\(echo hi\)|report one/, "the job's work stays out of the chat");
-        assert.match(latest(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+○ j${id} never closed · 3 turns · 1 tool call · \\$0\\.00 · haiku`), 'how the run ended, in a line');
+        assert.match(latest(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+○ j${id} never closed · \\d+s · 3 turns · 1 tool call · \\$0\\.00 · haiku`), 'how the run ended, in a line');
         // Its watcher has all of it, and how it ended.
         const watched = readFileSync(join(paths().jobs, String(id), 'live.log'), 'utf8').replace(/\x1b\[[0-9;]*m/g, '');
         assert.match(watched, new RegExp(`^⏺ j${id} scout · haiku — look\\n {2}looking around\\n {2}⏺ \\$ echo hi\\n {4}⎿ {2}hi\\n {2}report one\\n`));
@@ -495,7 +536,7 @@ test('a job run in the chat keeps out of it — who it is and where to follow it
 
         // Named, it reaches a job wherever it runs — this one never closed, so it is still open — and a job that is not there is said back.
         await tty.type(`@j${id} and the ui too${ENTER}`);
-        await shows(new RegExp(`> @j${id} and the ui too`), 'the message to the open job');
+        await shows(new RegExp(`┃ @j${id} and the ui too`), 'the message to the open job');
         assert.deepEqual(takeInbox(id), ['and the ui too']);
         await tty.type(`@j999 anyone?${ENTER}`);
         await shows(/no job j999/, 'the refusal');
@@ -530,11 +571,23 @@ test('what the model is thinking shows under the working line until it acts, and
       try {
         await tty.type(`what is in the tests${ENTER}`);
         await shows(/Working…/, 'the working line');
-        // The thinking as it comes: the last line of it, under the working line.
+        // The thinking as it comes: the end of it — what it is thinking now — under the working line, folded to the window.
         events.emit('thinking', { text: 'First I will look at the test files.\nThen the fixtures they share.' });
-        await shows(/Working…[^\n]*\n\s+⎿\s+Then the fixtures they share\./, 'the last line of the thinking');
+        await shows(/Working…[^\n]*\n {2}⎿ {2}First I will look at the test files\.\n {5}Then the fixtures they share\.\n/, 'the thinking so far');
         events.emit('thinking', { text: 'First I will look at the test files.\nThen the fixtures they share.\nThe loop test is the one.' });
-        await shows(/⎿\s+The loop test is the one\./, 'the thinking as it grows');
+        await shows(/⎿ {2}First I will[^\n]*\n {5}Then the fixtures[^\n]*\n {5}The loop test is the one\./, 'the thinking as it grows');
+        // A summary is one long paragraph: it is folded, not cut at the window's edge, and the rows shown are its last — the newest words are never the ones left out.
+        const paragraph = `I should start from the failing assertion and work back to where the value is computed, ${'checking each caller on the way, '.repeat(6)}and only then decide whether the fixture or the code is wrong.`;
+        events.emit('thinking', { text: `An older line.\n${paragraph}` });
+        await shows(/then decide whether the fixture or the code is wrong\./, 'the end of a long thought');
+        const under = latest().slice(latest().indexOf('Working…')).split('\n').slice(1, 5);
+        assert.match(under[0], /^ {2}⎿ {2}\S/);
+        assert.match(under[2], /^ {5}\S.*wrong\.$/, 'three rows of it, the last its end');
+        assert.equal(under[3], '', 'and no more than three');
+        assert.ok(under.slice(0, 3).every((row) => row.length <= 80), 'each inside the window');
+        assert.doesNotMatch(latest(), /An older line|I should start from/, 'what was thought before has made way for it');
+        events.emit('thinking', { text: 'First I will look at the test files.\nThen the fixtures they share.\nThe loop test is the one.' });
+        await shows(/The loop test is the one\./, 'a shorter thought again');
         // A request sent again: a line that says so, where the work shows.
         events.emit('retry', { attempt: 2, limit: 6, delayMs: 4000, reason: '529 overloaded_error Overloaded' });
         await shows(/retrying in 4s \(2 of 6\) — 529 overloaded_error Overloaded/, 'the retry');
@@ -623,7 +676,7 @@ test('Up recalls what was typed, across sessions, the last fifty; /model changes
   });
 });
 
-test('the logo is the background of the window: faint and centred in it, the box to type in at its foot; the conversation covers it as it grows, and a full screen is drawn as before', async () => {
+test('the logo is the background of the empty window: faint and centred in it, the box to type in at its foot; once something is said the room is the conversation\'s, and a full screen is drawn as before', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -659,24 +712,19 @@ test('the logo is the background of the window: faint and centred in it, the box
         tty.resize(80, 30);
         await until(() => inPlace(30) && atFoot(30), 'the logo in the middle of the window again once it is shorter');
 
-        // A turn in hand puts its working line above the room; the logo does not move for it.
+        // The logo is the empty room's. Once something is said it is gone whole — never a piece of it showing under the work — and the box stays at the foot.
+        const gone = () => !logo.some((row) => latest().includes(row));
         await tty.type(`go${ENTER}`);
-        await until(() => /Working…/.test(latest()) && inPlace(30) && atFoot(30), 'the logo where it was while the turn works');
+        await until(() => /Working…/.test(latest()) && gone() && atFoot(30), 'no logo while the turn works, the box where it was');
         held.open();
-        await until(() => /⏺ done/.test(latest()) && !/Working…/.test(latest()) && inPlace(30), 'the logo where it was after the turn');
+        await until(() => /⏺ done/.test(latest()) && !/Working…/.test(latest()) && gone() && atFoot(30), 'no logo after the turn, the box where it was');
 
-        // Output that reaches the logo's first row covers it; the rest stays where it was.
-        const middle = Math.floor((30 - logo.length) / 2);
-        const reach = middle - lines().slice(0, middle).findLastIndex((l) => l.trim()) - 2;
-        await tty.type(`! seq 1 ${reach}${ENTER}`);
-        await until(() => new RegExp(`\\n\\s+${reach}\\n`).test(latest()), 'the output');
-        const covered = lines().findIndex((l) => new RegExp(`^\\s+${reach}$`).test(l));
-        await until(() => inPlace(30, covered) && atFoot(30), 'the logo under the output covered, the rest in place');
-        assert.ok(!latest().includes(logo[0]) && latest().includes(logo[1]), 'part covered, part showing');
-
+        // Output that fills the window: the box straight under it, as before.
         await tty.type(`! seq 1 60${ENTER}`);
+        await until(() => /\n\s+… \+55 lines\n\s+58\n\s+59\n\s+60\n/.test(latest()) && atFoot(30), 'both ends of the output, the box still at the foot');
+        await tty.type('\x0f');
         await until(() => /\b60\n\n╭─+╮\n│ > /.test(latest()), 'the box straight under the output that filled the window');
-        assert.ok(!logo.some((row) => latest().includes(row)), 'no logo when there is no room for it');
+        assert.ok(gone());
         await tty.type('\x04');
         await leaves(ui);
       } finally {
@@ -800,7 +848,8 @@ test('jobs delegated side by side each stand under their own call while they wor
     model: 'opus', effort: 'high', routed: null, contextTokens: 0, commands: [],
     start: () => '',
     expand: (line) => ({ text: line, said: line }),
-    interrupt() {}, end() {}, tell: () => false,
+    interrupt() {}, end() {}, tell: () => false, steer() {}, unsteer: () => false,
+    where: () => ({ cwd: '/work/here', name: 'here', branch: null }), spent: () => 0,
     say: () => new Promise((resolve) => (finish = resolve)),
   };
   const tty = fakeTty({ columns: 100 });
@@ -895,4 +944,221 @@ test('an MCP call that needs the user\'s word asks on the screen; a key answers 
       db.close();
     }
   });
+});
+
+test('the work as it happens: a running command shows what it prints and how long it has run, an edit is a diff in the project\'s own paths, and the turn ends on what it took', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-ui-work-')));
+      mkdirSync(join(root, '.git'));
+      writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/fix-total\n');
+      writeFileSync(join(root, 'cart.js'), 'export function total(items) {\n  let sum = 0;\n  for (const item of items) {\n    sum += item.price;\n  }\n  return sum;\n}\n');
+      const { send } = transport([
+        { reply: reply('tool_use', [call('t1', 'bash', { command: "echo compiling; printf 'token=ghp_%s\\n' abcdefghijklmnopqrstuvwxyz0123456789; sleep 1.6; echo built" })]) },
+        { reply: reply('tool_use', [call('t2', 'str_replace_based_edit_tool', { command: 'str_replace', path: join(root, 'cart.js'), old_str: '  for (const item of items) {\n    sum += item.price;\n  }', new_str: '  for (const item of items) {\n    sum += item.price * (item.quantity ?? 1);\n  }' })]) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'fixed' }]) },
+      ]);
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: root, send, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty({ columns: 100 });
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: root, logo: [], debug: true });
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 400; i++) {
+          if (pattern.test(tty.screen())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+      };
+      try {
+        // Where the tools run stands under the box: the project and its branch.
+        await shows(new RegExp(`opus · high\\s+${root.split('/').at(-1)} \\(fix-total\\)\\s+/ commands · /help`), 'the place under the box');
+        await tty.type(`fix the total${ENTER}`);
+        // While the command runs: the last of what it printed, without its secrets, and for how long it has run.
+        await shows(/\n⏺ Bash\(echo compiling;[^\n]*\n {2,3}built\)\n {2}⎿ {2}Running… 1s\n {5}compiling\n {5}token=\[redacted\]\n/, 'the running command with its output so far');
+        assert.doesNotMatch(tty.screen(), /ghp_abcdefghij/, 'a secret a command prints is not drawn while it runs either');
+        assert.match(tty.screen(), /Working… \(\d+s · [^)]*esc to interrupt\)/);
+        assert.doesNotMatch(tty.screen(), /quiet/, 'a command in hand is not the model gone quiet');
+        assert.doesNotMatch(tty.screen(), /\n {5}built\n/, 'what it has not printed yet is not there');
+        await shows(/⏺ fixed/, 'the end of the turn');
+        // The edit: the file from the project, the line the change is on, how much went and came, and only the lines that changed with what stayed around them.
+        assert.match(
+          tty.screen(),
+          /⏺ Update\(cart\.js:4\) \+1 −1\n\s+⎿\s+3 {5}for \(const item of items\) \{\n\s+4 - {5}sum \+= item\.price;\n\s+4 \+ {5}sum \+= item\.price \* \(item\.quantity \?\? 1\);\n\s+5 {5}\}\n/,
+        );
+        await shows(/\n {2}\d+s · 2 calls · edited cart\.js\n/, 'the footer: how long, how many calls, what was changed');
+        await tty.type('\x04');
+        await leaves(ui);
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a long turn that ends behind another window rings; one in front does not; the title says what the chat is doing; and the terminal is left as it was found', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const held = gate();
+      const { send } = transport([
+        { reply: reply('end_turn', [{ type: 'text', text: 'first' }]) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'second' }]), gate: held },
+        { reply: reply('end_turn', [{ type: 'text', text: 'third' }]) },
+      ]);
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty();
+      // Every turn counts as a long one here, and a silence of a twentieth of a second is one worth saying.
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true, notifyAfterMs: 0, quietAfterMs: 50 });
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 300; i++) {
+          if (pattern.test(tty.screen())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+      };
+      const rings = () => tty.controls().filter((c) => c.startsWith('\x1b]9;'));
+      const name = tmpdir().split('/').at(-1);
+      try {
+        await shows(/opus · high/, 'the footer');
+        assert.equal(tty.controls()[1], '\x1b[22;0t\x1b[?1004h', 'the terminal\'s title is kept to be given back, and it is asked to say when its window is in front');
+        assert.ok(tty.controls().includes(`\x1b]2;sumo · ${name}\x07`), 'the title: whose chat, and where');
+
+        // In front: the turn ends on its footer, and no bell.
+        await tty.type(`one${ENTER}`);
+        await shows(/⏺ first/, 'the first reply');
+        await shows(/\n {2}0s\n/, 'a footer for a turn that counts as long');
+        assert.deepEqual(rings(), []);
+
+        // The window goes behind — said by the terminal, not typed — and the turn ends there: one bell, with what ended.
+        await tty.type('\x1b[O');
+        assert.match(tty.screen(), /│ > \s+│/, 'nothing landed in the box');
+        await tty.type(`two${ENTER}`);
+        await shows(/quiet \d+s · esc to interrupt/, 'the silence, said while the model says nothing');
+        assert.ok(tty.controls().includes(`\x1b]2;✳ sumo · ${name}\x07`), 'the title says it is at work');
+        held.open();
+        await shows(/⏺ second/, 'the second reply');
+        for (let i = 0; i < 100 && rings().length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+        assert.deepEqual(rings(), [`\x1b]9;sumo — ${name}: done\x07\x07`]);
+
+        // Back in front: quiet again.
+        await tty.type('\x1b[I');
+        await tty.type(`three${ENTER}`);
+        await shows(/⏺ third/, 'the third reply');
+        assert.equal(rings().length, 1);
+        await tty.type('\x04');
+        await leaves(ui);
+        assert.equal(tty.controls().at(-1), '\x1b[?1004l\x1b[23;0t', 'leaving: no more word of the focus, and the title given back');
+      } finally {
+        ui.unmount();
+      }
+
+      // Turned off, a turn that ends behind another window says nothing.
+      const { send: again } = transport([{ reply: reply('end_turn', [{ type: 'text', text: 'done' }]) }]);
+      const quiet = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: again, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const other = fakeTty();
+      const second = runUi({ session: quiet, events, stdin: other.stdin, stdout: other.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true, notifyAfterMs: 0, notify: false });
+      try {
+        await other.type('\x1b[O', `go${ENTER}`);
+        for (let i = 0; i < 300 && !/⏺ done/.test(other.screen()); i++) await new Promise((r) => setTimeout(r, 10));
+        await new Promise((r) => setTimeout(r, 50));
+        assert.match(other.screen(), /⏺ done/);
+        assert.ok(!other.controls().some((c) => c.startsWith('\x1b]9;')), 'no bell when it is turned off');
+        await other.type('\x04');
+        await leaves(second);
+      } finally {
+        second.unmount();
+        quiet.end();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('/copy takes the last reply as it was written, or its last code block; /help says the commands and the keys; a long paste is drawn by a part of it', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const answer = 'Run this, which is a line long enough that a window sixty columns wide has to fold it:\n\n```sh\nnpm ci\n  npm test\n```\n\nThen it is done.';
+      const { send, seen } = transport([{ reply: reply('end_turn', [{ type: 'text', text: answer }]) }, { reply: reply('end_turn', [{ type: 'text', text: 'read it' }]) }]);
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty({ columns: 60, rows: 30 });
+      const copied = [];
+      let clipboardWorks = true;
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true, copy: async (text) => clipboardWorks && copied.push(text) > 0 });
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 300; i++) {
+          if (pattern.test(tty.screen())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+      };
+      try {
+        await tty.type(`/copy${ENTER}`);
+        await shows(/no reply to copy yet/, 'that there is nothing to copy');
+        await tty.type(`how${ENTER}`);
+        await shows(/Then it is done\./, 'the reply');
+
+        await tty.type(`/copy${ENTER}`);
+        await shows(/copied the last reply — 8 lines/, 'that it was copied');
+        assert.deepEqual(copied, [answer], 'as the model wrote it: no indent, no line folded to the window');
+        await tty.type(`/copy code${ENTER}`);
+        await shows(/copied the last code block — 2 lines/, 'that the block was copied');
+        assert.equal(copied[1], 'npm ci\n  npm test', 'the code alone, its own indentation kept');
+        await tty.type(`/copy that${ENTER}`);
+        await shows(/\/copy takes nothing, or "code" — not "that"/, 'the refusal');
+        // No clipboard command here: the terminal is asked to take it.
+        clipboardWorks = false;
+        await tty.type(`/copy code${ENTER}`);
+        await shows(/through the\s+terminal's clipboard/, 'the other way');
+        assert.ok(tty.controls().includes(`\x1b]52;c;${Buffer.from('npm ci\n  npm test').toString('base64')}\x07`));
+        clipboardWorks = true;
+
+        // /help is the chat's own words, drawn as a reply — and not what /copy takes.
+        await tty.type(`/help${ENTER}`);
+        await shows(/Commands[\s\S]*\/copy[\s\S]*\/help[\s\S]*Keys[\s\S]*Ctrl-O[\s\S]*Ctrl-W/, 'the commands and the keys');
+        await tty.type(`/copy${ENTER}`);
+        await shows(/copied the last reply — 8 lines[\s\S]*copied the last reply — 8 lines/, 'the model\'s reply copied again, not the help');
+        assert.equal(copied.at(-1), answer);
+
+        // A paste of forty lines: the box draws the rows around the cursor and says how many more there are; the frame stays inside the window.
+        const pasted = Array.from({ length: 40 }, (_, i) => `pasted line ${i + 1}`).join('\n');
+        await tty.type(`\x1b[200~${pasted}\x1b[201~`);
+        await shows(/│ > … \+30 lines\s+│\n│ {3}pasted line 31\s[\s\S]*pasted line 40\s+│\n╰/, 'the end of the paste, and how much is above it');
+        assert.doesNotMatch(tty.screen().slice(tty.screen().lastIndexOf('╭')), /pasted line 12\b/, 'not all of it is drawn in the box');
+        await tty.type(ENTER);
+        await shows(/⏺ read it/, 'the reply to it');
+        assert.equal(seen[1].messages.at(-1).content.at(-1).text ?? seen[1].messages.at(-2).content.at(-1).text, pasted, 'all of it was sent');
+        assert.match(tty.screen(), /┃ pasted line 1\n┃ pasted line 2\n[\s\S]*┃ pasted line 10\n┃ … \+30 lines\n/, 'and once sent it is drawn by its top');
+        await tty.type('\x04');
+        await leaves(ui);
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('the part of a long text the box draws is the rows around the cursor', () => {
+  const lines = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n');
+  assert.deepEqual(inView({ text: 'short\ntext', cursor: 3 }, 40, 10), { text: 'short\ntext', cursor: 3, above: 0, below: 0 }, 'a text that fits is drawn whole');
+  const end = inView({ text: lines, cursor: lines.length }, 40, 10);
+  assert.deepEqual([end.above, end.below], [20, 0]);
+  assert.equal(end.text, lines.split('\n').slice(20).join('\n'));
+  assert.equal(end.cursor, end.text.length, 'the cursor is where it was, in the part shown');
+  const top = inView({ text: lines, cursor: 0 }, 40, 10);
+  assert.deepEqual([top.above, top.below, top.cursor], [0, 20, 0]);
+  const mid = inView({ text: lines, cursor: lines.indexOf('line 15') }, 40, 10);
+  assert.ok(mid.text.includes('line 15') && mid.above + mid.below === 20 && mid.above > 0 && mid.below > 0);
+  assert.equal(mid.text.slice(mid.cursor, mid.cursor + 7), 'line 15');
+  // One line with no end to it is rows too: as much of it as the box is wide to each.
+  const one = inView({ text: 'x'.repeat(1000), cursor: 1000 }, 50, 10);
+  assert.deepEqual([one.above, one.below, one.text.length, one.cursor], [10, 0, 500, 500]);
 });

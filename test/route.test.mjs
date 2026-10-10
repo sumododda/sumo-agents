@@ -172,9 +172,27 @@ test('routeStats and statsLines group finished jobs by model and effort', async 
 
       const lines = statsLines(db, { project: project.slug });
       assert.deepEqual(lines, [
-        'opus/high: 1 job, 1 done, 0 failed, 1 reviewed, avg 1.0 important',
-        'sonnet/medium: 3 jobs, 2 done, 1 failed, 1 reviewed, avg 2.0 important',
+        'worker · opus/high: 1 job, 1 done, 0 failed, 1 reviewed, avg 1.0 important',
+        'worker · sonnet/medium: 3 jobs, 2 done, 1 failed, 1 reviewed, avg 2.0 important',
       ]);
+
+      // What a route costs is what a job on it took, not what a token on it costs: where the ledger has a job's requests, the
+      // line says what a job took on average — requests, time, money — and each role has its own line, since a scout's job is not a worker's.
+      const run = db.prepare(`INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, note, job_id) VALUES (?, 'scout', ?, 100, 10, ?, 1, 'turn', ?)`);
+      const scout = (model, effort, requests, cost, seconds) => {
+        const id = Number(db.prepare(`INSERT INTO jobs (project, title, agent, status, created_at, updated_at, model, effort) VALUES (?, 'look', 'scout', 'done', ?, ?, ?, ?)`).run(project.slug, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', model, effort).lastInsertRowid);
+        for (let i = 0; i < requests; i++) run.run(new Date(Date.parse('2026-10-01T00:00:00.000Z') + (i * seconds * 1000) / (requests - 1)).toISOString(), model, cost / requests, id);
+      };
+      scout('haiku', 'none', 60, 0.3, 200);
+      scout('haiku', 'none', 40, 0.2, 100);
+      scout('sonnet', 'low', 6, 0.07, 39);
+      assert.deepEqual(statsLines(db, { project: project.slug }), [
+        'scout · haiku/none: 2 jobs, 2 done, 0 failed, 0 reviewed, avg - important — a job: 50 requests, 2m 30s, $0.25',
+        'scout · sonnet/low: 1 job, 1 done, 0 failed, 0 reviewed, avg - important — a job: 6 requests, 39s, $0.07',
+        'worker · opus/high: 1 job, 1 done, 0 failed, 1 reviewed, avg 1.0 important',
+        'worker · sonnet/medium: 3 jobs, 2 done, 1 failed, 1 reviewed, avg 2.0 important',
+      ]);
+      assert.equal(routeStats(db, { project: project.slug }).length, 4, 'the router\'s history is still by route alone');
 
       assert.deepEqual(statsLines(db, { project: 'no-such-project' }), ['no finished jobs yet']);
     } finally {

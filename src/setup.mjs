@@ -26,6 +26,7 @@ export const CONFIG_DEFAULTS = {
   'dream.model': 'local',
   'chat.model': 'opus',
   'chat.effort': 'high',
+  'chat.notify': 'on',
   'model.source': 'https://huggingface.co',
   'model.repo': 'Qwen/Qwen3-4B-GGUF',
   'model.file': 'Qwen3-4B-Q4_K_M.gguf',
@@ -409,6 +410,7 @@ export function config(key, value) {
       if (key === 'prime.budget') positiveInteger(value, 'prime.budget needs a positive number');
       // Sent with every chat turn: a word the API does not take would fail each one, not this command.
       if (key === 'chat.effort' && !CHAT_EFFORTS.includes(value)) throw new UsageError(`no such effort "${value}" — one of: ${CHAT_EFFORTS.join(', ')}`);
+      if (key === 'chat.notify' && value !== 'on' && value !== 'off') throw new UsageError('chat.notify is on or off: the bell and the notification when a long turn ends behind another window');
       // Stored for every later setup: one that is not a URL would fail each of them.
       if (key === 'model.source') sourceOrRefuse(value);
       // The file name decides where the bytes land and what the server is asked for: a name, never a path.

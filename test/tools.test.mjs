@@ -31,3 +31,17 @@ test('a command\'s output comes back in the order it was printed, and a flood is
   const shown = await runBash({ command: `${JSON.stringify(process.execPath)} -e "process.stdout.write('x'.repeat(2_000_000))"` }, ctx);
   assert.match(shown.content, /\[cut 1984000 characters from the middle/);
 });
+
+test('a command says what it prints as it prints it, to whoever is watching; what comes back at the end is the same', async () => {
+  const { runCommand, runTool } = await import('../src/tools.mjs');
+  const seen = [];
+  const run = await runCommand('echo one; sleep 0.3; echo two >&2', { cwd: REPO_ROOT, env: { PATH: process.env.PATH }, onOutput: (chunk) => seen.push(chunk) });
+  assert.equal(seen.join(''), 'one\ntwo\n');
+  assert.ok(seen.length >= 2, 'as it came, not at the end');
+  assert.equal(run.output, 'one\ntwo\n');
+
+  const heard = [];
+  const out = await runTool({ name: 'bash', input: { command: 'echo hi' } }, { cwd: REPO_ROOT, roots: [REPO_ROOT], env: { PATH: process.env.PATH } }, { onOutput: (chunk) => heard.push(chunk) });
+  assert.equal(out.content, 'hi');
+  assert.equal(heard.join(''), 'hi\n', 'the shell tool passes it on');
+});

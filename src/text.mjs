@@ -61,6 +61,12 @@ export function estimateTokens(text) {
 }
 
 /** The first `max` units of a text, less half a character: a cut inside an emoji leaves a lone surrogate, which no API takes. */
+/** How long something took or has run, for a line of the screen or of numbers: `42s`, `3m 05s`. */
+export function elapsed(ms) {
+  const seconds = Math.floor(ms / 1000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`;
+}
+
 export function head(text, max) {
   const cut = text.slice(0, max);
   return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;

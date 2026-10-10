@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { promisify } from 'node:util';
@@ -68,4 +68,22 @@ export function droppedImages(text) {
   for (const s of stats) tooBig(s.size);
   const images = paths.map((p) => imageOf(readFileSync(p)));
   return images.every(Boolean) ? images : null;
+}
+
+/** The commands that put text on the clipboard, by platform: the first one that is there takes it. */
+const COPIERS = process.platform === 'darwin' ? [['pbcopy']] : [['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']];
+
+/** Text to the clipboard, exactly as given. False when no command here takes it — the caller has the terminal to ask instead. */
+export async function copyText(text, copiers = COPIERS) {
+  for (const [command, ...args] of copiers) {
+    const taken = await new Promise((resolve) => {
+      const child = spawn(command, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+      child.on('error', () => resolve(false));
+      child.on('close', (status) => resolve(status === 0));
+      child.stdin.on('error', () => {});
+      child.stdin.end(text);
+    });
+    if (taken) return true;
+  }
+  return false;
 }

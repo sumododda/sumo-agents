@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join, sep } from 'node:path';
 import { compactInput, isMcpTool, splitMcpName } from './mcp.mjs';
 import { REPO_ROOT } from './paths.mjs';
+import { elapsed } from './text.mjs';
 import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
 
 /**
@@ -106,7 +107,8 @@ export function hangOf(line) {
  * `hang` is the indent of the list item a line may go on with: an indented line that is not an item of its own is drawn there.
  */
 export function renderLine(line, s, { fence = false, width = MAX_WIDTH, hang = null } = {}) {
-  if (fence) return `    ${s.dim(line)}`;
+  // Code is what is read most closely: the frame around it is faint, the code is not.
+  if (fence) return `    ${line}`;
   const heading = /^(#{1,6})\s+(.*)$/.exec(line);
   if (heading) return wrap(heading[1].length === 1 ? s.bold(s.underline(inline(heading[2], s))) : s.bold(inline(heading[2], s)), width);
   const item = LIST_ITEM.exec(line);
@@ -307,16 +309,31 @@ export function logoLines(file = LOGO_FILE) {
   return rows;
 }
 
-const SHOWN_OUTPUT_LINES = 3;
+const SHOWN_REPORT_LINES = 3;
+const SHOWN_HEAD_LINES = 2;
+const SHOWN_TAIL_LINES = 3;
 const SHOWN_DIFF_LINES = 12;
+const SHOWN_COMMAND_LINES = 3;
+const SHOWN_COMMAND_CHARS = 240;
+
+const more = (n) => ({ text: `… +${n} line${n === 1 ? '' : 's'}`, tone: 'dim' });
 
 /** The top of a list of lines, and how many more there were. */
 function top(lines, max) {
-  return lines.length > max ? [...lines.slice(0, max), { text: `… +${lines.length - max} line${lines.length - max === 1 ? '' : 's'}`, tone: 'dim' }] : lines;
+  return lines.length > max ? [...lines.slice(0, max), more(lines.length - max)] : lines;
+}
+
+/** Both ends of what a command printed, and how many lines lie between: a run says how it went in its last lines. */
+function ends(lines, full) {
+  if (full || lines.length <= SHOWN_HEAD_LINES + SHOWN_TAIL_LINES) return lines;
+  return [...lines.slice(0, SHOWN_HEAD_LINES), more(lines.length - SHOWN_HEAD_LINES - SHOWN_TAIL_LINES), ...lines.slice(-SHOWN_TAIL_LINES)];
 }
 
 /** A path as a person reads it: under the home directory, from `~`. */
 export const tilde = (path, home = homedir()) => (path === home ? '~' : String(path).startsWith(`${home}${sep}`) ? `~${String(path).slice(home.length)}` : String(path));
+
+/** A path as the work reads it: a file in the project from the project, anything else from the home directory. */
+export const pathFrom = (path, cwd) => (cwd && path === cwd ? '.' : cwd && String(path).startsWith(`${cwd}${sep}`) ? String(path).slice(cwd.length + 1) : tilde(path));
 
 /** How a delegated job ended, for the line that sums it up: its mark, the word for it, and its colour. */
 const JOB_ENDS = { done: ['✓', 'done', 'add'], failed: ['✗', 'failed', 'error'], needs_input: ['?', 'needs your answer', 'ask'], open: ['○', 'never closed', 'dim'] };
@@ -325,56 +342,92 @@ const toned = (text, tone) => String(text).split('\n').map((t) => ({ text: t, to
 const count = (text) => [{ text: `${text === '' ? 0 : text.replace(/\n$/, '').split('\n').length} lines`, tone: 'dim' }];
 
 /**
- * A tool call for the screen: what ran, and under it the part of the result
- * worth a glance — the top of a command's output, an edit as the lines that
- * went and came, a read or a write as its size. Without a result it is the
- * call alone; `full` is every line, and the file itself for a read or a write.
+ * An edit as a diff: the lines old and new share at their ends are what stayed, and what lies between is what went and
+ * what came — each numbered as the file numbers it when `line` says where the old text began, with one line of what
+ * stayed on either side. Folded, a big change keeps the top of each side, so what came is never folded away whole.
  */
-export function toolView(call, result = null, { full = false } = {}) {
+function diffView(old, now, line, full) {
+  const was = old === '' ? [] : old.replace(/\r\n/g, '\n').split('\n');
+  const is = now === '' ? [] : now.replace(/\r\n/g, '\n').split('\n');
+  let head = 0;
+  while (head < was.length && head < is.length && was[head] === is[head]) head++;
+  let tail = 0;
+  while (tail < was.length - head && tail < is.length - head && was.at(-1 - tail) === is.at(-1 - tail)) tail++;
+  const went = was.slice(head, was.length - tail);
+  const came = is.slice(head, is.length - tail);
+  const wide = line === null ? 0 : String(line + Math.max(was.length, is.length)).length;
+  const row = (n, sign, text, tone) => ({ text: line === null ? `${sign} ${text}` : `${String(line + n).padStart(wide)} ${sign} ${text}`, tone });
+  const fold = (rows) => (full || went.length + came.length <= SHOWN_DIFF_LINES ? rows : top(rows, SHOWN_DIFF_LINES / 2));
+  return {
+    at: line === null ? null : line + head,
+    stat: { added: came.length, removed: went.length },
+    lines: [
+      ...(head > 0 ? [row(head - 1, ' ', was[head - 1], 'dim')] : []),
+      ...fold(went.map((text, i) => row(head + i, '-', text, 'del'))),
+      ...fold(came.map((text, i) => row(head + i, '+', text, 'add'))),
+      ...(tail > 0 ? [row(is.length - tail, ' ', is[is.length - tail], 'dim')] : []),
+    ],
+  };
+}
+
+/**
+ * A tool call for the screen: what ran, and under it the part of the result
+ * worth a glance — both ends of a command's output, an edit as a diff, a read
+ * or a write as its size. Without a result it is the call alone; `full` is
+ * every line, the command whole, and the file itself for a read or a write.
+ * `cwd` is the project the work is in: a file in it is named from there.
+ */
+export function toolView(call, result = null, { full = false, cwd = null } = {}) {
   const input = call.input ?? {};
+  const output = () => ends(toned(result.content, result.isError ? 'error' : 'plain'), full);
   if (call.name === BASH_TOOL.name) {
-    const [first, ...rest] = String(input.command ?? '').split('\n');
-    const detail = `${first.slice(0, 120)}${rest.length > 0 || first.length > 120 ? ' …' : ''}`;
+    // Folded, the command is its first lines; asked for in full, it is all there: nothing else on the screen says what ran.
+    const command = String(input.command ?? '').trim();
+    const start = command.split('\n').slice(0, SHOWN_COMMAND_LINES).join('\n').slice(0, SHOWN_COMMAND_CHARS);
+    const detail = full || start.length === command.length ? command : `${start} …`;
     if (!result) return { title: 'Bash', detail, lines: [] };
     if (result.content === '') return { title: 'Bash', detail, lines: [{ text: '(no output)', tone: 'dim' }] };
-    return { title: 'Bash', detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+    return { title: 'Bash', detail, lines: output() };
   }
   if (call.name === DELEGATE_TOOL.name) {
     const detail = input.job !== undefined ? `j${input.job}` : `${input.agent ?? 'worker'} · ${input.title ?? ''}`;
     if (!result) return { title: 'Delegate', detail, lines: [] };
-    if (!result.job || full) return { title: 'Delegate', detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+    if (!result.job || full) return { title: 'Delegate', detail, lines: output() };
     // A job that ran: how it went in one line, then the top of what it reported.
     const { job } = result;
     const [mark, said, tone] = JOB_ENDS[job.status] ?? JOB_ENDS.open;
     const route = job.effort && job.effort !== 'none' ? `${job.model}/${job.effort}` : job.model;
-    const summary = `${mark} j${job.id} ${said} · ${job.turns} turn${job.turns === 1 ? '' : 's'} · ${job.toolCalls} tool call${job.toolCalls === 1 ? '' : 's'} · $${job.costUsd.toFixed(2)} · ${route}`;
+    // How long it took comes first: it is what the wait was.
+    const summary = `${mark} j${job.id} ${said}${job.seconds === undefined ? '' : ` · ${elapsed(job.seconds * 1000)}`} · ${job.turns} turn${job.turns === 1 ? '' : 's'} · ${job.toolCalls} tool call${job.toolCalls === 1 ? '' : 's'} · $${job.costUsd.toFixed(2)} · ${route}`;
     const report = String(job.report ?? '').trim();
-    return { title: 'Delegate', detail, lines: [{ text: summary, tone }, ...(report ? top(toned(report, 'plain'), SHOWN_OUTPUT_LINES) : [])] };
+    return { title: 'Delegate', detail, lines: [{ text: summary, tone }, ...(report ? top(toned(report, 'plain'), SHOWN_REPORT_LINES) : [])] };
   }
   if (isMcpTool(call.name)) {
     // A server's tool: the server as the title, the tool with its input as the detail, what came back under it.
     const { server, tool } = splitMcpName(call.name);
     const detail = `${tool}(${compactInput(input)})`;
     if (!result) return { title: server, detail, lines: [] };
-    return { title: server, detail, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+    return { title: server, detail, lines: output() };
   }
   if (call.name !== EDITOR_TOOL.name) {
     // A job's own tools: what it was given in a line, what came back under it.
     const given = String(input.status ?? input.query ?? input.question ?? input.text ?? '').split('\n')[0].slice(0, 80);
     if (!result) return { title: call.name, detail: given, lines: [] };
-    return { title: call.name, detail: given, lines: top(toned(result.content, result.isError ? 'error' : 'plain'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+    return { title: call.name, detail: given, lines: output() };
   }
   const range = Array.isArray(input.view_range) ? `:${input.view_range.join('-')}` : '';
   const title = input.command === 'view' ? 'Read' : input.command === 'create' ? 'Write' : input.command === 'str_replace' || input.command === 'insert' ? 'Update' : call.name;
-  const detail = `${tilde(input.path ?? '')}${range}`;
+  const detail = `${pathFrom(input.path ?? '', cwd)}${range}`;
   if (!result) return { title, detail, lines: [] };
-  if (result.isError) return { title, detail, lines: top(toned(result.content, 'error'), full ? Infinity : SHOWN_OUTPUT_LINES) };
+  if (result.isError) return { title, detail, lines: output() };
   const added = (text) => toned(text, 'add').map((l) => ({ ...l, text: `+ ${l.text}` }));
   if (input.command === 'view') return { title, detail, lines: full ? toned(result.content, 'plain') : count(result.content) };
   if (input.command === 'create') return { title, detail, lines: full ? added(String(input.file_text ?? '').replace(/\n$/, '')) : count(String(input.file_text ?? '')) };
-  const went = input.command === 'str_replace' ? toned(input.old_str ?? '', 'del').map((l) => ({ ...l, text: `- ${l.text}` })) : [];
+  // The editor says where the old text began and what the file had there; a result that does not is drawn from what the model sent.
   const came = input.command === 'insert' ? (input.insert_text ?? input.new_str ?? '').replace(/\n$/, '') : (input.new_str ?? '');
-  return { title, detail, lines: top([...went, ...added(came)], full ? Infinity : SHOWN_DIFF_LINES) };
+  const edit = result.edit ?? { line: null, old: input.command === 'str_replace' ? (input.old_str ?? '') : '', new: came };
+  const diff = diffView(edit.old, edit.new, edit.line ?? null, full);
+  return { title, detail: diff.at === null ? detail : `${detail}:${diff.at}`, stat: diff.stat, lines: diff.lines };
 }
 
 const kindOf = (raw) => (/^Ask the user/.test(raw) ? 'ask' : /^Warning/.test(raw) ? 'warning' : /^Left off/.test(raw) ? 'left' : /^- m\d+ /.test(raw) ? 'item' : raw);

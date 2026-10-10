@@ -100,31 +100,70 @@ describe('the chat terminal rendering', () => {
     assert.deepEqual(logoLines(file), []);
   });
 
-  it('shows a tool call the way the work reads: what ran, and the top of what came back', () => {
+  it('shows a tool call the way the work reads: the command whole, and both ends of what came back', () => {
     const bash = { name: 'bash', input: { command: 'npm test\necho more' } };
-    assert.deepEqual(toolView(bash), { title: 'Bash', detail: 'npm test …', lines: [] }, 'before the result there is only the call');
-    assert.deepEqual(toolView(bash, { content: 'a\nb\nc\nd\ne', isError: false }).lines, [
-      { text: 'a', tone: 'plain' },
-      { text: 'b', tone: 'plain' },
-      { text: 'c', tone: 'plain' },
-      { text: '… +2 lines', tone: 'dim' },
+    assert.deepEqual(toolView(bash), { title: 'Bash', detail: 'npm test\necho more', lines: [] }, 'before the result there is only the call');
+    assert.deepEqual(toolView(bash, { content: 'a\nb\nc\nd\ne', isError: false }).lines.map((l) => l.text), ['a', 'b', 'c', 'd', 'e'], 'a few lines are shown whole');
+    // The verdict of a test run is its last lines: the top two and the last three are shown, the middle counted.
+    assert.deepEqual(toolView(bash, { content: 'banner\none\ntwo\nthree\nfour\nfive\nFAIL\n(exit 1)', isError: false }).lines, [
+      { text: 'banner', tone: 'plain' },
+      { text: 'one', tone: 'plain' },
+      { text: '… +3 lines', tone: 'dim' },
+      { text: 'five', tone: 'plain' },
+      { text: 'FAIL', tone: 'plain' },
+      { text: '(exit 1)', tone: 'plain' },
     ]);
     assert.deepEqual(toolView(bash, { content: '', isError: false }).lines, [{ text: '(no output)', tone: 'dim' }]);
     assert.deepEqual(toolView(bash, { content: 'boom\n(exit 1)', isError: true }).lines.map((l) => l.tone), ['error', 'error']);
   });
 
-  it('shows an edit as the lines that went and the lines that came', () => {
-    const edit = { name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: '/p/a.mjs', old_str: 'const a = 1;', new_str: 'const a = 2;\nconst b = 3;' } };
-    assert.deepEqual(toolView(edit, { content: 'edited /p/a.mjs', isError: false }), {
+  it('shows a long command folded to its first lines, and whole when asked', () => {
+    const long = `cd /work && ${'grep -rn "needle" src test docs | sort | uniq -c | '.repeat(8)}wc -l`;
+    const folded = toolView({ name: 'bash', input: { command: long } }).detail;
+    assert.ok(folded.length > 200 && folded.length < long.length && folded.endsWith(' …'), `more than a line of it, and not all of it: ${folded.length}`);
+    assert.equal(toolView({ name: 'bash', input: { command: long } }, null, { full: true }).detail, long, 'asked for in full, the command is whole');
+    const script = { name: 'bash', input: { command: 'set -e\nnpm ci\nnpm test\nnpm run lint\n' } };
+    assert.equal(toolView(script).detail, 'set -e\nnpm ci\nnpm test …', 'the first three lines of a script, and that there is more');
+    assert.equal(toolView(script, null, { full: true }).detail, 'set -e\nnpm ci\nnpm test\nnpm run lint');
+  });
+
+  it('shows an edit as a diff: the lines that changed, numbered as the file numbers them, with a line of what stayed around them', () => {
+    const input = { command: 'str_replace', path: '/p/cart.js', old_str: '  for (const item of items) {\n    sum += item.price;\n  }', new_str: '  for (const item of items) {\n    sum += item.price * (item.quantity ?? 1);\n  }' };
+    const edit = { name: 'str_replace_based_edit_tool', input };
+    // What the editor says it did: where the old text began, and the text as the file had it and has it now.
+    const done = { content: 'edited /p/cart.js', isError: false, edit: { line: 3, old: input.old_str, new: input.new_str } };
+    assert.deepEqual(toolView(edit, done), {
       title: 'Update',
-      detail: '/p/a.mjs',
+      detail: '/p/cart.js:4',
+      stat: { added: 1, removed: 1 },
       lines: [
-        { text: '- const a = 1;', tone: 'del' },
-        { text: '+ const a = 2;', tone: 'add' },
-        { text: '+ const b = 3;', tone: 'add' },
+        { text: '3     for (const item of items) {', tone: 'dim' },
+        { text: '4 -     sum += item.price;', tone: 'del' },
+        { text: '4 +     sum += item.price * (item.quantity ?? 1);', tone: 'add' },
+        { text: '5     }', tone: 'dim' },
       ],
     });
-    assert.deepEqual(toolView(edit, { content: 'old_str was not found in /p/a.mjs', isError: true }).lines, [{ text: 'old_str was not found in /p/a.mjs', tone: 'error' }], 'a refused edit shows the refusal, not the diff');
+    // Lines only added: numbered as the new file numbers them.
+    const grown = { name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: '/p/a.mjs', old_str: 'const a = 1;', new_str: 'const a = 1;\nconst b = 3;' } };
+    assert.deepEqual(toolView(grown, { content: 'edited /p/a.mjs', isError: false, edit: { line: 9, old: 'const a = 1;', new: 'const a = 1;\nconst b = 3;' } }).lines, [
+      { text: ' 9   const a = 1;', tone: 'dim' },
+      { text: '10 + const b = 3;', tone: 'add' },
+    ]);
+    // A result that does not say where (one kept from before): the same diff, without the numbers.
+    assert.deepEqual(toolView(edit, { content: 'edited /p/cart.js', isError: false }).lines.map((l) => l.text), ['    for (const item of items) {', '-     sum += item.price;', '+     sum += item.price * (item.quantity ?? 1);', '    }']);
+    assert.deepEqual(toolView(edit, { content: 'old_str was not found in /p/cart.js', isError: true }).lines, [{ text: 'old_str was not found in /p/cart.js', tone: 'error' }], 'a refused edit shows the refusal, not the diff');
+
+    // A big change folded: what went and what came each keep their top, so what was added is never folded away whole.
+    const many = (n, word) => Array.from({ length: n }, (_, i) => `${word} ${i}`).join('\n');
+    const big = toolView({ name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: '/p/a.mjs', old_str: many(20, 'old'), new_str: many(20, 'new') } }, { content: 'edited', isError: false, edit: { line: 1, old: many(20, 'old'), new: many(20, 'new') } });
+    assert.deepEqual(big.stat, { added: 20, removed: 20 });
+    assert.ok(big.lines.some((l) => l.tone === 'add' && /new 0$/.test(l.text)) && big.lines.some((l) => l.tone === 'del' && /old 0$/.test(l.text)), 'both sides show');
+    assert.equal(big.lines.filter((l) => /^… \+\d+ lines$/.test(l.text)).length, 2, 'and each says how much more there is');
+    assert.ok(big.lines.length <= 14);
+
+    // An insert: the lines that came, numbered from the line they landed on.
+    const insert = { name: 'str_replace_based_edit_tool', input: { command: 'insert', path: '/p/a.mjs', insert_line: 2, insert_text: 'x\ny\n' } };
+    assert.deepEqual(toolView(insert, { content: 'inserted', isError: false, edit: { line: 3, old: '', new: 'x\ny' } }), { title: 'Update', detail: '/p/a.mjs:3', stat: { added: 2, removed: 0 }, lines: [{ text: '3 + x', tone: 'add' }, { text: '4 + y', tone: 'add' }] });
 
     const view = { name: 'str_replace_based_edit_tool', input: { command: 'view', path: '/p/a.mjs', view_range: [1, 40] } };
     assert.deepEqual(toolView(view, { content: '1\ta\n2\tb', isError: false }), { title: 'Read', detail: '/p/a.mjs:1-40', lines: [{ text: '2 lines', tone: 'dim' }] });
@@ -256,6 +295,12 @@ describe('the markdown a model writes', () => {
   it('marks a quote and still reads the marks inside it, and names the language a code block is in', () => {
     assert.equal(rendered('> a **bold** claim'), '  │ a bold claim');
     assert.equal(rendered('```js\nconst x = 1;\n```'), '    ┌─ js\n    const x = 1;\n    └─');
+    // Code is what is read most closely: its frame is faint, the code itself is not.
+    const lit = [];
+    const coloured = createRenderer((t) => lit.push(t), styles(true));
+    coloured.write('```js\nconst x = 1;\n```\n');
+    assert.equal(lit[1], '    const x = 1;\n', 'the code at full weight');
+    assert.match(lit[0], /\x1b\[2m/, 'the frame dim');
   });
 
   it('sets a heading apart by its level: the top one underlined as well as bold', () => {
@@ -277,6 +322,8 @@ describe('the markdown a model writes', () => {
     ]);
     const failed = toolView(call, { content, job: { ...job, status: 'failed', report: '' } }).lines;
     assert.deepEqual(failed[0], { text: '✗ j41 failed · 3 turns · 9 tool calls · $0.02 · sonnet/low', tone: 'error' });
+    // How long the job took, when the result says: it is what the wait was.
+    assert.equal(toolView(call, { content, job: { ...job, seconds: 130 } }).lines[0].text, '✓ j41 done · 2m 10s · 3 turns · 9 tool calls · $0.02 · sonnet/low');
     assert.deepEqual(toolView(call, { content, job }, { full: true }).lines.map((l) => l.text), content.split('\n'), 'the full view is everything the model was told');
   });
 });
@@ -287,5 +334,12 @@ describe('paths', () => {
     assert.equal(toolView(view).detail, '~/proj/a.mjs:1-9');
     assert.equal(toolView({ ...view, input: { ...view.input, path: '/etc/hosts', view_range: undefined } }).detail, '/etc/hosts');
     assert.equal(toolView({ ...view, input: { ...view.input, path: `${homedir()}-other/a.mjs`, view_range: undefined } }).detail, `${homedir()}-other/a.mjs`, 'only the home itself, not a name that starts the same');
+  });
+
+  it('are shown from the project when they are in it: the file, not the way to it', () => {
+    const view = { name: 'str_replace_based_edit_tool', input: { command: 'view', path: '/work/shop/src/cart.js', view_range: [1, 9] } };
+    assert.equal(toolView(view, null, { cwd: '/work/shop' }).detail, 'src/cart.js:1-9');
+    assert.equal(toolView(view, null, { cwd: '/work/sh' }).detail, '/work/shop/src/cart.js:1-9', 'only the project itself, not a name that starts the same');
+    assert.equal(toolView({ ...view, input: { command: 'view', path: '/work/shop' } }, null, { cwd: '/work/shop' }).detail, '.', 'the project itself');
   });
 });

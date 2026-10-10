@@ -40,6 +40,7 @@ sumo setup --no-model                                                           
 sumo config model.source <url>                                                      # change it later
 sumo config chat.model opus                                                        # what `sumo chat` runs on; `auto` routes each turn
 sumo config chat.effort high                                                       # effort when using a fixed chat model
+sumo config chat.notify off                                                        # no bell when a long turn ends behind another window
 sumo models                                                                         # the API models: on or off, and why
 sumo models discover                                                                # ask the API again which of them this credential can use
 sumo models disable fable                                                           # keep one out of the chat, the router and the passes
@@ -52,23 +53,43 @@ and sets it — `/model opus high`, `/model haiku`,
 or `/model auto` to have the same local router that routes jobs pick a model and effort for each turn
 from what you typed (the menu offers the choices as you type; a switch costs one uncached turn, and a
 router that cannot answer refuses the turn); `/new` starts a fresh session, the memory block given to
-the model again, on a cleared screen; `/resume` picks a saved session up where it stopped — every
+the model again, at the top of the window — the old one scrolled up, not wiped; `/resume` picks a saved session up where it stopped — every
 session is saved after each turn, whole but for its pictures and with secrets redacted, the menu lists
 them newest first with the heavy ones marked, a session open in another terminal is refused, and
-`sumo chat --resume [id]` opens one from the shell (the newest without an id); `/memory` opens the memory in your browser; `/mcp` lists the MCP servers — connected or not, their tools, what may run unasked; `! <command>` runs a command yourself, where the agent would be refused; `/exit` (or `/quit`) ends it.
+`sumo chat --resume [id]` opens one from the shell (the newest without an id); `/copy` puts the last reply on the clipboard as it was written — no indent, no line folded to the window — and `/copy code` its last code block; `/help` lists the commands and the keys; `/memory` opens the memory in your browser; `/mcp` lists the MCP servers — connected or not, their tools, what may run unasked; `! <command>` runs a command yourself, where the agent would be refused; `/exit` (or `/quit`) ends it.
 
 The chat is a screen, not a scroll of lines: a box to type in (`\`+Enter, Shift-Enter or Option-Enter
 for a new line, Up for what you sent before — the last fifty, kept across sessions — `/` for the command menu;
 Ctrl-V pastes an image from the clipboard, on macOS, and an image file dropped on the box is the image —
-either stands in the box as `[Image #1]` and goes to the model with the message that names it), each tool call with the top
-of its result (Ctrl-O for all of it, and again to fold it back), the reply's markdown drawn as it reads —
-bold, italics, lists and task boxes, quotes, code blocks with their language, tables as tables — and a working
-line while the model is busy. A delegated job stands under the call that started it while it works: how long,
+either stands in the box as `[Image #1]` and goes to the model with the message that names it; a paste too
+long for the box is drawn by the ten rows around the cursor, all of it still there). What you said stands
+at full weight with a bar down its side. Each tool call shows what ran and what came back: a command by its
+first lines, and while it runs the last three lines it has printed and how long it has run; then the first
+two and the last three lines of its output, because a run says how it went at the end; an edit as a diff —
+the file from the project, the line it is on, `+1 −1`, the lines that changed numbered as the file numbers
+them with a line of what stayed around them. Ctrl-O is everything in full — the whole command, all the
+output, the file read or written — and again to fold it back. The reply's markdown is drawn as it reads —
+bold, italics, lists and task boxes, quotes, code blocks with their language and at full weight, tables as
+tables — and a working line while the model is busy, which says so when the model has been quiet for twenty
+seconds with nothing running. A delegated job stands under the call that started it while it works: how long,
 how many calls, what it runs now; it ends in one line — done or failed, what it cost — over the top of its report.
-Esc stops the turn; a message sent while it works is queued and goes next; Ctrl-C twice leaves. A resized
-window is redrawn to fit. The memory block goes to the model, not the screen; only a warning in it is
-shown. While the conversation is short the box stands at the foot of the window, a lion faint behind the
-room above it, covered as the conversation grows. The words on the working line are yours:
+
+A turn that made calls, or took ten seconds, ends on one line: how long, how many calls, the files it edited,
+what it cost. If it took ten seconds and the terminal says its window is not the one in front, it also rings
+— a bell and a notification (OSC 9), as does a question that waits for you; `sumo config chat.notify off`
+turns that off. The window's title says `sumo · <project>`, with a mark while it works or waits. Under the
+box: the model and effort, the size of the context, what the session has cost, and the project the tools run
+in with its branch.
+
+Esc stops the turn — first it closes an open command menu — and Ctrl-C first clears what is typed; Ctrl-C twice
+on an empty box leaves. A message sent while the model works is read with its next request, in the same turn
+(`next step:` above the box until it is); a command or a picture waits for the turn to end (`queued:`). Up on
+an empty box takes back what is waiting, and stopping the turn brings all of it back to the box instead of
+sending it. A resized window is redrawn to fit. The memory block goes to the model, not the screen; only a
+warning in it is shown. Opening the chat scrolls the window clear rather than wiping it, so what the terminal
+showed before is still in its scrollback; a resize or Ctrl-O draws everything again and does wipe it. While the
+conversation is short the box stands at the foot of the window; until you send the first message a lion stands
+faint in the room above it. The words on the working line are yours:
 `spinner.txt`, one a line, a random one to start each turn and the next every five seconds; so is the lion,
 `logo.txt`.
 Piped (`echo … | sumo chat`), it prints plain lines, the memory block first.
@@ -100,7 +121,8 @@ second to thirty (or what the API asked for), each try said on the screen and wr
 request the API refuses as wrong is not. A turn the API pauses of its own accord goes on. The same call made
 with the same answer three times in a row is said to the model; five times, and the turn is stopped. The turn
 before the last of a run carries a warning, so a job that hits the turn limit still closes. Every model but
-Haiku is asked to say what it is thinking in summary, and the last line of it shows under the working line.
+Haiku is asked to say what it is thinking in summary, and the end of it — its last three rows, folded to the
+window — shows under the working line.
 
 | When | What runs | Cost to the model you chat with |
 |---|---|---|
@@ -227,7 +249,9 @@ The route is the router's answer, and nothing else's. On every `sumo job new` an
 4B open model (Qwen3-4B, through llama.cpp) reads the role, project, task text and the project's history,
 describes the job — its kind, how much code it touches, whether it is risky — and then answers with a
 model, an effort and one sentence. It runs locally, costs nothing, and takes about a second once the
-model is loaded. There are no flags to override it, no project rules, no retry ladder and no floors.
+model is loaded. A scout's job is put to it as reading, not as changing code: read as a change, an audit
+is "novel" and so is a summary of an unfamiliar project, and both went to the dearest model; read as
+reading, finding and describing are routine and only judging — an audit, a review, a bug hunt — is hard. There are no flags to override it, no project rules, no retry ladder and no floors.
 
 The same model, through the same server, writes memory; see *The local model* below for what it is, how it
 is run and how it was measured.
@@ -265,7 +289,7 @@ Important issues each. So when a reviewer finishes, its Important count is store
 and that is what the router's history and `sumo job stats` report:
 
 ```sh
-sumo job stats --project <slug>     # per model/effort: jobs, done, failed, reviewed, avg important
+sumo job stats --project <slug>     # per role and model/effort: jobs, done, failed, reviewed, avg important — and what a job took: requests, time, money
 sumo job retry <id>                 # a failed job, or one reviewed with 3+ Important: same brief,
                                    # previous notes and report attached, routed afresh
 ```
@@ -277,6 +301,12 @@ real router in a throwaway home and prints how many tasks were routed too high a
 ```sh
 node --disable-warning=ExperimentalWarning test/router-probes.mjs
 ```
+
+Six of its eighteen tasks are scout jobs, labelled from this machine's own ledger: the haiku scouts took 39 to 77
+requests and $0.15 to $0.50 a job, the one on sonnet/low did a like audit in 6 requests for $0.07 — so for reading
+that is more than one lookup, haiku is not the cheap end. Measured 2026-10-10: 15, 15 and 16 of 18 right over the
+three histories; before scouts had a prompt of their own, 14, 14 and 15, with a summary of a project routed to fable.
+`sumo job stats` shows the same thing as it accrues — what a job on each route took, per role.
 
 A retry is routed like any job, except that the router is also told what the previous attempt ran on
 and how it ended.
@@ -505,7 +535,7 @@ src/loop.mjs         the loop every conversation runs in; src/tools.mjs the shel
 src/mcp.mjs          the MCP servers: their configuration, the two transports, the allow list, `sumo mcp`
 src/chat.mjs         the chat; src/hooks.mjs the session policy as events
 src/ui.mjs           the chat's screen (Ink, loaded only by `sumo chat`); src/editor.mjs the box you type in
-spinner.txt          the words the chat shows while it works — edit them; logo.txt the lion behind the screen
+spinner.txt          the words the chat shows while it works — edit them; logo.txt the lion in the empty chat
 src/route.mjs        how a job's model and effort are chosen: the router, and the stats
 src/local-server.mjs the one llama-server behind the router and the memory passes; src/model.mjs the calls to it and to the API
 test/  probes/       the suite, and the live measurements

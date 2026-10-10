@@ -44,6 +44,14 @@ const PROBES = [
   ['opus/high', 'fable/high', 'worker', 'Token refresh for API auth', '## Goal\nDesign and build OAuth token refresh, with the credentials kept in the OS keychain. Handle a token that expires mid-request, two refreshes racing each other, and a revoked token.\n\n## Non-goals\nNo new dependency.\n\n## Check\n`npm test` passes with a test for each failure path.'],
   ['haiku/none', 'sonnet/medium', 'reviewer', 'Review: typo fix in the README', '## Goal\nReview the one-line README typo fix.'],
   ['opus/high', 'opus/max', 'reviewer', 'Review: token refresh for API auth', '## Goal\nReview the OAuth token refresh change: keychain storage, a token expiring mid-request, concurrent refreshes, revocation.'],
+  // A scout only reads and reports. On this machine the haiku scouts took 39 to 77 requests and $0.15 to $0.50 each, and the one
+  // on sonnet/low did a like audit in 6 requests for $0.07 — so for reading that is more than one lookup, haiku is not the cheap end.
+  ['haiku/none', 'sonnet/low', 'scout', 'Find where a function is defined', '## Goal\nFind where `renderTable` is defined and list every place that calls it, with file and line. Describe only.\n\n## Check\nNone: nothing is changed.'],
+  ['sonnet/low', 'sonnet/medium', 'scout', 'Describe what the project does', '## Goal\nRead the README, the entry points and the main packages, and say in a page what this project does and how its parts fit together. Describe only.\n\n## Check\nNone: nothing is changed.'],
+  ['sonnet/low', 'sonnet/high', 'scout', 'Is the HTTP API RESTful', '## Goal\nList the HTTP endpoints the server registers and say, for each, whether its method and path follow REST conventions. Describe only.\n\n## Check\nNone: nothing is changed.'],
+  ['sonnet/low', 'opus/medium', 'scout', 'Audit: which dependency upgrades are needed', '## Goal\nRead the manifest and the lockfile, list the dependencies that are behind their latest release, and say which upgrades matter and why. Upgrade nothing.\n\n## Check\nNone: nothing is changed.'],
+  ['sonnet/medium', 'opus/high', 'scout', 'Audit: API authentication coverage', '## Goal\nAudit every HTTP endpoint for authentication and authorization: which middleware guards it, which roles may call it, and any endpoint left open. Report findings with file and line. Change nothing.'],
+  ['sonnet/medium', 'opus/high', 'scout', 'Review session handling for correctness', '## Goal\nRead how sessions are saved, locked and resumed, and report any way two processes could corrupt one. Describe only; fix nothing.'],
 ];
 
 /** What the project's finished jobs look like before the router is asked: [status, model, effort, important]. */

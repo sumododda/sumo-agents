@@ -233,8 +233,9 @@ const repeated = (count) => `\n[sumo: this is the same call with the same answer
  * the API takes. `inbox` hands over what the user said to this conversation
  * while it worked: it is read with the next request, behind the tool results,
  * and a conversation about to end is given one more request to answer it.
+ * `onOutput` is handed what a shell command prints, as it prints it.
  */
-export async function converse(db, params, { send = sendToApi, ctx, ledger, beforeTool = null, concurrent = null, onText = null, onThinking = null, onTool = null, onResult = null, onTurn = null, onRetry = null, onCompact = null, inbox = null, signal = null, retry = RETRY, compact = null, now = () => new Date().toISOString() }) {
+export async function converse(db, params, { send = sendToApi, ctx, ledger, beforeTool = null, concurrent = null, onText = null, onThinking = null, onTool = null, onOutput = null, onResult = null, onTurn = null, onRetry = null, onCompact = null, inbox = null, signal = null, retry = RETRY, compact = null, now = () => new Date().toISOString() }) {
   const totals = { inputTokens: 0, outputTokens: 0, costUsd: 0, toolCalls: 0, contextTokens: 0 };
   let turns = 0;
   let stop = 'max_turns';
@@ -311,7 +312,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
       onTool?.(call);
       let out;
       try {
-        out = (await beforeTool?.(call)) ?? (isMcpTool(call.name) ? await runMcpTool(call, { signal }) : await runTool(call, ctx, { signal }));
+        out = (await beforeTool?.(call)) ?? (isMcpTool(call.name) ? await runMcpTool(call, { signal }) : await runTool(call, ctx, { signal, onOutput: onOutput && ((chunk) => onOutput(call, chunk)) }));
       } catch (cause) {
         // A call that is not answered makes the next request invalid; a failure is an answer.
         out = { content: `the tool failed: ${cause.message}`, isError: true };
