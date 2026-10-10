@@ -534,7 +534,35 @@ the chat model save directly. `dream.model` is the same.
 ```sh
 npm test                              # offline suite, no real model calls (recorded answers)
 node probes/scope-accuracy.mjs        # live: the local writer on 30 labelled turns, $0 (`haiku` to compare, about 9 cents)
+node --disable-warning=ExperimentalWarning probes/coding-eval.mjs    # live: eight small jobs, scored by what they never saw
 ```
+
+### The coding eval
+
+Whether a change to the loop, the prompts, the tools or the router makes jobs come out right more often, or
+cheaper, is not something the offline suite can say. `probes/coding-eval.mjs` runs eight small jobs for real
+— six for a worker, two for a scout — each a project that fits on a page, written out fresh, handed over as
+a brief, and scored by what the job never saw: hidden tests against the tree it left, the files it was told
+not to touch, and for a scout the line its report was asked to end on. Each task has a way to be done wrong
+that still looks done: `quantity || 1` passes the test given and counts a quantity of 0 as one; a bug whose
+tests already pass can be left in place under a DONE; the test can be edited to agree with the code.
+
+```sh
+node --disable-warning=ExperimentalWarning probes/coding-eval.mjs --list
+node --disable-warning=ExperimentalWarning probes/coding-eval.mjs                              # routed by the router
+node --disable-warning=ExperimentalWarning probes/coding-eval.mjs --route sonnet/medium        # one model for all: only the harness varies
+node --disable-warning=ExperimentalWarning probes/coding-eval.mjs --task cart-quantity --runs 3 --json before.json
+```
+
+It prints a line per job — `PASS`, `FAIL`, or `FALSE DONE` for a job that said DONE and was wrong, which is
+counted apart because nobody looks again at a DONE — with its route, requests, time and cost, and a line that
+sums them. It needs a credential and the router model, runs in a home of its own, and reads the real one only
+for which models are on. Run it before a change and after, on a pinned route, and more than once: one run of
+eight tasks is a small sample.
+
+The eval is itself under test (`test/coding-eval.test.mjs`): stand-in agents run the tasks through the real
+job machinery, and the score must tell them apart — one that does each task right passes all eight, and the
+sloppy fix, the idle DONE, the edited test and the report with one name too many do not.
 
 ## Layout
 
@@ -550,6 +578,6 @@ src/ui.mjs           the chat's screen (Ink, loaded only by `sumo chat`); src/ed
 spinner.txt          the words the chat shows while it works — edit them; logo.txt the lion in the empty chat
 src/route.mjs        how a job's model and effort are chosen: the router, and the stats
 src/local-server.mjs the one llama-server behind the router and the memory passes; src/model.mjs the calls to it and to the API
-test/  probes/       the suite, and the live measurements
+test/  probes/       the suite, and the live measurements: memory scope, routing, and the coding eval
 docs/ADR-runtime.md  the decision to own the runtime, and the plan it followed; docs/PLAN.md the original design
 ```
