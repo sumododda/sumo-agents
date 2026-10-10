@@ -1,7 +1,7 @@
 // The input box of the chat: what each key does to the text, the history, and the command menu.
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { editor, keysOf, menuFor, paste, press } from '../src/editor.mjs';
+import { editor, keysOf, matchFiles, mentionAt, menuFor, menuOf, paste, press } from '../src/editor.mjs';
 
 const COMMANDS = [{ name: 'fix' }, { name: 'feature' }, { name: 'dream' }];
 const type = (state, text) => [...text].reduce((s, ch) => press(s, ch, {}).state, state);
@@ -200,5 +200,46 @@ describe('the chat input box', () => {
 
   it('keeps a control key in a burst a control key', () => {
     assert.deepEqual(keysOf('ab\x03', {}), [['a', {}], ['b', {}], ['c', { ctrl: true }]]);
+  });
+});
+
+describe('naming a file with @', () => {
+  const FILES = ['README.md', 'src/cart.js', 'src/cart.test.js', 'src/checkout/cart-total.js', 'docs/carts.md', 'package.json'];
+  const files = (query) => matchFiles(FILES, query);
+
+  it('finds the mention the cursor stands at the end of, and nothing in an address or a word', () => {
+    assert.deepEqual(mentionAt({ text: 'see @src/ca', cursor: 11 }), { from: 4, query: 'src/ca' });
+    assert.deepEqual(mentionAt({ text: '@', cursor: 1 }), { from: 0, query: '' });
+    assert.equal(mentionAt({ text: 'mail me@home', cursor: 12 }), null, 'an address is not a mention');
+    assert.equal(mentionAt({ text: 'see @src then', cursor: 13 }), null, 'only the one being typed');
+    assert.deepEqual(mentionAt({ text: 'see @src then', cursor: 8 }), { from: 4, query: 'src' }, 'wherever in the text the cursor is');
+  });
+
+  it('offers the files the letters could mean: a name that starts with them first, the shorter path first', () => {
+    assert.deepEqual(matchFiles(FILES, 'car'), ['src/cart.js', 'docs/carts.md', 'src/cart.test.js', 'src/checkout/cart-total.js']);
+    assert.deepEqual(matchFiles(FILES, 'SRC/'), ['src/cart.js', 'src/cart.test.js', 'src/checkout/cart-total.js'], 'a path that starts with them, whatever the case');
+    assert.deepEqual(matchFiles(FILES, 'total'), ['src/checkout/cart-total.js']);
+    assert.deepEqual(matchFiles(FILES, 'zzz'), []);
+    assert.equal(matchFiles(Array.from({ length: 50 }, (_, i) => `f${i}.js`), 'f').length, 8, 'no more than the menu holds');
+  });
+
+  it('puts the picked path where the mention was, with the rest of the text after it, and sends nothing', () => {
+    let s = type(editor(), 'compare @car with the docs');
+    s = { ...s, cursor: 'compare @car'.length };
+    assert.deepEqual(menuOf(s, COMMANDS, files).map((m) => m.label), ['src/cart.js', 'docs/carts.md', 'src/cart.test.js', 'src/checkout/cart-total.js']);
+    const picked = press(s, '', { downArrow: true }, COMMANDS, files).state;
+    const done = press(picked, '\r', ENTER, COMMANDS, files);
+    assert.equal(done.submit, undefined, 'Enter on the menu picks');
+    assert.equal(done.state.text, 'compare docs/carts.md  with the docs');
+    assert.equal(done.state.cursor, 'compare docs/carts.md '.length, 'the cursor after the path, ready for the next word');
+    assert.deepEqual(menuOf(done.state, COMMANDS, files), [], 'and the menu is gone');
+    // A menu Esc shut stays shut for that text, and opens again when the text changes.
+    const shut = { ...s, shut: s.text };
+    assert.deepEqual(menuOf(shut, COMMANDS, files), []);
+    assert.equal(press(shut, '\r', ENTER, COMMANDS, files).submit, 'compare @car with the docs', 'Enter then sends what is written');
+    assert.deepEqual(menuOf(press(shut, 't', {}, COMMANDS, files).state, COMMANDS, files).map((m) => m.label), matchFiles(FILES, 'cart'), 'a letter more, and it is open again');
+    // The slash menu is as it was, and without a list of files nothing is offered.
+    assert.deepEqual(menuOf(type(editor(), '/f'), COMMANDS, files).map((m) => m.label), ['/fix', '/feature']);
+    assert.deepEqual(menuOf(s, COMMANDS), []);
   });
 });

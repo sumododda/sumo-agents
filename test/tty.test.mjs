@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { createRenderer, flow, header, logoLines, messageAt, pickMessage, prompt, renderBlock, renderLine, spinnerMessages, styles, sunset, toolView, wrap } from '../src/tty.mjs';
+import { createRenderer, flow, header, logoLines, messageAt, pickMessage, prompt, renderBlock, renderLine, spinnerMessages, styles, sunset, toolView, transcript, wrap } from '../src/tty.mjs';
 
 const on = styles(true);
 const off = styles(false);
@@ -341,5 +341,35 @@ describe('paths', () => {
     assert.equal(toolView(view, null, { cwd: '/work/shop' }).detail, 'src/cart.js:1-9');
     assert.equal(toolView(view, null, { cwd: '/work/sh' }).detail, '/work/shop/src/cart.js:1-9', 'only the project itself, not a name that starts the same');
     assert.equal(toolView({ ...view, input: { command: 'view', path: '/work/shop' } }, null, { cwd: '/work/shop' }).detail, '.', 'the project itself');
+  });
+});
+
+describe('the conversation as text for a pager', () => {
+  it('is every entry in full: what was said, each reply as it is drawn, the whole command and all it printed, an edit as its diff', () => {
+    const many = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n');
+    const log = [
+      { kind: 'header', route: 'opus · high', cwd: '~/shop', block: '' },
+      { kind: 'user', text: 'fix the total\nand say why' },
+      { kind: 'reply', raw: 'Looking at **cart.js**.' },
+      { kind: 'tool', call: { name: 'bash', input: { command: `npm test # ${'x'.repeat(300)}` } }, result: { content: many, isError: true } },
+      { kind: 'tool', call: { name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: '/work/shop/cart.js', old_str: 'a', new_str: 'b' } }, result: { content: 'edited', isError: false, edit: { line: 4, old: 'a', new: 'b' } } },
+      { kind: 'user', text: '! git status' },
+      { kind: 'shell', result: { content: 'clean', isError: false } },
+      { kind: 'job', id: 7, agent: 'scout', route: 'sonnet/low', title: 'look' },
+      { kind: 'note', text: 'Interrupted' },
+      { kind: 'error', text: 'error: 529' },
+      { kind: 'footer', text: '48s · 2 calls · $0.07' },
+    ];
+    const text = transcript(log, styles(false), { width: 80, cwd: '/work/shop' });
+    assert.ok(text.startsWith('┃ fix the total\n┃ and say why\n\n⏺ Looking at cart.js.\n\n⏺ Bash(npm test # xxx'), text.slice(0, 120));
+    assert.ok(text.includes('x'.repeat(300)), 'the command whole');
+    assert.match(text, /⎿ {2}line 1\n {5}line 2\n[\s\S]* {5}line 30\n/);
+    assert.equal(text.match(/line \d+/g).length, 30, 'every line it printed');
+    assert.match(text, /\n⏺ Update\(cart\.js:4\) \+1 −1\n {2}⎿ {2}4 - a\n {5}4 \+ b\n/);
+    assert.match(text, /\n┃ ! git status\n {2}⎿ {2}clean\n/);
+    assert.match(text, /\n⏺ j7 scout · sonnet\/low — look\n {2}⎿ {2}Interrupted\n\nerror: 529\n\n {2}48s · 2 calls · \$0\.07\n$/);
+    assert.doesNotMatch(text, /opus · high/, 'the header is the screen\'s');
+    // In colour where the terminal has it.
+    assert.match(transcript(log, styles(true), { width: 80 }), /\x1b\[31m⏺\x1b\[39m \x1b\[1mBash/);
   });
 });

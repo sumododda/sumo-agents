@@ -29,8 +29,40 @@ export function menuFor(text, commands) {
     .map((choice) => ({ name: choice.name, label: choice.name, hint: choice.hint, complete: `${head}${choice.name} ` }));
 }
 
-/** The menu for the text being written; a recalled entry has none, so the arrows keep walking history. */
-export const menuOf = (state, commands) => (state.at === state.history.length ? menuFor(state.text, commands) : []);
+/**
+ * The `@word` the cursor stands at the end of — a file being named: where it starts, and what has been typed of it.
+ * Null when there is none: the `@` must begin the text or follow a space, so an address or a decorator is not one.
+ */
+export function mentionAt({ text, cursor }) {
+  const m = /(^|\s)@([\w./~-]*)$/.exec(text.slice(0, cursor));
+  return m ? { from: m.index + m[1].length, query: m[2] } : null;
+}
+
+/** The files a few typed characters could mean, best first: a name that starts with them, a path that does, then either holding them; the shorter path first. */
+export function matchFiles(list, query, max = 8) {
+  const q = query.toLowerCase();
+  const found = [];
+  for (const path of list) {
+    const p = path.toLowerCase();
+    const name = p.slice(p.lastIndexOf('/') + 1);
+    const rank = name.startsWith(q) ? 0 : p.startsWith(q) ? 1 : name.includes(q) ? 2 : p.includes(q) ? 3 : -1;
+    if (rank !== -1) found.push([rank, path]);
+  }
+  return found.sort((a, b) => a[0] - b[0] || a[1].length - b[1].length || (a[1] < b[1] ? -1 : 1)).slice(0, max).map(([, path]) => path);
+}
+
+/**
+ * The menu for the text being written: the slash menu, or — given `files(query, from)`, which answers with the paths a
+ * mention could mean — the files for the `@word` at the cursor; picking one leaves its path where the mention was. A
+ * recalled entry has none, so the arrows keep walking history; nor has a text whose menu Esc shut (`shut`), until it changes.
+ */
+export function menuOf(state, commands, files = null) {
+  if (state.at !== state.history.length || state.shut === state.text) return [];
+  const menu = menuFor(state.text, commands);
+  const at = menu.length === 0 && files ? mentionAt(state) : null;
+  if (!at) return menu;
+  return files(at.query, at.from).map((path) => ({ name: path, label: path, hint: '', file: true, complete: `${state.text.slice(0, at.from)}${path} ${state.text.slice(state.cursor)}`, cursor: at.from + path.length + 1 }));
+}
 
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 /** The character before the cursor, whole: an emoji is several code units and one keystroke. */
@@ -111,8 +143,8 @@ function send(state) {
  * is the slash menu's list. Returns the next state, and `submit` when the key
  * sent the text.
  */
-export function press(state, input, key, commands = []) {
-  const menu = menuOf(state, commands);
+export function press(state, input, key, commands = [], files = null) {
+  const menu = menuOf(state, commands, files);
   const { text, cursor } = state;
   const word = key.meta || key.ctrl;
 
@@ -120,12 +152,12 @@ export function press(state, input, key, commands = []) {
     if (text[cursor - 1] === '\\') return { state: insert(cut(state, cursor - 1, cursor), '\n') };
     if (key.shift || key.meta) return { state: insert(state, '\n') };
     const chosen = menu[state.pick];
-    if (chosen && text !== chosen.complete.trimEnd()) return { state: edit(state, chosen.complete, chosen.complete.length) };
+    if (chosen && text !== chosen.complete.trimEnd()) return { state: edit(state, chosen.complete, chosen.cursor ?? chosen.complete.length) };
     return send(state);
   }
   if (key.tab) {
     const chosen = menu[state.pick];
-    return { state: chosen ? edit(state, chosen.complete, chosen.complete.length) : state };
+    return { state: chosen ? edit(state, chosen.complete, chosen.cursor ?? chosen.complete.length) : state };
   }
   if (key.upArrow) return { state: vertical(state, -1, menu) };
   if (key.downArrow) return { state: vertical(state, 1, menu) };

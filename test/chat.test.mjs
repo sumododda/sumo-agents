@@ -1089,7 +1089,7 @@ test('the commands of the menu work from inside a project: the guide comes with 
       const fix = session.expand('/fix the login bug');
       assert.match(fix.text, /Make it fail on demand/, 'the guide itself, not a path the tools cannot reach from the project');
       assert.match(fix.text, /for this: the login bug$/);
-      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /copy /help /new /exit');
+      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /copy /stop /help /new /exit');
 
       const dream = session.expand('/dream');
       await session.say(dream.text, dream.said);
@@ -1607,3 +1607,151 @@ test('what the screen asks the session: the commands it adds, where the work is,
     }
   });
 });
+
+/** Two conversations over one transport, as the chat and its background job are: each request is answered from its own list, told apart by the job's `finish` tool. */
+const split = ({ chat: forChat, job: forJob }) => {
+  const seen = { chat: [], job: [] };
+  const send = (params, { onText, signal } = {}) =>
+    new Promise((resolve, reject) => {
+      const who = params.tools.some((t) => t.name === 'finish') ? 'job' : 'chat';
+      seen[who].push(structuredClone(params));
+      const next = (who === 'job' ? forJob : forChat).shift();
+      if (!next) return reject(new Error(`nothing left to answer the ${who} with`));
+      const deliver = () => {
+        for (const b of next.reply.content) if (b.type === 'text' && onText) onText(b.text);
+        resolve(next.reply);
+      };
+      if (!next.gate) return deliver();
+      signal?.addEventListener('abort', () => reject(new Error('Request was aborted.')));
+      next.gate.then(deliver);
+    });
+  return { send, seen };
+};
+const opens = () => {
+  let open;
+  const gate = new Promise((r) => (open = r));
+  return { gate, open };
+};
+test('a chat that works in the background: delegate answers at once and the turn ends while the job runs; its report comes later as an automated event, in a turn of its own, and is never the user\'s words', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const id = scoutJob(db, 'sumo-agents-bg-');
+      const working = opens();
+      const { send, seen } = split({
+        chat: [
+          { reply: reply('tool_use', [call('t1', 'delegate', { job: id })]) },
+          { reply: reply('end_turn', [{ type: 'text', text: 'the scout is looking; I will say what it finds' }]) },
+          { reply: reply('end_turn', [{ type: 'text', text: 'it found two things' }]) },
+        ],
+        job: [{ reply: reply('end_turn', [{ type: 'text', text: 'two things: a and b' }]), gate: working.gate }, { reply: reply('end_turn', []) }],
+      });
+      const watched = [];
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, background: true, watch: (e) => watched.push(e), now: () => NOW });
+      session.start('startup');
+
+      // The turn that delegates ends while the job is still at work.
+      const first = await session.say('check simba');
+      assert.equal(first.text, 'the scout is looking; I will say what it finds');
+      const answered = seen.chat[1].messages.at(-1).content[0];
+      assert.equal(answered.type, 'tool_result');
+      assert.match(answered.content, new RegExp(`^j${id} is running in the background`));
+      assert.match(answered.content, /its report will reach you later, as an automated event/i);
+      assert.match(answered.content, /do not guess/i);
+      assert.deepEqual(session.running(), [id]);
+      assert.equal(session.waiting(), 0);
+      assert.equal(await session.wake(), null, 'nothing has reported: there is nothing to wake for');
+      assert.ok(watched.some((e) => e.type === 'job' && e.job.id === id) && !watched.some((e) => e.type === 'job-report'));
+
+      // It reports: whoever watches is told, with how it went, and the report waits for the model.
+      working.open();
+      await until(() => session.waiting() === 1, 'the report');
+      assert.deepEqual(session.running(), []);
+      const told = watched.find((e) => e.type === 'job-report');
+      assert.equal(told.job, id);
+      assert.match(told.result.content, /^STATUS: never closed/);
+      assert.equal(told.result.job.id, id);
+
+      // A turn of its own reads it: marked as no word of the user's, and kept out of what memory holds as theirs.
+      const woke = await session.wake();
+      assert.equal(woke.text, 'it found two things');
+      const event = seen.chat[2].messages.at(-1);
+      assert.equal(event.role, 'user');
+      assert.match(event.content[0].text, new RegExp(`^<sumo>\\nAn automated event, not a message from the user: j${id} has reported\\.\\nSTATUS: never closed`));
+      assert.equal(session.waiting(), 0);
+      assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['check simba']);
+      assert.ok(paired(session.params.messages));
+    } finally {
+      db.close();
+      await closeMcp();
+    }
+  });
+});
+
+test('a background job outlives the turn that started it: a report that comes while the model works is read with its next request; stopping the turn leaves the job running; a job the user stops says so with the next message, and wakes nothing', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const id = scoutJob(db, 'sumo-agents-bg-');
+      const working = opens();
+      const thinking = opens();
+      const { send, seen } = split({
+        chat: [
+          { reply: reply('tool_use', [call('t1', 'delegate', { job: id })]) },
+          { reply: reply('end_turn', [{ type: 'text', text: 'meanwhile' }]), gate: thinking.gate },
+          { reply: reply('end_turn', [{ type: 'text', text: 'and the scout says a and b' }]) },
+        ],
+        job: [{ reply: reply('end_turn', [{ type: 'text', text: 'a and b' }]), gate: working.gate }, { reply: reply('end_turn', []) }],
+      });
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, background: true, now: () => NOW });
+      session.start('startup');
+      const turn = session.say('check simba');
+      await until(() => seen.chat.length === 2, 'the request after the delegate call');
+      // The job reports while the model is still answering: it is read behind that answer, in the same turn.
+      working.open();
+      await until(() => session.running().length === 0, 'the job to end');
+      thinking.open();
+      assert.equal((await turn).text, 'and the scout says a and b');
+      assert.match(seen.chat[2].messages.at(-1).content[0].text, new RegExp(`^An automated event, not a message from the user: j${id} has reported\\.\\nSTATUS: never closed`));
+      assert.equal(session.waiting(), 0, 'read: nothing is left to wake for');
+
+      // Another job: the turn that started it is stopped, and the job is not.
+      const again = anotherJob(db);
+      const forever = opens();
+      const held = opens();
+      const next = split({
+        chat: [{ reply: reply('tool_use', [call('t2', 'delegate', { job: again })]) }, { reply: reply('end_turn', [{ type: 'text', text: 'never said' }]), gate: held.gate }, { reply: reply('end_turn', [{ type: 'text', text: 'noted' }]) }],
+        job: [{ reply: reply('end_turn', [{ type: 'text', text: 'never said either' }]), gate: forever.gate }],
+      });
+      const other = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: next.send, background: true, now: () => NOW });
+      other.start('startup');
+      const stopped = other.say('check again');
+      await until(() => next.seen.chat.length === 2 && next.seen.job.length === 1, 'both at work');
+      other.interrupt();
+      assert.equal((await stopped).stop, 'interrupted');
+      assert.deepEqual(other.running(), [again], 'Esc stops the chat\'s turn, not the job in the background');
+
+      // The user stops the job: it ends, and that is said to the model with whatever comes next — no turn is started for it.
+      assert.equal(other.stop(again), true);
+      await until(() => other.running().length === 0, 'the stopped job to end');
+      assert.equal(other.waiting(), 0, 'a job the user stopped wakes nothing');
+      assert.equal(other.stop(again), false, 'only a running job can be stopped');
+      await other.say('what now');
+      const sent = next.seen.chat[2].messages;
+      assert.equal(sent.at(-2).content.at(-1).text, 'what now');
+      assert.match(JSON.stringify(sent.at(-1)), new RegExp(`An automated event, not a message from the user: j${again} has reported\\.[^"]*stopped: interrupted by the user`));
+      await other.settle();
+    } finally {
+      db.close();
+      await closeMcp();
+    }
+  });
+});
+
+/** A second open job in the project the first made. */
+function anotherJob(db) {
+  const id = Number(db.prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('simba', 'look again', 'scout', 'running', null, ?, ?, 'haiku', 'none', 'test')`).run(NOW, NOW).lastInsertRowid);
+  mkdirSync(join(paths().jobs, String(id)), { recursive: true });
+  writeFileSync(join(paths().jobs, String(id), 'brief.md'), '# Job\n\n## The task\nlook again\n');
+  return id;
+}

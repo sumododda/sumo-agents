@@ -53,22 +53,26 @@ and sets it — `/model opus high`, `/model haiku`,
 or `/model auto` to have the same local router that routes jobs pick a model and effort for each turn
 from what you typed (the menu offers the choices as you type; a switch costs one uncached turn, and a
 router that cannot answer refuses the turn); `/new` starts a fresh session, the memory block given to
-the model again, at the top of the window — the old one scrolled up, not wiped; `/resume` picks a saved session up where it stopped — every
+the model again, at the top of the window — the old one scrolled up, not wiped; `/resume` picks a saved session up where it stopped, its last five turns drawn again so you see where that was — every
 session is saved after each turn, whole but for its pictures and with secrets redacted, the menu lists
 them newest first with the heavy ones marked, a session open in another terminal is refused, and
-`sumo chat --resume [id]` opens one from the shell (the newest without an id); `/copy` puts the last reply on the clipboard as it was written — no indent, no line folded to the window — and `/copy code` its last code block; `/help` lists the commands and the keys; `/memory` opens the memory in your browser; `/mcp` lists the MCP servers — connected or not, their tools, what may run unasked; `! <command>` runs a command yourself, where the agent would be refused; `/exit` (or `/quit`) ends it.
+`sumo chat --resume [id]` opens one from the shell (the newest without an id); `/copy` puts the last reply on the clipboard as it was written — no indent, no line folded to the window — and `/copy code` its last code block; `/help` lists the commands and the keys; `/memory` opens the memory in your browser; `/mcp` lists the MCP servers — connected or not, their tools, what may run unasked; `/stop` stops a job at work in the background; `! <command>` runs a command yourself, where the agent would be refused; `/exit` (or `/quit`) ends it.
 
 The chat is a screen, not a scroll of lines: a box to type in (`\`+Enter, Shift-Enter or Option-Enter
 for a new line, Up for what you sent before — the last fifty, kept across sessions — `/` for the command menu;
 Ctrl-V pastes an image from the clipboard, on macOS, and an image file dropped on the box is the image —
 either stands in the box as `[Image #1]` and goes to the model with the message that names it; a paste too
-long for the box is drawn by the ten rows around the cursor, all of it still there). What you said stands
+long for the box is drawn by the ten rows around the cursor, all of it still there; `@` and a few letters
+names a file of the project — the menu offers the ones they could mean, Enter or Tab puts the path in, Esc
+shuts the menu and keeps your words; Ctrl-G opens the message in `$VISUAL` or `$EDITOR`, and what you save
+there comes back to the box). What you said stands
 at full weight with a bar down its side. Each tool call shows what ran and what came back: a command by its
 first lines, and while it runs the last three lines it has printed and how long it has run; then the first
 two and the last three lines of its output, because a run says how it went at the end; an edit as a diff —
 the file from the project, the line it is on, `+1 −1`, the lines that changed numbered as the file numbers
-them with a line of what stayed around them. Ctrl-O is everything in full — the whole command, all the
-output, the file read or written — and again to fold it back. The reply's markdown is drawn as it reads —
+them with a line of what stayed around them. Ctrl-O is everything in full — the whole conversation in your
+pager (`$PAGER`, or `less`), every command whole with all its output, to scroll and to search; the screen
+behind it is left as it was. The reply's markdown is drawn as it reads —
 bold, italics, lists and task boxes, quotes, code blocks with their language and at full weight, tables as
 tables — and a working line while the model is busy, which says so when the model has been quiet for twenty
 seconds with nothing running. A delegated job stands under the call that started it while it works: how long,
@@ -87,7 +91,7 @@ on an empty box leaves. A message sent while the model works is read with its ne
 an empty box takes back what is waiting, and stopping the turn brings all of it back to the box instead of
 sending it. A resized window is redrawn to fit. The memory block goes to the model, not the screen; only a
 warning in it is shown. Opening the chat scrolls the window clear rather than wiping it, so what the terminal
-showed before is still in its scrollback; a resize or Ctrl-O draws everything again and does wipe it. While the
+showed before is still in its scrollback; a resized window is drawn again from the top, and that does wipe it. While the
 conversation is short the box stands at the foot of the window; until you send the first message a lion stands
 faint in the room above it. The words on the working line are yours:
 `spinner.txt`, one a line, a random one to start each turn and the next every five seconds; so is the lion,
@@ -172,9 +176,17 @@ sumo forget <id>                    # stop it being true (history kept);  --purg
 ## Delegation
 
 The main agent does small things itself. Big, parallel or reading-heavy work it hands off with its
-`delegate` tool: a written brief becomes a job, the job runs in the chat's own process on the route the
-router chose, and its report comes back as the tool's result. Several `delegate` calls in one reply run at
-the same time. The job gets the brief as its only user turn — with the project's card and your global
+`delegate` tool: a written brief becomes a job, and the job runs in the chat's own process on the route the
+router chose. On the chat's screen it runs in the background: the call answers at once, the turn goes on or
+ends, and you keep working — ask something else, start another job. The job stands on a line above the box
+while it works (`⏺ j43 in the background · 2m 10s · 14 tool calls · …`). When it reports, how it went is drawn
+where the conversation has got to, and the model reads the report as an automated event, never as your
+words: with its next request if it is at work, otherwise in a turn the screen starts for it — so the main
+agent picks the work back up by itself. Esc stops the chat's turn, not the job; `/stop` (or `/stop j43`)
+stops a job, which says so with your next message and starts no turn; a question a job asks is answered or
+refused (Esc) without stopping it; `/new` and `/resume` wait until no job is at work; leaving the chat stops
+the jobs still running, to be picked up again later. Piped, and in `sumo job run`, nothing changes: the call
+waits and the report is its result. Several `delegate` calls in one reply run at the same time. The job gets the brief as its only user turn — with the project's card and your global
 rules in it — a short frozen system prompt that carries the Coding rules from `AGENTS.md`, and tools by role:
 
 | Role | Model and effort | Tools | For |

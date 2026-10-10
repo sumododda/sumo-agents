@@ -52,7 +52,7 @@ const COMMANDS = {
  * What the command menu shows, in the order it shows it; the models `/model` offers are the ones that are on as it is typed.
  * The effort a model would keep comes first (`effortNow`), so Enter on the open menu keeps it rather than dropping to the lowest.
  */
-export function commandList(db, { effortNow = () => null, saved = () => [] } = {}) {
+export function commandList(db, { effortNow = () => null, saved = () => [], running = () => [] } = {}) {
   const efforts = () => {
     const now = effortNow();
     return EFFORTS.includes(now) ? [now, ...EFFORTS.filter((e) => e !== now)] : EFFORTS;
@@ -71,6 +71,7 @@ export function commandList(db, { effortNow = () => null, saved = () => [] } = {
     { name: 'mcp', hint: 'the MCP servers: connected or not, their tools, what may run unasked' },
     { name: 'resume', hint: 'pick a saved session up where it stopped', choices: (given) => (given.length === 0 ? saved().map((s) => ({ name: shortId(s.id), hint: s.hint })) : []) },
     { name: 'copy', hint: 'the last reply to the clipboard, as it was written; `code` for its last code block', choices: (given) => (given.length === 0 ? ['code'] : []) },
+    { name: 'stop', hint: 'stop a job at work in the background', choices: (given) => (given.length === 0 ? running().map((id) => `j${id}`) : []) },
     { name: 'help', hint: 'the commands and the keys' },
     { name: 'new', hint: 'start a fresh session' },
     { name: 'exit', hint: 'leave' },
@@ -211,8 +212,13 @@ function configured(db, key) {
  * for each turn's model when the model is `auto`. `approve` puts an MCP call
  * that is not on the allow list to the user — the chat's own, or a job's run
  * here — and answers `once`, `always` or `no`; without it such a call is refused.
+ * With `background`, a delegated job does not hold the turn: `delegate` answers
+ * at once, the job runs beside the conversation with a stop of its own, and its
+ * report reaches the model later as an automated event — with its next request
+ * if it is at work, else in a turn of its own (`wake`), which whoever watches
+ * starts when told `job-report`.
  */
-export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, herdr = runHerdr, env = process.env, route = chooseChatRoute, approve = null, now = () => new Date().toISOString() } = {}) {
+export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, herdr = runHerdr, env = process.env, route = chooseChatRoute, approve = null, background = false, now = () => new Date().toISOString() } = {}) {
   // A route the chat was started with holds through a resumed session; one it was not, the saved session brings back.
   const given = { model: model !== undefined, effort: effort !== undefined };
   model ??= configured(db, 'chat.model');
@@ -253,6 +259,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   const workers = new Set();
   /** What the user said to the chat while it worked, not read yet: it goes in with the model's next request of the same turn. */
   const steers = [];
+  /** The jobs at work in the background, each with the stop that is its own: Esc stops the chat's turn, not the work handed off. */
+  const stops = new Map();
+  /** The background jobs' runs, so a chat that closes can wait for the ones it stopped to let go. */
+  const runs = new Set();
+  /** The jobs the user stopped: their end is said, and wakes nothing. */
+  const stoppedByUser = new Set();
+  /** What background jobs reported and the model has not read yet: `{ id, text, quiet }`. */
+  const reports = [];
   /** The memory page, once /memory has asked for it: the promise of its address. */
   let page = null;
   const ledger = { kind: 'chat', sessionId: null };
@@ -265,6 +279,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       return kept && kept !== 'none' ? kept : CONFIG_DEFAULTS['chat.effort'];
     },
     saved: () => others().map((s) => ({ id: s.id, hint: describeSaved(s, now()) })),
+    running: () => [...stops.keys()],
   });
 
   const emit = (text) => out(text);
@@ -384,12 +399,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   }
 
   /**
-   * `delegate`: a job is made from the brief, or an open one picked up, and run here on its own route; the chat waits
-   * for its report. Calls in one reply run side by side, but a worker has its project's working tree to itself.
+   * `delegate`: a job is made from the brief, or an open one picked up, and run here on its own route. The chat waits
+   * for its report — or, working in the background, is answered at once and reads the report when it comes. Calls in
+   * one reply run side by side, but a worker has its project's working tree to itself.
    * `callId` is the delegate call's own, so a screen can show the job under the call that started it.
    */
   async function delegate(input, callId = null) {
-    const { signal } = stopper;
+    const own = background ? new AbortController() : null;
+    const signal = own?.signal ?? stopper.signal;
     let claimed = null;
     const claim = (agent, slug) => {
       if (agent !== 'worker') return;
@@ -397,9 +414,12 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       workers.add(slug);
       claimed = slug;
     };
+    const release = () => {
+      if (claimed) workers.delete(claimed);
+    };
+    let id;
+    let warnings = [];
     try {
-      let id;
-      let warnings = [];
       if (input.job !== undefined && input.job !== null) {
         const job = getJob(db, parseJobId(input.job));
         claim(job.agent, job.project);
@@ -412,64 +432,123 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         activity(`briefing a ${agent}…`);
         ({ job: { id }, warnings } = await newJob(db, { project: project.slug, title: input.title, agent, task: input.task, guide: input.guide, reviews: input.reviews ?? undefined, testsMayChange: Boolean(input.tests_may_change), now: now() }));
       }
-      const inbox = [];
-      jobs.set(id, inbox);
-      const began = Date.now();
-      // Its work is written down as it happens, for `sumo job watch` — in a Herdr tab of its own, or any terminal —
-      // and without its secrets, through the same redaction as what the model sees.
-      const record = (t) => appendLive(id, redact(t).text);
-      const live = jobPrinter(record, styles(false), { clean: (t) => redact(t).text });
-      let ended = [];
-      try {
-        const outcome = await runJob(db, id, {
-          send: (p) => send(p, { signal }),
-          signal,
-          approve,
-          inbox: () => inbox.splice(0),
-          onStart: (job) => {
-            startLive(id);
-            live.onStart(job);
-            watch({ type: 'job', job, call: callId, tab: env.HERDR_ENV ? watchTab(job) : null });
-          },
-          onTool: (call) => {
-            live.onTool(call);
-            activity(`j${id} ${describeCall(call)}`);
-            watch({ type: 'tool', call, job: id });
-          },
-          onResult: (call, result) => {
-            live.onResult(call, result);
-            watch({ type: 'result', call, result, job: id });
-          },
-          onTurn: live.onTurn,
-          onThinking: (_delta, snapshot) => watch({ type: 'thinking', job: id, text: snapshot }),
-          onRetry: (r) => {
-            live.onRetry(r);
-            watch({ type: 'retry', job: id, ...r });
-          },
-          onCompact: (c) => {
-            live.onCompact(c);
-            watch({ type: 'compact', job: id, ...c });
-          },
-        });
-        ended = runLines(outcome);
-        const report = reportOf(id);
-        // Model-written, like any tool output: redacted before it reaches the chat's context. `job` is how it went, for the screen only.
-        const { job, turns, totals } = outcome;
-        return {
-          content: capRedacted([...warnings, ...ended, ...(report ? ['', report] : [])].join('\n')),
-          job: { id, status: job.status, seconds: Math.round((Date.now() - began) / 1000), turns, toolCalls: totals.toolCalls, costUsd: totals.costUsd, model: job.model, effort: job.effort, report: report ? redact(report).text : '' },
-        };
-      } catch (cause) {
-        ended = [cause.message];
-        throw cause;
-      } finally {
-        jobs.delete(id);
-        endLive(id, ended.map((l) => redact(l).text));
-        watch({ type: 'job-end', job: id });
-      }
-    } finally {
-      if (claimed) workers.delete(claimed);
+    } catch (cause) {
+      release();
+      throw cause;
     }
+    let begun;
+    const started = new Promise((resolve) => (begun = resolve));
+    const work = runHere(id, warnings, { signal, callId, begun }).finally(release);
+    if (!own) return work;
+
+    // In the background. A job that cannot start says so as the call's own answer; one that has started answers later.
+    stops.set(id, own);
+    const first = await Promise.race([started, work.then(() => null, (cause) => ({ cause }))]);
+    if (first?.cause) {
+      stops.delete(id);
+      throw first.cause;
+    }
+    const run = work
+      .then((result) => result, (cause) => ({ content: `j${id} stopped on an error: ${cause.message}`, isError: true }))
+      .then((result) => {
+        stops.delete(id);
+        runs.delete(run);
+        const quiet = stoppedByUser.delete(id);
+        reports.push({ id, quiet, text: `An automated event, not a message from the user: j${id} has reported.\n${result.content}` });
+        watch({ type: 'job-report', job: id, result, quiet });
+      });
+    runs.add(run);
+    const job = getJob(db, id);
+    return {
+      content:
+        `j${id} is running in the background (${job.agent} · ${routeOf(job)} — ${job.title}). Its report will reach you later, as an automated event marked as ` +
+        'not from the user: with your next request if you are still at work, otherwise in a turn of its own. Until then you know nothing of what it found — ' +
+        'do not guess its result, and do not do its work yourself. Carry on with what does not depend on it, or end your turn and say it is running.',
+    };
+  }
+
+  /** One job, run here to its end: watched as it works, written down for `sumo job watch`, and answered with how it went and what it reported. */
+  async function runHere(id, warnings, { signal, callId, begun }) {
+    const inbox = [];
+    jobs.set(id, inbox);
+    const began = Date.now();
+    // Its work is written down as it happens, for `sumo job watch` — in a Herdr tab of its own, or any terminal —
+    // and without its secrets, through the same redaction as what the model sees.
+    const record = (t) => appendLive(id, redact(t).text);
+    const live = jobPrinter(record, styles(false), { clean: (t) => redact(t).text });
+    let ended = [];
+    try {
+      const outcome = await runJob(db, id, {
+        send: (p) => send(p, { signal }),
+        signal,
+        approve,
+        inbox: () => inbox.splice(0),
+        onStart: (job) => {
+          startLive(id);
+          live.onStart(job);
+          watch({ type: 'job', job, call: callId, tab: env.HERDR_ENV ? watchTab(job) : null });
+          begun();
+        },
+        onTool: (call) => {
+          live.onTool(call);
+          activity(`j${id} ${describeCall(call)}`);
+          watch({ type: 'tool', call, job: id });
+        },
+        onResult: (call, result) => {
+          live.onResult(call, result);
+          watch({ type: 'result', call, result, job: id });
+        },
+        onTurn: live.onTurn,
+        onThinking: (_delta, snapshot) => watch({ type: 'thinking', job: id, text: snapshot }),
+        onRetry: (r) => {
+          live.onRetry(r);
+          watch({ type: 'retry', job: id, ...r });
+        },
+        onCompact: (c) => {
+          live.onCompact(c);
+          watch({ type: 'compact', job: id, ...c });
+        },
+      });
+      ended = runLines(outcome);
+      const report = reportOf(id);
+      // Model-written, like any tool output: redacted before it reaches the chat's context. `job` is how it went, for the screen only.
+      const { job, turns, totals } = outcome;
+      return {
+        content: capRedacted([...warnings, ...ended, ...(report ? ['', report] : [])].join('\n')),
+        job: { id, status: job.status, seconds: Math.round((Date.now() - began) / 1000), turns, toolCalls: totals.toolCalls, costUsd: totals.costUsd, model: job.model, effort: job.effort, report: report ? redact(report).text : '' },
+      };
+    } catch (cause) {
+      ended = [cause.message];
+      throw cause;
+    } finally {
+      jobs.delete(id);
+      endLive(id, ended.map((l) => redact(l).text));
+      watch({ type: 'job-end', job: id });
+    }
+  }
+
+  /** Stops a job at work in the background, for the user: it ends where it is, and its end is said to the model with whatever comes next. */
+  function stop(id) {
+    const own = stops.get(id);
+    if (!own) return false;
+    stoppedByUser.add(id);
+    own.abort();
+    return true;
+  }
+
+  /** The chat is closing: the jobs still at work are stopped — each can be picked up again from its notes — and waited for, so none is cut off mid-write. */
+  async function settle() {
+    for (const id of [...stops.keys()]) stop(id);
+    await Promise.allSettled([...runs]);
+  }
+
+  /**
+   * A turn nobody typed: what background jobs have reported since the model last looked, put to it as an automated event.
+   * Null when nothing is waiting — a job the user stopped waits for the next message instead.
+   */
+  async function wake() {
+    if (!reports.some((r) => !r.quiet)) return null;
+    return say(reports.splice(0).map((r) => r.text).join('\n\n'), '', [], { automated: true });
   }
 
   /** The job's tab in Herdr, showing its work: its pane, or why there is none — the job runs here either way. A watcher that never starts in it is said when it gives up. */
@@ -507,9 +586,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
    * One turn. `text` is what the model is sent; `said` is what the user typed of it — for a slash command, the words after the command — and is all that memory keeps as theirs.
    * `images` go before the words, each under the label the text names it by: `{ label, mediaType, data }`, the data in base64.
    */
-  async function say(text, said = text, images = []) {
+  async function say(text, said = text, images = [], { automated = false } = {}) {
     try {
-      const outcome = await turn(text, said, images);
+      const outcome = await turn(text, said, images, automated);
       persist();
       return outcome;
     } finally {
@@ -524,13 +603,16 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
    */
   function heard() {
     const said = steers.splice(0);
-    if (said.length === 0) return [];
-    watch({ type: 'heard', said });
-    return said.map((text) => {
-      const brought = event('prompt', { prompt: text, context_tokens: lastContext });
-      logLine(transcript, { type: 'user', message: { role: 'user', content: redact(text).text } });
-      return brought ? `${text}\n<sumo>\n${brought}\n</sumo>` : text;
-    });
+    if (said.length > 0) watch({ type: 'heard', said });
+    return [
+      ...said.map((text) => {
+        const brought = event('prompt', { prompt: text, context_tokens: lastContext });
+        logLine(transcript, { type: 'user', message: { role: 'user', content: redact(text).text } });
+        return brought ? `${text}\n<sumo>\n${brought}\n</sumo>` : text;
+      }),
+      // What a background job reported while the model worked: read now, as something that happened, not as the user's words.
+      ...reports.splice(0).map((report) => ({ event: report.text })),
+    ];
   }
 
   /** Takes back something said while the turn worked, if the model has not read it yet. */
@@ -541,7 +623,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return true;
   }
 
-  async function turn(text, said, images) {
+  async function turn(text, said, images, automated = false) {
     stopper = new AbortController();
     // The servers connect while the first turn is typed; the first request waits for them, and Esc does not.
     if (!registry) {
@@ -552,7 +634,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       if (registry.servers().length > 0 || registry.error) watch({ type: 'mcp', servers: registry.servers(), error: registry.error });
     }
     // On auto the router names this turn's model first; a router that cannot answer refuses the turn, and nothing of it reaches the conversation.
-    if (model === 'auto') {
+    // A turn nobody typed runs on the route the last one had: there is no message to size it by.
+    if (model === 'auto' && !(automated && routed)) {
       let chosen;
       try {
         workspace();
@@ -572,15 +655,16 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       watch({ type: 'route', ...routed });
     }
     settleTail();
-    // A resumed session is told so with its first turn, ahead of whatever else the turn brings in.
-    const injected = [note, event('prompt', { prompt: said, context_tokens: lastContext })].filter(Boolean).join('\n');
+    // A resumed session is told so with its first turn, and what background jobs reported while nobody was looking rides in with a message
+    // too. An automated turn is that report itself: nothing in it is the user's, so nothing of it is kept as theirs.
+    const injected = [note, ...(automated ? [] : [...reports.splice(0).map((r) => r.text), event('prompt', { prompt: said, context_tokens: lastContext })])].filter(Boolean).join('\n');
     note = null;
     const pictures = images.flatMap(({ label, mediaType, data }) => [{ type: 'text', text: label }, { type: 'image', source: { type: 'base64', media_type: mediaType, data } }]);
-    const at = params.messages.push({ role: 'user', content: [...pictures, { type: 'text', text }] }) - 1;
+    const at = params.messages.push(automated ? asText(text) : { role: 'user', content: [...pictures, { type: 'text', text }] }) - 1;
     spoken = true;
     if (injected) params.messages.push(injection(injected, params.model, params.messages));
-    // The log keeps what memory keeps: the user's words without their secrets.
-    logLine(transcript, { type: 'user', message: { role: 'user', content: redact(text).text } });
+    // The log keeps what memory keeps: the user's words without their secrets — and an event as an event.
+    logLine(transcript, automated ? { type: 'event', text: redact(text).text } : { type: 'user', message: { role: 'user', content: redact(text).text } });
 
     let continued = false;
     for (;;) {
@@ -651,7 +735,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     const [, name, args = ''] = m;
     if (name === 'exit' || name === 'quit') return { control: 'quit' };
     if (name === 'new' || name === 'memory') return { control: name };
-    if (name === 'model' || name === 'resume' || name === 'mcp' || name === 'copy' || name === 'help') return { control: name, args: args.trim() };
+    if (name === 'model' || name === 'resume' || name === 'mcp' || name === 'copy' || name === 'help' || name === 'stop') return { control: name, args: args.trim() };
     const make = Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
     return make ? { text: make(args.trim()), said: args.trim() } : { error: `no such command /${name} — one of: ${commands.map((c) => `/${c.name}`).join(' ')}` };
   }
@@ -695,6 +779,13 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     /** Said to the chat while it works: read with the model's next request of this turn. */
     steer: (text) => void steers.push(text),
     unsteer,
+    wake,
+    stop,
+    settle,
+    /** The jobs at work in the background, by id. */
+    running: () => [...stops.keys()],
+    /** How many background jobs have reported and wait for a turn to read them. */
+    waiting: () => reports.filter((r) => !r.quiet).length,
     where,
     spent,
     tell,
@@ -736,6 +827,8 @@ async function screen(db, { model, effort, resume }) {
   const session = createChat(db, {
     model,
     effort,
+    // On the screen a delegated job does not hold the turn: the user goes on working, and the report is read when it comes.
+    background: true,
     out: (t) => events.emit('text', t),
     watch: (e) => events.emit(e.type, e),
     // A call waiting on the user's word goes to the screen, which answers it with a key.
@@ -744,6 +837,8 @@ async function screen(db, { model, effort, resume }) {
   try {
     await runUi({ session, events, resume, notify: configured(db, 'chat.notify') !== 'off' }).waitUntilExit();
   } finally {
+    // Jobs still at work in the background are stopped with the chat, and let go of what they hold before it closes.
+    await session.settle();
     session.end();
     await closeMcp();
   }

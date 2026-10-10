@@ -15,12 +15,13 @@ import { redact } from './redact.mjs';
 export const BASH_TOOL = { type: 'bash_20250124', name: 'bash' };
 export const EDITOR_TOOL = { type: 'text_editor_20250728', name: 'str_replace_based_edit_tool' };
 
-/** The chat's own: hands a piece of work to a sub-agent with a fresh context and waits for its report. Several in one reply run at once. */
+/** The chat's own: hands a piece of work to a sub-agent with a fresh context. Its report is the call's answer, or — in the background — comes later. Several in one reply run at once. */
 export const DELEGATE_TOOL = {
   name: 'delegate',
   description:
     'Hand a piece of work to a sub-agent with a fresh context: scout looks (no edits), worker builds, reviewer judges a change it did not write. ' +
-    'It runs on its own route and returns its report. Several calls in one reply run at the same time; one worker per project at a time. ' +
+    'It runs on its own route. Its report is this call\'s result — or, when the result says the job is running in the background, it reaches you later ' +
+    'as an automated event. Several calls in one reply run at the same time; one worker per project at a time. ' +
     'To continue an open job instead (one from an earlier session), give only `job`.',
   input_schema: {
     type: 'object',
