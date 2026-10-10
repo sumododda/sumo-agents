@@ -256,10 +256,11 @@ test('a watcher is told what ran, what came back and what it cost; an interrupt 
       const stopped = await first;
       assert.equal(stopped.stop, 'interrupted');
       assert.equal(readFileSync(spawned, 'utf8'), 'scribe run\n', 'a turn the user stopped is still a turn that ended: what they said is filed');
-      assert.deepEqual(watched.map((e) => e.type), ['usage', 'tool', 'result'], 'the cost comes with the reply, before its tools run');
+      assert.deepEqual(watched.map((e) => e.type).filter((t) => t !== 'output'), ['usage', 'tool', 'result'], 'the cost comes with the reply, before its tools run');
+      assert.ok(watched.findIndex((e) => e.type === 'output') > watched.findIndex((e) => e.type === 'tool'), 'and what a command prints, while it runs');
       assert.equal(watched[0].totals.outputTokens, 40);
       assert.equal(watched[1].call.input.command, 'echo one');
-      assert.deepEqual(watched[2].result, { content: 'one', isError: false });
+      assert.deepEqual(watched.find((e) => e.type === 'result').result, { content: 'one', isError: false });
 
       // Stopped while a command was running: it is killed, the call after it never runs, and both are answered.
       const began = Date.now();
@@ -1088,7 +1089,7 @@ test('the commands of the menu work from inside a project: the guide comes with 
       const fix = session.expand('/fix the login bug');
       assert.match(fix.text, /Make it fail on demand/, 'the guide itself, not a path the tools cannot reach from the project');
       assert.match(fix.text, /for this: the login bug$/);
-      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /new /exit');
+      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /copy /help /new /exit');
 
       const dream = session.expand('/dream');
       await session.say(dream.text, dream.said);
@@ -1523,6 +1524,86 @@ test('a job delegated from the chat asks on the chat\'s screen when it wants an 
     } finally {
       await closeMcp();
       db.close();
+    }
+  });
+});
+
+test('said while it works: read with the next request in the same turn, kept as the user\'s words, and never said twice', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const watched = [];
+      const responses = [
+        reply('tool_use', [call('t1', 'bash', { command: 'echo one' })]),
+        reply('end_turn', [{ type: 'text', text: 'done, with tabs' }]),
+        reply('end_turn', [{ type: 'text', text: 'second' }]),
+      ];
+      const seen = [];
+      let session;
+      const send = async (params) => {
+        seen.push(structuredClone(params));
+        // Typed while the first request is out: before the model's next request, not after the turn.
+        if (seen.length === 1) session.steer('use tabs, not spaces');
+        return responses.shift();
+      };
+      session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, watch: (e) => watched.push(e), now: () => NOW });
+      session.start('startup');
+      await session.say('format the file');
+
+      const tail = seen[1].messages.at(-1).content;
+      assert.equal(tail[0].type, 'tool_result');
+      assert.equal(tail.at(-1).text, 'The user says, while you work: use tabs, not spaces', 'behind the tool results of the same turn');
+      assert.deepEqual(watched.filter((e) => e.type === 'heard').map((e) => e.said), [['use tabs, not spaces']], 'the screen is told it was read');
+      assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['format the file', 'use tabs, not spaces'], 'what was said is the user\'s, and memory keeps it');
+
+      // Said and taken back before it was read: it is not read.
+      session.steer('never mind');
+      assert.equal(session.unsteer('never mind'), true);
+      assert.equal(session.unsteer('never mind'), false, 'only what is still waiting can be taken back');
+      await session.say('next');
+      assert.doesNotMatch(JSON.stringify(seen[2].messages.slice(-2)), /never mind|use tabs/, 'nothing said before rides into a later turn');
+    } finally {
+      db.close();
+      await closeMcp();
+    }
+  });
+});
+
+test('what the screen asks the session: the commands it adds, where the work is, what the session has cost, and a command\'s output as it comes', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-where-')));
+      mkdirSync(join(root, '.git'));
+      writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/fix/cart-total\n');
+      const watched = [];
+      const { send } = canned([reply('tool_use', [call('t1', 'bash', { command: 'echo first; echo second' })], { input_tokens: 1_000_000, output_tokens: 0 }), reply('end_turn', [{ type: 'text', text: 'ok' }], { input_tokens: 0, output_tokens: 0 })]);
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: root, send, watch: (e) => watched.push(e), now: () => NOW });
+      session.start('startup');
+
+      assert.deepEqual(session.expand('/copy'), { control: 'copy', args: '' });
+      assert.deepEqual(session.expand('/copy code'), { control: 'copy', args: 'code' });
+      assert.deepEqual(session.expand('/help'), { control: 'help', args: '' });
+      assert.ok(session.commands.some((c) => c.name === 'copy') && session.commands.some((c) => c.name === 'help'), 'both are in the menu');
+
+      assert.deepEqual(session.where(), { cwd: root, name: root.split('/').at(-1), branch: 'fix/cart-total' }, 'no project named yet: the directory the chat was started in, and its branch');
+      assert.equal(session.spent(), 0);
+      await session.say('go');
+      assert.ok(session.spent() > 0, 'what the session\'s requests have cost so far');
+      assert.equal(session.spent(), db.prepare('SELECT SUM(cost_usd) AS c FROM model_runs WHERE session_id = ?').get(session.sessionId).c);
+      assert.equal(watched.filter((e) => e.type === 'output').map((e) => e.chunk).join(''), 'first\nsecond\n', 'a command\'s output reaches the screen as it is printed');
+      assert.equal(watched.find((e) => e.type === 'output').call.id, 't1');
+
+      // A detached head has no branch to name; a directory that is no repository has none either.
+      writeFileSync(join(root, '.git', 'HEAD'), '0123456789abcdef0123456789abcdef01234567\n');
+      assert.equal(session.where().branch, '01234567');
+      const elsewhere = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
+      elsewhere.start('startup');
+      assert.equal(elsewhere.where().branch, null);
+      elsewhere.end();
+    } finally {
+      db.close();
+      await closeMcp();
     }
   });
 });

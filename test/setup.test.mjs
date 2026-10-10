@@ -229,12 +229,15 @@ test('config refuses an effort the API does not take and a model file that is a 
   for (const [args, message] of [
     [['config', 'chat.effort', 'banana'], /no such effort "banana"/],
     [['config', 'model.file', '../../etc/passwd'], /model\.file is a file name/],
+    [['config', 'chat.notify', 'maybe'], /chat\.notify is on or off/],
   ]) {
     const run = s.sumo(args);
     assert.equal(run.code, 2, `${args.join(' ')} → ${run.out}`);
     assert.match(run.err, message);
   }
   assert.match(s.sumo(['config', 'chat.effort', 'xhigh']).out, /chat\.effort = xhigh/);
+  assert.match(s.sumo(['config', 'chat.notify']).out, /chat\.notify = on/, 'the bell is on until it is turned off');
+  assert.match(s.sumo(['config', 'chat.notify', 'off']).out, /chat\.notify = off/);
   const { CHAT_EFFORTS } = await import('../src/setup.mjs');
   const { EFFORTS } = await import('../src/route.mjs');
   assert.deepEqual(CHAT_EFFORTS, EFFORTS);

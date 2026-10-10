@@ -206,6 +206,14 @@ test('an edit whose old_str is off by trailing spaces, line endings or indentati
   assert.equal(indented.isError, false, indented.content);
   assert.match(indented.content, /matched without its indentation/);
   assert.equal(readFileSync(join(root, 'c.py'), 'utf8'), 'class A:\n    def f(self):\n        return 2\n');
+  // What the screen draws the change from: where it begins, and the lines as the file had them and has them — not as the model wrote them.
+  assert.deepEqual(indented.edit, { line: 2, old: '    def f(self):\n        return 1', new: '    def f(self):\n        return 2' });
+  assert.deepEqual(crlf.edit, { line: 1, old: 'one\ntwo', new: 'uno\ndos' }, 'the line endings plain, whatever the file has');
+  // A change inside a line is shown as the whole line it is in.
+  writeFileSync(join(root, 'e.js'), 'const a = 1;\nconst total = price + tax;\nexport { a };\n');
+  assert.deepEqual(runEditor({ command: 'str_replace', path: 'e.js', old_str: 'price + tax', new_str: 'price * quantity + tax' }, ctx).edit, { line: 2, old: 'const total = price + tax;', new: 'const total = price * quantity + tax;' });
+  // Whole lines taken out, newline and all: what went, and nothing in its place.
+  assert.deepEqual(runEditor({ command: 'str_replace', path: 'e.js', old_str: 'const a = 1;\n', new_str: '' }, ctx).edit, { line: 1, old: 'const a = 1;', new: '' });
 
   // Looser is not laxer: two places that match without their spaces are still two places.
   writeFileSync(join(root, 'd.txt'), 'x = 1 \ny = 2\nx = 1\n');
@@ -690,7 +698,9 @@ test('a command that cannot start says why, and an insert at a line that is not 
   assert.match(refused.content, /insert_line/);
   assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'nothing was written');
   // The tool sends the text as insert_text, one line with its newline; without it there is nothing to insert.
-  assert.equal(runEditor({ command: 'insert', path: 'a.txt', insert_line: 1, insert_text: 'X\n' }, ctx).isError, false);
+  const inserted = runEditor({ command: 'insert', path: 'a.txt', insert_line: 1, insert_text: 'X\n' }, ctx);
+  assert.equal(inserted.isError, false);
+  assert.deepEqual(inserted.edit, { line: 2, old: '', new: 'X' }, 'for the screen: the line it landed on, and what came');
   assert.equal(readFileSync(join(root, 'a.txt'), 'utf8'), 'one\nX\ntwo\n');
   const empty = runEditor({ command: 'insert', path: 'a.txt', insert_line: 1 }, ctx);
   assert.equal(empty.isError, true);

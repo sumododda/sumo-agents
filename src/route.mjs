@@ -1,6 +1,7 @@
 import { usableModels } from './catalog.mjs';
 import { callLocalModel } from './model.mjs';
 import { UsageError } from './memory.mjs';
+import { elapsed } from './text.mjs';
 
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -14,6 +15,23 @@ const ROUTER_SYSTEM =
   'touches. risky: true when it touches security, credentials, money, migrations or concurrency. Model follows kind: haiku for mechanical (it ' +
   'takes no effort setting), sonnet for routine, opus for hard, fable for novel. Effort follows surface: low for one spot, medium for a few ' +
   'files, high for many interacting parts. risky raises the effort one step (low, medium, high, xhigh, max) and makes a routine job hard. ' +
+  'History lists only the routes that failed or drew Important review findings on this project: for work like that, go above them.';
+
+/**
+ * The same grammar read for a scout, which reads and reports and changes nothing: the kinds above are told in terms of
+ * changing code, and read that way an audit is "novel" and a summary of an unfamiliar project is too — the dearest model
+ * for work that is reading. Here they are told in terms of what a reading job asks for.
+ */
+const SCOUT_ROUTER_SYSTEM =
+  'You assign a reading job to a model and an effort level. The job is done by a scout: it reads code and reports, and changes nothing. ' +
+  'Answer with JSON only. First classify the job, then choose. kind: mechanical (one lookup: where one thing is defined, what one setting ' +
+  'is), routine (finding, tracing, listing, describing or summarizing code: what a project does, how a feature works, which endpoints ' +
+  'exist, which dependencies are behind — however large or unfamiliar the project), hard (it must judge: an audit of security or ' +
+  'correctness, a review, a hunt for the cause of a bug), novel (almost never: only reasoning nobody has written down, such as proving a ' +
+  'concurrent algorithm correct). surface: how much code must be read. risky: true when what is judged is security, credentials, money, ' +
+  'migrations or concurrency. Model follows kind: haiku for mechanical (it takes no effort setting), sonnet for routine, opus for hard, ' +
+  'fable for novel. Effort follows surface: low for one spot, medium for a few files or a whole project read for a summary, high when ' +
+  'many interacting parts must be judged together. risky raises the effort one step (low, medium, high, xhigh, max). ' +
   'History lists only the routes that failed or drew Important review findings on this project: for work like that, go above them.';
 
 /**
@@ -84,12 +102,29 @@ function historyText(db, projectSlug) {
     .join('\n');
 }
 
-/** `jobs, done, failed, reviewed, avg important` — one line per model/effort seen. */
+/**
+ * `jobs, done, failed, reviewed, avg important` — one line per role and model/effort seen, and, where the ledger holds a
+ * job's requests, what a job on that route took on average: requests, time, money. A route's price is what a job on it
+ * costs, not what a token on it costs — a cheap model that takes ten times the requests is the dear one.
+ */
 export function statsLines(db, { project } = {}) {
-  const rows = routeStats(db, { project });
+  const rows = db
+    .prepare(
+      `SELECT j.agent, j.model, j.effort, COUNT(*) AS jobs, SUM(j.status = 'done') AS done, SUM(j.status = 'failed') AS failed,
+              SUM(j.important IS NOT NULL) AS reviewed, AVG(j.important) AS important,
+              AVG(r.requests) AS requests, AVG(r.seconds) AS seconds, AVG(r.cost) AS cost
+       FROM jobs j
+       LEFT JOIN (SELECT job_id, COUNT(*) AS requests, SUM(cost_usd) AS cost, (julianday(MAX(ts)) - julianday(MIN(ts))) * 86400 AS seconds
+                  FROM model_runs WHERE job_id IS NOT NULL GROUP BY job_id) r ON r.job_id = j.id
+       WHERE j.model IS NOT NULL AND j.status IN ('done', 'failed')${project ? ' AND j.project = ?' : ''}
+       GROUP BY j.agent, j.model, j.effort ORDER BY j.agent, j.model, j.effort`,
+    )
+    .all(...(project ? [project] : []));
   if (rows.length === 0) return ['no finished jobs yet'];
   return rows.map(
-    (r) => `${r.model}/${r.effort}: ${r.jobs} job${r.jobs === 1 ? '' : 's'}, ${r.done} done, ${r.failed} failed, ${r.reviewed} reviewed, avg ${r.reviewed > 0 ? r.avgImportant.toFixed(1) : '-'} important`,
+    (r) =>
+      `${r.agent} · ${r.model}/${r.effort}: ${r.jobs} job${r.jobs === 1 ? '' : 's'}, ${r.done} done, ${r.failed} failed, ${r.reviewed} reviewed, avg ${r.reviewed > 0 ? r.important.toFixed(1) : '-'} important` +
+      (r.requests === null ? '' : ` — a job: ${Math.round(r.requests)} request${Math.round(r.requests) === 1 ? '' : 's'}, ${elapsed(Math.round(r.seconds) * 1000)}, $${r.cost.toFixed(2)}`),
   );
 }
 
@@ -140,7 +175,7 @@ function chatRouterPrompt(db, { project, text }) {
   return [`project: ${project ? `${project.slug}${stack ? ` (${stack})` : ''}` : 'none'}`, `models: ${usableModels(db).join(', ')}`, 'turn:', String(text ?? '').slice(0, TASK_CUT)].join('\n');
 }
 
-const askRouter = (db, { agent, project, task, title, retryOf }) => askFor(db, ROUTER_SYSTEM, routerPrompt(db, { agent, project, task, title, retryOf }));
+const askRouter = (db, { agent, project, task, title, retryOf }) => askFor(db, agent === 'scout' ? SCOUT_ROUTER_SYSTEM : ROUTER_SYSTEM, routerPrompt(db, { agent, project, task, title, retryOf }));
 
 async function askFor(db, system, prompt) {
   const usable = usableModels(db);

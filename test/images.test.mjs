@@ -1,10 +1,10 @@
 // Pictures for the chat: an image on the clipboard, or image files dropped on the terminal as their paths.
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { clipboardImage, droppedImages, MAX_IMAGE_BYTES } from '../src/images.mjs';
+import { clipboardImage, copyText, droppedImages, MAX_IMAGE_BYTES } from '../src/images.mjs';
 
 const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
 const JPEG = Buffer.from('ffd8ffe000104a464946', 'hex');
@@ -55,4 +55,13 @@ test('a paste that is only paths of image files is those images, typed by their 
 test('with no osascript, Ctrl-V says the clipboard needs macOS rather than that it holds no image', async () => {
   const missing = Object.assign(new Error('spawn osascript ENOENT'), { code: 'ENOENT' });
   await assert.rejects(clipboardImage(async () => { throw missing; }), /needs macOS — drop the image file on the box instead/);
+});
+
+test('text for the clipboard goes to the first command that takes it, exactly as given; with none, the caller is told so', async () => {
+  const kept = join(mkdtempSync(join(tmpdir(), 'sumo-agents-copy-')), 'clipboard');
+  const text = 'npm ci\n  npm test — ünïcode, no newline added';
+  // The first is not on this machine, the second fails, the third takes it.
+  assert.equal(await copyText(text, [['no-such-clipboard-command'], ['sh', '-c', 'exit 3'], ['sh', '-c', `cat > ${JSON.stringify(kept)}`]]), true);
+  assert.equal(readFileSync(kept, 'utf8'), text);
+  assert.equal(await copyText(text, [['no-such-clipboard-command']]), false);
 });

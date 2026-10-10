@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { openDb } from '../src/db.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { chooseChatRoute } from '../src/route.mjs';
+import { chooseChatRoute, chooseRoute } from '../src/route.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const answer = (file, data) => writeFileSync(file, JSON.stringify({ is_error: false, result: '', structured_output: data, usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 }));
@@ -42,6 +42,38 @@ test('the chat router is shown the project and the turn, answers a route, and a 
 
       rmSync(routerAnswer, { force: true });
       await assert.rejects(chooseChatRoute(db, { project, text: 'x' }), /the router failed: .*no router answer recorded/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a scout\'s job is put to the router as reading, a worker\'s and a reviewer\'s as changing code: the same grammar, the kinds told for the work', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-route-scout-'));
+  const routerAnswer = join(root, 'router-answer.json');
+  const routerSaw = join(root, 'router-saw.json');
+  const env = { SUMO_AGENTS_MODEL_CMD: join(REPO_ROOT, 'test', 'fixtures', 'model-stub.mjs'), STUB_ROUTER_ANSWER: routerAnswer, STUB_CAPTURE: routerSaw };
+  await withHome(freshHome(), env, async () => {
+    const db = openDb();
+    try {
+      const { project } = addProject(db, root, { slug: 'simba', now: '2026-09-30T12:00:00.000Z' });
+      answer(routerAnswer, { kind: 'routine', surface: 'a few files', risky: false, model: 'sonnet', effort: 'medium', reason: 'a summary of what is there' });
+      const saw = async (agent) => {
+        assert.deepEqual(await chooseRoute(db, { agent, project, title: 'Describe what simba does', task: 'Say what it does.' }), { model: 'sonnet', effort: 'medium', reason: 'router: a summary of what is there' });
+        return JSON.parse(readFileSync(routerSaw, 'utf8'));
+      };
+      const scout = await saw('scout');
+      assert.match(scout.system, /^You assign a reading job/);
+      // Read as changing code, an audit is "novel" and so is a summary of an unfamiliar project: for a scout neither is said to be.
+      assert.match(scout.system, /routine \(finding, tracing, listing, describing or summarizing code/);
+      assert.match(scout.system, /hard \(it must judge: an audit/);
+      assert.doesNotMatch(scout.system, /deep security review/);
+      assert.match(scout.prompt, /^role: scout\nproject: simba/);
+      for (const agent of ['worker', 'reviewer']) {
+        const other = await saw(agent);
+        assert.match(other.system, /^You assign a coding job/, agent);
+        assert.equal(other.schema === undefined || JSON.stringify(other.schema) === JSON.stringify(scout.schema), true, 'the grammar is the same for every role');
+      }
     } finally {
       db.close();
     }

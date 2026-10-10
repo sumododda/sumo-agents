@@ -212,9 +212,10 @@ const result = (content, isError = false) => ({ content: redact(String(content))
  * always gets a process group of its own, so a stop or the time limit reaches
  * everything it started, and so does this process being told to go. A child
  * left in the background does not hold the call: once the shell has gone, the
- * output already on its way is drained and the command is over.
+ * output already on its way is drained and the command is over. `onOutput` is
+ * handed each piece as it is printed, for a screen that shows the work.
  */
-export function runCommand(command, { cwd, env, signal = null, timeoutMs = null }) {
+export function runCommand(command, { cwd, env, signal = null, timeoutMs = null, onOutput = null }) {
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, shell: SHELL, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     if (child.pid) trackGroup(child.pid);
@@ -255,6 +256,7 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null 
         else {
           kept[name].push(chunk);
           kept.output.push(chunk);
+          onOutput?.(chunk);
         }
       });
     }
@@ -274,7 +276,7 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null 
 }
 
 /** A shell command, in the project directory, without the secrets, refused when the guard says so. */
-export async function runBash({ command, restart }, ctx, { signal = null, timeoutMs = COMMAND_TIMEOUT_MS } = {}) {
+export async function runBash({ command, restart }, ctx, { signal = null, timeoutMs = COMMAND_TIMEOUT_MS, onOutput = null } = {}) {
   // The tool is specified as one session the model may restart; here every call is its own shell, so there is nothing to restart.
   if (restart) return result('Bash session restarted: every command already runs in a fresh shell, in the project directory');
   if (typeof command !== 'string' || !command.trim()) return result('bash needs a command', true);
@@ -282,7 +284,7 @@ export async function runBash({ command, restart }, ctx, { signal = null, timeou
   if (refused) return result(refused, true);
   // The commands that run the project's checks give each check its own limit; one limit over all of them would cut a verdict off half-way.
   const limit = OWN_LIMITS.test(command) ? null : timeoutMs;
-  const run = await runCommand(command, { cwd: ctx.cwd, env: ctx.env ?? childEnv(), signal, timeoutMs: limit });
+  const run = await runCommand(command, { cwd: ctx.cwd, env: ctx.env ?? childEnv(), signal, timeoutMs: limit, onOutput });
   if (run.error) return result(run.error, true);
   const failed = run.stopped !== null || run.status !== 0;
   const output = run.output.trimEnd();
@@ -365,6 +367,20 @@ function locate(text, oldStr) {
   return loose;
 }
 
+/**
+ * An edit for the screen, which draws it as a diff: the line the change begins on, and the whole lines it touched as
+ * the file had them and as it has them now — what was matched and written, not what the model sent. The model is told none of it.
+ */
+function changeOf(text, { start, end }, replacement) {
+  const from = text.lastIndexOf('\n', start - 1) + 1;
+  // A span that ends on a newline took whole lines: the line after it is not part of the change.
+  const whole = end > start && text[end - 1] === '\n';
+  const to = whole ? end : text.indexOf('\n', end) === -1 ? text.length : text.indexOf('\n', end);
+  // For the screen the line endings are plain, whatever the file's are.
+  const lines = (t) => redact(t.replace(/\r\n/g, '\n').replace(whole ? /\n$/ : /\r$/, '')).text;
+  return { line: text.slice(0, from).split('\n').length, old: lines(text.slice(from, to)), new: lines(`${text.slice(from, start)}${replacement}${text.slice(end, to)}`) };
+}
+
 /** The text editor's four commands, each inside the jail; secret files are neither shown nor written. */
 export function runEditor(input, ctx) {
   let path;
@@ -407,7 +423,7 @@ export function runEditor(input, ctx) {
           if (where.reindent) replacement = where.reindent(replacement);
         }
         writeFileSync(path, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`);
-        return result(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`);
+        return { ...result(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`), edit: changeOf(text, where, replacement) };
       }
       case 'insert': {
         if (secret) return result(secret, true);
@@ -421,7 +437,7 @@ export function runEditor(input, ctx) {
         const at = Math.max(0, Math.min(lines.at(-1) === '' ? lines.length - 1 : lines.length, line));
         lines.splice(at, 0, text.replace(/\n$/, ''));
         writeFileSync(path, lines.join('\n'));
-        return result(`inserted into ${path} after line ${at}`);
+        return { ...result(`inserted into ${path} after line ${at}`), edit: { line: at + 1, old: '', new: redact(text.replace(/\n$/, '')).text } };
       }
       default:
         return result(`unknown command ${input.command}`, true);
@@ -432,8 +448,8 @@ export function runEditor(input, ctx) {
 }
 
 /** One tool call, whichever tool it names; a name nothing answers to is an error the model can read. */
-export function runTool(block, ctx, { signal = null } = {}) {
-  if (block.name === BASH_TOOL.name) return runBash(block.input ?? {}, ctx, { signal });
+export function runTool(block, ctx, { signal = null, onOutput = null } = {}) {
+  if (block.name === BASH_TOOL.name) return runBash(block.input ?? {}, ctx, { signal, onOutput });
   if (block.name === EDITOR_TOOL.name) return runEditor(block.input ?? {}, ctx);
   return result(`no tool called ${block.name}`, true);
 }

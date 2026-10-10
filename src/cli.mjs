@@ -97,7 +97,7 @@ sumo job verify <id>          the same checks now, judged against the baseline
 sumo job changes <id>         everything the job changed, as one file
 sumo job finish <id> --status DONE|FAILED [--accept "<why>"]     (report on stdin)
 sumo job retry <id>           a failed job, or a done one reviewed with important >= 3, routed afresh
-sumo job stats [--project S]  jobs, done, failed, reviewed, avg important — per model/effort
+sumo job stats [--project S]  jobs, done, failed, reviewed, avg important, and what a job took — per role and model/effort
 sumo job list [--all]`,
   prime: 'sumo prime [--budget N]',
   scribe: 'sumo scribe run|show|status|stats',
