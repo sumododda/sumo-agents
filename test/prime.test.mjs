@@ -1,9 +1,11 @@
 // The block every session starts with has a ceiling, whatever it is handed.
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { openDb, setMeta } from '../src/db.mjs';
 import { add } from '../src/memory.mjs';
 import { prime } from '../src/prime.mjs';
+import { ensureScratch } from '../src/projects.mjs';
 import { estimateTokens } from '../src/text.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
@@ -83,5 +85,23 @@ test('with the memory writer off, the block tells the model to save what lasts i
     } finally {
       db.close();
     }
+  });
+});
+
+test('the block says where work that belongs to no project goes; scratch is not listed among the projects, and alone it is not a memory', async () => {
+  await withDb((db) => {
+    ensureScratch(db, NOW);
+    const empty = prime(db, { now: NOW });
+    assert.match(empty, /Nothing remembered yet/);
+    const line = empty.split('\n').find((l) => l.startsWith('Scratch: '));
+    assert.ok(line.startsWith(`Scratch: ${join(process.env.SUMO_AGENTS_HOME, 'scratch')} — `), line);
+    assert.match(line, /a folder per chore.*14 days/);
+
+    db.prepare('INSERT INTO projects (slug, name, path, created_at) VALUES (?, ?, ?, ?)').run('mine', 'mine', '/work/mine', NOW);
+    setMeta(db, 'config.scratch.days', '3');
+    const block = prime(db, { now: NOW });
+    assert.match(block, /^Projects: mine \(\/work\/mine\)$/m);
+    assert.match(block, /^Scratch: .* 3 days/m);
+    assert.doesNotMatch(block, /Nothing remembered yet/);
   });
 });

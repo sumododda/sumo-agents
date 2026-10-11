@@ -4,10 +4,11 @@ import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
 import { getMeta, setMeta, tx } from './db.mjs';
+import { autoGuides, guideBody, matchGuide, WORKER_GUIDES } from './guides.mjs';
 import { UsageError } from './memory.mjs';
-import { paths, REPO_ROOT } from './paths.mjs';
+import { paths } from './paths.mjs';
 import { preferences } from './prime.mjs';
-import { getProject } from './projects.mjs';
+import { getProject, isScratch } from './projects.mjs';
 import { chooseRoute, statsLines } from './route.mjs';
 import { verifyCommands } from './scan.mjs';
 import { runScribe } from './scribe.mjs';
@@ -163,10 +164,20 @@ const writeState = (db, id, state) => {
 
 /** The written way of doing one kind of work, without its title — the brief has its own heading for it. */
 export function guideFor(name) {
-  if (!GUIDES.includes(name)) throw new UsageError(`--guide is one of: ${GUIDES.join(', ')}`);
-  const text = readOr(join(REPO_ROOT, 'guides', `${name}.md`));
-  if (!text.trim()) throw new UsageError(`guides/${name}.md is missing or empty`);
-  return text.replace(/^#[^\n]*\n+/, '').trim();
+  if (!GUIDES.includes(name)) throw new UsageError(`--guide is one of: ${[...GUIDES, 'none'].join(', ')}`);
+  const text = guideBody(name);
+  if (!text) throw new UsageError(`guides/${name}.md is missing or empty`);
+  return text;
+}
+
+/**
+ * The guide a job carries when none is named: a reviewer always review; a worker the one its title and goal ask
+ * for, the way the chat is handed one by the user's words — unless the switch is off. A scout changes nothing.
+ */
+function defaultGuide(db, { agent, title, task }) {
+  if (agent === 'reviewer') return 'review';
+  if (agent !== 'worker' || !autoGuides(db)) return null;
+  return matchGuide(`${title}\n${task.split(/\n(?=## )/)[0]}`, WORKER_GUIDES);
 }
 
 /**
@@ -222,7 +233,8 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
   if (reviews !== undefined && agent !== 'reviewer') throw new UsageError('--reviews goes with --agent reviewer');
   const project = getProject(db, nameOrAlias);
   // Everything that can refuse the job is settled before the job exists.
-  const guide = guideName || agent === 'reviewer' ? guideFor(guideName ?? 'review') : null;
+  const chosen = guideName === 'none' ? null : (guideName ?? defaultGuide(db, { agent, title, task }));
+  const guide = chosen ? guideFor(chosen) : null;
   const judged = agent === 'reviewer' ? changeToJudge(db, { project, reviews }) : null;
 
   // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory.
@@ -569,17 +581,21 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
     if (targetId !== null) db.prepare('UPDATE jobs SET important = ? WHERE id = ?').run(findingsCount(report), targetId);
   }
 
-  const ops = learnedLines(report).map((body) => ({ op: 'gotcha', scope: `project:${job.project}`, body: clip(body, 300) }));
+  // Scratch keeps no memory: what a chore there taught is in its report, and where it stopped is nowhere to come back to.
+  const kept = !isScratch(getProject(db, job.project));
+  const ops = kept ? learnedLines(report).map((body) => ({ op: 'gotcha', scope: `project:${job.project}`, body: clip(body, 300) })) : [];
   const learned = applyOps(db, ops, { source: 'worker', turns: new Map(), now });
 
   const summary = /^##\s*Summary\s*\n+([^\n]+)/im.exec(report)?.[1]?.trim();
-  addCheckpoint(db, {
-    sessionId: job.session_id,
-    project: job.project,
-    done: clip(`${status === 'DONE' ? 'finished' : 'FAILED'} job j${id} "${job.title}"${summary ? `: ${summary}` : ''}`, 300),
-    next: status === 'FAILED' ? `read the report: sumo job show ${id}` : null,
-    now,
-  });
+  if (kept) {
+    addCheckpoint(db, {
+      sessionId: job.session_id,
+      project: job.project,
+      done: clip(`${status === 'DONE' ? 'finished' : 'FAILED'} job j${id} "${job.title}"${summary ? `: ${summary}` : ''}`, 300),
+      next: status === 'FAILED' ? `read the report: sumo job show ${id}` : null,
+      now,
+    });
+  }
   return { job: getJob(db, id), learned, verdict, unverified: graded && accept !== undefined };
 }
 

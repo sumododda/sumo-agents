@@ -172,7 +172,11 @@ export function press(state, input, key, commands = [], files = null) {
     if (input === 'j') return { state: insert(state, '\n') };
     if (input === 'a') return { state: { ...state, cursor: lineStart(state) } };
     if (input === 'e') return { state: { ...state, cursor: lineEnd(state) } };
-    if (input === 'u') return { state: cut(state, lineStart(state), cursor) };
+    if (input === 'u') {
+      // At the start of a line nothing of it is before the cursor: the line above goes instead, so pressing it again clears a box of many lines.
+      const start = lineStart(state);
+      return { state: cut(state, start === cursor && cursor > 0 ? lineStart({ text: state.text, cursor: cursor - 1 }) : start, cursor) };
+    }
     if (input === 'k') return { state: cut(state, cursor, lineEnd(state)) };
     if (input === 'w') return { state: cut(state, wordLeft(state), cursor) };
     if (input === 'd') return { state: cut(state, cursor, cursor + under(state).length) };

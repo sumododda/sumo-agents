@@ -1,4 +1,4 @@
-import { aliasesOf, getProject } from './projects.mjs';
+import { aliasesOf, getProject, isScratch, scratchRules } from './projects.mjs';
 import { clip, estimateTokens } from './text.mjs';
 
 const CARD_BUDGET_TOKENS = 200;
@@ -23,6 +23,8 @@ export function ago(iso, now) {
  */
 export function card(db, nameOrAlias, { budget = CARD_BUDGET_TOKENS, now = new Date().toISOString() } = {}) {
   const project = getProject(db, nameOrAlias);
+  // Scratch has no memory to show: its card is how it is used.
+  if (isScratch(project)) return [`<project ${project.slug}> ${project.path}`, ...scratchRules(db), '</project>'].join('\n');
   const scope = `project:${project.slug}`;
   const rows = db
     .prepare(`SELECT * FROM memories WHERE scope = ? AND state = 'active' ORDER BY pinned DESC, importance DESC, hits DESC, id DESC`)

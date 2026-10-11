@@ -104,7 +104,7 @@ test('the screen: a box to type in, a working line with the user\'s own words, t
         }
         assert.match(tty.screen(), /\n┃ fix it\n/, 'what was typed, a bar down its side');
         assert.match(tty.screen(), /esc to interrupt/);
-        assert.equal(seen[0].messages.at(-1).content[0].text, 'fix it');
+        assert.equal(seen[0].messages.findLast((m) => m.role === 'user').content[0].text, 'fix it');
         assert.match(JSON.stringify(seen[0]), /Always squash before merging/, 'the model still starts from the memory');
 
         // Typed while it works: it stands above the box, and the model reads it with its next request — in this turn, not after it.
@@ -972,6 +972,7 @@ test('the work as it happens: a running command shows what it prints and how lon
       mkdirSync(join(root, '.git'));
       writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/fix-total\n');
       writeFileSync(join(root, 'cart.js'), 'export function total(items) {\n  let sum = 0;\n  for (const item of items) {\n    sum += item.price;\n  }\n  return sum;\n}\n');
+      addProject(db, root, { slug: 'shopcart', now: NOW });
       const { send } = transport([
         { reply: reply('tool_use', [call('t1', 'bash', { command: "echo compiling; printf 'token=ghp_%s\\n' abcdefghijklmnopqrstuvwxyz0123456789; sleep 1.6; echo built" })]) },
         { reply: reply('tool_use', [call('t2', 'str_replace_based_edit_tool', { command: 'str_replace', path: join(root, 'cart.js'), old_str: '  for (const item of items) {\n    sum += item.price;\n  }', new_str: '  for (const item of items) {\n    sum += item.price * (item.quantity ?? 1);\n  }' })]) },
@@ -989,9 +990,10 @@ test('the work as it happens: a running command shows what it prints and how lon
         assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
       };
       try {
-        // Where the tools run stands under the box: the project and its branch.
-        await shows(new RegExp(`opus · high\\s+${root.split('/').at(-1)} \\(fix-total\\)\\s+/ commands · /help`), 'the place under the box');
-        await tty.type(`fix the total${ENTER}`);
+        // Where the tools run stands under the box: scratch until a project is named, then the project and its branch.
+        await shows(/opus · high\s+scratch\s+\/ commands · \/help/, 'the place under the box');
+        await tty.type(`fix the total in shopcart${ENTER}`);
+        await shows(/opus · high\s+shopcart \(fix-total\)\s/, 'the project under the box, once it is named');
         // While the command runs: the last of what it printed, without its secrets, and for how long it has run.
         await shows(/\n⏺ Bash\(echo compiling;[^\n]*\n {2,3}built\)\n {2}⎿ {2}Running… 1s\n {5}compiling\n {5}token=\[redacted\]\n/, 'the running command with its output so far');
         assert.doesNotMatch(tty.screen(), /ghp_abcdefghij/, 'a secret a command prints is not drawn while it runs either');
@@ -1039,7 +1041,7 @@ test('a long turn that ends behind another window rings; one in front does not; 
         assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
       };
       const rings = () => tty.controls().filter((c) => c.startsWith('\x1b]9;'));
-      const name = tmpdir().split('/').at(-1);
+      const name = 'scratch';
       try {
         await shows(/opus · high/, 'the footer');
         assert.equal(tty.controls()[1], '\x1b[22;0t\x1b[?1004h', 'the terminal\'s title is kept to be given back, and it is asked to say when its window is in front');
@@ -1256,6 +1258,72 @@ test('a job in the background: the turn that delegates ends and the box is free;
 
         await tty.type(`/stop${ENTER}`);
         await shows(/no job is at work in the background/, 'nothing to stop');
+        await tty.type('\x04');
+        await leaves(ui);
+      } finally {
+        ui.unmount();
+        await session.settle();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a job thinking in the background does not redraw the screen at every word of the thought: its line says where the thought has got to when its clock ticks', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-ui-still-'));
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
+      addProject(db, root, { slug: 'simba', now: NOW });
+      const id = Number(db.prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('simba', 'look', 'scout', 'running', null, ?, ?, 'haiku', 'none', 'test')`).run(NOW, NOW).lastInsertRowid);
+      mkdirSync(join(paths().jobs, String(id)), { recursive: true });
+      writeFileSync(join(paths().jobs, String(id), 'brief.md'), '# Job\n\n## The task\nlook around\n');
+
+      const working = gate();
+      const chat = [reply('tool_use', [call('t1', 'delegate', { job: id })]), reply('end_turn', [{ type: 'text', text: 'the scout is looking' }]), reply('end_turn', [{ type: 'text', text: 'read' }])];
+      const send = async (params, { onText, signal } = {}) => {
+        if (params.tools.some((t) => t.name === 'finish')) {
+          await Promise.race([working.promise, new Promise((_, no) => signal?.addEventListener('abort', () => no(new Error('Request was aborted.')), { once: true }))]);
+          return reply('end_turn', []);
+        }
+        const next = chat.shift();
+        for (const b of next.content) if (b.type === 'text' && onText) onText(b.text);
+        return next;
+      };
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, background: true, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty({ columns: 110 });
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 300; i++) {
+          if (pattern.test(tty.screen())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+      };
+      try {
+        await tty.type(`check simba${ENTER}`);
+        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*\\n⏺ j${id} in the background · \\d+s · 0 tool calls · thinking…\\n`), 'the job above the box, and no turn at work');
+
+        // The thought comes a word at a time, many times a second. Every frame is the whole screen written again.
+        let frames = 0;
+        const write = tty.stdout.write;
+        tty.stdout.write = (frame) => {
+          if (String(frame).includes('in the background')) frames++;
+          return write.call(tty.stdout, frame);
+        };
+        for (let i = 0; i < 30; i++) {
+          events.emit('thinking', { type: 'thinking', job: id, text: `reading the code, word ${i}` });
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        assert.ok(frames <= 2, `${frames} frames drawn for thirty words of one thought`);
+        await shows(/thinking: reading the code, word 29\n/, 'where the thought has got to, at the next tick of the job\'s clock');
+        tty.stdout.write = write;
+
+        working.open();
+        await shows(/⏺ read/, 'the reply to the report');
         await tty.type('\x04');
         await leaves(ui);
       } finally {

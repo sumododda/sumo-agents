@@ -4,9 +4,10 @@ import { card } from './card.mjs';
 import { getMeta, openDb, setMeta } from './db.mjs';
 import { backup } from './export.mjs';
 import { guardCommand, guardPath } from './guard.mjs';
+import { autoGuides, firingGuides, matchGuide, renderGuide } from './guides.mjs';
 import { paths } from './paths.mjs';
 import { prime } from './prime.mjs';
-import { detect, touch } from './projects.mjs';
+import { detect, keepScratch, touch } from './projects.mjs';
 import { closingQuestions, recallBeforeAsking } from './recall.mjs';
 import { line } from './render.mjs';
 import { shouldRun, spawnDetached } from './scribe.mjs';
@@ -40,6 +41,10 @@ export function fieldsOf(p) {
     reply: p.last_assistant_message ?? '',
     contextTokens: Number.isFinite(p.context_tokens) ? p.context_tokens : null,
     stopHookActive: p.stop_hook_active === true,
+    // A guide the user named by its command; the files the turn edited after a declared check last ran, and those checks.
+    guide: p.guide ?? null,
+    edited: Array.isArray(p.edited) ? p.edited.map(String) : [],
+    checks: Array.isArray(p.checks) ? p.checks.map(String) : [],
   };
 }
 
@@ -79,6 +84,40 @@ function sizeNudge(db, e, now) {
   return contextNudge(band, tokens, focusOf(db, e.sessionId));
 }
 
+/**
+ * The guide for the kind of work the message asks for, once per session — unless a taught workflow matched the
+ * same message: the user's own way of doing the thing wins. One named by its command (`/fix`) goes in whatever
+ * was shown before, and whatever the switch says: the user asked for it.
+ */
+function guideDue(db, e, now, taught) {
+  const name = e.guide ?? (!taught && autoGuides(db) ? matchGuide(e.prompt) : null);
+  if (!name || !firingGuides().some((g) => g.name === name)) return '';
+  const slug = `guide:${name}`;
+  if (!e.guide && db.prepare('SELECT 1 FROM session_injections WHERE session_id = ? AND slug = ?').get(e.sessionId, slug)) return '';
+  markInjected(db, e.sessionId, slug, now);
+  return renderGuide(name);
+}
+
+/**
+ * An edit nothing has checked is not done, whatever the reply says. The chat says which files the turn edited after
+ * the last of the project's declared checks ran, and which those checks are; the fact is put in front of the model
+ * and the turn goes on. An edit made through the shell is not seen, and a harness that says nothing of edits is
+ * left alone.
+ */
+function unchecked(db, e) {
+  if (e.edited.length === 0 || !autoGuides(db)) return '';
+  const first = e.edited.slice(0, 3);
+  const rest = e.edited.length > 3 ? `${e.edited.length - 3} more` : first.length > 1 ? first.pop() : null;
+  const shown = rest ? `${first.join(', ')} and ${rest}` : first[0];
+  const were = e.edited.length === 1 ? 'was' : 'were';
+  const them = e.edited.length === 1 ? 'it' : 'them';
+  const next =
+    e.checks.length > 0
+      ? `nothing has checked ${them} since. The project's check is ${e.checks.map((c) => `\`${c}\``).join(' and ')} — run it and say what it showed, or say why it does not apply.`
+      : 'nothing ran after. This project declares no check — run what proves the change (the reproduction, or the test you wrote), or say why nothing does.';
+  return `<check>\nNot done yet: ${shown} ${were} edited and ${next}\n</check>`;
+}
+
 const HANDLERS = {
   'session-start'(db, e, now) {
     ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
@@ -103,6 +142,12 @@ const HANDLERS = {
       // Housekeeping too: a saved session that cannot be let go stays, and is said in the hook log, never to the session starting.
       logFailure('session-start prune', cause);
     }
+    try {
+      keepScratch(db, now);
+    } catch (cause) {
+      // And this: scratch that cannot be made or tidied is said in the hook log; the session still gets its memory.
+      logFailure('session-start scratch', cause);
+    }
 
     return prime(db, { now });
   },
@@ -125,6 +170,8 @@ const HANDLERS = {
     if (asked.length > 0) {
       cards.push(`The user taught a workflow for what they are asking — follow it exactly, in order:\n${asked.map(renderWorkflow).join('\n')}`);
     }
+    const guide = guideDue(db, e, now, asked.length > 0);
+    if (guide) cards.push(guide);
 
     const size = sizeNudge(db, e, now);
     if (size) cards.push(size);
@@ -155,12 +202,12 @@ const HANDLERS = {
     ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
     if (shouldRun(db, { event: 'stop', now })) spawnDetached(['scribe', 'run']);
 
-    // The other gate: a turn that ends by asking the user something memory may already hold.
-    // Already continuing because of it → whatever the turn ends on now goes to the user.
-    if (e.stopHookActive || !e.reply) return '';
-    const known = recallBeforeAsking(db, { sessionId: e.sessionId, asked: closingQuestions(e.reply), now });
-    if (known.length === 0) return '';
-    return JSON.stringify({ context: `Before the user answers that: ${alreadyKnown(known)} If none does, the question stands — say so in one line.` });
+    // The other gates: a turn that ends on an edit nothing checked, or by asking the user something memory may
+    // already hold. Already continuing because of one → whatever the turn ends on now goes to the user.
+    if (e.stopHookActive) return '';
+    const known = e.reply ? recallBeforeAsking(db, { sessionId: e.sessionId, asked: closingQuestions(e.reply), now }) : [];
+    const held = [unchecked(db, e), known.length > 0 ? `Before the user answers that: ${alreadyKnown(known)} If none does, the question stands — say so in one line.` : ''].filter(Boolean);
+    return held.length > 0 ? JSON.stringify({ context: held.join('\n') }) : '';
   },
 
   'session-end'(db, e, now) {

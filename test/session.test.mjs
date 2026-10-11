@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { contextUse } from '../src/sessions.mjs';
@@ -698,4 +698,26 @@ test('a last reply longer than the first look, with no line end after it, is sti
   const long = `{"message":{"role":"assistant","model":"claude-opus-5-5","usage":{"input_tokens":5000},"content":[{"type":"text","text":"${'x'.repeat(1_500_000)}"}]},"type":"assistant"}`;
   write(file, `${first}\n${long}`);
   assert.deepEqual(contextUse(file), { tokens: 5000, model: 'claude-opus-5-5' });
+});
+
+test('a session start keeps scratch: it is there and registered, an idle chore is let go, and the folders are walked once a day, not at every start', () => {
+  const s = sandbox();
+  const idle = (name) => {
+    const dir = join(s.home, 'scratch', name);
+    mkdirSync(dir, { recursive: true });
+    const then = new Date(Date.now() - 30 * 86_400_000);
+    utimesSync(dir, then, then);
+    return dir;
+  };
+  const first = idle('2026-01-01-old');
+
+  const start = s.hook('session-start', { ...SESSION, source: 'startup' });
+  assert.equal(start.code, 0);
+  assert.match(start.out, /^Scratch: /m);
+  assert.match(s.sumo(['project', 'show', 'scratch']).out, /^<project scratch> /);
+  assert.equal(existsSync(first), false);
+
+  const second = idle('2026-01-02-old');
+  s.hook('session-start', { ...SESSION, source: 'startup' });
+  assert.equal(existsSync(second), true, 'looked at today already');
 });

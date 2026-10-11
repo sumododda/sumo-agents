@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { openDb } from '../src/db.mjs';
-import { detect } from '../src/projects.mjs';
+import { card } from '../src/card.mjs';
+import { openDb, setMeta } from '../src/db.mjs';
+import { addProject, detect, ensureScratch, getProject, keepScratch, listProjects, pruneScratch } from '../src/projects.mjs';
 import { estimateTokens } from '../src/text.mjs';
+import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 import { sandbox } from './helpers.mjs';
 
 /** A small but realistic repository for the scanner to read. */
@@ -267,4 +270,106 @@ test('purging an active scanned fact keeps it let go on the next rescan', () => 
   s.sumo(['forget', String(about().id), '--purge']);
   assert.match(s.sumo(['project', 'rescan', 'simba']).out, /^rescanned: 0 new/);
   assert.equal(about(), undefined);
+});
+
+/** Runs `fn` with a database in a home of its own, for what reads the home straight from the environment. */
+async function withDb(fn) {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      await fn(db);
+    } finally {
+      db.close();
+    }
+  });
+}
+
+/** Makes `path` look last written `days` ago. A link is aged itself, not what it points at. */
+function age(path, days, { link = false } = {}) {
+  const then = new Date(Date.now() - days * 86_400_000);
+  (link ? lutimesSync : utimesSync)(path, then, then);
+}
+
+test('scratch is a project in the home, registered once: its card is how it is used, and the word in a sentence never means it', async () => {
+  await withDb((db) => {
+    const now = new Date().toISOString();
+    const path = ensureScratch(db, now);
+    assert.equal(path, realpathSync(join(process.env.SUMO_AGENTS_HOME, 'scratch')));
+    assert.equal(ensureScratch(db, now), path, 'asked again, nothing changes');
+    assert.deepEqual(listProjects(db).map((p) => [p.slug, p.path]), [['scratch', path]]);
+
+    assert.deepEqual(detect(db, 'rebuild the parser from scratch'), [], 'a turn of phrase must not move the work');
+
+    setMeta(db, 'config.scratch.days', '9');
+    const shown = card(db, 'scratch');
+    assert.match(shown, new RegExp(`^<project scratch> ${path}\\n`));
+    assert.match(shown, /one folder per chore/);
+    assert.match(shown, /9 days/);
+    assert.match(shown, /sumo project add/);
+  });
+});
+
+test('a chore nothing was written in for the set days is let go; one written in deep down stays; a link goes without what it points at', async () => {
+  await withDb((db) => {
+    const now = new Date().toISOString();
+    const scratch = ensureScratch(db, now);
+    const outside = mkdtempSync(join(tmpdir(), 'sumo-agents-outside-'));
+    writeFileSync(join(outside, 'kept.txt'), 'not scratch');
+
+    mkdirSync(join(scratch, 'idle', 'sub'), { recursive: true });
+    writeFileSync(join(scratch, 'idle', 'sub', 'a.txt'), 'a');
+    mkdirSync(join(scratch, 'worked', 'sub'), { recursive: true });
+    writeFileSync(join(scratch, 'worked', 'sub', 'fresh.txt'), 'b');
+    writeFileSync(join(scratch, 'loose.txt'), 'c');
+    symlinkSync(outside, join(scratch, 'link'));
+
+    for (const old of ['idle/sub/a.txt', 'idle/sub', 'idle', 'worked/sub', 'worked', 'loose.txt']) age(join(scratch, old), 30);
+    age(join(outside, 'kept.txt'), 30);
+    age(outside, 30);
+    age(join(scratch, 'link'), 30, { link: true });
+
+    assert.equal(pruneScratch(now, 14), 3);
+    assert.equal(existsSync(join(scratch, 'idle')), false);
+    assert.equal(existsSync(join(scratch, 'loose.txt')), false);
+    assert.equal(existsSync(join(scratch, 'worked', 'sub', 'fresh.txt')), true, 'a file written in yesterday keeps its whole chore');
+    assert.equal(existsSync(join(outside, 'kept.txt')), true, 'what a link points at is not scratch');
+    assert.equal(pruneScratch(now, 60), 0, 'inside the days, nothing goes');
+  });
+});
+
+test("a project of the user's already called scratch keeps the name, and is never pruned as scratch", async () => {
+  await withDb((db) => {
+    const now = new Date().toISOString();
+    const mine = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-mine-')));
+    mkdirSync(join(mine, 'old'));
+    age(join(mine, 'old'), 30);
+    addProject(db, mine, { slug: 'scratch', now });
+
+    ensureScratch(db, now);
+    assert.equal(getProject(db, 'scratch').path, mine);
+    assert.doesNotMatch(card(db, 'scratch'), /one folder per chore/, 'their project has its own card');
+    pruneScratch(now, 14);
+    assert.equal(existsSync(join(mine, 'old')), true);
+  });
+});
+
+test('scratch is tidied at a session start once a day: not again within the day, and again after it', async () => {
+  await withDb((db) => {
+    const at = (hours) => new Date(Date.now() + hours * 3_600_000).toISOString();
+    const idle = (name) => {
+      const dir = join(ensureScratch(db), name);
+      mkdirSync(dir);
+      age(dir, 30);
+      return dir;
+    };
+    const first = idle('one');
+    keepScratch(db, at(0));
+    assert.equal(existsSync(first), false);
+
+    const second = idle('two');
+    keepScratch(db, at(1));
+    assert.equal(existsSync(second), true, 'every folder was walked an hour ago');
+    keepScratch(db, at(25));
+    assert.equal(existsSync(second), false);
+  });
 });

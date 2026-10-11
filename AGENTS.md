@@ -13,7 +13,8 @@ is the memory block: preferences, projects, where things were left, open jobs, t
 - The block says "Ask the user" → ask, then `sumo confirm` or `sumo reject`. More: guides/memory.md.
 
 ## Projects
-Unknown project → find it on disk, confirm the path once, `sumo project add` (guides/projects.md).
+A project in the block is at the path beside it: never search for it. Unknown name → guides/projects.md.
+No project → work in scratch; the block says where.
 A project's card arrives when it first comes up; for one that has not, `sumo project show <slug>`.
 
 ## Work
@@ -31,7 +32,6 @@ run at once — read guides/delegation.md first.
 - Reuse existing helpers; copy an in-repo example before inventing a pattern.
 - Never fake it: no invented APIs, flags or files; no placeholders. Unsure or unfinished → say so.
 - Two failed attempts at the same fix → stop and rethink from the evidence. No third variation.
-- Fix, feature or review → read guides/<that>.md first.
 - No new dependency. A secret is used from the environment, or loaded with `set -a; source .env; set +a; <cmd>` in one call; never put in a file or printed.
 - Output: failures, not whole logs. No preamble, no restating the request. Only you see a command's output (the
   screen shows one line): say what the user needs. Edit the lines that change, never a whole file.

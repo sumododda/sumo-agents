@@ -1,10 +1,12 @@
-import { existsSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, resolve } from 'node:path';
-import { tx } from './db.mjs';
+import { basename, join, resolve } from 'node:path';
+import { getMeta, setMeta, tx } from './db.mjs';
 import * as memory from './memory.mjs';
 import { UsageError } from './memory.mjs';
+import { paths } from './paths.mjs';
 import { gitRemote, scan } from './scan.mjs';
+import { CONFIG_DEFAULTS } from './setup.mjs';
 
 /**
  * Names too ordinary to mean "this project" when they turn up in a sentence.
@@ -12,7 +14,7 @@ import { gitRemote, scan } from './scan.mjs';
  */
 const ORDINARY = new Set(
   `api app apps web site docs doc test tests main server client core lib src demo tmp temp blog backend frontend
-   service services tools utils common shared data config scripts infra mobile desktop admin dashboard`.split(/\s+/),
+   service services tools utils common shared data config scripts infra mobile desktop admin dashboard scratch`.split(/\s+/),
 );
 const MIN_DETECT_LENGTH = 3;
 
@@ -163,4 +165,68 @@ export function detect(db, text) {
     if (new RegExp(`(?<![\\w-])${escaped}(?![\\w-])`).test(lower)) found.add(slug);
   }
   return [...found];
+}
+
+/** The project for work that belongs to none. It lives in Sumo's own home, and a chore in it is kept only while it is worked on. */
+export const SCRATCH = 'scratch';
+const DAY_MS = 24 * 3_600_000;
+
+/** Scratch's directory, made if it is not there: tools start in it, so it has to be. */
+export function scratchDir() {
+  mkdirSync(paths().scratch, { recursive: true, mode: 0o700 });
+  return realpathSync(paths().scratch);
+}
+
+/** Only the directory in the home is scratch: a project of the user's that has the name is theirs. */
+export const isScratch = (project) => project.path === scratchDir();
+
+/** How many days a chore nothing is written in is kept. */
+export const scratchDays = (db) => Number(getMeta(db, 'config.scratch.days') ?? CONFIG_DEFAULTS['scratch.days']);
+
+/** How scratch is used, as its card and a job's brief say it. */
+export const scratchRules = (db) => [
+  'for work that belongs to no project: one folder per chore, named <date>-<what it is>',
+  `a folder nothing is written in for ${scratchDays(db)} days is deleted — to keep one, move it out of here, then: sumo project add <path>`,
+  'nothing here is checked or remembered: say in the report what you ran to prove the work',
+];
+
+/**
+ * Registers scratch, so a job is handed it like any project. Nothing is scanned: what is in it says nothing that lasts.
+ * A project already called scratch keeps the name — the work with no project still has the directory to go to.
+ */
+export function ensureScratch(db, now = new Date().toISOString()) {
+  const path = scratchDir();
+  const taken = db.prepare('SELECT 1 FROM projects WHERE slug = ? OR path = ?').get(SCRATCH, path) ?? db.prepare('SELECT 1 FROM project_aliases WHERE alias = ?').get(SCRATCH);
+  if (!taken) db.prepare('INSERT INTO projects (slug, name, path, created_at) VALUES (?, ?, ?, ?)').run(SCRATCH, SCRATCH, path, now);
+  return path;
+}
+
+/** Whether anything at `path` or under it was written after `cutoff`. A link is not followed: what it points at is not scratch's. */
+function writtenSince(path, cutoff) {
+  const stat = lstatSync(path);
+  if (stat.mtimeMs > cutoff) return true;
+  return stat.isDirectory() && readdirSync(path).some((name) => writtenSince(join(path, name), cutoff));
+}
+
+/** Lets go of what nothing has been written in for `days`, a chore at a time. Returns how many went. */
+export function pruneScratch(now, days) {
+  const dir = scratchDir();
+  const cutoff = Date.parse(now) - days * DAY_MS;
+  let gone = 0;
+  for (const name of readdirSync(dir)) {
+    const chore = join(dir, name);
+    if (writtenSince(chore, cutoff)) continue;
+    rmSync(chore, { recursive: true, force: true });
+    gone++;
+  }
+  return gone;
+}
+
+/** What a session start owes scratch: that it is there, and — once a day, since every folder is walked — that what is idle goes. */
+export function keepScratch(db, now) {
+  ensureScratch(db, now);
+  const last = getMeta(db, 'scratch.pruned');
+  if (last && Date.parse(now) - Date.parse(last) < DAY_MS) return;
+  pruneScratch(now, scratchDays(db));
+  setMeta(db, 'scratch.pruned', now);
 }

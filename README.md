@@ -41,13 +41,20 @@ sumo config model.source <url>                                                  
 sumo config chat.model opus                                                        # what `sumo chat` runs on; `auto` routes each turn
 sumo config chat.effort high                                                       # effort when using a fixed chat model
 sumo config chat.notify off                                                        # no bell when a long turn ends behind another window
+sumo config guides.auto off                                                        # no guide riding in unasked, no turn held for an unchecked edit
+sumo config projects.home ~/code                                                   # where a new project is made (your home, until you say)
+sumo config scratch.days 30                                                        # how long scratch keeps a chore nothing is written in (14)
 sumo models                                                                         # the API models: on or off, and why
 sumo models discover                                                                # ask the API again which of them this credential can use
 sumo models disable fable                                                           # keep one out of the chat, the router and the passes
 ```
 
 Then just talk. Mention a project the way you normally would; the first time, the agent finds it on
-disk, confirms the path with you, and registers it. In the chat: `/fix`, `/feature`, `/review`
+disk, confirms the path with you, and registers it — and a name of yours it had to look up becomes an alias,
+so it is looked up once. Work that belongs to no project is done in `~/.sumo-agents/scratch/`, a folder per
+chore: with no project named the tools start there, wherever you started the chat; a job is handed it as the
+project `scratch`; nothing is remembered or checked there, and a chore nothing is written in for 14 days is
+deleted — move one out and register it to keep it. In the chat: `/fix`, `/feature`, `/review`
 load the matching guide; `/dream` tidies the memory and says what changed; `/model` says the route
 and sets it — `/model opus high`, `/model haiku`,
 or `/model auto` to have the same local router that routes jobs pick a model and effort for each turn
@@ -137,6 +144,8 @@ window — shows under the working line.
 | An edit's `old_str` is not in the file exactly as written | It is matched again with the file's line endings, then line by line without trailing spaces, then without its indentation too — the replacement set in at the file's depth — and the result says how it matched. A looser match is still refused unless it is the only one. | 0 |
 | The editor reaches for a path outside the project | Refused: the editor is jailed to the project (symlinks followed). Shell commands start in the project directory but can access other paths, and run with your environment — every token you exported, so a probe or a smoke test can use it — minus Sumo's own Anthropic credential. A command whose only job is to print the whole environment (`env`, `printenv`, bare `export` or `set`) is refused; a `.env` is loaded with `set -a; source .env; set +a`, never printed. | 0 |
 | The agent is about to run a shell command a taught workflow gates (`gh pr create`, for a workflow taught with `--gate 'gh(-axi)? pr create'`) | The command is held back once and the agent is handed the workflow's steps. It follows them, then runs the command. The same steps ride in with your message when you ask for the thing yourself. | 0 until it fires |
+| Your message asks for a fix, a feature or a review ("the export is broken", "add a --json flag", "review j12") | The matching guide rides in as an operator message, once per session — judged by the same word stems as a taught workflow, with no model asked. A taught workflow that matches the same message goes in instead. `/fix`, `/feature` and `/review` name one outright. The screen shows `guide: fix`. | 0, or ≤ 450 once per guide |
+| The agent ends a turn after editing a file, and none of the project's declared checks (`npm test`, `make check` …) ran since | It is told the fact — which files, which check — and continued once, the way a question memory can answer is. A command that is not the check (`git status`) does not count; a project that declares no check is cleared by any command. The screen shows `held: 2 files edited, npm test not run`. | ≤ 60 tokens and one request, on such a turn |
 | The agent ends a turn on a question | Memory is searched with the question's own words, in plain code. If something close is there, the agent is handed it once and carries on instead of waiting for you; if nothing is, the question reaches you untouched. | 0 unless memory answers |
 | A turn ends | The **scribe** is scheduled when a pending turn contains a standing instruction, three turns are waiting, or its last run was at least five minutes ago (or it has never run). Session start and end also sweep up pending turns. A detached call to the local model proposes memories; code checks each against what you actually typed. | 0 |
 | 3 finished sessions pile up | The **dream** pass reads them side by side: contradictions, repeated corrections, routines worth naming. | 0 |
@@ -325,20 +334,29 @@ and how it ended.
 
 ## How coding work gets done
 
-Three kinds of work have a written way of doing them. Each is a short numbered list in `guides/`, read
-only when that work comes up:
+Three kinds of work have a written way of doing them. Each is a short numbered list in `guides/`, and
+each rides in by itself when your message asks for that kind of work:
 
-| You type | Guide | The gist |
+| You type (or say) | Guide | The gist |
 |---|---|---|
 | `/fix <what is wrong>` | `guides/fix.md` | What changed recently → make it fail on demand → find *where* it breaks before saying *why* → one cause at a time, each with evidence → fix where it starts → the same reproduction passes |
 | `/feature <what to build>` | `guides/feature.md` | Size it (experiment · change to existing code · new subsystem) → agree what done means → tests first, seen failing → build without touching them → name a wrong implementation that would still pass, and kill it |
 | `/review <what to judge>` | `guides/review.md` | A reviewer that did not write the code, reading only the change: first "does it do what was asked" (missing · extra · misunderstood), then "can it be trusted"; every finding has a file:line and a concrete way it fails |
 
-You do not have to type the command: `AGENTS.md` tells the agent to read the matching guide first.
+You do not have to type the command. Each guide opens with a `when:` line — the phrases that mean you are
+asking for its kind of work (`fix, bug, broken, failing, crash, …`) — and code matches your message against
+them by word stems, the way a taught workflow is matched: no model, no delay, nothing in the context until
+one fires. One guide per message, review before fix before feature ("review my fix" is a review; "fix the
+broken add button" is a fix), once per session; a taught workflow that matches the same message wins. In
+the chat, `review` goes in as "delegate it to a reviewer" plus how to receive the findings, since code
+written in a session is never judged in that session. `test/guides.test.mjs` holds the probe set — fifty
+messages in the shape of real ones, each with the guide it should bring — and names the misses it accepts.
+`sumo config guides.auto off` turns the matching off; the commands still work.
 
 **`--guide`** is how the same steps reach a job. `sumo job new --guide fix` pastes `guides/fix.md`
-into the worker's brief, so a delegated fix is done the same way as one done in the conversation. A
-reviewer job always carries `guides/review.md`.
+into the worker's brief, so a delegated fix is done the same way as one done in the conversation. Unsaid,
+a worker gets the guide its title and goal ask for, if any (`--guide none` for none); a reviewer job always
+carries `guides/review.md`; a scout gets none.
 
 ## How a worker's DONE is checked
 
@@ -448,6 +466,7 @@ in for test and lint. `sumo project rescan <slug>` after setting one up.
 | reviewers and scouts receive no editor tool | reviewers and scouts use their shell only for reading |
 | | a worker running `sumo job baseline` first — though skipping it only hurts the worker |
 | a taught workflow's steps before a gated shell command | the nudge to start a new session |
+| the end of a turn that edited a file and ran no declared check — held once, the check named | the guide that rode in being followed |
 | no job, no run | |
 | matched destructive and secret-reading shell commands are refused; editor paths stay inside the project and exclude secret files | shell commands stay inside the project |
 | Sumo's own credential is withheld from every command; a command that prints the whole environment is refused; recognized secrets in output are redacted | |
@@ -569,7 +588,7 @@ sloppy fix, the idle DONE, the edited test and the report with one name too many
 ```
 AGENTS.md            the system prompt of the chat, and the only always-loaded instructions
 prompts/             agent.md — the system prompt of a job; scribe.md, dream.md — the memory passes
-guides/              read on demand: memory · projects · workflows · delegation · fix · feature · review
+guides/              fix · feature · review ride in when your words ask for them; memory · projects · workflows · delegation are read on demand
 bin/sumo.mjs  src/    the `sumo` CLI — Node, the Anthropic SDK, SQLite full-text search
 src/loop.mjs         the loop every conversation runs in; src/tools.mjs the shell and editor with their policy
 src/mcp.mjs          the MCP servers: their configuration, the two transports, the allow list, `sumo mcp`

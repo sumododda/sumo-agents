@@ -1,3 +1,6 @@
+---
+when: review, audit, "look over", critique
+---
 # Review
 
 1. Judge the change, not its author's account of it. A report is claims; a stated reason never makes a finding smaller.
