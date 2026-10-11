@@ -187,11 +187,14 @@ sumo forget <id>                    # stop it being true (history kept);  --purg
 The main agent does small things itself. Big, parallel or reading-heavy work it hands off with its
 `delegate` tool: a written brief becomes a job, and the job runs in the chat's own process on the route the
 router chose. On the chat's screen it runs in the background: the call answers at once, the turn goes on or
-ends, and you keep working — ask something else, start another job. The job stands on a line above the box
-while it works (`⏺ j43 in the background · 2m 10s · 14 tool calls · …`). When it reports, how it went is drawn
-where the conversation has got to, and the model reads the report as an automated event, never as your
-words: with its next request if it is at work, otherwise in a turn the screen starts for it — so the main
-agent picks the work back up by itself. Esc stops the chat's turn, not the job; `/stop` (or `/stop j43`)
+ends, and you keep working — ask something else, start another job. The job stands in a row under the box
+while it works (`⏺ j43 scout — Map the parser · 2m 10s · 14 tool calls · …`). Down from the box steps onto a
+job and Enter opens it: the end of its record above the box — each call, the top of what came back, what it
+said — as it grows; `@ message` then talks to that job, Ctrl-O shows all of the record, Esc closes it. When
+it reports, how it went is drawn where the conversation has got to, and the model reads the report as an
+automated event, never as your words: with its next request if it is at work, otherwise in a turn the
+screen starts for it — so the main agent picks the work back up by itself. Esc stops the chat's turn, not
+the job; `/stop` (or `/stop j43`)
 stops a job, which says so with your next message and starts no turn; a question a job asks is answered or
 refused (Esc) without stopping it; `/new` and `/resume` wait until no job is at work; leaving the chat stops
 the jobs still running, to be picked up again later. Piped, and in `sumo job run`, nothing changes: the call

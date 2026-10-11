@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { createChat } from '../src/chat.mjs';
 import { openDb, setMeta } from '../src/db.mjs';
 import { add } from '../src/memory.mjs';
-import { takeInbox } from '../src/jobs.mjs';
+import { appendLive, startLive, takeInbox } from '../src/jobs.mjs';
 import { paths } from '../src/paths.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
@@ -1185,7 +1185,7 @@ test('the part of a long text the box draws is the rows around the cursor', () =
   assert.deepEqual([one.above, one.below, one.text.length, one.cursor], [10, 0, 500, 500]);
 });
 
-test('a job in the background: the turn that delegates ends and the box is free; the job stands above it while it works; the chat answers other things meanwhile; and when the job reports, the turn that reads the report starts by itself', async () => {
+test('a job in the background: the turn that delegates ends and the box is free; the job stands under it while it works; the chat answers other things meanwhile; and when the job reports, the turn that reads the report starts by itself', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -1230,13 +1230,13 @@ test('a job in the background: the turn that delegates ends and the box is free;
       };
       try {
         await tty.type(`check simba${ENTER}`);
-        // The turn ends with the job still at work: no working line, the box free, the job on a line of its own above it.
+        // The turn ends with the job still at work: no working line, the box free, the job in a row of its own under it.
         await shows(/⏺ the scout is looking/, 'the end of the turn that delegated');
-        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*\\n⏺ j${id} in the background · \\d+s · 0 tool calls · thinking…\\n`), 'the job above the box, and no turn at work');
+        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*╯\\n {2}⏺ j${id} scout — look · \\d+s · 0 tool calls · thinking…\\n`), 'the job under the box, and no turn at work');
         // What the call answered is the model's — how to wait, what not to guess. The screen says the one thing it means.
         assert.match(tty.screen(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n {2}⎿ {2}running in the background — its report comes here when it is done\\n`), 'that it runs in the background');
         assert.doesNotMatch(tty.screen(), /do not guess/);
-        assert.match(tty.screen(), new RegExp(`@ message talks to j${id} · /stop stops it`));
+        assert.match(tty.screen(), new RegExp(`@ message talks to j${id} · ↓ enter opens it · /stop stops it`));
 
         // A session that starts over cannot take the report with it.
         await tty.type(`/new${ENTER}`);
@@ -1245,7 +1245,7 @@ test('a job in the background: the turn that delegates ends and the box is free;
         // Meanwhile the chat is the user's: another turn, start to finish, with the job still going.
         await tty.type(`what is two and two${ENTER}`);
         await shows(/⏺ four/, 'the answer to something else');
-        assert.match(tty.screen(), new RegExp(`⏺ j${id} in the background`), 'the job still at work');
+        assert.match(tty.screen(), new RegExp(`⏺ j${id} scout — look`), 'the job still at work');
         assert.equal(seen.length, 3);
 
         // It reports: how it went is drawn, and the turn that reads the report starts with nobody typing.
@@ -1253,7 +1253,7 @@ test('a job in the background: the turn that delegates ends and the box is free;
         await shows(/⏺ the scout found a and b/, 'the reply to the report');
         assert.match(tty.screen(), new RegExp(`⏺ four[\\s\\S]*⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+○ j${id} never closed · \\d+s · 2 turns · 0 tool calls[\\s\\S]*⏺ the scout found a and b`), 'the report\'s line, then the reply to it');
         assert.match(seen[3].messages.at(-1).content[0].text, new RegExp(`^<sumo>\\nAn automated event, not a message from the user: j${id} has reported\\.`));
-        await shows(new RegExp(`^(?![\\s\\S]*j${id} in the background)(?![\\s\\S]*esc to interrupt)`), 'the job gone from above the box, and no turn at work');
+        await shows(new RegExp(`^(?![\\s\\S]*j${id} scout — look)(?![\\s\\S]*esc to interrupt)`), 'the job gone from under the box, and no turn at work');
         assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['check simba', 'what is two and two'], 'nobody typed the report');
 
         await tty.type(`/stop${ENTER}`);
@@ -1305,13 +1305,13 @@ test('a job thinking in the background does not redraw the screen at every word 
       };
       try {
         await tty.type(`check simba${ENTER}`);
-        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*\\n⏺ j${id} in the background · \\d+s · 0 tool calls · thinking…\\n`), 'the job above the box, and no turn at work');
+        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*╯\\n {2}⏺ j${id} scout — look · \\d+s · 0 tool calls · thinking…\\n`), 'the job under the box, and no turn at work');
 
         // The thought comes a word at a time, many times a second. Every frame is the whole screen written again.
         let frames = 0;
         const write = tty.stdout.write;
         tty.stdout.write = (frame) => {
-          if (String(frame).includes('in the background')) frames++;
+          if (String(frame).includes('scout — look')) frames++;
           return write.call(tty.stdout, frame);
         };
         for (let i = 0; i < 30; i++) {
@@ -1332,6 +1332,78 @@ test('a job thinking in the background does not redraw the screen at every word 
       }
     } finally {
       db.close();
+    }
+  });
+});
+
+test('the jobs at work stand under the box: Down steps onto one and Enter opens the end of its record above the box; it follows the record as it grows, @ talks to the one open, Esc closes it and stops nothing, and a job that ends closes with it', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const events = new EventEmitter();
+    const told = [];
+    let running = [41, 42];
+    let interrupted = 0;
+    const session = {
+      model: 'opus', effort: 'high', routed: null, contextTokens: 0, commands: [],
+      start: () => '',
+      expand: (line) => ({ text: line, said: line }),
+      interrupt: () => interrupted++, end() {}, tell: (text, id) => told.push([text, id]) && id, steer() {}, unsteer: () => false, running: () => running, waiting: () => 0,
+      where: () => ({ cwd: '/work/here', name: 'here', branch: null }), spent: () => 0,
+    };
+    for (const id of running) {
+      mkdirSync(join(paths().jobs, String(id)), { recursive: true });
+      startLive(id);
+    }
+    appendLive(41, '⏺ j41 scout · sonnet/low — Map it\n  ⏺ $ rg -n renderTable src\n    ⎿  src/tty.mjs:126\n  The table is drawn in one place.\n');
+    appendLive(42, '⏺ j42 worker · opus/high — Fix it\n');
+    const tty = fakeTty({ columns: 120 });
+    const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], listFiles: async () => [], debug: true });
+    const shows = async (pattern, what) => {
+      for (let i = 0; i < 300; i++) {
+        if (pattern.test(tty.screen())) return;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+    };
+    const DOWN = '\x1b[B';
+    const UP = '\x1b[A';
+    const OPEN = /⏺ j41 scout · sonnet\/low — Map it\n {2}⏺ \$ rg -n renderTable src\n {4}⎿ {2}src\/tty\.mjs:126\n {2}The table is drawn in one place\.\n[\s\S]*╭/;
+    try {
+      events.emit('job', { job: { id: 41, agent: 'scout', title: 'Map it', model: 'sonnet', effort: 'low' } });
+      events.emit('job', { job: { id: 42, agent: 'worker', title: 'Fix it', model: 'opus', effort: 'high' } });
+      await shows(/╰─+╯\n {2}⏺ j41 scout — Map it · \d+s · 0 tool calls · thinking…\n {2}⏺ j42 worker — Fix it · \d+s · 0 tool calls · thinking…\n/, 'both jobs under the box');
+      assert.match(tty.screen(), /↓ enter opens one/, 'how to open one');
+      assert.doesNotMatch(tty.screen(), /renderTable/, 'no record until one is opened');
+
+      // Down from the box steps onto the first, and on; the last is where it stops, and Up comes back.
+      await tty.type(DOWN);
+      await shows(/\n {2}❯ j41 scout — Map it[^\n]*\n {2}⏺ j42/, 'the first job stepped on');
+      assert.match(tty.screen(), /enter opens j41/);
+      await tty.type(DOWN, DOWN);
+      await shows(/\n {2}⏺ j41[^\n]*\n {2}❯ j42/, 'the last job stepped on, and held');
+      await tty.type(UP, ENTER);
+      await shows(OPEN, 'the record of the job opened, above the box');
+      assert.match(tty.screen(), /esc closes j41/);
+
+      // What it does next is on the screen at the next tick of its clock.
+      appendLive(41, '  ⏺ view ~/src/tty.mjs:120-140\n');
+      await shows(/The table is drawn in one place\.\n {2}⏺ view ~\/src\/tty\.mjs:120-140\n/, 'the record as it grows');
+
+      // Two jobs are at work, and the one open is the one a bare @ means.
+      await tty.type('@ look at the tests too', ENTER);
+      assert.deepEqual(told, [['look at the tests too', 41]]);
+
+      await tty.type(ESC);
+      await shows(/^(?![\s\S]*renderTable)[\s\S]*⏺ j41 scout — Map it/, 'the record closed, the job still under the box');
+      assert.equal(interrupted, 0, 'Esc closed the record and stopped nothing');
+
+      // A job that ends takes its row and its open record with it.
+      await tty.type(DOWN, ENTER);
+      await shows(OPEN, 'the record opened again');
+      running = [42];
+      events.emit('job-end', { job: 41 });
+      await shows(/^(?![\s\S]*renderTable)(?![\s\S]*j41 scout — Map it)[\s\S]*╯\n {2}⏺ j42 worker — Fix it/, 'the ended job gone, the other still there');
+    } finally {
+      ui.unmount();
     }
   });
 });
