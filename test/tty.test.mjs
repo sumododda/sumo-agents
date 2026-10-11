@@ -373,3 +373,32 @@ describe('the conversation as text for a pager', () => {
     assert.match(transcript(log, styles(true), { width: 80 }), /\x1b\[31m⏺\x1b\[39m \x1b\[1mBash/);
   });
 });
+
+describe('what the screen leaves out of a tool call, because it says nothing', () => {
+  it('a command that begins by going to the project is shown without that, and whole when asked', () => {
+    const go = { name: 'bash', input: { command: 'cd /work/shop && npm test' } };
+    assert.equal(toolView(go, null, { cwd: '/work/shop' }).detail, 'npm test');
+    assert.equal(toolView({ name: 'bash', input: { command: "cd '/work/shop/'; npm test" } }, null, { cwd: '/work/shop' }).detail, 'npm test');
+    assert.equal(toolView(go, null, { cwd: '/work/shop', full: true }).detail, 'cd /work/shop && npm test', 'in full it is as it was run');
+    assert.equal(toolView(go, null, { cwd: '/work' }).detail, 'cd /work/shop && npm test', 'going somewhere else is part of the command');
+    assert.equal(toolView({ name: 'bash', input: { command: 'cd /work/shop/src && ls' } }, null, { cwd: '/work/shop' }).detail, 'cd /work/shop/src && ls');
+    assert.equal(toolView({ name: 'bash', input: { command: 'cd /work/shop' } }, null, { cwd: '/work/shop' }).detail, 'cd /work/shop', 'a command that only goes there is still a command');
+  });
+
+  it('the empty lines of what came back are not shown folded, and are in full', () => {
+    const bash = { name: 'bash', input: { command: 'npm test' } };
+    const out = '\n> shop@1.0.0 test\n> node --test\n\n\nok 1\n\nok 2\n\n# pass 2\n# fail 0\n';
+    assert.deepEqual(toolView(bash, { content: out, isError: false }).lines.map((l) => l.text), ['> shop@1.0.0 test', '> node --test', '… +1 line', 'ok 2', '# pass 2', '# fail 0']);
+    assert.equal(toolView(bash, { content: out, isError: false }, { full: true }).lines.length, out.split('\n').length);
+    assert.deepEqual(toolView(bash, { content: ' \n\n', isError: false }).lines, [{ text: '(no output)', tone: 'dim' }]);
+  });
+
+  it('a job started in the background says so in a line, and its report is shown by its first words, not its heading', () => {
+    const call = { name: 'delegate', input: { agent: 'scout', title: 'Find callers' } };
+    const started = { content: 'j7 is running in the background (scout · sonnet/low — Find callers). Its report will reach you later, as an automated event…', isError: false };
+    assert.deepEqual(toolView(call, started).lines, [{ text: 'running in the background — its report comes here when it is done', tone: 'dim' }]);
+    assert.match(toolView(call, started, { full: true }).lines[0].text, /^j7 is running in the background \(scout/, 'in full, what the model was told');
+    const job = { id: 7, status: 'done', seconds: 8, turns: 4, toolCalls: 3, costUsd: 0.02, model: 'sonnet', effort: 'low', report: '## Summary\n\nOnly `page` calls it.\n\n## Files\nsrc/paginate.js\nline 8\nline 2\n' };
+    assert.deepEqual(toolView(call, { content: 'STATUS: DONE', job }).lines.map((l) => l.text), ['✓ j7 done · 8s · 4 turns · 3 tool calls · $0.02 · sonnet/low', 'Only `page` calls it.', 'src/paginate.js', 'line 8', '… +1 line']);
+  });
+});
