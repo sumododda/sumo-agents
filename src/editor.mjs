@@ -73,7 +73,13 @@ function before({ text, cursor }) {
 }
 /** The character the cursor is on; empty at the end of the text. */
 export const under = ({ text, cursor }) => GRAPHEMES.segment(text.slice(cursor))[Symbol.iterator]().next().value?.segment ?? '';
-const wordLeft = ({ text, cursor }) => cursor - /\S*\s*$/.exec(text.slice(0, cursor))[0].length;
+/** Where the word before the cursor starts, the spaces between them passed over. Walked back from the cursor: a pattern for it is tried from every place in the text, and a long paste is one long word. */
+function wordLeft({ text, cursor }) {
+  let at = cursor;
+  while (at > 0 && /\s/.test(text[at - 1])) at--;
+  while (at > 0 && /\S/.test(text[at - 1])) at--;
+  return at;
+}
 const wordRight = ({ text, cursor }) => cursor + /^\s*\S*/.exec(text.slice(cursor))[0].length;
 
 const edit = (state, text, cursor) => ({ ...state, text, cursor, pick: 0 });

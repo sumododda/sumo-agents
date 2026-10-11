@@ -95,6 +95,19 @@ describe('the chat input box', () => {
     assert.equal(s.text, 'one\n');
   });
 
+  it('goes back a word at once in a long paste: the word is found from the cursor, not from every place before it', () => {
+    // A pasted blob is one word of many thousand characters; found by a pattern tried from each of them, the key took seconds.
+    const blob = 'a'.repeat(30_000);
+    let s = paste(editor(), `${blob} two  `);
+    const began = performance.now();
+    s = key(s, { ctrl: true }, 'w');
+    assert.deepEqual([s.text, s.cursor], [`${blob} `, 30_001], 'the word before the cursor, and the spaces after it');
+    s = key(s, { leftArrow: true, meta: true });
+    assert.equal(s.cursor, 0, 'to the start of the blob');
+    const took = performance.now() - began;
+    assert.ok(took < 100, `${Math.round(took)} ms for two word keys`);
+  });
+
   it('Ctrl-U at the start of a line takes the line above, so pressing it again clears a box of many lines', () => {
     let s = paste(editor(), 'one\n• two\n• three\n');
     assert.equal(s.cursor, s.text.length, 'on the empty last line, as after a paste that ends in a newline');

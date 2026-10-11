@@ -132,7 +132,10 @@ const SELF_GRANT = new RegExp(
     /\benv\b[^;&|\n]*(?:\s-u\s*|\s--unset=)["']?SUMO_JOB\b/.source,
     /\b(?:export\s+-n|declare\s+\+x|typeset\s+\+x)\b[^;&|\n]*\bSUMO_JOB\b/.source,
     // Setting it where a command starts: after a separator, a keyword, sudo or eval, inside `sh -c "…"`, behind other assignments.
-    /(?:^|[;&|(`{!\n]|\$\(|\b(?:if|then|else|elif|do|while|until|time|eval|sudo(?:\s+(?:-[ugCDhpRrTt]\s*\S+|-\S+))*)\s|\b(?:ba|z|da|k)?sh\b[^;&|\n]*\s-c\s+["'])\s*(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S)*\s+)*["']?SUMO_JOB=/.source,
+    // An assignment's value is read as a shell reads a word — an escaped character, a quoted string, or a plain character —
+    // so a quote means one thing: where it could also be a character of its own, a long run of them was paired every way there is.
+    // The same for sudo's flags: one that takes a value takes the next word only when that word is not a flag itself.
+    /(?:^|[;&|(`{!\n]|\$\(|\b(?:if|then|else|elif|do|while|until|time|eval|sudo(?:\s+(?:-[ugCDhpRrTt]\s+(?!-\S)\S+|-\S+))*)\s|\b(?:ba|z|da|k)?sh\b[^;&|\n]*\s-c\s+["'])\s*(?:[A-Za-z_]\w*=(?:\\.|"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'\\])*\s+)*["']?SUMO_JOB=/.source,
     /\b(?:export|env|declare|typeset|readonly|local)\b[^;&|\n]*?\s["']?SUMO_JOB=/.source,
   ].join('|'),
 );

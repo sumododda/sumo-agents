@@ -970,6 +970,9 @@ test('reading code that names the job marker or the accept flag is reading; sett
     'sudo apt-get install -y jq',
     'if [ -z "$SUMO_JOB" ]; then echo outside; fi',
     'bash -c "npm test"',
+    // Inside a quoted value, or after an escaped space, it is part of that value: the shell sets nothing.
+    'NOTE="the marker is SUMO_JOB=1 here" make',
+    'NOTE=see\\ SUMO_JOB=1 make',
   ]) assert.equal(grantsItself(command), false, command);
   for (const command of [
     'sumo job finish 3 --status DONE --accept "trust me"',
@@ -991,6 +994,8 @@ test('reading code that names the job marker or the accept flag is reading; sett
     'sudo SUMO_JOB= sumo job tell 3',
     'A="x y" SUMO_JOB= sumo job tell 3',
     "A='x y' SUMO_JOB= sumo job tell 3",
+    'A="a\\"b" SUMO_JOB= sumo job tell 3',
+    "A=it\\'s SUMO_JOB= sumo job tell 3",
     'eval "SUMO_JOB= sumo job tell 3"',
     'bash -c "SUMO_JOB= sumo job tell 3"',
     "sh -c 'SUMO_JOB= sumo job tell 3'",
@@ -1002,7 +1007,25 @@ test('reading code that names the job marker or the accept flag is reading; sett
     'sudo -E SUMO_JOB= sumo job tell 3',
     'sudo -u root SUMO_JOB= sumo job tell 3',
     'sudo -u root -E SUMO_JOB=1 sumo job tell 3',
+    'sudo -uroot -g wheel -E SUMO_JOB= sumo job tell 3',
+    'sudo -u - SUMO_JOB= sumo job tell 3',
+    'sudo -u -E SUMO_JOB= sumo job tell 3',
   ]) assert.equal(grantsItself(command), true, command);
+});
+
+test('a command with a run of quoted strings is judged at once: a quote is read one way, as a shell reads it, not every way it could pair', async () => {
+  const { grantsItself } = await import('../src/loop.mjs');
+  // A script written to a file, with compact JSON given to a name: each quote in it was once both the start of a string
+  // and a character of its own, and a job's turn stood still while every pairing of them was tried.
+  const json = `{${Array.from({ length: 10 }, (_, i) => `"k${i}":"v${i}"`).join(',')}}`;
+  const began = performance.now();
+  assert.equal(grantsItself(`mkdir -p /tmp/bk && cd /tmp/bk && cat > fake.mjs <<'EOF'\nbooks=${json};\nserve(books)\nEOF`), false);
+  const took = performance.now() - began;
+  assert.ok(took < 100, `${Math.round(took)} ms to judge one command`);
+  // A flag of sudo's that takes a value was once that, and a flag like any other too: each one doubled the readings.
+  const sudo = performance.now();
+  assert.equal(grantsItself(`sudo ${'-ua '.repeat(24)}make install`), false);
+  assert.ok(performance.now() - sudo < 100, `${Math.round(performance.now() - sudo)} ms to judge sudo with its flags`);
 });
 
 test('a job created where no session had begun meets the workflow gate all the same', async () => {
