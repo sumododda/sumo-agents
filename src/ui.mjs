@@ -12,7 +12,7 @@ import { elapsed } from './text.mjs';
 import { editor, keysOf, matchFiles, menuOf, paste, press, under } from './editor.mjs';
 import { clipboardImage, copyText, droppedImages } from './images.mjs';
 import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
-import { colourEnabled, createRenderer, flow, logoLines, messageAt, pathFrom, pickMessage, renderBlock, safeForTerminal, spinnerMessages, styles, sunset, tilde, toolView, transcript, untab, wrap } from './tty.mjs';
+import { colourEnabled, createRenderer, flow, fold, logoLines, messageAt, pathFrom, pickMessage, renderBlock, safeForTerminal, spinnerMessages, styles, sunset, tilde, toolView, transcript, untab, wrap } from './tty.mjs';
 
 /**
  * The chat on a real terminal. What is finished scrolls away above — what
@@ -57,6 +57,14 @@ const FOCUS_ON = '\x1b[?1004h';
 const FOCUS_OFF = '\x1b[?1004l';
 const TITLE_KEEP = '\x1b[22;0t';
 const TITLE_BACK = '\x1b[23;0t';
+/**
+ * The terminal's second screen, for a program handed the terminal: whatever it prints is gone with it, and the chat is as
+ * it was. The cursor is not moved here: a terminal with no second screen would take that for a move on this one.
+ */
+const SCREEN_ASIDE = '\x1b[?1049h';
+const SCREEN_BACK = '\x1b[?1049l';
+/** Longer than Ink waits for the terminal to say how its keyboard speaks (200 ms): see `runUi`. */
+const KITTY_WAIT_MS = 300;
 /** A turn at least this long ends on a bell when the window is not in front, and on its footer whatever it did. */
 const NOTIFY_AFTER_MS = 10_000;
 /** No word from the model for this long, with nothing running, is said on the working line. */
@@ -167,8 +175,14 @@ function keepHistory(line) {
 
 const thousands = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
 
-/** The lines under a call: what came back, the first of them with the mark. */
-const linesUnder = (lines) => lines.map((line, i) => h(Text, { key: i, ...TONES[line.tone] }, `${i === 0 ? '  ⎿  ' : '     '}${untab(line.text)}`));
+/**
+ * The lines under a call: what came back, the first of them with the mark. Folded to `columns` here, by the same count the
+ * replies are folded by, so a line too long for the window goes on under itself — not under the mark, and not past the edge.
+ */
+const linesUnder = (lines, columns) =>
+  lines
+    .flatMap((line) => fold(untab(line.text), Math.max(20, columns - 6)).map((text) => ({ ...line, text })))
+    .map((line, i) => h(Text, { key: i, ...TONES[line.tone], wrap: 'truncate' }, `${i === 0 ? '  ⎿  ' : '     '}${line.text}`));
 
 /**
  * The last lines a running command has printed, as the screen may show them: without secrets or control characters, a
@@ -193,7 +207,7 @@ function Running({ live }) {
 }
 
 /** A tool call: what ran, and under it what came back — or, while it runs, the jobs it started, or what it prints. */
-function Tool({ view, failed = false, running = false, jobs = [], live = null }) {
+function Tool({ view, failed = false, running = false, jobs = [], live = null, columns }) {
   return h(
     Box,
     { flexDirection: 'column', marginTop: 1 },
@@ -206,7 +220,7 @@ function Tool({ view, failed = false, running = false, jobs = [], live = null })
     ),
     running && jobs.length === 0 ? h(Running, { live }) : null,
     ...jobs.map(([id, job]) => h(JobAtWork, { key: id, id, job })),
-    ...linesUnder(view.lines),
+    ...linesUnder(view.lines, columns),
   );
 }
 
@@ -257,7 +271,8 @@ function Reply({ text, first }) {
 }
 
 /** Something finished, drawn once and left to scroll. */
-function Item({ item }) {
+/** `columns` is the window's width, handed down: every item asking the terminal for it would be a listener each, on a stream that takes ten. */
+function Item({ item, columns }) {
   if (item.kind === 'header') {
     return h(
       Box,
@@ -282,13 +297,13 @@ function Item({ item }) {
     );
   }
   if (item.kind === 'text') return h(Reply, item);
-  if (item.kind === 'tool') return h(Tool, item);
-  if (item.kind === 'output') return h(Box, { flexDirection: 'column' }, ...linesUnder(item.lines));
+  if (item.kind === 'tool') return h(Tool, { ...item, columns });
+  if (item.kind === 'output') return h(Box, { flexDirection: 'column' }, ...linesUnder(item.lines, columns));
   if (item.kind === 'footer') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, `  ${item.text}`));
   // The mark stands apart from the words, so a line that wraps in a narrow window goes on under them, not under it.
   if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Text, { color: ACCENT }, '⏺ '), h(Text, null, h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, h(Text, { dimColor: true }, ` · ${item.where}`)));
   if (item.kind === 'error') return h(Box, { marginTop: 1 }, h(Text, { color: 'red' }, item.text));
-  return h(Text, { dimColor: true }, `  ⎿  ${item.text.split('\n').join('\n     ')}`);
+  return h(Box, { flexDirection: 'column' }, ...linesUnder(item.text.split('\n').map((text) => ({ text, tone: 'dim' })), columns));
 }
 
 /**
@@ -404,13 +419,13 @@ function helpText(commands) {
   return [
     '**Commands**',
     '',
-    '| | |',
+    '| Command | What it does |',
     '|---|---|',
     ...commands.map((c) => `| \`/${c.name}\` | ${c.hint.replaceAll('|', '\\|')} |`),
     '',
     '**Keys**',
     '',
-    '| | |',
+    '| Key | What it does |',
     '|---|---|',
     ...keys.map(([key, does]) => `| ${key} | ${does} |`),
     '',
@@ -462,7 +477,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
    */
   const measure = () => {
     for (const item of state.unmeasured.splice(0)) {
-      if (state.used < state.rows) state.used += renderToString(h(Item, { item }), { columns: state.columns }).split('\n').length;
+      if (state.used < state.rows) state.used += renderToString(h(Item, { item, columns: state.columns }), { columns: state.columns }).split('\n').length;
     }
   };
   const show = (items) => {
@@ -827,7 +842,15 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     state.away = true;
     try {
       tell(FOCUS_OFF);
-      await suspendTerminal(() => run(program, file));
+      await suspendTerminal(async () => {
+        // On a screen of its own: an editor or a pager that has one uses it anyway, and one that has none leaves nothing behind in the conversation.
+        tell(`${SCREEN_ASIDE}\x1b[2m${what} (${program.split(' ')[0].split('/').at(-1)}) has the terminal — the chat is back when it closes\x1b[22m\r\n`);
+        try {
+          await run(program, file);
+        } finally {
+          tell(SCREEN_BACK);
+        }
+      });
       return true;
     } catch (cause) {
       notify(`${what} could not be opened: ${cause.message}`);
@@ -1127,14 +1150,14 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   return h(
     Box,
     { flexDirection: 'column', minHeight: room },
-    h(Static, { key: state.epoch, items: state.items }, (item) => h(Item, { key: item.id, item })),
+    h(Static, { key: state.epoch, items: state.items }, (item) => h(Item, { key: item.id, item, columns })),
     tail ? h(Reply, { text: tail, first: state.fresh }) : null,
     // What runs now, and under a delegate call the jobs it started. In one box of their own, so the lines coming and going
     // never move what follows — the working line keeps its clock.
     h(
       Box,
       { flexDirection: 'column' },
-      ...[...state.running.values()].map((call) => h(Tool, { key: call.id, view: toolView(call, null, { cwd: state.where.cwd }), running: true, live: state.live.get(call.id), jobs: [...state.jobs].filter(([, job]) => job.parent === call.id) })),
+      ...[...state.running.values()].map((call) => h(Tool, { key: call.id, columns, view: toolView(call, null, { cwd: state.where.cwd }), running: true, live: state.live.get(call.id), jobs: [...state.jobs].filter(([, job]) => job.parent === call.id) })),
       // A job no call here started — none should be — still shows that it works.
     ),
     // The silence that is said is the model's: while a command, a job or a question is in hand, the wait is not on it.
@@ -1167,5 +1190,15 @@ export function runUi({ session, events, resume = null, stdin = process.stdin, s
   // What the window showed is scrolled up, not wiped: the terminal's scrollback from before the chat is still there to read.
   if (stdout.isTTY) stdout.write(scrolledClear(stdout.rows || 24));
   if (stdout.isTTY) stdout.write(`${TITLE_KEEP}${FOCUS_ON}`);
+  // While Ink waits for that answer — a fifth of a second, on a terminal that gives none — it keeps what is typed and, when
+  // it stops waiting, puts it back on the stream "so it isn't lost". But those keys were read as they came, and put back
+  // they are read again: a letter typed just as the chat opens landed twice. For as long as Ink waits, nothing is put back.
+  if (stdin.isTTY && typeof stdin.unshift === 'function') {
+    const putBack = stdin.unshift;
+    stdin.unshift = () => {};
+    setTimeout(() => {
+      stdin.unshift = putBack;
+    }, KITTY_WAIT_MS).unref();
+  }
   return render(h(App, { session, events, messages, cwd, block, opening, logo, clipboard, copy, notify, notifyAfterMs, quietAfterMs, run, listFiles }), { stdin, stdout, debug, exitOnCtrlC: false, kittyKeyboard: { mode: 'auto' } });
 }

@@ -148,8 +148,8 @@ function cut(line, width) {
   return pieces;
 }
 
-/** A cell's text folded to its column; a word wider than the column is cut, so the box keeps its shape. */
-function fold(text, width) {
+/** A text folded to `width`, as its rows; a word wider than that is cut, so nothing drawn from them runs past the edge. */
+export function fold(text, width) {
   return wrap(text, width)
     .split('\n')
     .flatMap((line) => (visible(line) <= width ? [line] : cut(line, width)));
@@ -379,10 +379,19 @@ function diffView(old, now, line, full) {
  */
 export function toolView(call, result = null, { full = false, cwd = null } = {}) {
   const input = call.input ?? {};
-  const output = () => ends(toned(result.content, result.isError ? 'error' : 'plain'), full);
+  // Folded, the empty lines of what came back are not shown: three of five lines spent on nothing say nothing.
+  const output = () => {
+    const lines = toned(result.content, result.isError ? 'error' : 'plain');
+    if (full) return lines;
+    const said = lines.filter((line) => line.text.trim() !== '');
+    return said.length === 0 ? [{ text: '(no output)', tone: 'dim' }] : ends(said, false);
+  };
   if (call.name === BASH_TOOL.name) {
     // Folded, the command is its first lines; asked for in full, it is all there: nothing else on the screen says what ran.
-    const command = String(input.command ?? '').trim();
+    // A command that begins by going to the project says nothing by it — the shell starts there — and is shown without that.
+    const whole = String(input.command ?? '').trim();
+    const there = cwd && !full ? new RegExp(`^cd\\s+(["']?)${cwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/?\\1\\s*(?:&&|;)\\s*`) : null;
+    const command = (there && whole.replace(there, '')) || whole;
     const start = command.split('\n').slice(0, SHOWN_COMMAND_LINES).join('\n').slice(0, SHOWN_COMMAND_CHARS);
     const detail = full || start.length === command.length ? command : `${start} …`;
     if (!result) return { title: 'Bash', detail, lines: [] };
@@ -392,6 +401,8 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
   if (call.name === DELEGATE_TOOL.name) {
     const detail = input.job !== undefined ? `j${input.job}` : `${input.agent ?? 'worker'} · ${input.title ?? ''}`;
     if (!result) return { title: 'Delegate', detail, lines: [] };
+    // Started in the background: what the call answered is for the model — how to wait, what not to guess. The screen says the one thing it means.
+    if (!full && !result.isError && /^j\d+ is running in the background/.test(result.content)) return { title: 'Delegate', detail, lines: [{ text: 'running in the background — its report comes here when it is done', tone: 'dim' }] };
     if (!result.job || full) return { title: 'Delegate', detail, lines: output() };
     // A job that ran: how it went in one line, then the top of what it reported.
     const { job } = result;
@@ -399,8 +410,9 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     const route = job.effort && job.effort !== 'none' ? `${job.model}/${job.effort}` : job.model;
     // How long it took comes first: it is what the wait was.
     const summary = `${mark} j${job.id} ${said}${job.seconds === undefined ? '' : ` · ${elapsed(job.seconds * 1000)}`} · ${job.turns} turn${job.turns === 1 ? '' : 's'} · ${job.toolCalls} tool call${job.toolCalls === 1 ? '' : 's'} · $${job.costUsd.toFixed(2)} · ${route}`;
-    const report = String(job.report ?? '').trim();
-    return { title: 'Delegate', detail, lines: [{ text: summary, tone }, ...(report ? top(toned(report, 'plain'), SHOWN_REPORT_LINES) : [])] };
+    // The top of the report is its first words, not the heading over them.
+    const report = String(job.report ?? '').split('\n').filter((line) => line.trim() && !/^#{1,6}\s/.test(line));
+    return { title: 'Delegate', detail, lines: [{ text: summary, tone }, ...top(report.map((text) => ({ text, tone: 'plain' })), SHOWN_REPORT_LINES)] };
   }
   if (isMcpTool(call.name)) {
     // A server's tool: the server as the title, the tool with its input as the detail, what came back under it.

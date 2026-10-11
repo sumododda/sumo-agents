@@ -1133,7 +1133,9 @@ test('/copy takes the last reply as it was written, or its last code block; /hel
         // No clipboard command here: the terminal is asked to take it.
         clipboardWorks = false;
         await tty.type(`/copy code${ENTER}`);
-        await shows(/through the\s+terminal's clipboard/, 'the other way');
+        await shows(/through the\s+terminal's\s+clipboard/, 'the other way');
+        assert.match(tty.screen(), /\n {2}⎿ {2}copied the last code block — 2 lines, through the\n {5}terminal's clipboard\n/, 'a note too long for the window goes on under itself');
+        assert.ok(tty.screen().split('\n').every((row) => row.length <= 60), 'and nothing drawn runs past the window\'s edge');
         assert.ok(tty.controls().includes(`\x1b]52;c;${Buffer.from('npm ci\n  npm test').toString('base64')}\x07`));
         clipboardWorks = true;
 
@@ -1204,9 +1206,10 @@ test('a job in the background: the turn that delegates ends and the box is free;
         job: [reply('end_turn', [{ type: 'text', text: 'a and b' }]), reply('end_turn', [])],
       };
       const seen = [];
-      const send = async (params, { onText } = {}) => {
+      const send = async (params, { onText, signal } = {}) => {
         const who = params.tools.some((t) => t.name === 'finish') ? 'job' : 'chat';
-        if (who === 'job' && answers.job.length === 2) await working.promise;
+        // Held until the test lets it go — or until the job is stopped, as a request is: a look at the screen that fails must not leave it waiting for ever.
+        if (who === 'job' && answers.job.length === 2) await Promise.race([working.promise, new Promise((_, no) => signal?.addEventListener('abort', () => no(new Error('Request was aborted.')), { once: true }))]);
         const next = answers[who].shift();
         if (who === 'chat') seen.push(structuredClone(params));
         for (const b of next.content) if (b.type === 'text' && onText) onText(b.text);
@@ -1228,7 +1231,9 @@ test('a job in the background: the turn that delegates ends and the box is free;
         // The turn ends with the job still at work: no working line, the box free, the job on a line of its own above it.
         await shows(/⏺ the scout is looking/, 'the end of the turn that delegated');
         await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*\\n⏺ j${id} in the background · \\d+s · 0 tool calls · thinking…\\n`), 'the job above the box, and no turn at work');
-        assert.match(tty.screen(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+j${id} is running in the background`), 'what the call answered');
+        // What the call answered is the model's — how to wait, what not to guess. The screen says the one thing it means.
+        assert.match(tty.screen(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n {2}⎿ {2}running in the background — its report comes here when it is done\\n`), 'that it runs in the background');
+        assert.doesNotMatch(tty.screen(), /do not guess/);
         assert.match(tty.screen(), new RegExp(`@ message talks to j${id} · /stop stops it`));
 
         // A session that starts over cannot take the report with it.
@@ -1346,6 +1351,40 @@ test('a file is named with @: the menu offers the project\'s files, Enter puts t
         ui.unmount();
       }
     } finally {
+      db.close();
+    }
+  });
+});
+
+test('a long conversation is drawn without a word from Node: no item listens to the terminal on its own', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    const warned = [];
+    const onWarning = (warning) => warned.push(String(warning));
+    process.on('warning', onWarning);
+    try {
+      // Fourteen tool calls in one turn: each is an item on the screen, and a listener apiece would pass the ten a stream takes quietly.
+      const calls = Array.from({ length: 14 }, (_, i) => ({ reply: reply('tool_use', [call(`t${i}`, 'bash', { command: `echo line ${i}` })]) }));
+      const { send } = transport([...calls, { reply: reply('end_turn', [{ type: 'text', text: 'all fourteen ran' }]) }]);
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty({ columns: 100 });
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
+      try {
+        await tty.type(`go${ENTER}`);
+        for (let i = 0; i < 600 && !/⏺ all fourteen ran/.test(tty.screen()); i++) await new Promise((r) => setTimeout(r, 10));
+        assert.match(tty.screen(), /⏺ Bash\(echo line 13\)\n {2}⎿ {2}line 13\n/);
+        assert.match(tty.screen(), /\n {2}\d+s · 14 calls/);
+        await new Promise((r) => setImmediate(r));
+        assert.deepEqual(warned, [], 'nothing was warned of');
+        assert.ok(tty.stdout.listenerCount('resize') <= 10, `the terminal has ${tty.stdout.listenerCount('resize')} listeners for its size`);
+        await tty.type('\x04');
+        await leaves(ui);
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      process.off('warning', onWarning);
       db.close();
     }
   });
