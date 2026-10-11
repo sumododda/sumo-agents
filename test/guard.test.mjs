@@ -167,6 +167,27 @@ test('a command that would print a secret file is refused; sourcing it, listing 
   }
 });
 
+test('loading a secret file in one command and printing something else in the next is not printing the secret', () => {
+  for (const command of [
+    'set -a; source .env; set +a; npm test 2>&1 | tail -20',
+    'source .env && ./scripts/deploy.sh | grep -v warning',
+    'set -a; . .env; set +a; pytest -q 2>&1 | tail -3',
+    'source .env && curl -s $API_URL/health | jq .status',
+    'bash -c "source .env && head -1 out.txt"',
+    'cp .env.example .env && cat README.md',
+    'ls -la .env && cat package.json',
+    'cat > notes.md <<"EOF"\ncopy .env.example to .env first\nEOF',
+    'export ENV_FILE=.env && npm test | tail -20',
+    'docker run --env-file=.env img | tail -5',
+  ]) {
+    assert.equal(guardCommand(command), null, `should allow: ${command}`);
+  }
+  // Bound to a name and printed through it, or printed in the same simple command, it is still a reading.
+  for (const command of ['f=.env; cat $f', 'for f in .env .env.local; do cat "$f"; done', 'source .env && cat .env', 'npm test | tail; grep TOKEN .env', 'find . -name .env -exec cat {} \\;']) {
+    assert.match(guardCommand(command) ?? '', /^Refused: .*secret/i, `should refuse: ${command}`);
+  }
+});
+
 test('a secret file is a secret in any case and through a redirect, and git\'s stored credentials are one', () => {
   for (const command of ['cat .ENV', 'grep KEY .Env.local', 'cat <.env', 'echo "$(< .env)"', 'cat ~/.git-credentials', 'head ~/.ssh/ID_RSA', 'cat certs/SERVER.PEM']) {
     assert.match(guardCommand(command) ?? '', /^Refused: .*secret/i, command);

@@ -24,6 +24,26 @@ const PRINTS = /(^|[\s;&|($`])(cat|head|tail|less|more|bat|grep|rg|egrep|fgrep|s
 
 /** Where one simple command ends and the next begins: a separator, a pipe, a new line, a subshell or a substitution. */
 const SEPARATORS = /[;&|\n()`]|\$\(/;
+
+/** A secret file bound to a name instead of read: `f=.env`, `for f in .env .env.local`. What later prints `$f` is a reading of it. */
+const BINDS = /(^|[\s;&|(`])(?:\w+=|for\s+\w+\s+in\s)/;
+
+/**
+ * Whether a command puts a secret file's contents in front of the model: a printing command with the file among its
+ * words — in the same simple command, not merely somewhere in the same line, so `source .env && npm test | tail` is
+ * what it looks like — or a printing command given a variable the file was bound to earlier in the line.
+ */
+function printsSecret(command) {
+  const parts = command.replace(/\\\n/g, ' ').split(SEPARATORS);
+  let bound = false;
+  for (const part of parts) {
+    if (!SECRET_FILE.test(part)) continue;
+    // `$(< .env)` was split at its `$(`: what is left starts with the redirect.
+    if (PRINTS.test(part) || /^\s*</.test(part)) return true;
+    if (BINDS.test(part)) bound = true;
+  }
+  return bound && parts.some((part) => PRINTS.test(part) && part.includes('$'));
+}
 /**
  * A command whose only job is to print the whole environment, secrets and all: `env`, `printenv`, `export`, `set`, `declare`
  * or `typeset` with nothing but flags and redirections after it. `env FOO=1 cmd`, `set -e`, `export FOO=1` and `printenv HOME` are not that.
@@ -79,7 +99,7 @@ const RULES = [
     test: (c) => /\b(?:psql|mysql|mariadb|sqlite3|sqlcmd|mongosh?)\b[\s\S]*\b(?:DROP\s+(?:TABLE|DATABASE|SCHEMA)|TRUNCATE)\b/i.test(c),
     why: () => 'that statement empties or drops a table or database',
   },
-  { test: (c) => PRINTS.test(c) && SECRET_FILE.test(c), why: () => 'it would print a secret file (.env, a private key, credentials). Use `source`/`set -a` to load it without showing it' },
+  { test: (c) => printsSecret(c), why: () => 'it would print a secret file (.env, a private key, credentials). Use `source`/`set -a` to load it without showing it' },
   { test: (c) => c.replace(/\\\n/g, ' ').split(SEPARATORS).some((part) => DUMPS_ENV.test(part)), why: () => 'it would print the whole environment, secrets included. A variable is for the command that needs it, never for printing' },
 ];
 
