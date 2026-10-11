@@ -30,7 +30,7 @@ export const DELEGATE_TOOL = {
       project: { type: 'string', description: 'the project slug' },
       title: { type: 'string', description: 'a few words' },
       task: { type: 'string', description: 'the brief, a contract: ## Goal, ## Non-goals, ## Must not change, ## Check (the command that proves it, or why none), ## Report' },
-      guide: { type: 'string', enum: ['fix', 'feature'], description: 'carry guides/<guide>.md into the brief' },
+      guide: { type: 'string', enum: ['fix', 'feature', 'none'], description: 'carry guides/<guide>.md into the brief; unsaid, a worker gets the one its title and goal ask for, if any' },
       reviews: { type: 'integer', description: 'reviewer only: the worker job whose change to judge; without it, the uncommitted change' },
       tests_may_change: { type: 'boolean', description: 'worker only: existing tests may be edited' },
       job: { type: 'integer', description: 'continue this open job; nothing else is given' },

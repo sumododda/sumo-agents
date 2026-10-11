@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { ago } from './card.mjs';
 import { getMeta } from './db.mjs';
 import { runDream } from './dream.mjs';
 import { openWatchTab, runHerdr } from './herdr.mjs';
-import { appendLive, endLive, getJob, guideFor, newJob, parseJobId, reportOf, startLive, tell as tellJob } from './jobs.mjs';
+import { appendLive, endLive, getJob, newJob, parseJobId, reportOf, startLive, tell as tellJob } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
 import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, textOf, thinkingFor, withMcp, withServers } from './loop.mjs';
 import { closeMcp, compactInput, gateMcp, isMcpTool, mcpLines, mcpReady, splitMcpName } from './mcp.mjs';
@@ -16,9 +16,10 @@ import { takeLock } from './lock.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { UsageError } from './memory.mjs';
 import { openInBrowser, servePage } from './page.mjs';
-import { getProject } from './projects.mjs';
+import { getProject, scratchDir } from './projects.mjs';
 import { redact } from './redact.mjs';
 import { chooseChatRoute, EFFORTS } from './route.mjs';
+import { verifyCommands } from './scan.mjs';
 import { outcomeLines, runScribe } from './scribe.mjs';
 import { currentProject, describeSaved, findSaved, loadState, lockFile, saveState, savedSessions, sessionLine, shortId, withoutThinking } from './sessions.mjs';
 import { BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
@@ -40,12 +41,13 @@ import { colourEnabled, createRenderer, header, prompt, renderBlock, safeForTerm
 /** Models that take operator instructions as `role: "system"` messages mid-conversation; the others get them as text in the user turn. */
 const SYSTEM_MESSAGES = new Set([MODEL_IDS.opus, MODEL_IDS.sonnet, MODEL_IDS.fable]);
 
-// The guide comes with the command: from inside a project the tools cannot reach guides/ by a relative path, and the editor is jailed away from it.
+// The guide comes with the command, by name, through the prompt hook — the same way it comes when the user's words ask for
+// it: from inside a project the tools cannot reach guides/ by a relative path, and the editor is jailed away from it.
 const COMMANDS = {
-  fix: (args) => `${guideFor('fix')}\n\nFollow that, in order, for this: ${args}`,
-  feature: (args) => `${guideFor('feature')}\n\nFollow that, in order, for this: ${args}`,
-  review: (args) => `Review this: ${args}\nCode written in this session is never reviewed in this session: delegate it to a reviewer (agent "reviewer", the task what was asked); then this is how to treat the findings:\n${guideFor('review').replace(/^[\s\S]*?\*\*Receiving a review\.\*\*\s*/, '')}`,
-  dream: () => 'Run `sumo dream run` and tell me, in a few lines, what it changed and what it wants me to confirm.',
+  fix: (args) => ({ text: `Fix this: ${args}`, guide: 'fix' }),
+  feature: (args) => ({ text: `Build this: ${args}`, guide: 'feature' }),
+  review: (args) => ({ text: `Review this: ${args}`, guide: 'review' }),
+  dream: () => ({ text: 'Run `sumo dream run` and tell me, in a few lines, what it changed and what it wants me to confirm.' }),
 };
 
 /**
@@ -373,11 +375,11 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
 
   const event = (name, payload) => handleEvent(db, name, { session_id: sessionId, cwd, transcript_path: transcript, ...payload }, now());
 
-  /** The project the work is in: the one whose card came in last, else none (tools then run where the chat was started). */
+  /** The project the work is in: the one whose card came in last, else none (tools then run in scratch, wherever the chat was started). */
   function workspace() {
     const slug = currentProject(db, sessionId);
     if (slug && project?.slug !== slug) project = getProject(db, slug);
-    return project ? contextFor(project) : contextFor({ path: cwd });
+    return project ? contextFor(project) : contextFor({ path: scratchDir() });
   }
 
   /** The workflow gate, the cheap-model passes and `delegate`; anything else is the tool's own business. */
@@ -585,10 +587,11 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   /**
    * One turn. `text` is what the model is sent; `said` is what the user typed of it — for a slash command, the words after the command — and is all that memory keeps as theirs.
    * `images` go before the words, each under the label the text names it by: `{ label, mediaType, data }`, the data in base64.
+   * `guide` is the one a slash command named, which rides in whether or not the words would have brought it.
    */
-  async function say(text, said = text, images = [], { automated = false } = {}) {
+  async function say(text, said = text, images = [], { automated = false, guide = null } = {}) {
     try {
-      const outcome = await turn(text, said, images, automated);
+      const outcome = await turn(text, said, images, automated, guide);
       persist();
       return outcome;
     } finally {
@@ -607,6 +610,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return [
       ...said.map((text) => {
         const brought = event('prompt', { prompt: text, context_tokens: lastContext });
+        noteGuides(brought);
         logLine(transcript, { type: 'user', message: { role: 'user', content: redact(text).text } });
         return brought ? `${text}\n<sumo>\n${brought}\n</sumo>` : text;
       }),
@@ -623,8 +627,24 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return true;
   }
 
-  async function turn(text, said, images, automated = false) {
+  /** The screen is told which guide rode in: one dim line, so the user knows the model was handed a way of working. */
+  function noteGuides(brought) {
+    for (const [, name] of brought.matchAll(/^<guide (\w+)>/gm)) watch({ type: 'guide', name });
+  }
+
+  async function turn(text, said, images, automated = false, guide = null) {
     stopper = new AbortController();
+    // Edits nothing has checked: an editor call that writes adds its file; one of the project's declared checks running
+    // clears them — any command does when the project declares none. The gate at the end of the turn is told what is
+    // left. The shell can edit too (`sed -i`, a redirect); that is not seen.
+    const unchecked = new Set();
+    const declared = () => verifyCommands(workspace().cwd).map((c) => c.command);
+    const noteCall = (call) => {
+      if (call.name === EDITOR_TOOL.name && call.input?.command !== 'view' && call.input?.path) unchecked.add(resolve(workspace().cwd, String(call.input.path)));
+      if (call.name !== BASH_TOOL.name) return;
+      const checks = declared();
+      if (checks.length === 0 || checks.some((c) => String(call.input?.command ?? '').includes(c))) unchecked.clear();
+    };
     // The servers connect while the first turn is typed; the first request waits for them, and Esc does not.
     if (!registry) {
       const stopped = new Promise((resolve) => stopper.signal.addEventListener('abort', () => resolve('stopped'), { once: true }));
@@ -657,7 +677,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     settleTail();
     // A resumed session is told so with its first turn, and what background jobs reported while nobody was looking rides in with a message
     // too. An automated turn is that report itself: nothing in it is the user's, so nothing of it is kept as theirs.
-    const injected = [note, ...(automated ? [] : [...reports.splice(0).map((r) => r.text), event('prompt', { prompt: said, context_tokens: lastContext })])].filter(Boolean).join('\n');
+    const injected = [note, ...(automated ? [] : [...reports.splice(0).map((r) => r.text), event('prompt', { prompt: said, context_tokens: lastContext, guide })])].filter(Boolean).join('\n');
+    noteGuides(injected);
     note = null;
     const pictures = images.flatMap(({ label, mediaType, data }) => [{ type: 'text', text: label }, { type: 'image', source: { type: 'base64', media_type: mediaType, data } }]);
     const at = params.messages.push(automated ? asText(text) : { role: 'user', content: [...pictures, { type: 'text', text }] }) - 1;
@@ -686,6 +707,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         onTool: (call) => {
           activity(describeCall(call));
           watch({ type: 'tool', call });
+          noteCall(call);
         },
         onResult: (call, result) => watch({ type: 'result', call, result }),
         onTurn: (response, totals) => {
@@ -703,12 +725,17 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         event('stop', { stop_hook_active: true });
         return outcome;
       }
-      // Memory before the user: a turn ending on a question memory can answer is given the answer and continued, once.
-      // Only a turn the model ended itself: after an error or a cut-off reply the turn is simply over, and the scribe still hears of it.
+      // The check before the user, and memory before the user: a turn ending on an edit nothing checked, or on a question
+      // memory can answer, is told so and continued, once. Only a turn the model ended itself: after an error or a cut-off
+      // reply the turn is simply over, and the scribe still hears of it.
       const asked = outcome.stop === 'end_turn';
-      const held = continued ? '' : event('stop', asked ? { last_assistant_message: outcome.text, stop_hook_active: false } : { stop_hook_active: true });
+      const edited = [...unchecked].map((path) => relative(workspace().cwd, path));
+      const checks = declared();
+      const held = continued ? '' : event('stop', asked ? { last_assistant_message: outcome.text, stop_hook_active: false, edited, checks } : { stop_hook_active: true });
       if (!held) return outcome;
-      params.messages.push(injection(JSON.parse(held).context, params.model, params.messages));
+      const { context } = JSON.parse(held);
+      if (context.includes('<check>')) watch({ type: 'check', edited, checks });
+      params.messages.push(injection(context, params.model, params.messages));
       continued = true;
     }
   }
@@ -737,7 +764,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     if (name === 'new' || name === 'memory') return { control: name };
     if (name === 'model' || name === 'resume' || name === 'mcp' || name === 'copy' || name === 'help' || name === 'stop') return { control: name, args: args.trim() };
     const make = Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
-    return make ? { text: make(args.trim()), said: args.trim() } : { error: `no such command /${name} — one of: ${commands.map((c) => `/${c.name}`).join(' ')}` };
+    return make ? { ...make(args.trim()), said: args.trim() } : { error: `no such command /${name} — one of: ${commands.map((c) => `/${c.name}`).join(' ')}` };
   }
 
   /** `/mcp`: the servers as `sumo mcp` lists them. They connect once, while the first turn is typed, so an early look waits for them. */
@@ -904,7 +931,7 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
           rule();
           continue;
         }
-        const { text, said, control, args, error } = session.expand(line);
+        const { text, said, guide, control, args, error } = session.expand(line);
         if (error) {
           write(`${s.red(error)}\n`);
           continue;
@@ -932,7 +959,7 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
           continue;
         }
         write('\n');
-        const outcome = await session.say(text, said);
+        const outcome = await session.say(text, said, [], { guide });
         reply.flush();
         if (outcome.stop === 'error') write(`\n${s.red(`error: ${outcome.error}`)}\n`);
         if (stopReason(outcome.stop)) write(`\n${s.dim(stopReason(outcome.stop))}\n`);

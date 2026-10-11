@@ -1,3 +1,6 @@
+---
+when: add, build, implement, feature, extend, design, rewrite, approach, architecture
+---
 # Feature
 
 1. Size it. An experiment → the answer is the product and the code is thrown away. A change to code already here → say the approach in a few sentences. A new subsystem or a changed interface → a written design first. Bigger than it looked → stop and step up; never down.

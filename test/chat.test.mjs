@@ -1,6 +1,6 @@
 // The chat session: the memory block first, the policy raised in process, delegated jobs run inside the process, the session log.
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -796,7 +796,7 @@ test('a session started afresh starts small and nowhere: the size and the projec
       await session.say('something else entirely');
       const operator = seen[1].messages.filter((m) => m.role === 'system').map((m) => m.content);
       assert.deepEqual(operator, [], 'nothing tells a session that has just begun to start again');
-      assert.equal(seen[2].messages.at(-1).content[0].content.trim(), started, 'no card has come in, so the shell runs where the chat was started');
+      assert.equal(seen[2].messages.at(-1).content[0].content.trim(), realpathSync(paths().scratch), 'no card has come in, so the shell runs in scratch — not in the project before, not where the chat was started');
     } finally {
       db.close();
     }
@@ -815,7 +815,7 @@ test('a reply cut off inside a tool call is not run, and still leaves a conversa
       const session = createChat(db, { model: 'opus', effort: 'high', cwd, send, now: () => NOW });
       session.start('startup');
       assert.equal((await session.say('write a very large file')).stop, 'max_tokens');
-      assert.equal(existsSync(join(cwd, 'big.txt')), false, 'half a call is not a call');
+      assert.equal(existsSync(join(cwd, 'big.txt')) || existsSync(join(paths().scratch, 'big.txt')), false, 'half a call is not a call');
 
       await session.say('carry on');
       const sent = seen[1].messages;
@@ -842,7 +842,7 @@ test('a message that begins with a path is a message: it is sent as typed, and k
       assert.deepEqual(session.expand(typed), { text: typed });
       assert.deepEqual(session.expand('/etc/hosts'), { text: '/etc/hosts' });
       // A command is still a slash and a word, alone or followed by a space.
-      assert.match(session.expand('/fix the bug').text, /\n\nFollow that, in order, for this: the bug$/);
+      assert.deepEqual(session.expand('/fix the bug'), { text: 'Fix this: the bug', said: 'the bug', guide: 'fix' });
       assert.deepEqual(session.expand('/new'), { control: 'new' });
       assert.match(session.expand('/nope').error, /no such command \/nope/);
 
@@ -859,9 +859,14 @@ test('a command the user runs themselves where the directory is gone says so, to
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
+      // With no project the work is in scratch, which is always there: a directory that is gone is a project's.
       const gone = join(mkdtempSync(join(tmpdir(), 'sumo-agents-cwd-')), 'removed');
-      const session = createChat(db, { model: 'opus', effort: 'high', cwd: gone, send: () => assert.fail('nothing here talks to the model'), now: () => NOW });
+      mkdirSync(gone);
+      addProject(db, gone, { slug: 'simba', now: NOW });
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: canned([reply('end_turn', [{ type: 'text', text: 'ok' }])]).send, now: () => NOW });
       session.start('startup');
+      await session.say('look at simba');
+      rmSync(gone, { recursive: true });
       const said = await session.shell('echo hi');
       assert.match(said, /^the command could not be started: .*removed does not exist$/);
       assert.match(session.params.messages.at(-1).content[0].text, /^I ran `echo hi` myself:\nthe command could not be started: /);
@@ -997,10 +1002,10 @@ test('a slash command sends its sentence to the model, and keeps only the user\'
       session.start('startup');
 
       const review = session.expand('/review the diff on my branch');
-      assert.equal(review.said, 'the diff on my branch');
-      assert.match(review.text, /^Review this: the diff on my branch\nCode written in this session is never reviewed in this session/);
-      await session.say(review.text, review.said);
-      assert.match(seen[0].messages.at(-1).content[0].text, /^Review this: the diff on my branch/);
+      assert.deepEqual(review, { text: 'Review this: the diff on my branch', said: 'the diff on my branch', guide: 'review' });
+      await session.say(review.text, review.said, [], { guide: review.guide });
+      assert.match(seen[0].messages.at(-2).content[0].text, /^Review this: the diff on my branch/);
+      assert.match(seen[0].messages.at(-1).content, /^<guide review>\nCode written in this session is never reviewed in this session/, 'the guide follows, as an operator message');
 
       // A command with nothing after it is nothing the user said.
       const dream = session.expand('/dream');
@@ -1086,9 +1091,8 @@ test('the commands of the menu work from inside a project: the guide comes with 
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
       session.start('startup');
 
-      const fix = session.expand('/fix the login bug');
-      assert.match(fix.text, /Make it fail on demand/, 'the guide itself, not a path the tools cannot reach from the project');
-      assert.match(fix.text, /for this: the login bug$/);
+      // The guide is named, and comes through the prompt hook as an operator message — not a path the tools cannot reach from the project.
+      assert.deepEqual(session.expand('/fix the login bug'), { text: 'Fix this: the login bug', said: 'the login bug', guide: 'fix' });
       assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /copy /stop /help /new /exit');
 
       const dream = session.expand('/dream');
@@ -1586,15 +1590,17 @@ test('what the screen asks the session: the commands it adds, where the work is,
       assert.deepEqual(session.expand('/help'), { control: 'help', args: '' });
       assert.ok(session.commands.some((c) => c.name === 'copy') && session.commands.some((c) => c.name === 'help'), 'both are in the menu');
 
-      assert.deepEqual(session.where(), { cwd: root, name: root.split('/').at(-1), branch: 'fix/cart-total' }, 'no project named yet: the directory the chat was started in, and its branch');
+      addProject(db, root, { slug: 'cart', now: NOW });
+      assert.deepEqual(session.where(), { cwd: realpathSync(paths().scratch), name: 'scratch', branch: null }, 'no project named yet: scratch, wherever the chat was started');
       assert.equal(session.spent(), 0);
-      await session.say('go');
+      await session.say('go on with cart');
+      assert.deepEqual(session.where(), { cwd: root, name: 'cart', branch: 'fix/cart-total' }, 'the project named, and its branch');
       assert.ok(session.spent() > 0, 'what the session\'s requests have cost so far');
       assert.equal(session.spent(), db.prepare('SELECT SUM(cost_usd) AS c FROM model_runs WHERE session_id = ?').get(session.sessionId).c);
       assert.equal(watched.filter((e) => e.type === 'output').map((e) => e.chunk).join(''), 'first\nsecond\n', 'a command\'s output reaches the screen as it is printed');
       assert.equal(watched.find((e) => e.type === 'output').call.id, 't1');
 
-      // A detached head has no branch to name; a directory that is no repository has none either.
+      // A detached head has no branch to name; scratch, which is no repository, has none either.
       writeFileSync(join(root, '.git', 'HEAD'), '0123456789abcdef0123456789abcdef01234567\n');
       assert.equal(session.where().branch, '01234567');
       const elsewhere = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
@@ -1755,3 +1761,82 @@ function anotherJob(db) {
   writeFileSync(join(paths().jobs, String(id), 'brief.md'), '# Job\n\n## The task\nlook again\n');
   return id;
 }
+
+test('a guide rides in as an operator message with the message that asks for it — by its command or by its words — once, and the screen is told', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const watched = [];
+      const { send, seen } = canned([reply('end_turn', [{ type: 'text', text: 'one' }]), reply('end_turn', [{ type: 'text', text: 'two' }]), reply('end_turn', [{ type: 'text', text: 'three' }])]);
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, watch: (e) => watched.push(e), now: () => NOW });
+      session.start('startup');
+
+      const fix = session.expand('/fix the login bug');
+      await session.say(fix.text, fix.said, [], { guide: fix.guide });
+      const guides = (messages) => messages.filter((m) => m.role === 'system' && /^<guide /.test(m.content)).map((m) => m.content);
+      assert.equal(guides(seen[0].messages).length, 1);
+      assert.match(guides(seen[0].messages)[0], /^<guide fix>\nThe user is asking for a fix\.[\s\S]*Make it fail on demand[\s\S]*<\/guide>$/);
+      assert.equal(seen[0].messages.at(-2).content[0].text, 'Fix this: the login bug', 'the message itself carries only the words');
+
+      await session.say('the signup bug is the same, fix that too');
+      assert.equal(guides(seen[1].messages).length, 1, 'the same guide is not sent twice');
+
+      await session.say('then add a --json flag to the export');
+      assert.deepEqual(guides(seen[2].messages).map((g) => g.split('\n')[0]), ['<guide fix>', '<guide feature>']);
+      assert.deepEqual(watched.filter((e) => e.type === 'guide'), [{ type: 'guide', name: 'fix' }, { type: 'guide', name: 'feature' }]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a turn that edits and stops before the project\'s check ran is held once and told the check; one that ran it ends; a command that is not the check does not count', async () => {
+  // The real path: the project is registered by it, and the files are named under it, so the hold can name them by their project path.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-checked-')));
+  writeFileSync(join(dir, 'Makefile'), 'test:\n\t@true\n');
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const watched = [];
+      const edit = (id, command, extra) => call(id, 'str_replace_based_edit_tool', { command, path: join(dir, 'a.txt'), ...extra });
+      const { send, seen } = canned([
+        reply('tool_use', [edit('t1', 'create', { file_text: 'one\n' })]),
+        reply('end_turn', [{ type: 'text', text: 'Done: a.txt is written.' }]),
+        reply('tool_use', [call('t2', 'bash', { command: 'make test' })]),
+        reply('end_turn', [{ type: 'text', text: 'make test passes.' }]),
+
+        reply('tool_use', [edit('t3', 'str_replace', { old_str: 'one', new_str: 'two' })]),
+        reply('tool_use', [call('t4', 'bash', { command: 'make test' })]),
+        reply('end_turn', [{ type: 'text', text: 'Changed and checked.' }]),
+
+        reply('tool_use', [edit('t5', 'str_replace', { old_str: 'two', new_str: 'three' })]),
+        reply('tool_use', [call('t6', 'bash', { command: 'git status' })]),
+        reply('end_turn', [{ type: 'text', text: 'Changed.' }]),
+        reply('end_turn', [{ type: 'text', text: 'Right — make test passes.' }]),
+      ]);
+      // The project's card has to have come in for its checks to be the ones that count.
+      addProject(db, dir, { slug: 'checked', now: NOW });
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: dir, send, watch: (e) => watched.push(e), now: () => NOW });
+      session.start('startup');
+      // The hold comes after the model's reply, so it goes in as tagged text in a user turn, not as a system message.
+      const held = (messages) => messages.filter((m) => m.role === 'user' && typeof m.content[0]?.text === 'string' && m.content[0].text.includes('<check>')).map((m) => m.content[0].text);
+
+      const first = await session.say('in checked, write a.txt');
+      assert.equal(first.text, 'make test passes.');
+      assert.equal(seen.length, 4, 'held once: one more request, then the turn ends as the model ended it');
+      assert.deepEqual(held(seen[1].messages), []);
+      assert.match(held(seen[2].messages)[0], /^<sumo>\n<check>\nNot done yet: a\.txt was edited and nothing has checked it since\. The project's check is `make test` — run it/);
+      assert.deepEqual(watched.filter((e) => e.type === 'check'), [{ type: 'check', edited: ['a.txt'], checks: ['make test'] }]);
+
+      await session.say('change it');
+      assert.equal(seen.length, 7, 'the check ran after the edit: not held');
+      assert.deepEqual(held(seen[6].messages).length, 1, 'only the earlier hold is in the history');
+
+      await session.say('change it again');
+      assert.equal(seen.length, 11, 'git status is not the check: held');
+      assert.match(held(seen[10].messages).at(-1), /a\.txt was edited and nothing has checked it since/);
+    } finally {
+      db.close();
+    }
+  });
+});

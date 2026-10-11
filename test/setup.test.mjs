@@ -126,6 +126,21 @@ test('the schema is migrated once and recorded', () => {
   assert.equal(s.sql((db) => db.prepare('PRAGMA user_version').get().user_version), SCHEMA_VERSION);
 });
 
+test('where new projects are made is a directory that is there, and the days scratch keeps a chore a positive whole number', () => {
+  const s = sandbox();
+  assert.match(s.sumo(['config', 'projects.home']).out, /projects\.home = ~$/m);
+  mkdirSync(join(s.root, 'code'));
+  assert.match(s.sumo(['config', 'projects.home', join(s.root, 'code')]).out, /projects\.home = .*code$/m);
+  const missing = s.sumo(['config', 'projects.home', join(s.root, 'nowhere')]);
+  assert.equal(missing.code, 2);
+  assert.match(missing.err, /is not a directory/);
+  assert.match(s.sumo(['config', 'projects.home']).out, /code$/m, 'a refused value is not stored');
+
+  assert.match(s.sumo(['config', 'scratch.days']).out, /scratch\.days = 14/);
+  assert.match(s.sumo(['config', 'scratch.days', '30']).out, /scratch\.days = 30/);
+  for (const bad of ['0', 'soon', '1.5']) assert.equal(s.sumo(['config', 'scratch.days', bad]).code, 2, bad);
+});
+
 test('config reads defaults, stores changes and rejects names it does not know', () => {
   const s = sandbox();
   assert.match(s.sumo(['config', 'scribe.model']).out, /scribe\.model = local/);

@@ -1,3 +1,6 @@
+---
+when: fix, bug, broken, broke, failing, crash, regression, error, throws, exception, "doesn't work", "stopped working"
+---
 # Fix
 
 1. What changed recently? `git log -5`, `git diff` — most bugs arrive with a change.

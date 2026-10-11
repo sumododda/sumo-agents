@@ -1,7 +1,8 @@
 import { homedir } from 'node:os';
 import { ago } from './card.mjs';
 import { getMeta } from './db.mjs';
-import { listProjects } from './projects.mjs';
+import { paths } from './paths.mjs';
+import { isScratch, listProjects, scratchDays } from './projects.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { clip, estimateTokens } from './text.mjs';
 
@@ -33,12 +34,15 @@ export function prime(db, { budget, now = new Date().toISOString() } = {}) {
   // The small, time-sensitive sections are fixed first; preferences get whatever room is left.
   // Preserve the compact layout normally; when it cannot fit, keep time-sensitive lines first.
   const sections = [workflows(db), projectsLine(db), leftOff(db, now), jobs(db, now), toConfirm(db), warnings(db)];
+  // Where the work with no project goes is said every time, and is not something remembered.
+  const remembered = sections.flat().length;
+  sections.splice(2, 0, scratchLine(db));
   const fixed = sections.flat();
   const spent = estimateTokens([open, ...fixed, close].join('\n'));
   const prefs = preferences(db, limit - spent);
 
   const lines = [open, ...prefs, ...fixed, close];
-  if (lines.length === 2) lines.splice(1, 0, 'Nothing remembered yet. It fills in as the user talks.');
+  if (prefs.length + remembered === 0) lines.splice(1, 0, 'Nothing remembered yet. It fills in as the user talks.');
   const block = lines.join('\n');
   if (estimateTokens(block) <= limit) return block;
 
@@ -101,11 +105,15 @@ function workflows(db) {
 }
 
 function projectsLine(db) {
-  const all = listProjects(db);
+  const all = listProjects(db).filter((p) => !isScratch(p));
   if (all.length === 0) return [];
   const shown = all.slice(0, MAX_PROJECTS).map((p) => `${p.slug} (${tilde(p.path)})`);
   const more = all.length > MAX_PROJECTS ? ` · +${all.length - MAX_PROJECTS} more: sumo project list` : '';
   return [`Projects: ${shown.join(' · ')}${more}`];
+}
+
+function scratchLine(db) {
+  return [`Scratch: ${tilde(paths().scratch)} — work that belongs to no project goes here, a folder per chore; one idle ${scratchDays(db)} days is deleted`];
 }
 
 function leftOff(db, now) {

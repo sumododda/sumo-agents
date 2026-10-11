@@ -4,7 +4,7 @@ import {
   readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { basename, delimiter, join } from 'node:path';
+import { basename, delimiter, isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
@@ -27,6 +27,9 @@ export const CONFIG_DEFAULTS = {
   'chat.model': 'opus',
   'chat.effort': 'high',
   'chat.notify': 'on',
+  'guides.auto': 'on',
+  'projects.home': '~',
+  'scratch.days': '14',
   'model.source': 'https://huggingface.co',
   'model.repo': 'Qwen/Qwen3-4B-GGUF',
   'model.file': 'Qwen3-4B-Q4_K_M.gguf',
@@ -209,7 +212,7 @@ async function askModelSource(defaultSource) {
 
 export async function setup({ binDir, link = true, modelSource, noModel = false } = {}) {
   const p = paths();
-  for (const dir of [p.home, p.bin, p.logs, p.backups, p.jobs, p.models]) {
+  for (const dir of [p.home, p.bin, p.logs, p.backups, p.jobs, p.models, p.scratch]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   chmodSync(p.home, 0o700);
@@ -408,9 +411,17 @@ export function config(key, value) {
     if (value !== undefined) {
       // A budget that is not a number would be no budget at all: every session's block would carry every preference.
       if (key === 'prime.budget') positiveInteger(value, 'prime.budget needs a positive number');
+      // Zero or a word would let go of every chore at the next session start, or of none ever.
+      if (key === 'scratch.days') positiveInteger(value, 'scratch.days needs a positive number: the days a chore nothing is written in is kept');
+      // Where a new project is made: a place that is not there, or that moves with the shell's directory, is no answer to "where".
+      if (key === 'projects.home') {
+        const dir = value.replace(/^~(?=$|\/)/, homedir());
+        if (!isAbsolute(dir) || !existsSync(dir) || !statSync(dir).isDirectory()) throw new UsageError(`${value} is not a directory — projects.home is where new projects are made, absolute or under ~`);
+      }
       // Sent with every chat turn: a word the API does not take would fail each one, not this command.
       if (key === 'chat.effort' && !CHAT_EFFORTS.includes(value)) throw new UsageError(`no such effort "${value}" — one of: ${CHAT_EFFORTS.join(', ')}`);
       if (key === 'chat.notify' && value !== 'on' && value !== 'off') throw new UsageError('chat.notify is on or off: the bell and the notification when a long turn ends behind another window');
+      if (key === 'guides.auto' && value !== 'on' && value !== 'off') throw new UsageError('guides.auto is on or off: a guide riding in with the message that asks for its kind of work, and a turn held for an edit nothing checked');
       // Stored for every later setup: one that is not a URL would fail each of them.
       if (key === 'model.source') sourceOrRefuse(value);
       // The file name decides where the bytes land and what the server is asked for: a name, never a path.

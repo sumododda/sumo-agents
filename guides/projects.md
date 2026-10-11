@@ -3,7 +3,8 @@
 A project is a directory somewhere on this machine, registered once.
 
 **First mention of something you don't know**
-1. `sumo project list` — maybe it has another name.
+1. `sumo project list` — maybe it has another name. It does → `sumo project alias <slug> <the name they used>`,
+   so that name brings its card from now on, and stop here: its path is on the list.
 2. Find it on disk (the user's home, one or two levels deep). Several candidates → ask which.
 3. Confirm the path with the user once, then
    `sumo project add <path> --alias <what the user calls it>` (repeat `--alias` for each name).
@@ -16,5 +17,11 @@ A project is a directory somewhere on this machine, registered once.
   that before editing; if it says the repo is indexed, locate code through the index first.
 - Use the commands on the card. Don't guess a test command the card already gives you.
 - The repo changed shape (new package manager, new test runner) → `sumo project rescan <slug>`.
+
+**A new project** is made under `sumo config projects.home`, then registered — not wherever you happen to be.
+
+**No project** → scratch (`sumo project show scratch`): one folder per chore, named `<date>-<what it is>`. With no
+project named the tools start there; from inside a project, hand the chore to a job with project `scratch`. A folder
+nothing is written in for `sumo config scratch.days` days is deleted — worth keeping → move it out, `sumo project add`.
 
 `sumo project alias <slug> <name>` adds a name · `sumo project archive <slug>` retires one (memories kept).

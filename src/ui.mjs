@@ -638,7 +638,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         redraw();
         return record({ kind: 'shell', result: { content: await session.shell(line.slice(1).trim()), isError: false } });
       }
-      const { text, said, control, args, error } = session.expand(line);
+      const { text, said, guide, control, args, error } = session.expand(line);
       if (error) return record({ kind: 'error', text: error });
       if (control === 'quit') return leave();
       if (control === 'new') {
@@ -694,7 +694,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         return record({ kind: 'note', text });
       }
       record({ kind: 'user', text: line });
-      await modelTurn(() => session.say(text, said, images));
+      await modelTurn(() => session.say(text, said, images, { guide }));
     } catch (cause) {
       closeReply();
       record({ kind: 'error', text: `error: ${cause.message}` });
@@ -918,12 +918,14 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     // What the model — or a job's — is thinking, so far: shown under the working line, or on the job's line, until it acts.
     const onThinking = ({ text, job }) => {
       if (job) {
+        // Kept, not drawn: a thought comes a word at a time, and every frame is the whole screen written again. The job's
+        // line has a clock that ticks each second, and says where the thought has got to then.
         const at = state.jobs.get(job);
         if (at) at.thought = text;
-      } else {
-        state.thought = text;
-        state.heard = Date.now();
+        return;
       }
+      state.thought = text;
+      state.heard = Date.now();
       redraw();
     };
     // A request being sent again, or a job's conversation summarized to make room: said where the work shows, with the job's id.
@@ -963,6 +965,15 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         if (at !== -1) state.queue.splice(at, 1);
         record({ kind: 'user', text });
       }
+    };
+    // What the model was handed without being asked: a way of working, or the check it stopped short of.
+    const onGuide = ({ name }) => {
+      closeReply();
+      record({ kind: 'note', text: `guide: ${name}` });
+    };
+    const onCheck = ({ edited, checks }) => {
+      closeReply();
+      record({ kind: 'note', text: `held: ${edited.length} file${edited.length === 1 ? '' : 's'} edited, ${checks.length > 0 ? `${checks.join(' and ')} not run` : 'no check declared'}` });
     };
     // A job's work is not the chat's: it shows one line while it works, its report when it ends, and the rest where it is watched.
     const onResult = ({ call, result, job }) => {
@@ -1013,9 +1024,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       if (error) record({ kind: 'error', text: `mcp: ${error}` });
       for (const server of servers.filter((s) => !s.ok)) record({ kind: 'error', text: `mcp ${server.name}: ${server.error} — sumo mcp shows every server` });
     };
-    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('mcp', onMcp);
+    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('guide', onGuide).on('check', onCheck).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('mcp', onMcp);
     return () => {
-      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('mcp', onMcp);
+      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('guide', onGuide).off('check', onCheck).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('mcp', onMcp);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
       clearTimeout(state.drawSoon);

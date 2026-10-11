@@ -150,6 +150,28 @@ package-lock.json — removed
   assert.equal(readFileSync(join(s.home, 'jobs', '1', 'report.md'), 'utf8').startsWith('## Summary'), true);
 });
 
+test('a chore in scratch: the brief says how scratch is used, a worker finishes it with nothing to check, nothing is filed under it, and no reviewer is sent in', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  s.hook('session-start', { session_id: 'sess-a', cwd: '/x', transcript_path: null, source: 'startup' });
+
+  const created = s.sumo(['job', 'new', '--project', 'scratch', '--title', 'rename the scans'], { input: TASK });
+  assert.equal(created.code, 0, created.err);
+  const brief = readFileSync(join(s.home, 'jobs', '1', 'brief.md'), 'utf8');
+  assert.match(brief, /Work only inside: .*\/home\/scratch /);
+  assert.match(brief, /one folder per chore/);
+
+  const done = s.sumo(['job', 'finish', '1', '--status', 'done'], { input: '## Summary\nRenamed 40 scans.\n## Learned\n- the scanner writes names in Latin-1\n' });
+  assert.equal(done.code, 0, done.err);
+  assert.match(done.out, /^STATUS: DONE — j1/);
+  assert.equal(s.sql((db) => db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE scope = 'project:scratch'`).get().n), 0);
+  assert.doesNotMatch(s.sumo(['prime']).out, /Left off: scratch/);
+
+  const review = s.sumo(['job', 'new', '--project', 'scratch', '--title', 'review it', '--agent', 'reviewer', '--reviews', '1'], { input: TASK });
+  assert.equal(review.code, 2);
+  assert.match(review.err, /there is no change to hand over/);
+});
+
 test('a rule stated a minute ago is filed before the brief is built, so the worker gets it', () => {
   const s = sandbox();
   s.routerWillSay('sonnet', 'medium');
@@ -341,4 +363,29 @@ test('a list that leaves older jobs out says how many', () => {
   const out = s.sumo(['job', 'list', '--all']).out.trimEnd().split('\n');
   assert.equal(out.length, 31);
   assert.equal(out.at(-1), '… 3 older — sumo job show <id> for one of them');
+});
+
+test('a worker is handed the guide its title and goal ask for; told none, or a scout, it gets nothing; the switch turns it off', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  withSimba(s);
+  const brief = (id) => s.sumo(['job', 'brief', String(id)]).out;
+  const make = (title, args = [], task = TASK) => {
+    const created = s.sumo(['job', 'new', '--project', 'simba', '--title', title, ...args], { input: task });
+    assert.equal(created.code, 0, created.err);
+    return Number(/^created j(\d+)/.exec(created.out)[1]);
+  };
+
+  const fix = make('The last page of results is missing', ['--agent', 'worker'], TASK.replace('Migrate the project from npm to pnpm.', 'Users report the last page is missing. Find the cause, fix it, and add a test.'));
+  assert.match(brief(fix), /## How this kind of work is done here\n1\. What changed recently\?/, 'the goal says "fix": the fix guide rides in');
+  const feature = make('count: a --json flag', ['--agent', 'worker'], TASK.replace('Migrate the project from npm to pnpm.', 'Add a --json flag to bin/count.js.'));
+  assert.match(brief(feature), /## How this kind of work is done here\n1\. Size it\./);
+  assert.doesNotMatch(brief(make('migrate to pnpm', ['--agent', 'worker'])), /How this kind of work is done here/, 'a title and goal that ask for neither bring neither');
+  assert.doesNotMatch(brief(make('fix the paging', ['--agent', 'worker', '--guide', 'none'])), /How this kind of work is done here/, 'none means none');
+  assert.doesNotMatch(brief(make('fix the paging', ['--agent', 'scout'])), /How this kind of work is done here/, 'a scout changes nothing');
+  assert.match(brief(make('fix the paging', ['--agent', 'worker', '--guide', 'feature'])), /1\. Size it\./, 'a named guide wins over the words');
+  assert.match(s.sumo(['job', 'new', '--project', 'simba', '--title', 't', '--guide', 'plan'], { input: TASK }).err, /--guide is one of: fix, feature, review, none/);
+
+  s.sumo(['config', 'guides.auto', 'off']);
+  assert.doesNotMatch(brief(make('fix the paging', ['--agent', 'worker'])), /How this kind of work is done here/, 'off: only a named guide rides');
 });

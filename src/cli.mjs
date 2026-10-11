@@ -85,7 +85,7 @@ ${LEARN_USAGE}`,
   project: `sumo project add <path> [--slug S] [--alias A]...
 sumo project show <name> | list [--all] | rescan <name> | alias <name> <alias> | archive <name>   (add it again to bring it back)`,
   job: `sumo job new --project S --title T [--agent scout|worker|reviewer]   (task on stdin)
-        [--guide fix|feature|review]     carry guides/<name>.md into the brief
+        [--guide fix|feature|review|none]   carry guides/<name>.md into the brief (unsaid: what the title and goal ask for)
         [--reviews <id>]                 reviewer: judge that job's change (default: what is uncommitted)
         [--tests-may-change]             worker: this task is allowed to edit tests that already exist
 sumo job brief|show|abandon <id>

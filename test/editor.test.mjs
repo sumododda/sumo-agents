@@ -95,6 +95,22 @@ describe('the chat input box', () => {
     assert.equal(s.text, 'one\n');
   });
 
+  it('Ctrl-U at the start of a line takes the line above, so pressing it again clears a box of many lines', () => {
+    let s = paste(editor(), 'one\n• two\n• three\n');
+    assert.equal(s.cursor, s.text.length, 'on the empty last line, as after a paste that ends in a newline');
+    s = key(s, { ctrl: true }, 'u');
+    assert.deepEqual([s.text, s.cursor], ['one\n• two\n', 10]);
+    s = key(s, { ctrl: true }, 'u');
+    assert.deepEqual([s.text, s.cursor], ['one\n', 4]);
+    s = key(key(s, { ctrl: true }, 'u'), { ctrl: true }, 'u');
+    assert.deepEqual([s.text, s.cursor], ['', 0], 'and at the top there is nothing left to take');
+
+    // What stands after the cursor is kept: only the line above goes.
+    s = key(paste(editor(), 'one\ntwo\nthree'), { ctrl: true }, 'a');
+    s = key(s, { ctrl: true }, 'u');
+    assert.deepEqual([s.text, s.cursor], ['one\nthree', 4]);
+  });
+
   it('takes keys that arrive in one burst as the separate keys they were', () => {
     assert.deepEqual(keysOf('a', {}), [['a', {}]]);
     assert.deepEqual(keysOf('', { upArrow: true }), [['', { upArrow: true }]]);
