@@ -47,15 +47,17 @@ function printsSecret(command) {
 /**
  * A command whose only job is to print the whole environment, secrets and all: `env`, `printenv`, `export`, `set`, `declare`
  * or `typeset` with nothing but flags and redirections after it. `env FOO=1 cmd`, `set -e`, `export FOO=1` and `printenv HOME` are not that.
+ * A redirection is its first mark and whatever follows: `>>` read as one mark or as two is the same word, counted twice.
  */
-const DUMPS_ENV = /^\s*(?:sudo\s+)?(?:(?:env|printenv|declare|typeset)(?:\s+(?:-\S+|\d*[<>&]+\S*))*|export(?:\s+-p)?|set)\s*$/;
+const DUMPS_ENV = /^\s*(?:sudo\s+)?(?:(?:env|printenv|declare|typeset)(?:\s+(?:-\S+|\d*[<>&]\S*))*|export(?:\s+-p)?|set)\s*$/;
 
 /**
  * `rm` — by any path (`/bin/rm`), escaped (`\rm`), behind sudo, env, nice, timeout or xargs — and everything up to the
  * end of its command, which a new line is too. Its flags may come before or after its targets; only a recursive spelling
- * of them is looked at further.
+ * of them is looked at further. Each word between is read one way — a word, whatever it starts with: a dash that
+ * could be read apart from its word doubled the readings with every flag, and a build's worth of flags stood the check still.
  */
-const RM = /(^|[\s;&|(`"'])(?:(?:sudo|env|nice|timeout|xargs|command)(?:\s+-?\S+)*?\s+)?\\?(?:\/\S*\/)?rm\s+([^;&|)`\n]+)/g;
+const RM = /(^|[\s;&|(`"'])(?:(?:sudo|env|nice|timeout|xargs|command)(?:\s+\S+)*?\s+)?\\?(?:\/\S*\/)?rm\s+([^;&|)`\n]+)/g;
 const RECURSIVE = /(^|\s)(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=\s|$)/;
 const FLAG = /^-{1,2}[\w-]+$/;
 

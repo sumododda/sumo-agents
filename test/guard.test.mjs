@@ -86,6 +86,27 @@ test('a command whose only job is to print the whole environment is refused; one
   }
 });
 
+test('a command with many flags, or many redirections, is judged at once: each word of it is read one way', () => {
+  const timed = (command) => {
+    const began = performance.now();
+    const why = guardCommand(command);
+    return { why, took: performance.now() - began };
+  };
+  // After `env`, `sudo`, `timeout` and the like, a flag's dash was once both the dash and a character of the word: twenty flags were a million readings.
+  const flags = Array.from({ length: 20 }, (_, i) => `--enable-feature-${i}`).join(' ');
+  const build = timed(`env CC=clang ./configure ${flags} && make`);
+  assert.equal(build.why, null);
+  assert.ok(build.took < 100, `${Math.round(build.took)} ms to judge a build with twenty flags`);
+  assert.match(guardCommand(`env A=1 nice -n 5 ${flags} rm -rf ~`) ?? '', /^Refused: .*whole tree/, 'rm behind many flags is still rm');
+  // A redirection's `>>` was once one mark or two: the same, for a line of them.
+  const appends = Array.from({ length: 20 }, (_, i) => `>>log${i}`).join(' ');
+  const dump = timed(`declare ${appends} x`);
+  assert.equal(dump.why, null);
+  assert.ok(dump.took < 100, `${Math.round(dump.took)} ms to judge a line of redirections`);
+  assert.match(guardCommand(`env ${appends}`) ?? '', /^Refused: .*whole environment/, 'a dump sent to many files is still a dump');
+  assert.match(guardCommand('env >a>b 2>&1') ?? '', /^Refused: .*whole environment/);
+});
+
 test('the home and the working directory spelled out in full are guarded as ~ and . are', () => {
   const where = { cwd: '/work/proj', home: '/Users/me' };
   for (const command of ['rm -rf /Users/me', 'rm -rf /Users/me/', 'rm -rf "/Users/me/Documents"', 'rm -rf /work/proj', 'rm -rf /work/proj/', 'rm -rf /work/proj/*']) {
