@@ -522,7 +522,7 @@ test('a job run in the chat keeps out of it — who it is and where to follow it
         await shows(new RegExp(`⏺ j${id} scout · haiku — look · follow it: sumo job watch ${id}`), 'who the job is, and where to follow it');
         assert.match(latest(), new RegExp(`@ message talks to j${id}`), 'how to talk to it, under the box');
         // While it works, it stands under the call that started it: how long it has run, how many calls, what it is doing now.
-        await shows(new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+j${id} · \\d+s · 0 tool calls · thinking…`), 'the job at work, under its call');
+        await shows(new RegExp(`⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+j${id} · \\d+s · 0 tool calls · working`), 'the job at work, under its call');
 
         // Typed for the job while it works: sent to it, not queued for the chat.
         await tty.type(`@stay in src${ENTER}`);
@@ -889,11 +889,11 @@ test('jobs delegated side by side each stand under their own call while they wor
     events.emit('job', { job: { id: 42, agent: 'worker', title: 'Fix it', model: 'opus', effort: 'high' }, call: 'd2' });
     const grep = { id: 'j1', name: 'bash', input: { command: 'rg -n renderTable src' } };
     events.emit('tool', { call: grep, job: 41 });
-    await shows(/⏺ Delegate\(scout · Map it\)\n\s+⎿\s+j41 · \d+s · 1 tool call · Bash\(rg -n renderTable src\)\n+⏺ Delegate\(worker · Fix it\)\n\s+⎿\s+j42 · \d+s · 0 tool calls · thinking…/, 'both jobs, each under its own call');
+    await shows(/⏺ Delegate\(scout · Map it\)\n\s+⎿\s+j41 · \d+s · 1 tool call · working\n+⏺ Delegate\(worker · Fix it\)\n\s+⎿\s+j42 · \d+s · 0 tool calls · working/, 'both jobs, each under its own call');
     events.emit('result', { call: grep, result: { content: 'src/tty.mjs:126' }, job: 41 });
     events.emit('tab-failed', { job: 42, reason: 'its Herdr tab never started the watcher' });
     await shows(/j42: its Herdr tab never started the watcher — follow it here: sumo job watch 42/, 'why the tab shows nothing, and how to follow it anyway');
-    await shows(/j41 · \d+s · 1 tool call · thinking…/, 'the job still there between its calls');
+    await shows(/j41 · \d+s · 1 tool call · working/, 'the job still there between its calls');
     finish({ stop: 'end_turn' });
     await shows(/^(?![\s\S]*j41 ·)/, 'the job rows gone with the turn');
   } finally {
@@ -1232,7 +1232,7 @@ test('a job in the background: the turn that delegates ends and the box is free;
         await tty.type(`check simba${ENTER}`);
         // The turn ends with the job still at work: no working line, the box free, the job in a row of its own under it.
         await shows(/⏺ the scout is looking/, 'the end of the turn that delegated');
-        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*╯\\n {2}⏺ j${id} scout — look · \\d+s · 0 tool calls · thinking…\\n`), 'the job under the box, and no turn at work');
+        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*╯\\n {2}⏺ main · idle\\n {2}⏺ j${id} scout — look · \\d+s · 0 tool calls · working\\n`), 'the job under the box, and no turn at work');
         // What the call answered is the model's — how to wait, what not to guess. The screen says the one thing it means.
         assert.match(tty.screen(), new RegExp(`⏺ Delegate\\(j${id}\\)\\n {2}⎿ {2}running in the background — its report comes here when it is done\\n`), 'that it runs in the background');
         assert.doesNotMatch(tty.screen(), /do not guess/);
@@ -1270,7 +1270,7 @@ test('a job in the background: the turn that delegates ends and the box is free;
   });
 });
 
-test('a job thinking in the background does not redraw the screen at every word of the thought: its line says where the thought has got to when its clock ticks', async () => {
+test('a job thinking in the background does not redraw the screen at every word of the thought, and its line says only that it is working', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -1305,7 +1305,7 @@ test('a job thinking in the background does not redraw the screen at every word 
       };
       try {
         await tty.type(`check simba${ENTER}`);
-        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*╯\\n {2}⏺ j${id} scout — look · \\d+s · 0 tool calls · thinking…\\n`), 'the job under the box, and no turn at work');
+        await shows(new RegExp(`^(?![\\s\\S]*esc to interrupt)[\\s\\S]*╯\\n {2}⏺ main · idle\\n {2}⏺ j${id} scout — look · \\d+s · 0 tool calls · working\\n`), 'the job under the box, and no turn at work');
 
         // The thought comes a word at a time, many times a second. Every frame is the whole screen written again.
         let frames = 0;
@@ -1319,7 +1319,10 @@ test('a job thinking in the background does not redraw the screen at every word 
           await new Promise((r) => setTimeout(r, 5));
         }
         assert.ok(frames <= 2, `${frames} frames drawn for thirty words of one thought`);
-        await shows(/thinking: reading the code, word 29\n/, 'where the thought has got to, at the next tick of the job\'s clock');
+        // The job's line says it is at work and no more: what it thinks and runs is in its record, a step and Enter away.
+        await new Promise((r) => setTimeout(r, 1100));
+        assert.match(tty.screen(), /scout — look · \d+s · 0 tool calls · working\n/, 'still one line, at the next tick of the job\'s clock');
+        assert.doesNotMatch(tty.screen(), /reading the code/, 'none of the thought on the job\'s line');
         tty.stdout.write = write;
 
         working.open();
@@ -1370,8 +1373,9 @@ test('the jobs at work stand under the box: Down steps onto one and Enter opens 
     try {
       events.emit('job', { job: { id: 41, agent: 'scout', title: 'Map it', model: 'sonnet', effort: 'low' } });
       events.emit('job', { job: { id: 42, agent: 'worker', title: 'Fix it', model: 'opus', effort: 'high' } });
-      await shows(/╰─+╯\n {2}⏺ j41 scout — Map it · \d+s · 0 tool calls · thinking…\n {2}⏺ j42 worker — Fix it · \d+s · 0 tool calls · thinking…\n/, 'both jobs under the box');
+      await shows(/╰─+╯\n {2}⏺ main · idle\n {2}⏺ j41 scout — Map it · \d+s · 0 tool calls · working\n {2}⏺ j42 worker — Fix it · \d+s · 0 tool calls · working\n/, 'the chat itself, then both jobs, under the box');
       assert.match(tty.screen(), /↓ enter opens one/, 'how to open one');
+      assert.match(tty.screen(), /0 tool calls · working\n {2}\S[^\n]*\n {2}@j<id> message talks to that job · ↓ enter opens one · \/stop stops it(\n|$)/, 'with jobs at work the route has a line of its own, and the keys the line under it, both from the left');
       assert.doesNotMatch(tty.screen(), /renderTable/, 'no record until one is opened');
 
       // Down from the box steps onto the first, and on; the last is where it stops, and Up comes back.
@@ -1396,12 +1400,26 @@ test('the jobs at work stand under the box: Down steps onto one and Enter opens 
       await shows(/^(?![\s\S]*renderTable)[\s\S]*⏺ j41 scout — Map it/, 'the record closed, the job still under the box');
       assert.equal(interrupted, 0, 'Esc closed the record and stopped nothing');
 
-      // A job that ends takes its row and its open record with it.
+      // The chat itself is the first row: with a record open, Down from the box steps onto it, and Enter comes back to it.
       await tty.type(DOWN, ENTER);
       await shows(OPEN, 'the record opened again');
+      await tty.type(DOWN);
+      await shows(/\n {2}❯ main · idle\n {2}⏺ j41/, 'main stepped on, from a job\'s record');
+      assert.match(tty.screen(), /enter shows main/);
+      await tty.type(ENTER);
+      await shows(/^(?![\s\S]*renderTable)[\s\S]*\n {2}⏺ main · idle\n {2}⏺ j41 scout — Map it/, 'back in the chat: the record closed, the rows still there');
+      // From the chat, Down steps past its own row onto the first job, and Up from there is main.
+      await tty.type(DOWN, UP);
+      await shows(/\n {2}❯ main · idle\n/, 'Up from the first job is main');
+      await tty.type(UP);
+      await shows(/\n {2}⏺ main · idle\n {2}⏺ j41/, 'and Up again is the box');
+
+      // A job that ends takes its row and its open record with it.
+      await tty.type(DOWN, ENTER);
+      await shows(OPEN, 'the record opened once more');
       running = [42];
       events.emit('job-end', { job: 41 });
-      await shows(/^(?![\s\S]*renderTable)(?![\s\S]*j41 scout — Map it)[\s\S]*╯\n {2}⏺ j42 worker — Fix it/, 'the ended job gone, the other still there');
+      await shows(/^(?![\s\S]*renderTable)(?![\s\S]*j41 scout — Map it)[\s\S]*╯\n {2}⏺ main · idle\n {2}⏺ j42 worker — Fix it/, 'the ended job gone, the other still there');
     } finally {
       ui.unmount();
     }

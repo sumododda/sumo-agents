@@ -188,9 +188,11 @@ The main agent does small things itself. Big, parallel or reading-heavy work it 
 `delegate` tool: a written brief becomes a job, and the job runs in the chat's own process on the route the
 router chose. On the chat's screen it runs in the background: the call answers at once, the turn goes on or
 ends, and you keep working — ask something else, start another job. The job stands in a row under the box
-while it works (`⏺ j43 scout — Map the parser · 2m 10s · 14 tool calls · …`). Down from the box steps onto a
+while it works (`⏺ j43 scout — Map the parser · 2m 10s · 14 tool calls · working`) — what it runs and thinks is
+not said there. Over the jobs stands a row for the chat itself (`⏺ main · working`). Down from the box steps onto a
 job and Enter opens it: the end of its record above the box — each call, the top of what came back, what it
-said — as it grows; `@ message` then talks to that job, Ctrl-O shows all of the record, Esc closes it. When
+said — as it grows; `@ message` then talks to that job, Ctrl-O shows all of the record, Esc closes it — or Down and
+Enter on `main` comes back to the chat. When
 it reports, how it went is drawn where the conversation has got to, and the model reads the report as an
 automated event, never as your words: with its next request if it is at work, otherwise in a turn the
 screen starts for it — so the main agent picks the work back up by itself. Esc stops the chat's turn, not
@@ -203,7 +205,7 @@ rules in it — a short frozen system prompt that carries the Coding rules from 
 
 | Role | Model and effort | Tools | For |
 |---|---|---|---|
-| `scout` | chosen per job by the router | shell + job tools | finding, tracing, auditing, summarizing — anything reading-heavy |
+| `scout` | chosen per job by the router | shell + web search and fetch + job tools | finding, tracing, auditing, summarizing — anything reading-heavy |
 | `worker` | chosen per job by the router | shell + editor + `baseline`/`verify` + job tools | building and fixing |
 | `reviewer` | chosen per job by the router | shell + job tools | judging a change it did not write |
 
@@ -217,6 +219,20 @@ its next request; a job running elsewhere is reached on disk, as with `sumo job 
 answers, reports and check results live in `~/.sumo-agents/jobs/<id>/`, so a job started today can be
 picked up tomorrow: `delegate` with only its `job` id, or `sumo job run <id>` in a terminal. One worker per
 project at a time — they share a working tree.
+
+## The web
+
+The chat and a `scout` can search the web and read a page: `web_search` and `web_fetch`, the API's own tools. They
+run on Anthropic's side, inside the request — no key, no dependency, nothing run on this machine. A search shows as
+`Search(…)` with the pages found under it, a page read as `Fetch(…)` with its size, and the pages a reply cites are
+listed under it. Workers and reviewers do not have them: a page is somebody else's words, and it is kept out of
+the conversations that change code or judge it. Nothing here enforces that a page's words stay information: the
+chat that reads one has a shell with your environment, and only the model's judgment stands between them.
+
+A search costs $0.01 on top of its tokens and is counted in the ledger; a fetch costs its tokens only. One search
+and one page read is some 30,000 tokens of context, so a lookup across many pages belongs to a scout. A page is cut
+at about 20,000 tokens; a PDF comes whole. There is no cap on how many searches a reply makes. Both tools are called
+directly: the newer way, where the model filters results in code first, is refused on a Claude Code token.
 
 ## MCP servers
 
@@ -544,6 +560,7 @@ node --disable-warning=ExperimentalWarning test/router-probes.mjs  # the router'
   scribe calls before the switch cost $1.86 in all, and dream's 18 cost $0.17.
 - The router: one local call per job, about a second once the model is loaded, $0.
 - The server: about 7 GB while it answers, under 0.5 GB asleep.
+- A web search: $0.01 and the tokens of what it found; a page read: its tokens.
 - The always-loaded prompt (`AGENTS.md`) is about 650 tokens, and a test keeps it there.
 
 When a local call fails (server down, a bundle past the 32k context, an answer cut off) and a credential is in
@@ -594,6 +611,7 @@ prompts/             agent.md — the system prompt of a job; scribe.md, dream.m
 guides/              fix · feature · review ride in when your words ask for them; memory · projects · workflows · delegation are read on demand
 bin/sumo.mjs  src/    the `sumo` CLI — Node, the Anthropic SDK, SQLite full-text search
 src/loop.mjs         the loop every conversation runs in; src/tools.mjs the shell and editor with their policy
+src/web.mjs          the web: the API's search and fetch tools, and how their blocks are read
 src/mcp.mjs          the MCP servers: their configuration, the two transports, the allow list, `sumo mcp`
 src/chat.mjs         the chat; src/hooks.mjs the session policy as events
 src/ui.mjs           the chat's screen (Ink, loaded only by `sumo chat`); src/editor.mjs the box you type in

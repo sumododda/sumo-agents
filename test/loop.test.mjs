@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { setModel } from '../src/catalog.mjs';
 import { openDb } from '../src/db.mjs';
 import { add, UsageError } from '../src/memory.mjs';
-import { jobPrinter } from '../src/chat.mjs';
+import { describeCall, jobPrinter } from '../src/chat.mjs';
 import { getJob, takeInbox, tell } from '../src/jobs.mjs';
 import Anthropic from '@anthropic-ai/sdk';
 import { converse, jobParams, markTail, RETRY, retryable, retryDelay, runJob, runLines, stopReason } from '../src/loop.mjs';
@@ -16,7 +16,8 @@ import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { cap, capRedacted, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
-import { styles } from '../src/tty.mjs';
+import { styles, toolView } from '../src/tty.mjs';
+import { sourcesOf, WEB_TOOLS } from '../src/web.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const NOW = '2026-09-30T12:00:00.000Z';
@@ -59,10 +60,74 @@ test('the request: frozen system with a cache breakpoint, the brief as the one u
   assert.equal(worker.max_tokens, 64_000, 'the thinking every current model does counts toward the limit, so it holds the thinking and the reply');
 
   const scout = jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' });
-  assert.deepEqual(scout.tools.map((t) => t.name), ['bash', 'note', 'ask', 'search_memory', 'finish'], 'a scout cannot edit, and has no checks to run');
+  assert.deepEqual(scout.tools.map((t) => t.name), ['bash', 'note', 'ask', 'search_memory', 'finish', 'web_search', 'web_fetch'], 'a scout cannot edit, has no checks to run, and can look on the web');
   assert.equal('output_config' in scout, false, 'haiku takes no effort');
   const reviewer = jobParams({ job: { agent: 'reviewer', model: 'opus', effort: 'high' }, text: 'judge', system: 'rules' });
   assert.deepEqual(reviewer.tools.map((t) => t.name), ['bash', 'note', 'ask', 'search_memory', 'finish'], 'a reviewer cannot edit');
+});
+
+test('a search and a fetch run on the API\'s side: each is said as a call and its answer, once, as it streams or from the whole reply; one the request ended on is answered too; a search is paid for', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-web-'));
+      const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }) };
+      const asked = () => jobParams({ job: { agent: 'scout', model: 'sonnet', effort: 'low' }, text: 'look it up', system: 'rules' });
+      assert.deepEqual(asked().tools.filter((t) => t.name.startsWith('web_')), WEB_TOOLS);
+      assert.ok(WEB_TOOLS.every((t) => t.allowed_callers.join() === 'direct'), 'called directly: run from code, they are refused on a Claude Code token');
+
+      const page = 'https://nodejs.org/en/about/previous-releases';
+      const content = [
+        { type: 'server_tool_use', id: 's1', name: 'web_search', input: { query: 'node lts' } },
+        { type: 'web_search_tool_result', tool_use_id: 's1', content: [{ type: 'web_search_result', title: 'Node.js releases', url: page, encrypted_content: 'x' }] },
+        { type: 'server_tool_use', id: 's2', name: 'web_fetch', input: { url: page } },
+        { type: 'web_fetch_tool_result', tool_use_id: 's2', content: { type: 'web_fetch_result', url: page, content: { type: 'document', title: 'Node.js releases', source: { type: 'text', media_type: 'text/plain', data: 'v24 is Active LTS' } } } },
+        { type: 'server_tool_use', id: 's3', name: 'web_fetch', input: { url: 'https://example.com/gone' } },
+        { type: 'web_fetch_tool_result', tool_use_id: 's3', content: { type: 'web_fetch_tool_result_error', error_code: 'url_not_accessible' } },
+        { type: 'text', text: 'Node 24.', citations: [{ type: 'web_search_result_location', url: page, title: 'Node.js releases', cited_text: 'v24', encrypted_index: 'i' }, { type: 'web_search_result_location', url: page, title: 'Node.js releases', cited_text: 'Active', encrypted_index: 'j' }] },
+      ];
+      const usage = { input_tokens: 100, output_tokens: 10, server_tool_use: { web_search_requests: 1, web_fetch_requests: 2 } };
+      const expected = [
+        'call search: node lts',
+        `answer s1: Node.js releases — ${page}`,
+        `call fetch: ${page}`,
+        'answer s2: Node.js releases — 17 characters',
+        'call fetch: https://example.com/gone',
+        'failed s3: fetch failed: url_not_accessible',
+      ];
+      const watching = () => {
+        const said = [];
+        return { said, onTool: (c) => said.push(`call ${describeCall(c)}`), onResult: (c, r) => said.push(`${r.isError ? 'failed' : 'answer'} ${c.id}: ${r.content}`) };
+      };
+
+      // Streamed: the transport hands over each block as it ends, then the whole reply.
+      const live = watching();
+      const streamed = asked();
+      const outcome = await converse(db, streamed, { send: async (_p, { onBlock }) => (content.forEach(onBlock), reply('end_turn', content, usage)), ctx, ledger: { kind: 'scout' }, now: () => NOW, onTool: live.onTool, onResult: live.onResult });
+      assert.deepEqual(live.said, expected, 'said as they came, and not again from the whole reply');
+      assert.equal(outcome.stop, 'end_turn');
+      assert.equal(outcome.totals.toolCalls, 3);
+      assert.ok(Math.abs(outcome.totals.costUsd - (0.0003 + 0.01)) < 1e-9, 'the tokens, and a cent for the search; a fetch costs its tokens only');
+      assert.deepEqual(streamed.messages[1].content, content, 'what came back is kept as it came: the API asks for it back unchanged');
+
+      // Not streamed: the same is said from the whole reply.
+      const whole = watching();
+      await converse(db, asked(), { send: async () => reply('end_turn', content, usage), ctx, ledger: { kind: 'scout' }, now: () => NOW, onTool: whole.onTool, onResult: whole.onResult });
+      assert.deepEqual(whole.said, expected);
+
+      // A request that fails with a search under way: the call is answered, so nothing is left running on the screen.
+      const cut = watching();
+      const failed = await converse(db, asked(), { send: async (_p, { onBlock }) => { onBlock(content[0]); throw new Error('socket hang up'); }, ctx, ledger: { kind: 'scout' }, now: () => NOW, onTool: cut.onTool, onResult: cut.onResult });
+      assert.equal(failed.stop, 'error');
+      assert.deepEqual(cut.said, ['call search: node lts', 'failed s1: not finished: the request ended first']);
+
+      assert.deepEqual(sourcesOf(content), [{ title: 'Node.js releases', url: page }], 'a page cited twice is a source once');
+      assert.deepEqual(toolView(content[0], { content: `Node.js releases — ${page}`, isError: false }), { title: 'Search', detail: 'node lts', lines: [{ text: `Node.js releases — ${page}`, tone: 'plain' }] });
+      assert.deepEqual(toolView(content[2]), { title: 'Fetch', detail: page, lines: [] });
+    } finally {
+      db.close();
+    }
+  });
 });
 
 test('a run: tool calls go through the guard, the jail and the cap; every response leaves a ledger row with the job on it', async () => {
@@ -1066,8 +1131,8 @@ test('a job gets the MCP tools too, deferred behind tool search and named in its
       ]);
       await runJob(db, id, { send: alone.send, now: () => NOW });
       const request = alone.seen[0];
-      assert.deepEqual(request.tools.map((t) => t.name).slice(0, 6), ['bash', 'note', 'ask', 'search_memory', 'finish', 'tool_search_tool_regex'], 'the role\'s tools first, then the search tool');
-      const deferred = request.tools.slice(6);
+      assert.deepEqual(request.tools.map((t) => t.name).slice(0, 8), ['bash', 'note', 'ask', 'search_memory', 'finish', 'web_search', 'web_fetch', 'tool_search_tool_regex'], 'the role\'s tools first, then the search tool');
+      const deferred = request.tools.slice(8);
       assert.equal(deferred.length, 9);
       assert.ok(deferred.every((t) => t.defer_loading === true && t.name.startsWith('mcp__demo__')), 'every MCP tool is deferred');
       assert.match(request.system[0].text, /demo \(9 tools\)/, 'the job is told which servers there are');

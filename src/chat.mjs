@@ -25,6 +25,7 @@ import { currentProject, describeSaved, findSaved, loadState, lockFile, saveStat
 import { BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { colourEnabled, createRenderer, header, prompt, renderBlock, safeForTerminal, styles, tilde, widthOf } from './tty.mjs';
+import { sourcesOf, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_TOOLS } from './web.mjs';
 
 /**
  * The conversation the user has with Sumo: the same loop a job runs in, with
@@ -107,6 +108,8 @@ export function describeCall(call) {
     const { server, tool } = splitMcpName(call.name);
     return `${server} · ${tool}(${compactInput(call.input)})`;
   }
+  if (call.name === WEB_SEARCH_TOOL.name) return `search: ${String(call.input?.query ?? '').slice(0, 120)}`;
+  if (call.name === WEB_FETCH_TOOL.name) return `fetch: ${String(call.input?.url ?? '').slice(0, 120)}`;
   return call.name;
 }
 
@@ -235,7 +238,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   let routed = null;
   // The guides it names are read from wherever the chat was started: their paths are made absolute, or the model goes looking for them.
   const system = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim().replaceAll(/(?<![\w/])guides\//g, `${join(REPO_ROOT, 'guides')}/`);
-  const own = [BASH_TOOL, EDITOR_TOOL, DELEGATE_TOOL];
+  const own = [BASH_TOOL, EDITOR_TOOL, DELEGATE_TOOL, ...WEB_TOOLS];
   /** The MCP servers of this process, once connected: their tools join the request, deferred, and their names the system prompt. */
   let registry = null;
   const connecting = mcpReady().then((r) => {
@@ -714,6 +717,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           lastContext = totals.contextTokens;
           logLine(transcript, { type: 'assistant', message: { role: 'assistant', model: response.model ?? params.model, usage: response.usage, content: response.content } });
           watch({ type: 'usage', totals });
+          // What the reply rests on, said under it: the pages it cites.
+          const sources = sourcesOf(response.content);
+          if (sources.length > 0) watch({ type: 'sources', sources });
         },
       });
       // Pictures the API refused would ride along with every later turn and be refused again: a turn refused before the model saw it keeps only its words.
@@ -900,6 +906,7 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
     // Piped, nobody answers a question: an MCP call not on the allow list is refused, and a server that failed is said.
     watch: (e) => {
       if (e.type === 'retry' && e.job === undefined) return write(`${s.dim(`  › ${retryLine(e)}`)}\n`);
+      if (e.type === 'sources') return write(`\n${e.sources.map((page) => s.dim(`  ⎿  ${safeForTerminal(`${page.title} — ${page.url}`).replace(/\s+/g, ' ')}`)).join('\n')}\n`);
       if (e.type !== 'mcp') return;
       if (e.error) write(`${s.red(`mcp: ${e.error}`)}\n`);
       for (const server of e.servers.filter((x) => !x.ok)) write(`${s.red(`mcp ${server.name}: ${server.error}`)}\n`);
