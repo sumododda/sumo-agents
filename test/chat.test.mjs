@@ -1439,9 +1439,9 @@ test('the chat offers the MCP tools behind tool search, names the servers to the
       await session.say('echo things');
 
       const first = seen[0];
-      assert.deepEqual(first.tools.map((t) => t.name).slice(0, 4), ['bash', 'str_replace_based_edit_tool', 'delegate', 'tool_search_tool_regex']);
-      assert.equal(first.tools.length, 4 + 9);
-      assert.ok(first.tools.slice(4).every((t) => t.defer_loading === true && t.name.startsWith('mcp__demo__')), 'the MCP tools are deferred, so none of them sits in the context');
+      assert.deepEqual(first.tools.map((t) => t.name).slice(0, 6), ['bash', 'str_replace_based_edit_tool', 'delegate', 'web_search', 'web_fetch', 'tool_search_tool_regex']);
+      assert.equal(first.tools.length, 6 + 9);
+      assert.ok(first.tools.slice(6).every((t) => t.defer_loading === true && t.name.startsWith('mcp__demo__')), 'the MCP tools are deferred, so none of them sits in the context');
       assert.match(first.system[0].text, /demo \(9 tools\)/, 'the model is told which servers there are');
       assert.doesNotMatch(first.system[0].text, /broken/);
       const told = watched.find((e) => e.type === 'mcp');

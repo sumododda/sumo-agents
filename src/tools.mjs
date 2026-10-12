@@ -19,7 +19,7 @@ export const EDITOR_TOOL = { type: 'text_editor_20250728', name: 'str_replace_ba
 export const DELEGATE_TOOL = {
   name: 'delegate',
   description:
-    'Hand a piece of work to a sub-agent with a fresh context: scout looks (no edits), worker builds, reviewer judges a change it did not write. ' +
+    'Hand a piece of work to a sub-agent with a fresh context: scout looks — at the code or on the web (no edits), worker builds, reviewer judges a change it did not write. ' +
     'It runs on its own route. Its report is this call\'s result — or, when the result says the job is running in the background, it reaches you later ' +
     'as an automated event. Several calls in one reply run at the same time; one worker per project at a time. ' +
     'To continue an open job instead (one from an earlier session), give only `job`.',

@@ -241,37 +241,36 @@ const thoughtRows = (text, width, rows = THOUGHT_ROWS) =>
     .flatMap((line) => wrap(line, width).split('\n'))
     .slice(-rows);
 
-/** The same for a place that has one line and `room` characters of it: the end of the thought, with a mark that it began before. */
-function thoughtEnd(text, room) {
-  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
-  return flat.length <= room ? flat : `…${flat.slice(1 - Math.max(2, room))}`;
-}
-
-/** The most of a job's title its row under the box shows: what it is doing now is the news, and needs the room. */
+/** The most of a job's title its row under the box shows. */
 const TITLE_CHARS = 32;
 
 /**
- * A job at work, in one line: how long, how many calls, and the one running now — or what it is thinking. Under the call
- * that waits for it; or — at work in the background, with no call standing over it — in a row of its own under the box,
- * with who it is, marked when it is the one stepped on (`picked`) or the one whose record is open.
+ * A job at work, in one line: how long, how many calls, and that it is working — what it runs and thinks is in its record,
+ * a step and Enter away, not here. Under the call that waits for it; or — at work in the background, with no call standing
+ * over it — in a row of its own under the box, with who it is, marked when it is the one stepped on (`picked`) or the one
+ * whose record is open.
  */
 function JobAtWork({ id, job, alone = false, picked = false, open = false }) {
   useAnimation({ interval: 1000 });
-  const { columns } = useWindowSize();
-  const now = job.call ? toolView(job.call) : null;
   const calls = `${job.calls} tool call${job.calls === 1 ? '' : 's'}`;
   const mark = alone ? (picked ? '  ❯ ' : '  ⏺ ') : '  ⎿  ';
   const who = alone ? ` ${job.agent} — ${job.title.length > TITLE_CHARS ? `${job.title.slice(0, TITLE_CHARS - 1)}…` : job.title}` : '';
   const lead = `j${id}${who} · ${elapsed(Date.now() - job.since)} · ${calls} · `;
-  // The line is one row: of a thought longer than what is left of it, the end is what shows.
-  const thought = thoughtEnd(job.thought, columns - mark.length - lead.length - 'thinking: '.length - 1);
   return h(
     Text,
     { wrap: 'truncate' },
     h(Text, picked || open ? { color: ACCENT } : { dimColor: true }, mark),
     h(Text, { dimColor: !picked }, lead),
-    now ? `${now.title}(${now.detail.split('\n')[0]})` : h(Text, { dimColor: true }, thought ? `thinking: ${thought}` : 'thinking…'),
+    h(Text, { dimColor: true }, 'working'),
   );
+}
+
+/** The chat itself, as the first of the rows under the box: the place Enter comes back to from a job's record. */
+const MAIN = 'main';
+
+/** The chat's own row, over the jobs it delegated: marked when it is the one stepped on (`picked`), or the one on the screen (`shown`). */
+function MainAtWork({ working, picked = false, shown = false }) {
+  return h(Text, { wrap: 'truncate' }, h(Text, picked || shown ? { color: ACCENT } : { dimColor: true }, picked ? '  ❯ ' : '  ⏺ '), h(Text, { dimColor: !picked }, 'main · '), h(Text, { dimColor: true }, working ? 'working' : 'idle'));
 }
 
 /** What a job at work has written down so far, as the screen may show it: its lines, under the one that says who it is. None where there is no record yet. */
@@ -427,7 +426,7 @@ function Status({ session, leaving, notice, jobs, aside = [], pick = null, open 
   const cost = dollars(spent) && ` · ${dollars(spent)}`;
   // Where the tools run: the project and the branch it is on. The header that says it scrolls away; this does not.
   const place = where ? `${where.name}${where.branch ? ` (${where.branch})` : ''}` : '';
-  const hint = leaving ? `Ctrl-C again to leave${aside.length > 0 ? ` — it stops ${aside.map((id) => `j${id}`).join(', ')}, to be picked up again later` : ''}` : notice ? notice : pick !== null ? `enter opens j${pick} · ↑ back to the box` : open !== null ? `esc closes j${open} · ctrl-o all of its record · @ message talks to it` : jobs.length > 0 ? `${jobs.length === 1 ? `@ message talks to j${jobs[0]}` : '@j<id> message talks to that job'} · ${aside.length > 0 ? `↓ enter opens ${aside.length === 1 ? 'it' : 'one'} · /stop stops it` : 'ctrl-o full output'}` : waiting ? '↑ takes back what is waiting' : '/ commands · /help · ctrl-o full output';
+  const hint = leaving ? `Ctrl-C again to leave${aside.length > 0 ? ` — it stops ${aside.map((id) => `j${id}`).join(', ')}, to be picked up again later` : ''}` : notice ? notice : pick === MAIN ? 'enter shows main · ↑ back to the box' : pick !== null ? `enter opens j${pick} · ↑ back to the box` : open !== null ? `esc closes j${open} · ctrl-o all of its record · @ message talks to it` : jobs.length > 0 ? `${jobs.length === 1 ? `@ message talks to j${jobs[0]}` : '@j<id> message talks to that job'} · ${aside.length > 0 ? `↓ enter opens ${aside.length === 1 ? 'it' : 'one'} · /stop stops it` : 'ctrl-o full output'}` : waiting ? '↑ takes back what is waiting' : '/ commands · /help · ctrl-o full output';
   // In a narrow window the hints give way, then the place — unless the line has something to say just now, which the place
   // gives way to; the model, the size of the context and the cost never fold.
   const route = `${routeLine(session)}${size}${cost}`;
@@ -435,6 +434,16 @@ function Status({ session, leaving, notice, jobs, aside = [], pick = null, open 
   const said = leaving || notice;
   const placed = place && place.length <= room - (said ? hint.length + 2 : 0) ? place : '';
   const hinted = room - (placed ? placed.length + 2 : 0) >= 12 ? hint : '';
+  // With jobs at work the keys are what is needed, and they are long: the route keeps its line, from the left, and they take the line under it.
+  if (jobs.length > 0) {
+    const beside = place && place.length <= room ? place : '';
+    return h(
+      Box,
+      { paddingX: 2, flexDirection: 'column' },
+      h(Box, { justifyContent: 'space-between', gap: 2 }, h(Box, { flexShrink: 0 }, h(Text, { dimColor: true }, route)), beside ? h(Box, { flexShrink: 0 }, h(Text, { dimColor: true }, beside)) : null),
+      h(Text, { dimColor: true, wrap: 'truncate' }, hint),
+    );
+  }
   return h(
     Box,
     { paddingX: 2, justifyContent: 'space-between', gap: 2 },
@@ -582,9 +591,14 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
 
   /** The jobs at work with no call standing over them, by id: the ones under the box. */
   const underBox = () => [...state.jobs].filter(([, job]) => !state.running.has(job.parent)).map(([id]) => id);
-  /** A job that has ended is no longer stepped on, nor open. */
+  /** The rows under the box: the chat itself, then those jobs. None when no job is there: the chat alone needs no row. */
+  const rowsUnderBox = () => {
+    const jobs = underBox();
+    return jobs.length > 0 ? [MAIN, ...jobs] : [];
+  };
+  /** A job that has ended is no longer stepped on, nor open; nor is the chat's row once the last job is gone. */
   const dropEnded = () => {
-    if (!state.jobs.has(state.pick)) state.pick = null;
+    if (!rowsUnderBox().includes(state.pick)) state.pick = null;
     if (!state.jobs.has(state.open)) state.open = null;
   };
 
@@ -977,15 +991,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       state.reply?.write(chunk);
       redraw();
     };
-    // What the model — or a job's — is thinking, so far: shown under the working line, or on the job's line, until it acts.
+    // What the model is thinking, so far: shown under the working line until it acts. A job's thought is its own: it is not drawn here.
     const onThinking = ({ text, job }) => {
-      if (job) {
-        // Kept, not drawn: a thought comes a word at a time, and every frame is the whole screen written again. The job's
-        // line has a clock that ticks each second, and says where the thought has got to then.
-        const at = state.jobs.get(job);
-        if (at) at.thought = text;
-        return;
-      }
+      if (job) return;
       state.thought = text;
       state.heard = Date.now();
       redraw();
@@ -995,7 +1003,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     const onCompact = (c) => record({ kind: 'note', text: `${c.job ? `j${c.job}: ` : ''}${compactLine(c)}` });
     const onTool = ({ call, job }) => {
       const at = state.jobs.get(job);
-      if (at) Object.assign(at, { call, calls: at.calls + 1, thought: '' });
+      if (at) at.calls++;
       else if (!job) {
         state.thought = '';
         closeReply();
@@ -1033,16 +1041,18 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       closeReply();
       record({ kind: 'note', text: `guide: ${name}` });
     };
+    // The pages a reply cites, under it. A title is a page's own words: nothing in it may drive the terminal.
+    const onSources = ({ sources }) => {
+      closeReply();
+      record({ kind: 'note', text: `sources:\n${sources.map((page) => safeForTerminal(`${page.title} — ${page.url}`).replace(/\s+/g, ' ')).join('\n')}` });
+    };
     const onCheck = ({ edited, checks }) => {
       closeReply();
       record({ kind: 'note', text: `held: ${edited.length} file${edited.length === 1 ? '' : 's'} edited, ${checks.length > 0 ? `${checks.join(' and ')} not run` : 'no check declared'}` });
     };
     // A job's work is not the chat's: it shows one line while it works, its report when it ends, and the rest where it is watched.
     const onResult = ({ call, result, job }) => {
-      if (job) {
-        if (state.jobs.has(job)) state.jobs.get(job).call = null;
-        return redraw();
-      }
+      if (job) return;
       // Delegated jobs run side by side: one ending leaves the others' calls on the screen.
       state.running.delete(call.id);
       state.live.delete(call.id);
@@ -1051,7 +1061,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       record({ kind: 'tool', call, result });
     };
     const onJob = ({ job, call = null, tab = null }) => {
-      state.jobs.set(job.id, { parent: call, call: null, calls: 0, since: Date.now(), thought: '', agent: job.agent, title: job.title, route: routeOf(job) });
+      state.jobs.set(job.id, { parent: call, calls: 0, since: Date.now(), agent: job.agent, title: job.title, route: routeOf(job) });
       const where = tab?.pane ? 'working in its Herdr tab' : tab?.error ? `no Herdr tab (${tab.error}) — sumo job watch ${job.id}` : `follow it: sumo job watch ${job.id}`;
       record({ kind: 'job', id: job.id, agent: job.agent, title: job.title, route: routeOf(job), where });
     };
@@ -1087,9 +1097,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       if (error) record({ kind: 'error', text: `mcp: ${error}` });
       for (const server of servers.filter((s) => !s.ok)) record({ kind: 'error', text: `mcp ${server.name}: ${server.error} — sumo mcp shows every server` });
     };
-    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('guide', onGuide).on('check', onCheck).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('mcp', onMcp);
+    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('guide', onGuide).on('sources', onSources).on('check', onCheck).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('mcp', onMcp);
     return () => {
-      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('guide', onGuide).off('check', onCheck).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('mcp', onMcp);
+      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('guide', onGuide).off('sources', onSources).off('check', onCheck).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('mcp', onMcp);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
       clearTimeout(state.drawSoon);
@@ -1147,14 +1157,15 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         settle(state.asks[0], 'no');
         continue;
       }
-      // The jobs under the box: Down past the box's last line steps onto them, and Up back off them; Enter opens the one
-      // stepped on. Esc steps off, and then closes the record that is open — both before it stops a turn. Any other key is the box's.
-      const listed = underBox();
+      // The rows under the box — the chat itself, then its jobs: Down past the box's last line steps onto them, and Up back off
+      // them; Enter opens the job stepped on, or on the chat's row comes back to the chat. Esc steps off, and then closes the
+      // record that is open — both before it stops a turn. Any other key is the box's.
+      const listed = rowsUnderBox();
       if (state.pick !== null) {
         const at = listed.indexOf(state.pick);
         const to = oneKey.downArrow ? listed[Math.min(at + 1, listed.length - 1)] : oneKey.upArrow && at > 0 ? listed[at - 1] : null;
-        if (oneKey.return) state.open = state.pick;
-        state.pick = to;
+        if (oneKey.return) state.open = state.pick === MAIN ? null : state.pick;
+        state.pick = to ?? null;
         if (oneKey.downArrow || oneKey.upArrow || oneKey.return || oneKey.escape) continue;
       } else if (oneKey.escape && state.open !== null && menuOf(state.ed, session.commands, files).length === 0) {
         state.open = null;
@@ -1210,7 +1221,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       }
       const pressed = press(state.ed, one, oneKey, session.commands, files);
       // Down that moved nothing — the last line of the text, nothing newer to recall — has left the box for the jobs under it.
-      if (oneKey.downArrow && pressed.state === state.ed && listed.length > 0) [state.pick] = listed;
+      // The first step is onto the row that is not on the screen already: a job from the chat, the chat from a job's record.
+      if (oneKey.downArrow && pressed.state === state.ed && listed.length > 0) state.pick = state.open === null ? listed[1] : MAIN;
       state.ed = pressed.state;
       if (pressed.submit !== undefined) submit(pressed.submit);
     }
@@ -1262,8 +1274,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       // A message for the model is read with its next request — which, while it waits on a delegated job, is when that job reports.
       ...state.queue.map(({ line, steer }, i) => h(Text, { key: i, dimColor: true, wrap: 'truncate' }, `  ${steer ? reading : 'queued'}: ${line.split('\n')[0]}${line.includes('\n') ? ' …' : ''}`)),
       h(Input, { state: state.ed, width: columns, rows }),
-      // The jobs at work in the background, under the box: they go on whether or not there is a turn.
-      ...underBox().map((id) => h(JobAtWork, { key: `j${id}`, id, job: state.jobs.get(id), alone: true, picked: id === state.pick, open: id === state.open })),
+      // The jobs at work in the background, under the box, and the chat over them: they go on whether or not there is a turn.
+      ...rowsUnderBox().map((id) => (id === MAIN ? h(MainAtWork, { key: MAIN, working: Boolean(state.working), picked: state.pick === MAIN, shown: state.open === null }) : h(JobAtWork, { key: `j${id}`, id, job: state.jobs.get(id), alone: true, picked: id === state.pick, open: id === state.open }))),
       menu.length > 0 ? h(Menu, { menu, pick: state.ed.pick }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, jobs: [...state.jobs.keys()], aside: session.running(), pick: state.pick, open: state.open, where: state.where, spent: state.spent, waiting: state.queue.length > 0, columns }),
     ),
   );

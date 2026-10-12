@@ -8,6 +8,7 @@ import { getMeta } from './db.mjs';
 import { ensureLocalServer, LOCAL_REASONING_BUDGET, modelIdOf } from './local-server.mjs';
 import { paths } from './paths.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
+import { SEARCH_USD } from './web.mjs';
 
 const TIMEOUT_MS = 180_000;
 // The SDK tries twice more by default, a timeout included: three minutes would be nine, and a call the API did
@@ -41,7 +42,9 @@ export function costOf(model, usage) {
   const read = usage.cache_read_input_tokens ?? 0;
   const written = usage.cache_creation_input_tokens ?? 0;
   const out = usage.output_tokens ?? 0;
-  return (plain * price.input + read * price.input * price.cacheRead + written * price.input * CACHE_WRITE + out * price.output) / 1_000_000;
+  // A web search is paid for by the search, on top of the tokens of what it found.
+  const searches = (usage.server_tool_use?.web_search_requests ?? 0) * SEARCH_USD;
+  return (plain * price.input + read * price.input * price.cacheRead + written * price.input * CACHE_WRITE + out * price.output) / 1_000_000 + searches;
 }
 
 /** The request one cheap-model call sends: a frozen system prompt, the bundle as the one user turn, the answer shape enforced by the API. */

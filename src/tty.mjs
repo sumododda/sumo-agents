@@ -5,6 +5,7 @@ import { compactInput, isMcpTool, splitMcpName } from './mcp.mjs';
 import { REPO_ROOT } from './paths.mjs';
 import { elapsed } from './text.mjs';
 import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
+import { isWebTool, WEB_SEARCH_TOOL } from './web.mjs';
 
 /**
  * What the chat terminal looks like: the reply's markdown turned into bold,
@@ -420,6 +421,11 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     const detail = `${tool}(${compactInput(input)})`;
     if (!result) return { title: server, detail, lines: [] };
     return { title: server, detail, lines: output() };
+  }
+  if (isWebTool(call)) {
+    // The web: what was searched for or which page was read, and under it the pages found or the page and its size.
+    const detail = String(input.query ?? input.url ?? '').slice(0, SHOWN_COMMAND_CHARS);
+    return { title: call.name === WEB_SEARCH_TOOL.name ? 'Search' : 'Fetch', detail, lines: result ? output() : [] };
   }
   if (call.name !== EDITOR_TOOL.name) {
     // A job's own tools: what it was given in a line, what came back under it.

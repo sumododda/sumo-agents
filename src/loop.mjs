@@ -14,6 +14,7 @@ import { costOf, logRun, usageOf } from './model.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
 import { BASH_TOOL, childEnv, EDITOR_TOOL, INTERRUPTED, runTool } from './tools.mjs';
+import { isWebCall, isWebResult, WEB_TOOLS, webResult } from './web.mjs';
 
 /**
  * The loop every conversation runs in: one request, the policy pipeline over
@@ -106,9 +107,10 @@ export function paramsFor({ model, effort, tools, text, system }) {
   return params;
 }
 
-/** The request for a job: tools by role, the MCP tools behind them, effort by route, the brief as the one user turn. */
+/** The request for a job: tools by role — the web for the one that looks — the MCP tools behind them, effort by route, the brief as the one user turn. */
 export function jobParams({ job, text, system = systemPrompt(), mcp = [] }) {
-  return paramsFor({ model: job.model, effort: job.effort, tools: withMcp([...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent)], mcp), text, system });
+  const own = [...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent), ...(job.agent === 'scout' ? WEB_TOOLS : [])];
+  return paramsFor({ model: job.model, effort: job.effort, tools: withMcp(own, mcp), text, system });
 }
 
 /** A conversation's own tools with the MCP ones after them, behind the search tool that finds them; just its own when there are none. */
@@ -168,13 +170,14 @@ export function markTail(messages) {
 
 export const textOf = (content) => content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
 
-/** The default transport: streamed, so a long turn never trips the HTTP timeout; the text and the thinking said as they come. */
-export async function sendToApi(params, { onText, onThinking, signal } = {}) {
+/** The default transport: streamed, so a long turn never trips the HTTP timeout; the text and the thinking said as they come, and each block of the reply as it ends. */
+export async function sendToApi(params, { onText, onThinking, onBlock, signal } = {}) {
   const credential = resolveAnthropicCredential();
   const client = anthropicClient({ timeout: REQUEST_TIMEOUT_MS }, credential);
   const stream = client.beta.messages.stream(authenticatedRequest(params, credential), signal ? { signal } : undefined);
   if (onText) stream.on('text', onText);
   if (onThinking) stream.on('thinking', (delta, snapshot) => onThinking(delta, snapshot));
+  if (onBlock) stream.on('contentBlock', onBlock);
   return stream.finalMessage();
 }
 
@@ -254,6 +257,26 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
   };
   /** The last call made and answered, and how many times in a row it has been exactly that. */
   const repeat = { key: null, count: 0 };
+  // A search or a fetch runs on the API's side, inside the request: its call and what came back are blocks of the reply. Each is said
+  // as any call and its answer are — as it streams, or from the whole reply when nothing streamed — and once: a paused turn's answer
+  // comes with the next reply. One the request ended on is answered here, so nothing is left running on the screen.
+  const web = { said: new Set(), open: new Map() };
+  const onBlock = (block) => {
+    if (isWebCall(block) && !web.said.has(block.id)) {
+      web.said.add(block.id);
+      web.open.set(block.id, block);
+      totals.toolCalls++;
+      onTool?.(block);
+    } else if (isWebResult(block) && web.open.has(block.tool_use_id)) {
+      const call = web.open.get(block.tool_use_id);
+      web.open.delete(block.tool_use_id);
+      onResult?.(call, webResult(block));
+    }
+  };
+  const endWeb = () => {
+    for (const call of web.open.values()) onResult?.(call, { content: 'not finished: the request ended first', isError: true });
+    web.open.clear();
+  };
 
   while (turns < MAX_TURNS) {
     turns++;
@@ -262,9 +285,10 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     // The same request, sent again while the API or the connection is the trouble; nothing of a failed try is kept.
     for (let attempt = 0; ; ) {
       try {
-        response = await send(params, { onText, onThinking, signal });
+        response = await send(params, { onText, onThinking, onBlock, signal });
         break;
       } catch (cause) {
+        endWeb();
         if (signal?.aborted) return interrupted();
         const why = describeFailure(cause).slice(0, 200);
         if (attempt < retry.limit && retryable(cause)) {
@@ -292,6 +316,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     // A reply with nothing in it is not kept either: the API refuses an empty message once anything follows it.
     if (response.content.length > 0 && !refused) params.messages.push({ role: 'assistant', content: response.content });
     if (!refused) text = textOf(response.content) || text;
+    for (const block of response.content) onBlock(block);
     onTurn?.(response, totals);
     // The API paused a long turn of its own accord: the reply so far is kept, and the turn simply goes on.
     if (response.stop_reason === 'pause_turn') continue;
@@ -374,6 +399,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     }
   }
 
+  endWeb();
   return { turns, stop, error: null, text, totals };
 }
 

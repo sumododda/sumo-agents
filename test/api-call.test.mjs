@@ -32,6 +32,7 @@ test('cost follows the price list: cache reads at the discount, cache writes at 
   const out = costOf('opus', { input_tokens: 0, output_tokens: 1_000_000 });
   assert.equal(out, 20);
   assert.equal(costOf('local:qwen', { input_tokens: 5000, output_tokens: 50 }), 0);
+  assert.equal(costOf('haiku', { input_tokens: 0, output_tokens: 0, server_tool_use: { web_search_requests: 3, web_fetch_requests: 5 } }), 0.03, 'a search is a cent on top of its tokens; a fetch is its tokens');
 });
 
 test('the schema reaches the API as it was written: an enum stays an enum the API holds the answer to', () => {
