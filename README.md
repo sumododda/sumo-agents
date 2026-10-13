@@ -35,21 +35,23 @@ machine and is never committed, so a work laptop and a personal one learn separa
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp`), for the local model that
   routes jobs and writes memory
 - One of `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) in the environment
+- Optional: `herdr` (`brew install herdr`), which opens a tab per job so you can watch it work
 
 ```sh
 git clone https://github.com/sumododda/sumo-agents.git ~/sumo-agents && cd ~/sumo-agents
 npm ci                     # install locked dependencies
 node bin/sumo.mjs setup    # create ~/.sumo-agents and link `sumo` onto your PATH
-sumo doctor                # every line should say ok
+sumo doctor                # every line should say ok (warn on optional items like herdr is fine)
 sumo chat                  # start talking
 ```
 
-`sumo setup` asks one question: where to download the router model from. Press Enter for the default
+The first `sumo setup` asks one question: where to download the router model from. Press Enter for the default
 (Hugging Face). The 2.5 GB model file goes to `~/.sumo-agents/models/` and is skipped if already there.
 
 ```sh
 sumo setup --model-source <url>   # non-interactive
 sumo setup --no-model             # skip the download
+sumo setup --bin-dir <dir>        # where to link `sumo` (or --no-link to skip linking)
 ```
 
 **Behind a corporate proxy**
@@ -84,9 +86,9 @@ Set with `sumo config <key> <value>`; `sumo config` alone lists them.
 | `chat.notify` | `on` | Bell + notification when a long turn ends in a background window. |
 | `guides.auto` | `on` | `off` stops guides from loading unasked and stops holding turns with unchecked edits. |
 | `projects.home` | `~` | Where new projects are created. |
-| `scratch.days` | `14` | Days before an untouched scratch folder is deleted. |
+| `scratch.days` | `14` | Days before a scratch folder nothing was written in is deleted. |
 | `prime.budget` | `800` | Token cap on the memory block that starts each session. |
-| `scribe.model` | `local` | Who writes memory: `local`, `haiku`, `sonnet`, or `off` (the chat model saves directly). |
+| `scribe.model` | `local` | Who writes memory: `local`, `off` (the chat model saves directly), or any API model that is on. |
 | `dream.model` | `local` | Same choices, for the dream pass. |
 | `model.source` | `https://huggingface.co` | Where the local model is downloaded from. |
 | `model.repo` | `Qwen/Qwen3-4B-GGUF` | GGUF repository on the model source. |
@@ -106,7 +108,10 @@ sumo models disable fable    # keep one out of the chat, router and memory passe
 that is off is hidden from the router, refused by `/model` and `sumo config`, never used for a retry, and
 won't run a job that was routed to it earlier. `sumo doctor` fails if no model is on or a configured one is off.
 
-**Environment variables:** `SUMO_AGENTS_CHECK_TIMEOUT_MS` sets the time limit per project check (default 9 minutes).
+**Environment variables**
+
+- `SUMO_AGENTS_HOME`: use a directory other than `~/.sumo-agents` (e.g. a second profile).
+- `SUMO_AGENTS_CHECK_TIMEOUT_MS`: time limit per project check (default 9 minutes).
 
 ---
 
@@ -119,38 +124,42 @@ Run `sumo chat` and talk. Piped input (`echo … | sumo chat`) prints plain line
 | Command | What it does |
 |---|---|
 | `/fix`, `/feature`, `/review` | Load that [coding guide](#coding-guides) for this message. |
-| `/model [model] [effort]` | Show or set the chat model, e.g. `/model opus high`, `/model haiku`, `/model auto`. A switch costs one uncached turn. |
-| `/new` | Start a fresh session. The old one scrolls up; it is not wiped. |
-| `/resume` | Reopen a saved session (newest first, heavy ones marked). Its last five turns are redrawn. |
+| `/model [model] [effort]` | Show or set the chat model, e.g. `/model opus high`, `/model haiku`, `/model auto`. Changing the model costs one uncached turn. |
+| `/new` | Start a fresh session. The old one scrolls up; it is not wiped. Refused while a background job is at work. |
+| `/resume [id]` | Without an id, list saved sessions (newest first, heavy ones marked). With one, reopen it and redraw its last five turns. Refused while a background job is at work. |
 | `/copy` · `/copy code` | Copy the last reply, or its last code block, to the clipboard exactly as written. |
 | `/dream` | Tidy the memory now and report what changed. |
 | `/memory` | Open the memory in your browser. |
 | `/mcp` | List MCP servers, their tools and what may run unasked. |
 | `/stop [job]` | Stop a background job (e.g. `/stop j43`). |
-| `! <command>` | Run a shell command yourself, including ones the agent is refused. |
+| `! <command>` | Run a shell command yourself, including ones the agent is refused. The model sees its output. |
 | `/help` | List commands and keys. |
 | `/exit`, `/quit` | Leave. |
 
-From the shell, `sumo chat --resume [id]` reopens a session (the newest if no id).
+From the shell: `sumo chat --model M --effort E` starts on that route, and `sumo chat --resume [id]` reopens a
+session (the newest if no id).
 
 ### Keys
 
 | Key | Action |
 |---|---|
-| `\`+Enter, Shift-Enter, Option-Enter | New line |
+| `\`+Enter, Shift-Enter, Option-Enter, Ctrl-J | New line |
 | Up | Previous messages (last 50, kept across sessions). On an empty box, takes back a queued message. |
 | `/` | Command menu |
-| `@` + letters | Insert a project file path (Enter or Tab to accept, Esc to dismiss) |
+| `@` + letters | Insert a file path from the project's git tree (Enter or Tab to accept, Esc to dismiss) |
 | Ctrl-V | Paste an image from the clipboard (macOS). Dropping an image file also works. |
 | Ctrl-G | Edit the message in `$VISUAL` / `$EDITOR` |
 | Ctrl-O | Open the whole conversation, every command and its full output, in `$PAGER` (or `less`) |
-| Esc | Close the menu; otherwise stop the current turn |
-| Ctrl-C | Clear the box; twice on an empty box to exit |
+| Esc | Close the menu or an open job; otherwise stop the current turn |
+| Ctrl-C | Clear the box. On an empty box: stop the running turn, or press twice within 2 s to exit. |
+| Ctrl-D | Exit (on an empty box) |
+| Ctrl-A / Ctrl-E, Ctrl-U / Ctrl-K, Ctrl-W, Option-←/→ | Readline-style editing (`/help` lists them all) |
 | Down, then Enter | Step onto a background job and open it (see [Jobs](#jobs-and-delegation)) |
 
 ### Sending while it works
 
-- A **message** sent mid-turn is read with the model's next request, in the same turn (shown as `next step:`).
+- A **message** sent mid-turn is read with the model's next request, in the same turn (shown as `next step:`,
+  or `when j<id> reports:` while the turn waits on a job).
 - A **command or image** waits for the turn to end (shown as `queued:`).
 - Stopping the turn puts everything queued back in the box.
 
@@ -164,8 +173,9 @@ From the shell, `sumo chat --resume [id]` reopens a session (the newest if no id
 - **A working line** while the model is busy, with the last three lines of its thinking summary below it
   (every model but Haiku). It says so if the model goes quiet for 20 seconds with nothing running.
 - **A summary line** after any turn that made calls or took 10+ seconds: duration, calls, files edited, cost.
-  If the window is in the background, it also rings a bell and sends a notification (OSC 9), as does a
-  question waiting for you.
+  If the turn took 10+ seconds and the window is in the background, it also rings a bell and sends a
+  notification (OSC 9). So does an MCP call waiting for your approval, and a background job's report.
+  `chat.notify off` turns this off.
 - **The status line** under the box: model and effort, context size, session cost, and the project and branch.
 - **The window title:** `sumo · <project>`, marked while working or waiting.
 
@@ -190,15 +200,15 @@ checked". A `check` script or Makefile target counts as the project's gate and s
 ```sh
 sumo project add <path> [--slug S] [--alias A]
 sumo project show <slug>
-sumo project list
+sumo project list [--all]      # --all includes archived projects
 sumo project rescan <slug>     # after adding a test/lint/check command
 sumo project alias <slug> <alias>
-sumo project archive <slug>
+sumo project archive <slug>    # memories kept; `project add` brings it back
 ```
 
 **Scratch.** Work that belongs to no project happens in `~/.sumo-agents/scratch/`, one folder per chore. With
 no project named, tools start there; a job gets it as the project `scratch`. Nothing in scratch is
-remembered or checked, and a folder untouched for 14 days (`scratch.days`) is deleted. To keep one, move it
+remembered or checked, and anything in it nothing was written in for 14 days (`scratch.days`) is deleted at the next session start. To keep one, move it
 out and register it as a project.
 
 ## Memory
@@ -583,21 +593,25 @@ One local model handles the bookkeeping: routing every job and every `auto` chat
 
 - **Router calls** use no thinking and answer in about a second.
 - **Memory passes** use thinking capped at 1,024 tokens and take 8–15 s.
-- Every answer is held to a JSON schema by the server's grammar, then checked by code against what you typed.
+- Every answer is held to a JSON schema by the server's grammar, then checked by code: a route against the
+  models that are on, a memory against what you actually typed.
 
 **The server** starts on first use and stays running, detached, over `~/.sumo-agents/models/` with a 32k context.
 It sleeps after 10 idle minutes (< 0.5 GB resident), wakes in under a second, takes up to ~15 s on first load,
-and uses ~7 GB while answering. `sumo scribe status` shows its pid, port and load state. `sumo setup` stops it
+and uses ~7 GB while answering. When the scribe is on the local model,
+`sumo scribe status` shows the server's pid, port and the model's load state. `sumo setup` stops it
 so a new model file or binary takes effect. Logs go to `~/.sumo-agents/logs/llama-server.log`.
 
 ```sh
 sumo config model.repo <org>/<repo>   # another GGUF repository
 sumo config model.file <name>.gguf    # file within it, then run: sumo setup
-sumo config scribe.model haiku        # use the API for memory instead (also sonnet, or off); same for dream.model
+sumo config scribe.model haiku        # write memory with an API model that is on (or `off`); same for dream.model
 ```
 
-**Fallback.** If a local call fails (server down, input past 32k, answer cut off) and a credential is set, the
-pass retries once on Haiku. Both calls are logged; `sumo scribe stats` breaks it down by kind.
+**Fallback.** If a local call fails (server down, input past 32k, answer cut off or unreadable) and a credential
+is set, the pass retries once on the cheapest API model that is on (Haiku unless you turned it off). Both calls
+are logged, the failed one noting the retry, in `~/.sumo-agents/logs/scribe.log`; `sumo scribe stats` totals
+runs per kind.
 
 ### How it was chosen
 
@@ -626,7 +640,7 @@ scopes each to the right project, quotes what was typed as proof, and files no n
 
 **Caveats:** probe bundles are ~750 tokens, while real scribe bundles are 4,800 (median) to 9,400 (p90) tokens
 and include assistant replies and related memories, so real accuracy may be lower. Every number is a single run
-at temperature 0 on a set written by the author.
+on a set written by the author; the local models ran at temperature 0, Haiku at the API default.
 
 ## Costs
 
@@ -647,7 +661,7 @@ npm test                                                           # offline sui
 node probes/scope-accuracy.mjs                                     # live: local memory writer on 30 turns, $0, ~90 s
 node probes/scope-accuracy.mjs haiku                               # same turns on Haiku, ~9 cents
 node --disable-warning=ExperimentalWarning test/router-probes.mjs  # live: the router's grading set
-node --disable-warning=ExperimentalWarning probes/coding-eval.mjs  # live: eight small jobs, scored on hidden tests
+node --disable-warning=ExperimentalWarning probes/coding-eval.mjs  # live: eight small jobs, scored on what they never saw
 ```
 
 ### The coding eval
@@ -655,7 +669,7 @@ node --disable-warning=ExperimentalWarning probes/coding-eval.mjs  # live: eight
 The offline suite can't tell whether a change to the loop, prompts, tools or router makes jobs come out right
 more often or cheaper. `probes/coding-eval.mjs` runs eight small real jobs (six worker, two scout). Each is a
 one-page project written fresh, handed over as a brief, and scored on what the job never saw: hidden tests, files
-it was told not to touch, and for scouts the line the report must end on.
+it was told not to touch, a test it was asked to add, and for scouts the answer lines the report must give.
 
 Each task has a tempting wrong answer that looks done: `quantity || 1` passes the given test but treats 0 as 1;
 a bug whose tests already pass can be left under a `DONE`; the test can be edited to match the code.
@@ -669,7 +683,8 @@ node --disable-warning=ExperimentalWarning probes/coding-eval.mjs --task cart-qu
 
 Each job prints `PASS`, `FAIL` or `FALSE DONE` (said DONE but was wrong, counted separately since nobody
 re-checks a DONE), with route, requests, time and cost, plus a total line. It needs a credential and the router
-model, runs in its own home, and reads the real one only to see which models are on. Run it before and after a
+model, runs in its own home, and reads the real one only for the router model, the llama-server path and which
+models are on. Run it before and after a
 change, on a pinned route, more than once: eight tasks is a small sample.
 
 The eval is itself tested (`test/coding-eval.test.mjs`): stand-in agents run the tasks through the real job
@@ -679,23 +694,41 @@ DONE, the edited test, the report with an extra name).
 ## Repository layout
 
 ```
-AGENTS.md              system prompt of the chat; the only always-loaded instructions
+AGENTS.md              the chat's system prompt (its Coding section also goes to every job)
 prompts/               agent.md (job system prompt) · scribe.md, dream.md (memory passes)
 guides/                fix, feature, review (auto-loaded) · memory, projects, workflows, delegation (read on demand)
 bin/sumo.mjs           the `sumo` CLI entry point
-src/loop.mjs           the agent loop every conversation runs in
-src/tools.mjs          the shell and editor, with their policy
-src/guard.mjs          the destructive and secret-reading command guards
-src/chat.mjs           the chat · src/hooks.mjs session policy as events
-src/ui.mjs             the chat screen (Ink, loaded only by `sumo chat`) · src/editor.mjs the input box
-src/route.mjs          job routing and stats
-src/local-server.mjs   the llama-server behind the router and memory passes · src/model.mjs calls to it and the API
-src/web.mjs            web search and fetch
-src/mcp.mjs            MCP config, transports, allow list and `sumo mcp`
 spinner.txt, logo.txt  the working-line phrases and the empty-chat lion
-test/                  offline test suite
-probes/                live measurements: memory scope, coding eval
-docs/                  ADR-runtime.md (why Sumo owns its runtime) · PLAN.md (original design)
+
+src/
+  cli.mjs              command parsing and dispatch
+  setup.mjs            setup, doctor, config defaults, the model download
+  catalog.mjs          the API models and their on/off switches
+  auth.mjs             credentials and the API client
+
+  chat.mjs             the chat · hooks.mjs session policy as events
+  ui.mjs               the chat screen (Ink, loaded only by `sumo chat`) · editor.mjs the input box · tty.mjs markdown on the terminal
+  loop.mjs             the agent loop every conversation runs in
+  tools.mjs            the shell and editor, with their policy · guard.mjs the refused commands
+  web.mjs              web search and fetch · mcp.mjs MCP servers, transports, allow list
+  sessions.mjs         sessions, turns, context thresholds, saved state · transcript.mjs · images.mjs
+
+  memory.mjs           the memory store · db.mjs SQLite schema and full-text search
+  scribe.mjs           the writer pass · dream.mjs the consolidation pass · apply.mjs the only way a suggestion becomes a memory
+  prime.mjs            the block a session starts with · recall.mjs searching memory before asking
+  workflows.mjs        taught workflows and their gates · guides.mjs auto-loaded guides
+  redact.mjs           secret scrubbing · page.mjs, page.html the `sumo memory` page · export.mjs
+
+  projects.mjs         the project registry · scan.mjs, card.mjs what a project declares, as a card
+  jobs.mjs             jobs · jobtools.mjs the tools a job gets · verify.mjs the checks behind DONE
+  route.mjs            routing for jobs and `auto` chat turns, and per-route stats
+  local-server.mjs     the llama-server behind the router and memory passes · model.mjs calls to it and the API
+  herdr.mjs            a Herdr tab per job, to watch it work
+
+test/                  offline suite (`*.test.mjs`), plus router-probes.mjs, the live router grading set
+probes/                live measurements: memory scope, the coding eval (tasks in coding-eval-tasks.mjs)
+docs/                  ADR-runtime.md (why Sumo owns its runtime) · PLAN.md (original design) · skills-plan.md
+BRIEFING.md            the 2026-10-07 hardening briefing
 ```
 
-Stack: Node, the Anthropic SDK, Ink, and SQLite full-text search.
+Stack: Node, the Anthropic SDK, Ink, and SQLite full-text search (`node:sqlite`, FTS5).
