@@ -1252,7 +1252,7 @@ test('a job in the background: the turn that delegates ends and the box is free;
         working.open();
         await shows(/⏺ the scout found a and b/, 'the reply to the report');
         assert.match(tty.screen(), new RegExp(`⏺ four[\\s\\S]*⏺ Delegate\\(j${id}\\)\\n\\s+⎿\\s+○ j${id} never closed · \\d+s · 2 turns · 0 tool calls[\\s\\S]*⏺ the scout found a and b`), 'the report\'s line, then the reply to it');
-        assert.match(seen[3].messages.at(-1).content[0].text, new RegExp(`^<sumo>\\nAn automated event, not a message from the user: j${id} has reported\\.`));
+        assert.match(seen[3].messages.at(-1).content[0].text, new RegExp(`^<event>\\nAn automated event, not a message from the user: j${id} has reported\\.`));
         await shows(new RegExp(`^(?![\\s\\S]*j${id} scout — look)(?![\\s\\S]*esc to interrupt)`), 'the job gone from under the box, and no turn at work');
         assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['check simba', 'what is two and two'], 'nobody typed the report');
 

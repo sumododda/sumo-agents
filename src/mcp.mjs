@@ -37,7 +37,7 @@ const STDERR_KEPT = 2_000;
 /** How long a closed stdio server is given to leave on its own before its group is killed. */
 const CLOSE_GRACE_MS = 1_000;
 /** What a call is shown as on the screen: this much of its input. */
-const INPUT_SHOWN = 100;
+export const INPUT_SHOWN = 100;
 
 export const DECLINED = 'not run: the user declined this call. Do not call it again; ask the user, or carry on another way.';
 
@@ -107,9 +107,23 @@ const serverName = (name) => {
   return String(name);
 };
 
+/** A server reached over the network is reached over TLS: a header token or a call's arguments in clear text are anyone's to read on the way. Loopback is the one exception. */
+export function refuseClearText(url) {
+  let parsed;
+  try {
+    parsed = new URL(String(url).replace(/\$\{[A-Za-z_][A-Za-z0-9_]*\}/g, 'x'));
+  } catch {
+    throw new UsageError(`"${url}" is not a URL`);
+  }
+  if (parsed.protocol === 'http:' && !['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)) {
+    throw new UsageError(`${url} is plain http: a token or a call would cross the network in clear text. Use https:// (http:// is taken only for 127.0.0.1 and localhost)`);
+  }
+}
+
 /** A server joins the file; one that is already there is left as it is, so an allow list is never lost to a retyped add. */
 export function addServer(name, spec) {
   serverName(name);
+  if (spec.url) refuseClearText(spec.url);
   const config = readConfig();
   if (config.mcpServers[name]) throw new UsageError(`${name} is already configured — sumo mcp remove ${name} first`);
   if (!spec.url && !spec.command) throw new UsageError('a server is a command (after --) or a --url');
@@ -357,6 +371,7 @@ function httpTransport(spec, env) {
 export async function connect(name, spec, { env = process.env, timeoutMs } = {}) {
   serverName(name);
   if (!spec?.url && !spec?.command) throw new UsageError(`${name} has neither "command" nor "url"`);
+  if (spec.url) refuseClearText(spec.url);
   const callLimit = timeoutMs ?? spec.timeout ?? CALL_TIMEOUT_MS;
   const connectLimit = timeoutMs ?? spec.timeout ?? CONNECT_TIMEOUT_MS;
   const transport = spec.url ? httpTransport(spec, env) : stdioTransport(spec, serverEnv(spec, env));
@@ -465,14 +480,11 @@ async function buildRegistry() {
     const { server } = splitMcpName(apiName);
     return sessions.has(server) ? failed(`no tool called ${apiName}`) : failed(`${server} is not connected${failures.has(server) ? `: ${failures.get(server)}` : ''}`);
   };
-  /** The spec as the file says it now: the allow list may have been edited since the servers were connected. */
-  const specOf = (server) => {
-    try {
-      return readConfig().mcpServers[server] ?? config.mcpServers[server];
-    } catch {
-      return config.mcpServers[server];
-    }
-  };
+  /**
+   * The spec as it was read when the servers connected, changed only by the user's "always" at the keyboard: the file is
+   * not read again while the process runs, so a shell that edits it — the model's, say — changes nothing until the next start.
+   */
+  const specOf = (server) => config.mcpServers[server];
 
   return {
     error,
@@ -480,7 +492,7 @@ async function buildRegistry() {
     get hasTools() {
       return tools.length > 0;
     },
-    /** Each server as the file says it now — its allow list may have changed since it connected — and how connecting went. */
+    /** Each server as this process holds it — the allow list as it connected, plus what the user allowed since — and how connecting went. */
     servers: () => names.map((name) => ({ name, spec: specOf(name), transport: config.mcpServers[name].url ? 'http' : 'stdio', ok: sessions.has(name), error: failures.get(name) ?? null, tools: sessions.get(name)?.tools.length ?? 0 })),
     targetOf: (apiName) => targets.get(apiName) ?? null,
     missing,
@@ -495,9 +507,14 @@ async function buildRegistry() {
       const target = targets.get(apiName);
       return Boolean(target) && allowedBy(specOf(target.server), target.tool);
     },
+    /** The user's "always": kept in the file for the next start, and in this process for the rest of this one. */
     allow(apiName) {
       const target = targets.get(apiName);
-      if (target) setAllow(target.server, target.tool, true);
+      if (!target) return;
+      const spec = config.mcpServers[target.server];
+      const list = Array.isArray(spec.allow) ? spec.allow : [];
+      if (spec.allow !== 'all') spec.allow = [...new Set([...list, target.tool])];
+      setAllow(target.server, target.tool, true);
     },
     /** One call, answered the way every tool answers: text without secrets, capped; a failure is an error the model can read. */
     async call(apiName, input, { signal = null } = {}) {
@@ -513,7 +530,9 @@ async function buildRegistry() {
         });
         return { content: capRedacted(resultText(result)), isError: Boolean(result?.isError) };
       } catch (cause) {
-        return failed(`${target.server}: ${cause.message}`);
+        // A call that ran out of time may still have run: a post, a ticket, an edit. Said, so the model does not make it again as if it had not.
+        const why = /did not answer within/.test(cause.message) ? `${cause.message} — outcome unknown: the call may have run; check before repeating it` : cause.message;
+        return failed(`${target.server}: ${why}`);
       }
     },
     async close() {

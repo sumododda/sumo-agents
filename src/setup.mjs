@@ -183,6 +183,10 @@ function cappedAt(limit) {
 /** A model source is a web address; anything else is refused before it is stored, since every later setup would fail on it. */
 function sourceOrRefuse(value) {
   if (!/^https?:\/\/[^\s/]/i.test(value)) throw new UsageError(`"${redactUrl(value)}" is not a web address — a model source looks like https://<host>[/<path>]`);
+  // The router model is run on every job: fetched in clear text it is anyone's on the way to replace. Loopback, a mirror on this machine, is the exception.
+  if (/^http:/i.test(value) && !/^http:\/\/(?:[^@/]*@)?(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(value)) {
+    throw new UsageError(`"${redactUrl(value)}" is plain http: the model would cross the network in clear text. Use https:// (http:// is taken only for 127.0.0.1 and localhost)`);
+  }
   return value;
 }
 

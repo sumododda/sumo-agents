@@ -1687,7 +1687,7 @@ test('a chat that works in the background: delegate answers at once and the turn
       assert.equal(woke.text, 'it found two things');
       const event = seen.chat[2].messages.at(-1);
       assert.equal(event.role, 'user');
-      assert.match(event.content[0].text, new RegExp(`^<sumo>\\nAn automated event, not a message from the user: j${id} has reported\\.\\nSTATUS: never closed`));
+      assert.match(event.content[0].text, new RegExp(`^<event>\\nAn automated event, not a message from the user: j${id} has reported\\.\\nSTATUS: never closed`), 'labelled as an event, never wrapped as operator text');
       assert.equal(session.waiting(), 0);
       assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['check simba']);
       assert.ok(paired(session.params.messages));
@@ -1748,8 +1748,11 @@ test('a background job outlives the turn that started it: a report that comes wh
       assert.equal(other.stop(again), false, 'only a running job can be stopped');
       await other.say('what now');
       const sent = next.seen.chat[2].messages;
-      assert.equal(sent.at(-2).content.at(-1).text, 'what now');
-      assert.match(JSON.stringify(sent.at(-1)), new RegExp(`An automated event, not a message from the user: j${again} has reported\\.[^"]*stopped: interrupted by the user`));
+      // The report rides in the user's turn as an event block of its own — never in a system message, which is the operator's voice.
+      assert.equal(sent.at(-1).role, 'user');
+      assert.equal(sent.at(-1).content[0].text, 'what now');
+      assert.match(sent.at(-1).content[1].text, new RegExp(`^<event>\\nAn automated event, not a message from the user: j${again} has reported\\.[\\s\\S]*stopped: interrupted by the user[\\s\\S]*\\n</event>$`));
+      assert.ok(!sent.some((m) => m.role === 'system' && /has reported/.test(m.content)), 'no report in a system message');
       await other.settle();
     } finally {
       db.close();
@@ -1841,6 +1844,79 @@ test('a turn that edits and stops before the project\'s check ran is held once a
       assert.match(held(seen[10].messages).at(-1), /a\.txt was edited and nothing has checked it since/);
     } finally {
       db.close();
+    }
+  });
+});
+
+test('fan-out has a ceiling: four jobs at work at once, and three turns nobody typed in a row — after that the reports wait for the user, and ride in with their next message as an event', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const first = scoutJob(db, 'sumo-agents-bg-cap-');
+      const ids = [first, ...Array.from({ length: 7 }, () => anotherJob(db))];
+      const working = opens();
+      const looked = (text) => [{ reply: reply('end_turn', [{ type: 'text', text }]) }, { reply: reply('end_turn', []) }];
+      const { send, seen } = split({
+        chat: [
+          { reply: reply('tool_use', ids.slice(0, 5).map((id, i) => call(`t${i}`, 'delegate', { job: id }))) },
+          { reply: reply('end_turn', [{ type: 'text', text: 'four are looking' }]) },
+          // Each turn the reports wake delegates again: a chain with no end, unless something ends it.
+          { reply: reply('tool_use', [call('t5', 'delegate', { job: ids[5] })]) },
+          { reply: reply('end_turn', [{ type: 'text', text: 'one more' }]) },
+          { reply: reply('tool_use', [call('t6', 'delegate', { job: ids[6] })]) },
+          { reply: reply('end_turn', [{ type: 'text', text: 'and another' }]) },
+          { reply: reply('tool_use', [call('t7', 'delegate', { job: ids[7] })]) },
+          { reply: reply('end_turn', [{ type: 'text', text: 'and one more' }]) },
+          { reply: reply('end_turn', [{ type: 'text', text: 'they found things' }]) },
+        ],
+        job: [
+          // The first four hold until the fifth has been refused; every job then reports without closing, twice asked.
+          ...Array.from({ length: 4 }, () => ({ reply: reply('end_turn', [{ type: 'text', text: 'looking' }]), gate: working.gate })),
+          ...Array.from({ length: 4 }, () => ({ reply: reply('end_turn', []) })),
+          ...looked('a'),
+          ...looked('b'),
+          ...looked('c'),
+        ],
+      });
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, background: true, now: () => NOW });
+      session.start('startup');
+
+      const asked = session.say('look everywhere');
+      await until(() => seen.chat.length === 2, 'the five delegate calls answered');
+      const answers = seen.chat[1].messages.at(-1).content;
+      assert.deepEqual(answers.slice(0, 4).map((r) => r.is_error), [false, false, false, false]);
+      assert.equal(answers[4].is_error, true);
+      assert.match(answers[4].content, new RegExp(`${ids.slice(0, 4).map((id) => `j${id}`).join(', ')} are at work already — 4 at once is the most; wait for a report`));
+      assert.deepEqual(session.running(), ids.slice(0, 4));
+      assert.equal((await asked).text, 'four are looking');
+
+      // They report. Each wake reads what waits and delegates again; the third such turn is the last that starts on its own.
+      working.open();
+      await until(() => session.waiting() > 0 && session.running().length === 0, 'the four reports');
+      assert.equal((await session.wake()).text, 'one more');
+      await until(() => session.waiting() === 1, 'the fifth report');
+      assert.equal((await session.wake()).text, 'and another');
+      await until(() => session.waiting() === 1, 'the sixth report');
+      assert.equal((await session.wake()).text, 'and one more');
+      await until(() => session.running().length === 0, 'the seventh job to end');
+      assert.equal(session.waiting(), 0, 'three turns nobody typed in a row: the next report waits for the user');
+      assert.equal(await session.wake(), null);
+      assert.equal(seen.chat.length, 8, 'no request was made for it');
+
+      // The user speaks: the report rides in with their message, as an event in their turn, and turns may wake again after it.
+      assert.equal((await session.say('what did they find')).text, 'they found things');
+      const sent = seen.chat[8].messages.at(-1);
+      assert.equal(sent.role, 'user');
+      assert.equal(sent.content[0].text, 'what did they find');
+      assert.match(sent.content[1].text, new RegExp(`^<event>\\nAn automated event, not a message from the user: j${ids[7]} has reported\\.[\\s\\S]*\\n</event>$`));
+      assert.ok(!seen.chat.flatMap((p) => p.messages).some((m) => m.role === 'system' && /has reported/.test(m.content)), 'no report ever went in as operator text');
+      assert.equal(session.waiting(), 0);
+      assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['look everywhere', 'what did they find']);
+      assert.ok(paired(session.params.messages));
+      await session.settle();
+    } finally {
+      db.close();
+      await closeMcp();
     }
   });
 });

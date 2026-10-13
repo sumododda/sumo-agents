@@ -6,7 +6,7 @@ import { createElement as h, useEffect, useReducer, useRef } from 'react';
 import { compactLine, retryLine, routeLine, routeOf } from './chat.mjs';
 import { liveFile } from './jobs.mjs';
 import { stopReason } from './loop.mjs';
-import { compactInput } from './mcp.mjs';
+import { compactInput, INPUT_SHOWN } from './mcp.mjs';
 import { paths } from './paths.mjs';
 import { redact } from './redact.mjs';
 import { elapsed } from './text.mjs';
@@ -304,11 +304,33 @@ function JobOpen({ id, job, rows }) {
   );
 }
 
-/** A call waiting on the user's word: who asks, what would run with what, and the keys that answer. */
+/** The most of a call's input the question shows in full; past it, the cut is said. A recipient or a body hidden past the cut is one the user never approved. */
+const ASK_INPUT_MAX = 4_000;
+
+/** A call waiting on the user's word: who asks, what would run with what — the whole input, not its first line — and the keys that answer. */
 function Ask({ ask, aside = false }) {
   const who = ask.job ? `j${ask.job}: ` : '';
+  const whole = JSON.stringify(ask.input ?? {});
+  // Short enough for the line, it is on the line; longer, it is laid out under it, every field whole, up to the cut.
+  const short = whole.length <= INPUT_SHOWN;
+  const laid = short ? [] : JSON.stringify(ask.input ?? {}, null, 2).split('\n');
+  const kept = [];
+  let size = 0;
+  for (const line of laid) {
+    if (size + line.length > ASK_INPUT_MAX) break;
+    kept.push(line);
+    size += line.length + 1;
+  }
+  const cut = laid.length - kept.length;
   // Esc stops the turn the call is part of; for a job at work in the background there is no such turn, and Esc refuses the call.
-  return h(Box, { marginTop: 1, flexDirection: 'column' }, h(Text, { color: 'yellow' }, `⚠ ${who}allow ${ask.server} · ${ask.tool}(${compactInput(ask.input)})?`), h(Text, { dimColor: true }, `  y once · a always · n no · esc ${aside ? 'no' : 'stop'}`));
+  return h(
+    Box,
+    { marginTop: 1, flexDirection: 'column' },
+    h(Text, { color: 'yellow' }, `⚠ ${who}allow ${ask.server} · ${ask.tool}(${short ? whole : '…'})?`),
+    ...kept.map((line, i) => h(Text, { key: i, color: 'yellow', wrap: 'truncate-end' }, `  ${line}`)),
+    cut > 0 ? h(Text, { color: 'yellow', dimColor: true }, `  … ${cut} more line${cut === 1 ? '' : 's'} of input not shown — n, and ask the model for less`) : null,
+    h(Text, { dimColor: true }, `  y once · a always · n no · esc ${aside ? 'no' : 'stop'}`),
+  );
 }
 
 /** One line of a reply; the first of a block carries the mark. */

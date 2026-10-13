@@ -46,7 +46,8 @@ function commandFor(call, job) {
     case 'ask':
       return given(input.question) ? { args: ['job', 'ask', id], stdin: input.question } : null;
     case 'search_memory':
-      return given(input.query) ? { args: ['search', input.query, '--project', job.project] } : null;
+      // The query comes after `--`: one that looks like a flag is still words to search for.
+      return given(input.query) ? { args: ['search', '--project', job.project, '--', input.query] } : null;
     case 'baseline':
       return { args: ['job', 'baseline', id], checks: true };
     case 'verify':

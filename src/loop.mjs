@@ -9,7 +9,7 @@ import { handleEvent } from './hooks.mjs';
 import { brief, getJob, takeInbox } from './jobs.mjs';
 import { isJobTool, jobTools, runJobTool } from './jobtools.mjs';
 import { takeLock } from './lock.mjs';
-import { gateMcp, isMcpTool, mcpReady, runMcpTool, TOOL_SEARCH } from './mcp.mjs';
+import { DECLINED, gateMcp, isMcpTool, mcpReady, runMcpTool, TOOL_SEARCH } from './mcp.mjs';
 import { UsageError } from './memory.mjs';
 import { costOf, logRun, usageOf } from './model.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
@@ -42,6 +42,8 @@ export const RETRY = { limit: 6, baseMs: 1000, capMs: 30_000 };
 /** The same call with the same input and the same answer, over and over: said to the model at the third, and the run stopped at the fifth. */
 const REPEAT_NUDGE_AT = 3;
 const REPEAT_STOP_AT = 5;
+/** Calls the user declined in one conversation: a model that keeps asking, or asks for the same thing another way, is stopped here. */
+const DECLINE_STOP_AT = 3;
 /** Said with the results of the turn before the last: a run that hits the limit still gets to close or sum up. */
 const LAST_TURN = 'This is the last request of this run: the turn limit is reached after it. If you have a job, close it with `finish` now — DONE or FAILED, with your report; otherwise say where things stand and what remains.';
 
@@ -127,28 +129,33 @@ export const withServers = (system, registry) => (registry?.hasTools ? `${system
 /**
  * The first of two guards on a job taking its own work unverified: the command as written — `--accept` on a finish,
  * or clearing or setting the SUMO_JOB marker the second guard reads (reading code that names it is fine). `sumo job finish` refuses `--accept` under that marker
- * however the command was spelled. Both stop mistakes, not a shell set on getting round them: a job's shell runs
- * with the user's own access.
+ * however the command was spelled. The chat's commands carry a marker of their own, SUMO_TOOL, under which `sumo` refuses what only the
+ * user does — the allow list, the configuration, memory written as the user's word — and the same patterns hold it. All of this stops
+ * mistakes, not a shell set on getting round them: the shell runs with the user's own access.
  */
 // Each part is held to one command, and the marker to where a shell would set it, so a search through code that names
 // them (`grep -rn "SUMO_JOB=" src`, `rg "job finish" && grep -- --accept`) is reading, not granting.
-const SELF_GRANT = new RegExp(
-  [
-    /\bjob\s+finish\b[^;&|\n]*--accept\b/.source,
-    // Clearing the marker, however a shell spells it.
-    /\bunset\b[^;&|\n]*\bSUMO_JOB\b/.source,
-    /\benv\b[^;&|\n]*(?:\s-u\s*|\s--unset=)["']?SUMO_JOB\b/.source,
-    /\b(?:export\s+-n|declare\s+\+x|typeset\s+\+x)\b[^;&|\n]*\bSUMO_JOB\b/.source,
-    // Setting it where a command starts: after a separator, a keyword, sudo or eval, inside `sh -c "…"`, behind other assignments.
-    // An assignment's value is read as a shell reads a word — an escaped character, a quoted string, or a plain character —
-    // so a quote means one thing: where it could also be a character of its own, a long run of them was paired every way there is.
-    // The same for sudo's flags: one that takes a value takes the next word only when that word is not a flag itself.
-    /(?:^|[;&|(`{!\n]|\$\(|\b(?:if|then|else|elif|do|while|until|time|eval|sudo(?:\s+(?:-[ugCDhpRrTt]\s+(?!-\S)\S+|-\S+))*)\s|\b(?:ba|z|da|k)?sh\b[^;&|\n]*\s-c\s+["'])\s*(?:[A-Za-z_]\w*=(?:\\.|"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'\\])*\s+)*["']?SUMO_JOB=/.source,
-    /\b(?:export|env|declare|typeset|readonly|local)\b[^;&|\n]*?\s["']?SUMO_JOB=/.source,
-  ].join('|'),
-);
+const MARKER = 'SUMO_(?:JOB|TOOL)';
+/** Clearing or setting a marker, however a shell spells it. */
+const MARKER_PATTERNS = [
+  // Clearing the marker, however a shell spells it.
+  `\\bunset\\b[^;&|\\n]*\\b${MARKER}\\b`,
+  `\\benv\\b[^;&|\\n]*(?:\\s-u\\s*|\\s--unset=)["']?${MARKER}\\b`,
+  `\\b(?:export\\s+-n|declare\\s+\\+x|typeset\\s+\\+x)\\b[^;&|\\n]*\\b${MARKER}\\b`,
+  // Setting it where a command starts: after a separator, a keyword, sudo or eval, inside `sh -c "…"`, behind other assignments.
+  // An assignment's value is read as a shell reads a word — an escaped character, a quoted string, or a plain character —
+  // so a quote means one thing: where it could also be a character of its own, a long run of them was paired every way there is.
+  // The same for sudo's flags: one that takes a value takes the next word only when that word is not a flag itself.
+  `(?:^|[;&|(\`{!\\n]|\\$\\(|\\b(?:if|then|else|elif|do|while|until|time|eval|sudo(?:\\s+(?:-[ugCDhpRrTt]\\s+(?!-\\S)\\S+|-\\S+))*)\\s|\\b(?:ba|z|da|k)?sh\\b[^;&|\\n]*\\s-c\\s+["'])\\s*(?:[A-Za-z_]\\w*=(?:\\\\.|"(?:[^"\\\\]|\\\\.)*"|'[^']*'|[^\\s"'\\\\])*\\s+)*["']?${MARKER}=`,
+  `\\b(?:export|env|declare|typeset|readonly|local)\\b[^;&|\\n]*?\\s["']?${MARKER}=`,
+];
+const TAMPERS = new RegExp(MARKER_PATTERNS.join('|'));
+const SELF_GRANT = new RegExp([/\bjob\s+finish\b[^;&|\n]*--accept\b/.source, ...MARKER_PATTERNS].join('|'));
 /** Whether a command, as written, takes its own work unverified or clears the marker that would stop it; a line continued with `\` is one line. */
 export const grantsItself = (command) => SELF_GRANT.test(command.replace(/\\\n/g, ' '));
+/** Whether a command, as written, clears or sets the marker that says it is the model's. */
+export const tampersMarker = (command) => TAMPERS.test(command.replace(/\\\n/g, ' '));
+export const TAMPER_REFUSED = 'Refused: the marker that says this shell is the model\'s is not yours to clear or set. What it holds back, the user does themselves.';
 const SELF_GRANT_REFUSED = "Refused: work is never taken unverified on its author's word. Finish FAILED with what blocks verification, or ask.";
 
 /** Said once to a job that ended its turn with the job still open: it finished the work but never said so. */
@@ -271,6 +278,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
   };
   /** The last call made and answered, and how many times in a row it has been exactly that. */
   const repeat = { key: null, count: 0 };
+  let declined = 0;
   // A search, a fetch or a question to the advisor runs on the API's side, inside the request: its call and what came back are blocks of
   // the reply. Each is said as any call and its answer are — as it streams, or from the whole reply when nothing streamed — and once: a
   // paused turn's answer comes with the next reply. One the request ended on is answered here, so nothing is left running on the screen.
@@ -396,9 +404,11 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
       else if (repeat.count >= REPEAT_NUDGE_AT) results[i] = { ...results[i], content: `${results[i].content}${repeated(repeat.count)}` };
     }
     // The advisor asked again and again is the same, and its tool cannot be taken away: the model is told so once, and then stopped.
-    if (looping || advisor.asked >= ADVISOR_STOP_AT) {
+    // So is a model the user has said no to, again and again: each no is final, and three of them end the conversation.
+    declined += results.filter((r) => r.content === DECLINED).length;
+    if (looping || advisor.asked >= ADVISOR_STOP_AT || declined >= DECLINE_STOP_AT) {
       params.messages.push({ role: 'user', content: results });
-      stop = looping ? 'loop' : 'advisor';
+      stop = looping ? 'loop' : declined >= DECLINE_STOP_AT ? 'declined' : 'advisor';
       break;
     }
     const enough = advisor.asked >= ADVISOR_SPENT_AT && !advisor.told ? [{ type: 'text', text: ADVISOR_SPENT }] : [];
@@ -438,8 +448,9 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
  * and where the whole of a command's output goes when the model is shown only its ends — the job's own folder, or the logs.
  */
 export function contextFor(project, { jobId = null } = {}) {
-  // A job's commands are marked as its own, so what only the user may grant — taking work unverified — is refused where it is read, however it was spelled.
-  const env = jobId === null ? childEnv() : { ...childEnv(), SUMO_JOB: String(jobId) };
+  // Every command is marked as the model's, and a job's as its own: what only the user may do — change the allow list or the
+  // configuration, take work unverified, write memory as if they had said it — is refused where it is read, however it was spelled.
+  const env = { ...childEnv(), SUMO_TOOL: '1', ...(jobId === null ? {} : { SUMO_JOB: String(jobId) }) };
   const spill = jobId === null ? join(paths().logs, 'output') : join(paths().jobs, String(jobId), 'output');
   return { cwd: project.path, roots: [project.path, ...(jobId === null ? [] : [join(paths().jobs, String(jobId))])], env, spill };
 }
@@ -512,6 +523,7 @@ export function stopReason(stop) {
   if (stop === 'max_turns') return `stopped: ${MAX_TURNS} turns without an end`;
   if (stop === 'loop') return `stopped: the same call was made ${REPEAT_STOP_AT} times with the same answer`;
   if (stop === 'advisor') return `stopped: the advisor was asked ${ADVISOR_STOP_AT} times`;
+  if (stop === 'declined') return `stopped: the user declined ${DECLINE_STOP_AT} calls`;
   return null;
 }
 

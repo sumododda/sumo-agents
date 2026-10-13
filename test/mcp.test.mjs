@@ -214,7 +214,7 @@ test('with nothing configured there are no tools, nothing to describe, and nothi
   });
 });
 
-test('the allow list: nothing is allowed until the user says so; a tool, or a whole server; it is kept in the file and read fresh', async () => {
+test('the allow list: nothing is allowed until the user says so; a tool, or a whole server; it is kept in the file for the next start, and an edit to the file reaches no running process', async () => {
   await withHome(freshHome(), {}, async () => {
     configure({ demo: stdioSpec() });
     try {
@@ -225,15 +225,17 @@ test('the allow list: nothing is allowed until the user says so; a tool, or a wh
       assert.equal(registry.allowed('mcp__demo__shout'), false);
       assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo'], 'written to the file, for the next session');
       assert.equal(statSync(join(paths().home, 'mcp.json')).mode & 0o777, 0o600);
-      // Edited outside the chat meanwhile: what the file says now is what holds.
+      // Edited in the file meanwhile — by the user in another terminal, or by the model's shell: what this process holds is what it read
+      // when it connected, plus what the user allowed at the keyboard. The file is for the next start.
       setAllow('demo', 'all', true);
-      assert.equal(registry.allowed('mcp__demo__shout'), true);
+      assert.equal(registry.allowed('mcp__demo__shout'), false, 'a file edit does not open a tool in a running process');
+      assert.equal(registry.servers().find((s) => s.name === 'demo').spec.allow.includes('echo'), true, 'the screen shows what holds here');
       setAllow('demo', 'all', false);
-      assert.equal(registry.allowed('mcp__demo__shout'), false);
-      assert.equal(registry.allowed('mcp__demo__echo'), false, 'revoking the server revokes every tool of it');
+      assert.equal(registry.allowed('mcp__demo__echo'), true, 'nor does one close what the user allowed here');
       setAllow('demo', 'echo', true);
       setAllow('demo', 'echo', false);
       assert.deepEqual(readConfig().mcpServers.demo.allow, []);
+      assert.deepEqual(registry.servers().find((s) => s.name === 'demo').spec.allow, ['echo']);
       assert.equal(allowedBy({ allow: 'all' }, 'anything'), true);
       assert.equal(allowedBy({}, 'anything'), false);
       assert.throws(() => setAllow('nowhere', 'x', true), /no MCP server called nowhere/);
@@ -326,6 +328,11 @@ test('sumo mcp: servers are added without their secrets, listed with their tools
   assert.match(run(['add', 'nothing']).err, /--url|command/);
   const web = run(['add', 'web', '--url', 'http://127.0.0.1:1/mcp', '--header', 'Authorization=Bearer ${DEMO_SECRET}']);
   assert.equal(web.code, 0, web.err);
+  const clear = run(['add', 'clear', '--url', 'http://example.test/mcp', '--header', 'Authorization=Bearer ${DEMO_SECRET}']);
+  assert.equal(clear.code, 2, 'a token over plain http to a host on the network is refused');
+  assert.match(clear.err, /plain http.*clear text.*https:\/\//);
+  assert.equal(run(['add', 'tls', '--url', 'https://example.test/mcp']).code, 0);
+  assert.equal(run(['remove', 'tls']).code, 0);
 
   const listed = run([], secret);
   assert.equal(listed.code, 0, listed.err);
@@ -355,4 +362,20 @@ test('sumo mcp: servers are added without their secrets, listed with their tools
   assert.doesNotMatch(run([]).out, /web/);
   assert.equal(run(['frobnicate']).code, 2);
   assert.match(s.sumo(['help']).out, /sumo mcp/);
+});
+
+test('a call that ran out of time is said to be of unknown outcome, so it is not made again as if it had never run; a server reached in clear text over the network is refused before it connects', async () => {
+  await withHome(freshHome(), {}, async () => {
+    configure({ demo: stdioSpec({ timeout: 300 }) });
+    try {
+      const registry = await mcpReady();
+      const late = await registry.call('mcp__demo__hang', {});
+      assert.equal(late.isError, true);
+      assert.match(late.content, /did not answer within 300 ms — outcome unknown: the call may have run; check before repeating it/);
+    } finally {
+      await closeMcp();
+    }
+    await assert.rejects(connect('clear', { url: 'http://example.test/mcp' }), /plain http.*clear text/);
+    await assert.rejects(connect('clear', { url: 'http://${HOST}/mcp' }), /plain http/, 'a host a placeholder names is on the network too');
+  });
 });

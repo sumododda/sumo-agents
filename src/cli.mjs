@@ -22,6 +22,7 @@ import * as projects from './projects.mjs';
 import { detail, historyLine, line, scopeLabel } from './render.mjs';
 import { buildBundle, modelStats, outcomeLines, runScribe, scribeStatus } from './scribe.mjs';
 import { findSaved, searchTurns, taskEndedNudge } from './sessions.mjs';
+import { overlap } from './text.mjs';
 import { CHAT_EFFORTS, config, doctor, positiveInteger, setup } from './setup.mjs';
 import { colourEnabled, safeForTerminal, styles } from './tty.mjs';
 import { ftsQuery } from './text.mjs';
@@ -121,6 +122,27 @@ sumo mcp allow <name> <tool>|all      let it run without asking      sumo mcp re
 };
 
 const ADDABLE = ['preference', 'fact', 'decision', 'gotcha'];
+
+/**
+ * Who runs this command: the model's shell carries SUMO_TOOL, a job's SUMO_JOB too. Under either, what only the user does is
+ * refused — the allow list, the switches and the configuration — and a job writes no memory at all. The chat may still remember
+ * for the user, held to what the user typed: a statement none of their recent words say is kept unconfirmed, for them to say yes to.
+ */
+const fromTool = () => Boolean(process.env.SUMO_TOOL || process.env.SUMO_JOB);
+const fromJob = () => process.env.SUMO_JOB || null;
+const OWNER_ONLY = "Refused: the model's shell does not change what the user controls — the MCP allow list, the models and the configuration. If the user wants it, they run it themselves: `! sumo …`";
+const jobWrites = () => `Refused: j${fromJob()} runs this command, and a job never writes memory. Put what you learned in your report; the user, or the chat, decides what is kept.`;
+/** The scribe's bar for "the user said this": the memory shares this much of its words with a turn the user typed. */
+const SAID_BY_USER = 0.34;
+const RECENT_TURNS = 40;
+/** Whether something the user typed lately says what the memory says, so a memory the model files as the user's is really theirs. */
+function saidByUser(db, text) {
+  return db
+    .prepare('SELECT text FROM user_turns ORDER BY id DESC LIMIT ?')
+    .all(RECENT_TURNS)
+    .some((turn) => overlap(text, turn.text) >= SAID_BY_USER);
+}
+const HELD = (id) => `held as unconfirmed: nothing the user typed lately says this, so it is theirs to confirm — sumo confirm m${id}, or sumo reject m${id}`;
 /** The docs say "workflow", the store says "procedure"; whoever types either means the same thing. */
 const WORKFLOW_NAMES = ['workflow', 'procedure'];
 
@@ -148,6 +170,14 @@ const COMMANDS = {
   models: { value: [], bool: [], run: runModels },
   mcp: { value: ['url'], multi: ['env', 'header'], bool: [], run: runMcp },
 };
+
+/** Memory a job's shell never writes: it reports, and the user or the chat decides. */
+const JOB_NEVER = ['add', 'learn', 'gate', 'supersede', 'forget', 'confirm', 'reject', 'apply'];
+/** What the model's shell never changes, by command and the subcommands that change something. */
+const OWNER_COMMANDS = new Map([
+  ['mcp', (args) => ['add', 'remove', 'allow', 'revoke'].includes(args[0])],
+  ['models', (args) => ['enable', 'disable', 'discover'].includes(args[0])],
+]);
 
 function parse(argv, spec) {
   const args = [];
@@ -226,29 +256,34 @@ function savedLines({ memory: saved, similar, redacted }) {
 
 function runAdd(db, { args, flags }) {
   need(args, 2, 'add');
+  if (fromJob()) throw new UsageError(jobWrites());
   const [type, ...text] = args;
   if (WORKFLOW_NAMES.includes(type)) throw new UsageError(`a workflow has a title and steps, so it is saved with sumo learn, not sumo add:\n${LEARN_USAGE}`);
   if (!ADDABLE.includes(type)) throw new UsageError(`unknown type "${type}" — one of: ${ADDABLE.join(', ')} (for a workflow: sumo learn)`);
-  return savedLines(
-    memory.add(db, {
-      type,
-      body: text.join(' '),
-      project: flags.project,
-      topic: flags.topic,
-      pin: flags.pin,
-      supersedes: flags.supersedes === undefined ? undefined : memory.parseId(flags.supersedes),
-      provenance: flags.observed ? 'observed' : 'stated',
-    }),
-  );
+  const body = text.join(' ');
+  // From the model's shell, the user's word is checked against the user's words: an inferred memory waits unconfirmed.
+  const held = fromTool() && !saidByUser(db, body);
+  const saved = memory.add(db, {
+    type,
+    body,
+    project: flags.project,
+    topic: flags.topic,
+    pin: flags.pin,
+    supersedes: flags.supersedes === undefined ? undefined : memory.parseId(flags.supersedes),
+    provenance: held ? 'inferred' : flags.observed ? 'observed' : 'stated',
+  });
+  return savedLines(saved).concat(held ? [HELD(saved.memory.id)] : []);
 }
 
 function runLearn(db, { args, flags }) {
   need(args, 1, 'learn');
+  if (fromJob()) throw new UsageError(jobWrites());
   const body = flags['from-file'] ? readFileSync(flags['from-file'], 'utf8') : process.stdin.isTTY ? '' : readFileSync(0, 'utf8');
   if (!body.trim()) throw new UsageError('no steps given — pipe them in, or use --from-file <path>');
-  return savedLines(
-    memory.add(db, { type: 'procedure', title: args.join(' '), cue: flags.cue, gate: flags.gate, body, project: flags.project }),
-  ).concat(flags.gate ? [`gates shell commands matching: ${flags.gate}`] : []);
+  const title = args.join(' ');
+  const held = fromTool() && !saidByUser(db, [title, flags.cue ?? '', body].join(' '));
+  const saved = memory.add(db, { type: 'procedure', title, cue: flags.cue, gate: flags.gate, body, project: flags.project, provenance: held ? 'inferred' : 'stated' });
+  return savedLines(saved).concat(flags.gate ? [`gates shell commands matching: ${flags.gate}`] : [], held ? [HELD(saved.memory.id)] : []);
 }
 
 function runGate(db, { args }) {
@@ -703,6 +738,7 @@ export async function main(argv) {
     if (command === 'doctor') return runDoctor();
     if (command === 'config') {
       const { args } = parse(rest, { value: [], bool: [] });
+      if (args[1] !== undefined && fromTool()) throw new UsageError(OWNER_ONLY);
       process.stdout.write(`${config(args[0], args[1]).join('\n')}\n`);
       return 0;
     }
@@ -711,6 +747,8 @@ export async function main(argv) {
     const spec = Object.hasOwn(COMMANDS, command) ? COMMANDS[command] : null;
     if (!spec) throw new UsageError(`unknown command "${command}" — see: sumo help`);
     const parsed = parse(rest, spec);
+    if (JOB_NEVER.includes(command) && fromJob()) throw new UsageError(jobWrites());
+    if (OWNER_COMMANDS.has(command) && fromTool() && OWNER_COMMANDS.get(command)(parsed.args)) throw new UsageError(OWNER_ONLY);
     const db = openDb();
     try {
       const lines = await spec.run(db, parsed);

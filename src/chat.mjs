@@ -10,7 +10,7 @@ import { runDream } from './dream.mjs';
 import { openWatchTab, runHerdr } from './herdr.mjs';
 import { appendLive, endLive, getJob, newJob, parseJobId, reportOf, startLive, tell as tellJob } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
-import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, textOf, thinkingFor, withMcp, withServers } from './loop.mjs';
+import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, TAMPER_REFUSED, tampersMarker, textOf, thinkingFor, withMcp, withServers } from './loop.mjs';
 import { closeMcp, compactInput, gateMcp, isMcpTool, mcpLines, mcpReady, splitMcpName } from './mcp.mjs';
 import { assertOn, MODEL_IDS, MODELS, modelId, usableModels } from './catalog.mjs';
 import { takeLock } from './lock.mjs';
@@ -99,6 +99,13 @@ export function injection(text, model, messages = []) {
 }
 
 const asText = (text) => ({ role: 'user', content: [{ type: 'text', text: `<sumo>\n${text}\n</sumo>` }] });
+/** Something that happened — a background job's report — as a block of a user turn: labelled as an event, never wrapped as operator text. */
+const eventBlock = (text) => ({ type: 'text', text: `<event>\n${text}\n</event>` });
+
+/** Automated turns in a row — a report read, which delegates, which reports — before the reports wait for the user's next message instead. */
+const MAX_WOKEN = 3;
+/** Jobs at work here at once: each report can start a turn, and each turn can delegate again. */
+const MAX_JOBS = 4;
 
 /** One line per tool call, so the user can watch the work: the command, or the edit and its file. */
 export function describeCall(call) {
@@ -274,6 +281,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   const stoppedByUser = new Set();
   /** What background jobs reported and the model has not read yet: `{ id, text, quiet }`. */
   const reports = [];
+  /** Turns nobody typed since the user last did: past MAX_WOKEN, what the jobs report waits for the user. */
+  let woken = 0;
   /** The memory page, once /memory has asked for it: the promise of its address. */
   let page = null;
   const ledger = { kind: 'chat', sessionId: null };
@@ -393,6 +402,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     if (isMcpTool(call.name)) return gateMcp(call, { approve, signal: stopper.signal });
     if (call.name !== BASH_TOOL.name) return null;
     const command = String(call.input?.command ?? '');
+    if (tampersMarker(command)) return { content: TAMPER_REFUSED, isError: true };
     const gate = event('pre-tool', { tool_name: 'bash', tool_input: { command } });
     if (gate) return { content: JSON.parse(gate).deny, isError: true };
     const pass = PASS_RUN.exec(command);
@@ -412,6 +422,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
    * `callId` is the delegate call's own, so a screen can show the job under the call that started it.
    */
   async function delegate(input, callId = null) {
+    // Counted where a run begins, before anything is awaited: five calls in one reply are judged one after another, not all at once.
+    if (jobs.size >= MAX_JOBS) throw new UsageError(`${[...jobs.keys()].map((j) => `j${j}`).join(', ')} are at work already — ${MAX_JOBS} at once is the most; wait for a report`);
     const own = background ? new AbortController() : null;
     const signal = own?.signal ?? stopper.signal;
     let claimed = null;
@@ -554,9 +566,13 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
    * Null when nothing is waiting — a job the user stopped waits for the next message instead.
    */
   async function wake() {
-    if (!reports.some((r) => !r.quiet)) return null;
+    if (waiting() === 0) return null;
+    woken++;
     return say(reports.splice(0).map((r) => r.text).join('\n\n'), '', [], { automated: true });
   }
+
+  /** How many reports wait for a turn of their own: none once MAX_WOKEN automated turns have run in a row — they wait for the user's next message. */
+  const waiting = () => (woken >= MAX_WOKEN ? 0 : reports.filter((r) => !r.quiet).length);
 
   /** The job's tab in Herdr, showing its work: its pane, or why there is none — the job runs here either way. A watcher that never starts in it is said when it gives up. */
   function watchTab(job) {
@@ -680,13 +696,16 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       watch({ type: 'route', ...routed });
     }
     settleTail();
-    // A resumed session is told so with its first turn, and what background jobs reported while nobody was looking rides in with a message
-    // too. An automated turn is that report itself: nothing in it is the user's, so nothing of it is kept as theirs.
-    const injected = [note, ...(automated ? [] : [...reports.splice(0).map((r) => r.text), event('prompt', { prompt: said, context_tokens: lastContext, guide })])].filter(Boolean).join('\n');
+    // A resumed session is told so with its first turn. An automated turn is a report itself: nothing in it is the user's, so nothing of it is kept as theirs.
+    const injected = [note, ...(automated ? [] : [event('prompt', { prompt: said, context_tokens: lastContext, guide })])].filter(Boolean).join('\n');
     noteGuides(injected);
     note = null;
+    if (!automated) woken = 0;
     const pictures = images.flatMap(({ label, mediaType, data }) => [{ type: 'text', text: label }, { type: 'image', source: { type: 'base64', media_type: mediaType, data } }]);
-    const at = params.messages.push(automated ? asText(text) : { role: 'user', content: [...pictures, { type: 'text', text }] }) - 1;
+    // What background jobs reported while nobody was looking rides in with the message, as blocks of its own: an event in the user's turn,
+    // never operator text — a report repeats what a page or a file said, and that is nobody's instruction.
+    const events = reports.splice(0).map((r) => eventBlock(r.text));
+    const at = params.messages.push(automated ? { role: 'user', content: [eventBlock(text)] } : { role: 'user', content: [...pictures, { type: 'text', text }, ...events] }) - 1;
     spoken = true;
     if (injected) params.messages.push(injection(injected, params.model, params.messages));
     // The log keeps what memory keeps: the user's words without their secrets — and an event as an event.
@@ -727,7 +746,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       // Pictures the API refused would ride along with every later turn and be refused again: a turn refused before the model saw it keeps only its words.
       // Only a refusal of the request itself (a 4xx); a rate limit, an overload or a dropped connection says nothing against the pictures.
       const rejected = outcome.status >= 400 && outcome.status < 500 && outcome.status !== 429;
-      if (outcome.stop === 'error' && rejected && pictures.length > 0 && !params.messages.slice(at + 1).some((m) => m.role === 'assistant')) params.messages[at].content = [{ type: 'text', text }];
+      if (outcome.stop === 'error' && rejected && pictures.length > 0 && !params.messages.slice(at + 1).some((m) => m.role === 'assistant')) params.messages[at].content = [{ type: 'text', text }, ...events];
       // Stopped by the user: the turn still ended, so the scribe is woken, but nothing is asked of memory and nothing continues.
       if (outcome.stop === 'interrupted') {
         event('stop', { stop_hook_active: true });
@@ -820,7 +839,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     /** The jobs at work in the background, by id. */
     running: () => [...stops.keys()],
     /** How many background jobs have reported and wait for a turn to read them. */
-    waiting: () => reports.filter((r) => !r.quiet).length,
+    waiting,
     where,
     spent,
     tell,

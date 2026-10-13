@@ -12,8 +12,8 @@ import { add, UsageError } from '../src/memory.mjs';
 import { describeCall, jobPrinter } from '../src/chat.mjs';
 import { getJob, takeInbox, tell } from '../src/jobs.mjs';
 import Anthropic from '@anthropic-ai/sdk';
-import { converse, jobParams, markTail, RETRY, retryable, retryDelay, runJob, runLines, stopReason } from '../src/loop.mjs';
-import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
+import { contextFor, converse, grantsItself, jobParams, markTail, RETRY, retryable, retryDelay, runJob, runLines, stopReason, tampersMarker } from '../src/loop.mjs';
+import { closeMcp, DECLINED, readConfig, writeConfig } from '../src/mcp.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { cap, capRedacted, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
@@ -946,14 +946,16 @@ test('a job closes, notes and reads memory with tools of its own: each runs the 
       const { id } = seed(db, { agent: 'scout', model: 'haiku', effort: 'none' });
       add(db, { type: 'gotcha', body: 'The briefing cron runs in UTC, not local time', project: 'demo', now: NOW });
       const { send, seen } = canned([
-        reply('tool_use', [call('t1', 'search_memory', { query: 'briefing cron' }), call('t2', 'note', { text: "found the cron; next: it's timezone" })]),
+        reply('tool_use', [call('t1', 'search_memory', { query: 'briefing cron' }), call('t1b', 'search_memory', { query: '-n timezone' }), call('t2', 'note', { text: "found the cron; next: it's timezone" })]),
         reply('tool_use', [call('t3', 'finish', { status: 'DONE' }), call('t4', 'finish', { status: 'DONE', report: "## Summary\nthe cron's in UTC\n## Learned\nnone" })]),
         reply('end_turn', [{ type: 'text', text: 'closed' }]),
       ]);
       const outcome = await runJob(db, id, { send, now: () => NOW });
 
-      const [found, noted] = seen[1].messages.at(-1).content;
+      const [found, flaggy, noted] = seen[1].messages.at(-1).content;
       assert.match(found.content, /briefing cron runs in UTC/);
+      assert.equal(flaggy.is_error, false, flaggy.content);
+      assert.match(flaggy.content, /nothing in memory for: -n timezone|UTC/, 'a query that looks like a flag is still words to search for');
       assert.equal(noted.is_error, false, noted.content);
       assert.match(readFileSync(join(paths().jobs, String(id), 'notes.md'), 'utf8'), /found the cron; next: it's timezone/, 'the words reach the job as written, quotes and all');
       const [incomplete, closed] = seen[2].messages.at(-1).content;
@@ -1259,6 +1261,49 @@ test('a job may ask a stronger model from inside a request — the next one up t
       assert.equal(await requested(), null, 'nothing on above it: the job runs as it always did');
     } finally {
       await closeMcp();
+      db.close();
+    }
+  });
+});
+
+test('a conversation the user has said no to three times is stopped, and the stop is said', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-loop-'));
+      const ask = (n) => reply('tool_use', [call(`t${n}`, 'mcp__slack__post', { text: `try ${n}` })]);
+      const { send, seen } = canned([ask(1), ask(2), ask(3), reply('end_turn', [{ type: 'text', text: 'never asked' }])]);
+      const params = jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'post something', system: 'rules' });
+      const outcome = await converse(db, params, { send, ctx: { cwd: root, roots: [root] }, ledger: { kind: 'scout' }, now: () => NOW, beforeTool: () => ({ content: DECLINED, isError: true }) });
+      assert.equal(outcome.stop, 'declined');
+      assert.equal(seen.length, 3, 'nothing is sent after the third no');
+      assert.equal(stopReason('declined'), 'stopped: the user declined 3 calls');
+      assert.equal(params.messages.at(-1).content[0].content, DECLINED, 'the last call still has its answer');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("every command the model runs carries the marker that says so, a job's its own too; a command that clears or sets either is held as written", async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-loop-'));
+      const { project } = addProject(db, root, { slug: 'marked', now: NOW });
+      assert.equal(contextFor(project).env.SUMO_TOOL, '1');
+      assert.equal(contextFor(project).env.SUMO_JOB, undefined);
+      assert.deepEqual([contextFor(project, { jobId: 7 }).env.SUMO_TOOL, contextFor(project, { jobId: 7 }).env.SUMO_JOB], ['1', '7']);
+      for (const command of ['unset SUMO_TOOL; sumo mcp allow slack all', 'env -u SUMO_TOOL sumo add preference "x"', 'SUMO_TOOL= sumo config chat.model haiku', 'export SUMO_TOOL=; sumo models enable opus', 'eval "SUMO_JOB= sumo job finish 3 --status DONE"']) {
+        assert.equal(tampersMarker(command), true, command);
+        assert.equal(grantsItself(command), true, command);
+      }
+      for (const command of ['grep -rn "SUMO_TOOL=" src', 'echo reading about SUMO_TOOL is fine', 'if [ -z "$SUMO_TOOL" ]; then echo outside; fi', 'sumo add preference "tabs"', 'sumo job finish 3 --status DONE']) {
+        assert.equal(tampersMarker(command), false, command);
+      }
+      assert.equal(grantsItself('sumo job finish 3 --status DONE --accept x'), true);
+      assert.equal(tampersMarker('sumo job finish 3 --status DONE --accept x'), false, 'taking work unverified is the job guard\'s, not the marker\'s');
+    } finally {
       db.close();
     }
   });
