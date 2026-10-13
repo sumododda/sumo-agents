@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, sep } from 'node:path';
+import { isAdvisorTool } from './advisor.mjs';
 import { compactInput, isMcpTool, splitMcpName } from './mcp.mjs';
 import { REPO_ROOT } from './paths.mjs';
 import { elapsed } from './text.mjs';
@@ -426,6 +427,10 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     // The web: what was searched for or which page was read, and under it the pages found or the page and its size.
     const detail = String(input.query ?? input.url ?? '').slice(0, SHOWN_COMMAND_CHARS);
     return { title: call.name === WEB_SEARCH_TOOL.name ? 'Search' : 'Fetch', detail, lines: result ? output() : [] };
+  }
+  if (isAdvisorTool(call)) {
+    // The advisor: who was asked. The advice is the model's alone to read, so under it only that it came, or why it did not.
+    return { title: 'Advisor', detail: String(input.asked ?? ''), lines: result ? output() : [] };
   }
   if (call.name !== EDITOR_TOOL.name) {
     // A job's own tools: what it was given in a line, what came back under it.

@@ -139,6 +139,10 @@ test('where new projects are made is a directory that is there, and the days scr
   assert.match(s.sumo(['config', 'scratch.days']).out, /scratch\.days = 14/);
   assert.match(s.sumo(['config', 'scratch.days', '30']).out, /scratch\.days = 30/);
   for (const bad of ['0', 'soon', '1.5']) assert.equal(s.sumo(['config', 'scratch.days', bad]).code, 2, bad);
+
+  assert.match(s.sumo(['config', 'jobs.advisor']).out, /jobs\.advisor = off/);
+  assert.match(s.sumo(['config', 'jobs.advisor', 'on']).out, /jobs\.advisor = on/);
+  assert.match(s.sumo(['config', 'jobs.advisor', 'opus']).err, /jobs\.advisor is on or off/);
 });
 
 test('config reads defaults, stores changes and rejects names it does not know', () => {

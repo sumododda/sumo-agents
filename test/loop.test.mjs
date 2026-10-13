@@ -5,8 +5,9 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { setModel } from '../src/catalog.mjs';
-import { openDb } from '../src/db.mjs';
+import { advisorOf } from '../src/advisor.mjs';
+import { MODELS, setModel } from '../src/catalog.mjs';
+import { openDb, setMeta } from '../src/db.mjs';
 import { add, UsageError } from '../src/memory.mjs';
 import { describeCall, jobPrinter } from '../src/chat.mjs';
 import { getJob, takeInbox, tell } from '../src/jobs.mjs';
@@ -1162,6 +1163,100 @@ test('a job gets the MCP tools too, deferred behind tool search and named in its
       assert.equal(asked[0].job, id);
       assert.equal(asked[0].tool, 'echo');
       assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo']);
+    } finally {
+      await closeMcp();
+      db.close();
+    }
+  });
+});
+
+test('a job may ask a stronger model from inside a request — the next one up that is on, behind a setting: what the advisor read is paid at its own price on a ledger row of its own, a turn that asked is not counted twice in the context, and asked three times the job is told to stop, at six it is stopped', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      assert.equal(advisorOf('haiku', MODELS), 'sonnet');
+      assert.equal(advisorOf('sonnet', MODELS), 'opus');
+      assert.equal(advisorOf('opus', MODELS), 'fable');
+      assert.equal(advisorOf('fable', MODELS), null, 'nothing is above it');
+      assert.equal(advisorOf('sonnet', ['haiku', 'sonnet', 'fable']), 'fable', 'a model that is off is passed over');
+      assert.equal(advisorOf('opus', ['haiku', 'sonnet', 'opus']), null, 'a model is never its own advisor');
+
+      const job = { agent: 'worker', model: 'sonnet', effort: 'medium' };
+      const plain = jobParams({ job, text: 'the brief', system: 'rules' });
+      const advised = () => jobParams({ job, text: 'the brief', system: 'rules', advisor: 'opus' });
+      assert.equal(plain.tools.some((t) => t.name === 'advisor'), false);
+      assert.equal(plain.system[0].text, 'rules');
+      assert.deepEqual(advised().tools, [...plain.tools, { type: 'advisor_20260301', name: 'advisor', model: 'claude-opus-5-5', max_uses: 1 }], 'once a request: the limit cannot be set for a whole job');
+      assert.deepEqual(advised().betas, [...plain.betas, 'advisor-tool-2026-03-01']);
+      assert.match(advised().system[0].text, /^rules\n\nYou have an advisor/, 'the model cannot be made to ask: it is told when to');
+
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-advisor-'));
+      const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }) };
+      const ask = { type: 'server_tool_use', id: 'a1', name: 'advisor', input: {} };
+      const advice = { type: 'advisor_tool_result', tool_use_id: 'a1', content: { type: 'advisor_redacted_result', encrypted_content: 'opaque', stop_reason: 'end_turn' } };
+      const content = [ask, advice, { type: 'text', text: 'retryRequest.' }];
+      // The usage of a real reply that asked once: the top counts the job's own model over its two passes, and the advisor is only among the iterations.
+      const usage = {
+        input_tokens: 118, cache_creation_input_tokens: 1686, cache_read_input_tokens: 1270, output_tokens: 111,
+        iterations: [
+          { type: 'message', input_tokens: 116, output_tokens: 26, cache_read_input_tokens: 0, cache_creation_input_tokens: 1270 },
+          { type: 'advisor_message', model: 'claude-opus-5-5', input_tokens: 154, output_tokens: 438, cache_read_input_tokens: 0, cache_creation_input_tokens: 2813 },
+          { type: 'message', input_tokens: 2, output_tokens: 85, cache_read_input_tokens: 1270, cache_creation_input_tokens: 416 },
+        ],
+      };
+      const watching = () => {
+        const said = [];
+        return { said, onTool: (c) => said.push(`call ${describeCall(c)}`), onResult: (c, r) => said.push(`${r.isError ? 'failed' : 'answer'} ${c.id}: ${r.content}`) };
+      };
+      const seen = watching();
+      const params = advised();
+      const outcome = await converse(db, params, { send: async () => ({ ...reply('end_turn', content, usage), model: 'claude-sonnet-5-5' }), ctx, ledger: { kind: 'worker' }, now: () => NOW, onTool: seen.onTool, onResult: seen.onResult });
+      assert.deepEqual(seen.said, ['call advisor: opus', 'answer a1: advice given'], 'who was asked; the advice itself is encrypted and is not shown');
+      assert.deepEqual(params.messages[1].content, content, 'the call and the advice go back as they came: the API reads the advice from them');
+      assert.equal(outcome.totals.toolCalls, 1);
+      assert.ok(Math.abs(outcome.totals.costUsd - (0.005815 + 0.023441)) < 1e-9, `the job's own tokens at its price and the advisor's at the advisor's, not ${outcome.totals.costUsd}`);
+      assert.equal(outcome.totals.inputTokens, 3074 + 2967);
+      assert.equal(outcome.totals.outputTokens, 111 + 438);
+      assert.equal(outcome.totals.contextTokens, 2 + 1270 + 416 + 85, 'what the conversation holds is what the last pass read and wrote, not both passes added up');
+      assert.deepEqual(
+        db.prepare('SELECT model, note, input_tokens, output_tokens FROM model_runs ORDER BY id').all().map((r) => ({ ...r })),
+        [
+          { model: 'claude-sonnet-5-5', note: 'turn 1 end_turn', input_tokens: 3074, output_tokens: 111 },
+          { model: 'claude-opus-5-5', note: 'turn 1 advisor', input_tokens: 2967, output_tokens: 438 },
+        ],
+      );
+
+      const down = watching();
+      await converse(db, advised(), { send: async () => reply('end_turn', [ask, { ...advice, content: { type: 'advisor_tool_result_error', error_code: 'overloaded' } }, { type: 'text', text: 'on my own, then' }]), ctx, ledger: { kind: 'worker' }, now: () => NOW, onTool: down.onTool, onResult: down.onResult });
+      assert.deepEqual(down.said, ['call advisor: opus', 'failed a1: advisor failed: overloaded']);
+      assert.deepEqual(toolView({ ...ask, input: { asked: 'opus' } }, { content: 'advice given', isError: false }), { title: 'Advisor', detail: 'opus', lines: [{ text: 'advice given', tone: 'plain' }] });
+
+      // Asked at every step: the tool cannot be taken away mid-conversation, so the job is told once, and then stopped.
+      let n = 0;
+      const asking = async () => (n++, reply('tool_use', [{ ...ask, id: `a${n}` }, { ...advice, tool_use_id: `a${n}` }, call(`t${n}`, 'bash', { command: `echo ${n}` })]));
+      const leaning = advised();
+      const stopped = await converse(db, leaning, { send: asking, ctx, ledger: { kind: 'worker' }, now: () => NOW });
+      assert.equal(stopped.stop, 'advisor');
+      assert.equal(stopped.turns, 6);
+      const notes = leaning.messages.filter((m) => m.role === 'user').slice(1).map((m) => m.content.filter((b) => b.type === 'text').map((b) => b.text));
+      assert.deepEqual(notes.map((texts) => texts.length), [0, 0, 1, 0, 0, 0], 'said once, with the answers of the turn that asked the third time');
+      assert.match(notes[2][0], /the advisor has been asked 3 times/);
+      assert.equal(stopReason('advisor'), 'stopped: the advisor was asked 6 times');
+
+      // A run reads the setting and the switches as they are now.
+      const { id } = seed(db);
+      const requested = async () => {
+        const { send, seen: sent } = canned([reply('end_turn', [{ type: 'text', text: 'not closing' }]), reply('end_turn', [{ type: 'text', text: 'still not' }])]);
+        await runJob(db, id, { send, now: () => NOW });
+        return sent[0].tools.find((t) => t.name === 'advisor')?.model ?? null;
+      };
+      assert.equal(await requested(), null, 'off until it is turned on');
+      setMeta(db, 'config.jobs.advisor', 'on');
+      assert.equal(await requested(), 'claude-opus-5-5');
+      setModel(db, 'opus', false, NOW);
+      assert.equal(await requested(), 'claude-fable-5-1', 'the next one up that is on');
+      setModel(db, 'fable', false, NOW);
+      assert.equal(await requested(), null, 'nothing on above it: the job runs as it always did');
     } finally {
       await closeMcp();
       db.close();

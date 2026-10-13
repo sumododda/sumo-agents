@@ -1,9 +1,10 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { ADVISOR_BETA, ADVISOR_SPENT, ADVISOR_SPENT_AT, ADVISOR_STOP_AT, advisorIn, advisorLine, advisorOf, advisorResult, advisorRuns, advisorTool, isAdvisorCall, isAdvisorResult } from './advisor.mjs';
 import { anthropicClient, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
 import { MODEL_IDS, modelId, MODELS, usableModels } from './catalog.mjs';
-import { tx } from './db.mjs';
+import { getMeta, tx } from './db.mjs';
 import { handleEvent } from './hooks.mjs';
 import { brief, getJob, takeInbox } from './jobs.mjs';
 import { isJobTool, jobTools, runJobTool } from './jobtools.mjs';
@@ -13,6 +14,7 @@ import { UsageError } from './memory.mjs';
 import { costOf, logRun, usageOf } from './model.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
+import { CONFIG_DEFAULTS } from './setup.mjs';
 import { BASH_TOOL, childEnv, EDITOR_TOOL, INTERRUPTED, runTool } from './tools.mjs';
 import { isWebCall, isWebResult, WEB_TOOLS, webResult } from './web.mjs';
 
@@ -107,10 +109,14 @@ export function paramsFor({ model, effort, tools, text, system }) {
   return params;
 }
 
-/** The request for a job: tools by role — the web for the one that looks — the MCP tools behind them, effort by route, the brief as the one user turn. */
-export function jobParams({ job, text, system = systemPrompt(), mcp = [] }) {
-  const own = [...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent), ...(job.agent === 'scout' ? WEB_TOOLS : [])];
-  return paramsFor({ model: job.model, effort: job.effort, tools: withMcp(own, mcp), text, system });
+/**
+ * The request for a job: tools by role — the web for the one that looks — the MCP tools behind them, effort by route, the brief as the one user turn.
+ * With an `advisor` it may ask that model: the tool, the beta it is under, and the line that says when asking is worth it.
+ */
+export function jobParams({ job, text, system = systemPrompt(), mcp = [], advisor = null }) {
+  const own = [...(job.agent === 'worker' ? [BASH_TOOL, EDITOR_TOOL] : [BASH_TOOL]), ...jobTools(job.agent), ...(job.agent === 'scout' ? WEB_TOOLS : []), ...(advisor ? [advisorTool(advisor)] : [])];
+  const params = paramsFor({ model: job.model, effort: job.effort, tools: withMcp(own, mcp), text, system: advisor ? `${system}\n\n${advisorLine(advisor)}` : system });
+  return advisor ? { ...params, betas: [...params.betas, ADVISOR_BETA] } : params;
 }
 
 /** A conversation's own tools with the MCP ones after them, behind the search tool that finds them; just its own when there are none. */
@@ -226,6 +232,14 @@ const pause = (ms, signal) =>
 
 /** One tool call and its answer as one string, so a call made again with the same answer is seen to be the same. */
 const sameAs = (call, result) => `${call.name}\n${JSON.stringify(call.input ?? {})}\n${result.content}`;
+/**
+ * What the conversation holds after a reply: what its last pass read and wrote. A reply the API made in several passes —
+ * the model asked the advisor, and went on — counts every pass at the top of its usage, and so the conversation more than once.
+ */
+function contextOf(model, usage) {
+  const last = usageOf(model, usage?.iterations?.findLast((entry) => entry.type === 'message') ?? usage);
+  return last.inputTokens + last.outputTokens;
+}
 const repeated = (count) => `\n[sumo: this is the same call with the same answer, ${count} times in a row — doing it again changes nothing. Do something else, or stop and say what blocks you.]`;
 
 /**
@@ -257,25 +271,30 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
   };
   /** The last call made and answered, and how many times in a row it has been exactly that. */
   const repeat = { key: null, count: 0 };
-  // A search or a fetch runs on the API's side, inside the request: its call and what came back are blocks of the reply. Each is said
-  // as any call and its answer are — as it streams, or from the whole reply when nothing streamed — and once: a paused turn's answer
-  // comes with the next reply. One the request ended on is answered here, so nothing is left running on the screen.
-  const web = { said: new Set(), open: new Map() };
+  // A search, a fetch or a question to the advisor runs on the API's side, inside the request: its call and what came back are blocks of
+  // the reply. Each is said as any call and its answer are — as it streams, or from the whole reply when nothing streamed — and once: a
+  // paused turn's answer comes with the next reply. One the request ended on is answered here, so nothing is left running on the screen.
+  const hosted = { said: new Set(), open: new Map() };
+  // Whom this conversation may ask, how many times it has, and whether it was told that is enough.
+  const advisor = { name: advisorIn(params.tools), asked: 0, told: false };
   const onBlock = (block) => {
-    if (isWebCall(block) && !web.said.has(block.id)) {
-      web.said.add(block.id);
-      web.open.set(block.id, block);
+    if ((isWebCall(block) || isAdvisorCall(block)) && !hosted.said.has(block.id)) {
+      hosted.said.add(block.id);
+      if (isAdvisorCall(block)) advisor.asked++;
+      // The advisor's call names nobody: the screen is given who was asked, on a copy — the block itself goes back as it came.
+      const call = isAdvisorCall(block) ? { ...block, input: { asked: advisor.name } } : block;
+      hosted.open.set(block.id, call);
       totals.toolCalls++;
-      onTool?.(block);
-    } else if (isWebResult(block) && web.open.has(block.tool_use_id)) {
-      const call = web.open.get(block.tool_use_id);
-      web.open.delete(block.tool_use_id);
-      onResult?.(call, webResult(block));
+      onTool?.(call);
+    } else if ((isWebResult(block) || isAdvisorResult(block)) && hosted.open.has(block.tool_use_id)) {
+      const call = hosted.open.get(block.tool_use_id);
+      hosted.open.delete(block.tool_use_id);
+      onResult?.(call, isWebResult(block) ? webResult(block) : advisorResult(block));
     }
   };
-  const endWeb = () => {
-    for (const call of web.open.values()) onResult?.(call, { content: 'not finished: the request ended first', isError: true });
-    web.open.clear();
+  const endHosted = () => {
+    for (const call of hosted.open.values()) onResult?.(call, { content: 'not finished: the request ended first', isError: true });
+    hosted.open.clear();
   };
 
   while (turns < MAX_TURNS) {
@@ -288,7 +307,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
         response = await send(params, { onText, onThinking, onBlock, signal });
         break;
       } catch (cause) {
-        endWeb();
+        endHosted();
         if (signal?.aborted) return interrupted();
         const why = describeFailure(cause).slice(0, 200);
         if (attempt < retry.limit && retryable(cause)) {
@@ -308,8 +327,16 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     totals.inputTokens += usage.inputTokens;
     totals.outputTokens += usage.outputTokens;
     totals.costUsd += costOf(served, response.usage ?? {});
-    totals.contextTokens = usage.inputTokens + usage.outputTokens;
+    totals.contextTokens = contextOf(served, response.usage);
     log({ ok: true, usage }, `turn ${turns} ${response.stop_reason}`, served);
+    // What the advisor read and wrote is not in the reply's own count: it is paid at the advisor's price, and has a row under its name.
+    for (const run of advisorRuns(response.usage)) {
+      const spent = usageOf(run.model, run);
+      totals.inputTokens += spent.inputTokens;
+      totals.outputTokens += spent.outputTokens;
+      totals.costUsd += spent.costUsd;
+      log({ ok: true, usage: spent }, `turn ${turns} advisor`, run.model);
+    }
 
     // A refused reply is not kept: what streamed before the refusal is not an answer, and its calls were never made.
     const refused = response.stop_reason === 'refusal';
@@ -368,12 +395,15 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
       if (repeat.count >= REPEAT_STOP_AT) looping = true;
       else if (repeat.count >= REPEAT_NUDGE_AT) results[i] = { ...results[i], content: `${results[i].content}${repeated(repeat.count)}` };
     }
-    if (looping) {
+    // The advisor asked again and again is the same, and its tool cannot be taken away: the model is told so once, and then stopped.
+    if (looping || advisor.asked >= ADVISOR_STOP_AT) {
       params.messages.push({ role: 'user', content: results });
-      stop = 'loop';
+      stop = looping ? 'loop' : 'advisor';
       break;
     }
-    params.messages.push({ role: 'user', content: [...results, ...heard(), ...(turns === MAX_TURNS - 1 ? [{ type: 'text', text: LAST_TURN }] : [])] });
+    const enough = advisor.asked >= ADVISOR_SPENT_AT && !advisor.told ? [{ type: 'text', text: ADVISOR_SPENT }] : [];
+    if (enough.length > 0) advisor.told = true;
+    params.messages.push({ role: 'user', content: [...results, ...heard(), ...enough, ...(turns === MAX_TURNS - 1 ? [{ type: 'text', text: LAST_TURN }] : [])] });
 
     // Past the band where the work must either stop or shed its past: the conversation so far is summarized server-side, here, at the
     // end of a tool round, and goes on from the summary. A summary that cannot be had costs nothing but its request: the run goes on as it was.
@@ -399,7 +429,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     }
   }
 
-  endWeb();
+  endHosted();
   return { turns, stop, error: null, text, totals };
 }
 
@@ -436,7 +466,9 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   const project = getProject(db, job.project);
   // The MCP servers of this process are the job's too: their tools behind the search tool, their names in its prompt.
   const registry = await mcpReady();
-  const params = jobParams({ job, text: brief(db, id), system: withServers(systemPrompt(), registry), mcp: registry.tools() });
+  // Whom this job may ask, by the setting and the switches as they are now: the next model up that is on, or nobody.
+  const advisor = (getMeta(db, 'config.jobs.advisor') ?? CONFIG_DEFAULTS['jobs.advisor']) === 'on' ? advisorOf(job.model, usableModels(db)) : null;
+  const params = jobParams({ job, text: brief(db, id), system: withServers(systemPrompt(), registry), mcp: registry.tools(), advisor });
   const lock = tx(db, () => takeRunLock(id));
   const heard = () => [...(inbox?.() ?? []), ...takeInbox(id)];
   const ctx = contextFor(project, { jobId: id });
@@ -479,6 +511,7 @@ export function stopReason(stop) {
   if (stop === 'model_context_window_exceeded') return 'stopped: the conversation no longer fits in the model\'s context';
   if (stop === 'max_turns') return `stopped: ${MAX_TURNS} turns without an end`;
   if (stop === 'loop') return `stopped: the same call was made ${REPEAT_STOP_AT} times with the same answer`;
+  if (stop === 'advisor') return `stopped: the advisor was asked ${ADVISOR_STOP_AT} times`;
   return null;
 }
 

@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { isAdvisorTool } from './advisor.mjs';
 import { ago } from './card.mjs';
 import { getMeta } from './db.mjs';
 import { runDream } from './dream.mjs';
@@ -110,6 +111,7 @@ export function describeCall(call) {
   }
   if (call.name === WEB_SEARCH_TOOL.name) return `search: ${String(call.input?.query ?? '').slice(0, 120)}`;
   if (call.name === WEB_FETCH_TOOL.name) return `fetch: ${String(call.input?.url ?? '').slice(0, 120)}`;
+  if (isAdvisorTool(call)) return `advisor: ${call.input?.asked ?? ''}`;
   return call.name;
 }
 

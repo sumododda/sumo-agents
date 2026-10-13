@@ -1,12 +1,34 @@
 {
   "name": "sumo-agents",
-  "private": true,
-  "type": "module",
+  "version": "0.1.0",
   "description": "One repo you talk to: a local memory engine and working process for coding agents.",
   "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sumododda/sumo-agents.git"
+  },
+  "homepage": "https://github.com/sumododda/sumo-agents#readme",
+  "bugs": "https://github.com/sumododda/sumo-agents/issues",
+  "keywords": [
+    "agent",
+    "claude",
+    "anthropic",
+    "memory",
+    "cli"
+  ],
   "bin": {
     "sumo": "bin/sumo.mjs"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "guides/",
+    "prompts/",
+    "AGENTS.md",
+    "logo.txt",
+    "spinner.txt"
+  ],
   "engines": {
     "node": "^22.19.0 || >=24.6.0"
   },

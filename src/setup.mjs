@@ -28,6 +28,7 @@ export const CONFIG_DEFAULTS = {
   'chat.effort': 'high',
   'chat.notify': 'on',
   'guides.auto': 'on',
+  'jobs.advisor': 'off',
   'projects.home': '~',
   'scratch.days': '14',
   'model.source': 'https://huggingface.co',
@@ -305,7 +306,7 @@ export function doctor() {
   // First, so it is still visible when a terminal folds the rest away: "did the update land?" is the
   // question asked most often, and the answer is which commit this copy is running.
   const code = codeVersion();
-  check(code !== null, `code ${code ?? 'unknown'}`, 'this copy is not a git checkout, so `git pull` cannot update it — clone the repo instead', true);
+  check(code !== null, `code ${code ?? 'unknown'}`, 'neither a git checkout nor an installed package — reinstall: npm i -g sumo-agents', true);
 
   const [major, minor] = process.versions.node.split('.').map(Number);
   const nodeOk = (major === 22 && minor >= 19) || (major === 24 && minor >= 6) || major > 24;
@@ -355,8 +356,10 @@ export function doctor() {
   const herdr = commandOnPath('herdr');
   // Optional: without it a job still runs in the chat; only the tab that shows it as it works is not opened.
   check(herdr !== null, 'herdr on PATH (optional: a tab per job, to watch it work)', 'brew install herdr — jobs run without it, unseen until they end; sumo job watch <id> shows one', true);
+  // Ours is the launcher, or the shim `npm install -g` makes, which points straight at this copy's entry.
   const found = commandOnPath('sumo');
-  const ours = found !== null && existsSync(p.launcher) && realpathSync(found) === realpathSync(p.launcher);
+  const real = found === null ? null : realpathSync(found);
+  const ours = real !== null && ((existsSync(p.launcher) && real === realpathSync(p.launcher)) || real === realpathSync(ENTRY));
   check(ours, '`sumo` on PATH is this one', found ? `PATH finds ${found} instead` : 'run: sumo setup');
 
   // The chat and every job go to the API; the memory passes run locally and only fall back to it.
@@ -382,9 +385,13 @@ export function doctor() {
   return checks;
 }
 
+/** A checkout says its commit; an installed package says its version. */
 function codeVersion() {
   try {
-    return execFileSync('git', ['-C', REPO_ROOT, 'log', '-1', '--format=%h · %cs · %s'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
+    if (existsSync(join(REPO_ROOT, '.git'))) {
+      return execFileSync('git', ['-C', REPO_ROOT, 'log', '-1', '--format=%h · %cs · %s'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
+    }
+    return JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')).version ?? null;
   } catch {
     return null;
   }
@@ -422,6 +429,7 @@ export function config(key, value) {
       if (key === 'chat.effort' && !CHAT_EFFORTS.includes(value)) throw new UsageError(`no such effort "${value}" — one of: ${CHAT_EFFORTS.join(', ')}`);
       if (key === 'chat.notify' && value !== 'on' && value !== 'off') throw new UsageError('chat.notify is on or off: the bell and the notification when a long turn ends behind another window');
       if (key === 'guides.auto' && value !== 'on' && value !== 'off') throw new UsageError('guides.auto is on or off: a guide riding in with the message that asks for its kind of work, and a turn held for an edit nothing checked');
+      if (key === 'jobs.advisor' && value !== 'on' && value !== 'off') throw new UsageError('jobs.advisor is on or off: a job asking the next model up for advice, from inside its own request');
       // Stored for every later setup: one that is not a URL would fail each of them.
       if (key === 'model.source') sourceOrRefuse(value);
       // The file name decides where the bytes land and what the server is asked for: a name, never a path.

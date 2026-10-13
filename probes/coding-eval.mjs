@@ -5,6 +5,7 @@
 // make jobs come out right more often, or cheaper? Run it before such a change and after it, and compare.
 //   node --disable-warning=ExperimentalWarning probes/coding-eval.mjs                     every task, routed by the router
 //   node … probes/coding-eval.mjs --route sonnet/medium       the same model for every task: the harness is what varies
+//   node … probes/coding-eval.mjs --route sonnet/medium --advisor   the same, with jobs.advisor on: each job may ask the next model up
 //   node … probes/coding-eval.mjs --task cart-quantity,who-calls --runs 3 --json out.json
 //   node … probes/coding-eval.mjs --list
 // Each task is a small project written out fresh, handed to a job as a brief, and scored by what the job never saw:
@@ -158,7 +159,7 @@ function parseArgs(argv) {
   const wanted = value('task')?.split(',');
   const unknown = (wanted ?? []).filter((id) => !TASKS.some((t) => t.id === id));
   if (unknown.length > 0) throw new Error(`no such task: ${unknown.join(', ')} — see --list`);
-  return { list: argv.includes('--list'), route: route ? { model, effort } : null, runs: Number(value('runs') ?? 1), json: value('json'), tasks: wanted ? TASKS.filter((t) => wanted.includes(t.id)) : TASKS };
+  return { list: argv.includes('--list'), advisor: argv.includes('--advisor'), route: route ? { model, effort } : null, runs: Number(value('runs') ?? 1), json: value('json'), tasks: wanted ? TASKS.filter((t) => wanted.includes(t.id)) : TASKS };
 }
 
 async function main() {
@@ -186,7 +187,8 @@ async function main() {
     setMeta(db, 'config.model.file', modelFile);
     // The models that are off on this machine are off here too: the router must not pick one the credential does not have.
     if (switches) setMeta(db, 'models.state', switches);
-    console.log(`coding eval — ${args.tasks.length} task${args.tasks.length === 1 ? '' : 's'} × ${args.runs}, ${args.route ? `pinned to ${args.route.model}/${args.route.effort}` : 'routed by the router'}\n`);
+    if (args.advisor) setMeta(db, 'config.jobs.advisor', 'on');
+    console.log(`coding eval — ${args.tasks.length} task${args.tasks.length === 1 ? '' : 's'} × ${args.runs}, ${args.route ? `pinned to ${args.route.model}/${args.route.effort}` : 'routed by the router'}${args.advisor ? ', with the advisor' : ''}\n`);
     for (let run = 1; run <= args.runs; run++) {
       for (const task of args.tasks) {
         const result = await runTask(db, task, { route: args.route, slug: args.runs === 1 ? task.id : `${task.id}-${run}` });
@@ -195,7 +197,7 @@ async function main() {
       }
     }
     console.log(`\n${summary(results)}`);
-    if (args.json) writeFileSync(args.json, `${JSON.stringify({ at: new Date().toISOString(), route: args.route, results }, null, 2)}\n`);
+    if (args.json) writeFileSync(args.json, `${JSON.stringify({ at: new Date().toISOString(), route: args.route, advisor: args.advisor, results }, null, 2)}\n`);
   } finally {
     stopLocalServer(db);
     db.close();

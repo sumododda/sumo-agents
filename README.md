@@ -38,12 +38,13 @@ machine and is never committed, so a work laptop and a personal one learn separa
 - Optional: `herdr` (`brew install herdr`), which opens a tab per job so you can watch it work
 
 ```sh
-git clone https://github.com/sumododda/sumo-agents.git ~/sumo-agents && cd ~/sumo-agents
-npm ci                     # install locked dependencies
-node bin/sumo.mjs setup    # create ~/.sumo-agents and link `sumo` onto your PATH
-sumo doctor                # every line should say ok (warn on optional items like herdr is fine)
-sumo chat                  # start talking
+npm install -g sumo-agents  # puts `sumo` on your PATH
+sumo setup                  # create ~/.sumo-agents and fetch the router model
+sumo doctor                 # every line should say ok (warn on optional items like herdr is fine)
+sumo chat                   # start talking
 ```
+
+To work on Sumo itself, run it from a clone instead (see [Development](#development)).
 
 The first `sumo setup` asks one question: where to download the router model from. Press Enter for the default
 (Hugging Face). The 2.5 GB model file goes to `~/.sumo-agents/models/` and is skipped if already there.
@@ -66,13 +67,12 @@ sumo setup --bin-dir <dir>        # where to link `sumo` (or --no-link to skip l
 ## Update
 
 ```sh
-cd ~/sumo-agents && git pull
-npm ci        # refresh dependencies
-sumo doctor   # the first line shows the running commit; compare it with GitHub
+npm update -g sumo-agents   # the newest release
+sumo doctor                 # the first line shows the running version
 ```
 
-`sumo` runs straight from the repo, so pulled code is live immediately and the database migrates itself on
-next open. Your memory in `~/.sumo-agents/` is untouched. Start a new `sumo chat` to pick up the new code and
+Every release is published from `main` by the repository's own workflow, with provenance. The database
+migrates itself on next open. Your memory in `~/.sumo-agents/` is untouched. Start a new `sumo chat` to pick up the new code and
 `AGENTS.md`. Re-run `sumo setup` only if `sumo doctor` asks (you moved the repo or changed Node versions).
 
 ## Configuration
@@ -85,6 +85,7 @@ Set with `sumo config <key> <value>`; `sumo config` alone lists them.
 | `chat.effort` | `high` | Effort when `chat.model` is a fixed model. |
 | `chat.notify` | `on` | Bell + notification when a long turn ends in a background window. |
 | `guides.auto` | `on` | `off` stops guides from loading unasked and stops holding turns with unchecked edits. |
+| `jobs.advisor` | `off` | `on` lets a job's model ask the next model up for advice from inside a request; told at the third asking, stopped at the sixth. |
 | `projects.home` | `~` | Where new projects are created. |
 | `scratch.days` | `14` | Days before a scratch folder nothing was written in is deleted. |
 | `prime.budget` | `800` | Token cap on the memory block that starts each session. |
@@ -683,6 +684,15 @@ on a set written by the author; the local models ran at temperature 0, Haiku at 
 ---
 
 ## Development
+
+```sh
+git clone https://github.com/sumododda/sumo-agents.git ~/sumo-agents && cd ~/sumo-agents
+npm ci                     # install locked dependencies
+node bin/sumo.mjs setup    # point ~/.sumo-agents/bin/sumo at this clone instead of the package
+```
+
+Then `sumo` runs straight from the repo, so edited code is live immediately. A release is a commit on
+`main` that raises the version in `package.json`: the workflow runs the suite and publishes it.
 
 ```sh
 npm test                                                           # offline suite, recorded answers, no real model calls
