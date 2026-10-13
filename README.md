@@ -213,20 +213,27 @@ out and register it as a project.
 
 ## Memory
 
-Everything you type is stored word for word, with secrets redacted. Two background passes turn it into memory:
+Everything you type is stored as you typed it, secrets redacted (a message over 4,000 characters is cut; slash
+commands are not stored). Two background passes turn it into memory:
 
-- **Scribe** runs after turns. It reads what you said, proposes memories, and code checks each against your
-  exact words. Statements it can tie to your words are saved silently. Anything it can't is held and asked
-  as a one-line question at the next session start.
-- **Dream** runs after every three finished sessions. It reads them side by side to find contradictions,
-  repeated corrections and routines worth naming.
+- **Scribe** runs in batches: at session start and end, and after a turn once a message reads like a lasting
+  rule ("always", "never", "from now on", "remember" …), three turns are waiting, or five minutes have passed.
+  It also runs before a job is created. It proposes memories, and code checks every statement credited to you
+  against your exact words: one it can tie to them is saved silently, one it can't is held and asked as a
+  one-line question at the next session start.
+- **Dream** is checked at session start. Once three finished sessions (ended, or idle for 2 hours) are waiting,
+  it reads them side by side for contradictions, repeated corrections and routines worth naming. `/dream` or
+  `sumo dream run` starts it by hand.
 
-Only your words become memory. Nothing from web pages, files or tool output is ever saved.
+**Where memories come from.** Rules and preferences come only from your words, quoted. Two other kinds are
+saved and labelled as such: *facts scanned* from a project's own files (stack, commands), and *gotchas*
+(traps) observed while working, from the assistant's replies or a job's `## Learned` section. Instructions
+found in web pages, files or tool output are never filed as yours.
 
 ```sh
 sumo memory                            # browser page: confirm guesses, edit, forget
 sumo prime                             # exactly what a new session is shown
-sumo export [--json]                   # everything, grouped by project
+sumo export [--json]                   # current memories grouped by project (--json: every row, projects, aliases)
 sumo search "<words>" [--project S]    # search memories
 sumo search "<words>" --turns          # search what you literally typed
 sumo add <type> "<text>" [--project S] # types: preference, fact, decision, gotcha
@@ -234,21 +241,21 @@ sumo learn "<title>" --cue "<action>" [--gate '<regex>']   # teach a workflow (s
 sumo gate <workflow-id> '<regex>'|off  # shell commands a workflow must run before
 sumo confirm <id> · sumo reject <id>   # settle a pending guess
 sumo history <id>                      # what a memory replaced, and what replaced it
-sumo forget <id> [--purge]             # retire it (history kept); --purge erases it
+sumo forget <id> [--purge]             # retire it (history kept); --purge erases it, its source turn and its backup copies
 sumo scribe show                       # what the scribe would be sent right now
-sumo scribe stats                      # what the background passes have cost
-sumo backup
+sumo scribe stats                      # what every model call has cost, by kind (chat, jobs, router, scribe, dream)
+sumo backup                            # also taken automatically once a week; the newest 5 are kept
 ```
 
-Ids look like `m12` (memories) and `j3` (jobs). `sumo help` lists every command.
+Ids look like `m12` (memories) and `j3` (jobs). `sumo help` lists the everyday commands.
 
 **Details**
 
 - Corrections that differ by one word or a case-sensitive name are kept as separate statements. Similar
   memories can be flagged for you to settle.
 - One message can set separate rules for several projects.
-- Passes run one at a time and only mark the turns they actually read, so a message that arrives mid-pass
-  stays pending. Dream waits for the scribe to finish a session before consolidating it.
+- Each pass runs one at a time and only marks the turns it actually read, so a message that arrives mid-pass
+  stays pending. Dream skips sessions whose turns the scribe hasn't filed yet.
 - In `sumo memory`, unsaved edits survive filtering, scope changes and a refused save. Saving or Cancel
   clears the draft; reloading or closing the page loses it.
 
@@ -266,7 +273,7 @@ written brief becomes a **job**, routed to a model by the [router](#routing-whic
 | `reviewer` | shell, job tools | judging a change it didn't write |
 
 Job tools are `note`, `ask`, `search_memory` and `finish`. A job gets its brief (with the project card and
-your global rules), a short system prompt carrying the coding rules from `AGENTS.md`, and the tools for its role.
+your global rules), a short system prompt carrying the Coding rules from `AGENTS.md`, and the tools for its role.
 
 **In the chat, jobs run in the background.** The `delegate` call returns at once and you keep working.
 Several `delegate` calls in one reply run in parallel.
@@ -279,39 +286,43 @@ Several `delegate` calls in one reply run in parallel.
 - When a job reports, the result is drawn in the conversation and the chat model picks the work back up on
   its own. The report is marked as an automated event, never as your words.
 - Esc stops the chat's turn, not the jobs. `/stop` (or `/stop j43`) stops a job.
-- A question from a job can be answered or refused (Esc) without stopping it.
-- `/new` and `/resume` wait until no job is running. Leaving the chat stops running jobs; they can be resumed later.
+- A job asking to run an MCP tool that isn't allowed yet can be answered (`y`/`a`/`n`) or refused (Esc)
+  without stopping it. A job's own `ask` stops it as needing input; answer with `sumo job answer` and run it again.
+- `/new` and `/resume <id>` are refused while a job is running: wait for its report, or `/stop` it. Leaving
+  the chat stops running jobs; they can be resumed later.
 
-Piped, or via `sumo job run`, a delegate call simply blocks and returns the report.
+In a piped chat, a `delegate` call blocks and returns the report. `sumo job run` runs one job in the foreground.
 
 **Jobs persist.** Briefs, notes, answers, reports and check results live in `~/.sumo-agents/jobs/<id>/`. Resume
-one with `delegate` and its id, or `sumo job run <id>`. Only one worker runs per project at a time, since
-they share a working tree.
+one with `delegate` and its id, or `sumo job run <id>`. A chat runs only one worker per project at a time,
+since workers share a working tree; `sumo job new` warns when another worker is running there.
 
-**Job tools run as separate `sumo job` processes**, so a worker's checks never stall the chat or other jobs.
-A job that stops without calling `finish` is told once to close itself. The Anthropic credential never enters
-a shell: `sumo job run` and `sumo job new` typed into the chat's shell are refused with a pointer to `delegate`.
+**Job tools run as separate `sumo` processes**, so a worker's checks never stall the chat or other jobs. A job
+that stops without calling `finish` is told once to close itself. The Anthropic credential never enters a
+shell: `sumo job run` and `sumo job new` typed into the chat's shell are refused with a pointer to `delegate`.
 
 ```sh
 sumo job new --project S --title T [--agent scout|worker|reviewer]   # brief on stdin
+             [--guide fix|feature|review|none] [--reviews <id>] [--tests-may-change]
 sumo job run <id>          # run it (append & to background it)
-sumo job list [--all] · show <id> · watch <id> · brief <id>
-sumo job tell <id> · answer <id> · abandon <id>
-sumo job retry <id>        # failed, or reviewed with 3+ Important issues: same brief, previous notes attached, routed afresh
+sumo job list [--all] · show <id> · watch <id> · brief <id> · changes <id>
+sumo job tell <id> · answer <id>    # text on stdin
+sumo job abandon <id>
+sumo job retry <id>        # failed, or reviewed with 3+ Important: same task, previous notes and report attached, routed afresh
 sumo job stats [--project S]
 ```
 
 ## Routing: which model a job gets
 
 The chat model never decides this. When a job is created or retried, a local 4B model (Qwen3-4B via
-llama.cpp) reads the role, project, task and the project's history, classifies the job (kind, how much code it
-touches, risk), and answers with a model, an effort and a one-sentence reason. It runs locally, costs nothing,
-and takes about a second once loaded.
+llama.cpp) reads the role, title, task, the project's stack and history, and the models that are on. It
+classifies the job (kind, how much code it touches, risk) and answers with a model, an effort and a
+one-sentence reason. It runs locally, costs nothing, and takes about a second once loaded.
 
 ```
 created j27 [worker·sumo-agents·running] Session hygiene: context gauge …
 route: opus/xhigh — router: a new feature across hooks and sessions with tests
-run it: sumo job run 27   (append & to carry on without waiting for it)
+run it: sumo job run 27   (append & to carry on without waiting for it) — inside the chat: delegate with job 27
 ```
 
 - **The router's answer is final.** No override flags, project rules, retry ladders or floors.
@@ -323,18 +334,21 @@ run it: sumo job run 27   (append & to carry on without waiting for it)
 - **History is evidence against a route only:** a model/effort that failed in this project, or that a
   review found Important issues in. Clean runs are left out, since a router shown one keeps choosing it.
 - **A retry** is routed like a new job, plus what the previous attempt ran on and how it ended.
-- **Effort is real.** It is sent as `output_config.effort`, and the ledger records what actually ran.
+- **Effort is real.** It is sent as `output_config.effort`, and the ledger records which model actually
+  answered each request.
 - Models: `haiku`, `sonnet`, `opus`, `fable` (only those [switched on](#configuration)). Effort: `low`,
   `medium`, `high`, `xhigh`, `max`. Haiku takes no effort.
 
-**Routes are graded by reviews, not by green checks.** A worker's `DONE` only proves the checks passed. Every
-Sonnet worker here passed its checks, and the Opus reviews that followed found 1 to 7 Important issues each.
-So a reviewer's Important count is stored on the job it judged, and that is what the router's history and
+**Routes are graded by reviews, not by green checks.** A worker's `DONE` only proves the checks passed; on this
+machine, Sonnet workers that passed their checks still had Important issues found in the Opus reviews that
+followed. So when a reviewer created with `--reviews <id>` finishes, the number of items under its report's
+Findings heading is stored on the job it judged as its Important count. That is what the router's history and
 `sumo job stats` report (per role and route: jobs, done, failed, reviewed, average Important, requests, time, cost).
 
 **Testing the router.** `test/router-probes.mjs` runs the real router in a throwaway home over 18 labelled
 tasks, each with the cheapest and dearest acceptable route, and reports how many were routed too high or too
-low. Run it after changing the router's prompt, history or model:
+low. It needs `sumo setup` done (the router model and llama-server) and takes about two minutes. Run it after
+changing the router's prompt, history or model:
 
 ```sh
 node --disable-warning=ExperimentalWarning test/router-probes.mjs
@@ -496,15 +510,24 @@ images to the model, MCP resources and prompts.
 
 Checked in plain code before anything runs. No memory or model is consulted.
 
-- **Destructive or secret-reading commands are refused** with the reason: `rm -rf ~` (by any path, escaped,
-  behind `sudo`, `env`, `nice`, `timeout`, `xargs` or `command`, flags before or after the target),
-  `git reset --hard`, `git clean -f`, `DROP TABLE`, `cat .env`, … Ordinary deletes like `rm -rf node_modules`
-  still pass. Force-push is deliberately allowed. To run a refused command yourself, use `! <command>`.
-- **The editor is jailed to the project** (symlinks followed) and can't touch secret files.
+- **Destructive commands are refused** with the reason:
+  - Recursive `rm` of `/`, your home, the working directory (`.`, `*`), or anything directly under `/` or `~`
+    (by any path, escaped, behind `sudo`, `env`, `nice`, `timeout`, `xargs` or `command`, flags before or
+    after the target). Ordinary deletes like `rm -rf node_modules` pass.
+  - `git reset --hard`, `git clean -f`, `git checkout .` / `git restore .`, `git branch -D`,
+    `git stash drop` / `clear`.
+  - `DROP TABLE` / `DATABASE` / `SCHEMA` or `TRUNCATE` sent through a database client (`psql`, `mysql`,
+    `sqlite3`, …).
+  - Force-push is deliberately allowed.
+- **Secret-reading commands are refused:** printing a secret file (`cat .env`, a private key, credentials),
+  and dumping the environment (`env`, `printenv`, `declare` / `typeset`, bare `export` / `export -p` or `set`).
+  Load a `.env` with `set -a; source .env; set +a`, never print it.
+- **To run a refused command yourself,** use `! <command>`.
+- **The editor is jailed to the project** (symlinks followed) and can't touch secret files. A job may also
+  read its own job folder.
 - **Shell commands** start in the project directory but can reach other paths. They run with your full
-  environment (so probes and smoke tests can use your tokens) *minus* Sumo's own Anthropic credential.
-  Commands that only print the environment (`env`, `printenv`, bare `export` or `set`) are refused. Load a
-  `.env` with `set -a; source .env; set +a`, never print it.
+  environment (so probes and smoke tests can use your tokens) *minus* the Anthropic credentials
+  (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`).
 - **Recognized secrets in output are redacted.**
 
 ### Enforced vs. requested
@@ -518,26 +541,28 @@ request in a prompt.
 | Existing tests untouched by a worker | The `AGENTS.md` rules for work done in the chat itself |
 | Reviewers and scouts get no editor | Reviewers and scouts using their shell only to read |
 | A taught workflow's steps before a gated shell command | A worker running `sumo job baseline` first (skipping it only hurts the worker) |
-| A turn that edited files without running a declared check is held once | The nudge to start a new session; following a loaded guide |
+| A chat turn that edited files through the editor without running a declared check is held once (while `guides.auto` is on) | The nudge to start a new session; following a loaded guide |
 | No route, no job | Shell commands staying inside the project |
 | Matched destructive and secret-reading commands refused; editor jailed | |
-| Sumo's credential withheld from every command; env dumps refused; secrets redacted | |
+| Anthropic credentials withheld from the agent's commands; env dumps refused; secrets redacted | |
 | A key or token in a worker's change blocks `DONE` | |
 | A job's model and effort set on the request from its route | |
 | An MCP tool not on the allow list waits for you, or is refused with nobody to ask | |
 
 ## Context and sessions
 
-Model quality drops with the absolute size of the context, not the fraction of the window used. It is
-measurable from tens of thousands of tokens: in one coding-agent study, 8 of 10 runs passed clean, but only 3
-of 10 with ~75k tokens of extra context, relevant or not. **A new task deserves a new session.**
+Model quality drops with the absolute size of the context, not the fraction of the window used, and the drop
+is measurable from tens of thousands of tokens. **A new task deserves a new session.**
 
-- **Gauge.** The exact context size is shown in the status line (or the plain prompt, `sumo 92k>`). At 80k
-  the agent is told once to finish the current piece and suggest `/new`; at 150k, to stop and note where it is.
-- **Boundary nudge.** `sumo job finish` and `sumo job abandon` suggest `/new` when the session is already heavy.
-- **Nothing is lost.** Each turn records where you left off, and the next session's memory block brings it
-  back. Open jobs resume from their briefs. `/resume` restores a session whole for 30 days, for the price of
-  one uncached turn.
+- **Gauge.** The context size (to the nearest k) is shown in the status line, or the plain prompt
+  (`sumo opus · high 92k>`). With your next message after the context passes 80k, the agent is told once to
+  finish the current piece and suggest `/new`; past 150k, to stop and note where it is. `/new` resets this.
+- **Boundary nudge.** `sumo job finish` and `sumo job abandon` suggest `/new` when the latest chat session is
+  past 80k.
+- **Nothing is lost.** When a reply reports finished work on a project, the memory writer records where it
+  stopped (a finished job records itself), and the next session's memory block brings back the latest three.
+  Open jobs resume from their briefs. `/resume` restores a session whole for 30 days, for the price of one
+  uncached turn.
 - **Old tool output is cleared first.** Past 60k tokens the API drops the oldest tool results, keeping the
   last five; the conversation itself is untouched.
 - **Jobs are compacted, not stopped.** At 150k tokens (at the end of a tool round), a job's conversation is
@@ -552,37 +577,40 @@ terminal can't be resumed.
 
 ## How a turn runs
 
-Each session runs in Sumo's own loop: one Anthropic Messages API request per turn, with
+Each session runs in Sumo's own loop: one Anthropic Messages API request per model step, repeated until the
+model stops calling tools. The chat's request carries
 
-- **three tools:** a shell and a file editor (Anthropic-defined, so no schema is sent) and `delegate`, plus
-  any MCP tools, deferred behind tool search;
+- **its tools:** a shell and a file editor (Anthropic-defined, so no schema is sent), `delegate`, and the API's
+  web search and fetch, plus any MCP tools, deferred behind tool search (jobs get [their role's tools](#jobs-and-delegation));
 - **a frozen system prompt** that caches across turns;
-- **server-side clearing** of old tool results past 60k tokens. History is never rewritten on the client.
+- **server-side clearing** of old tool results past 60k tokens. Within a running conversation, history is
+  append-only; the exceptions are job compaction and `/resume`.
 
 **Reliability**
 
-- Overloads, rate limits and broken streams are retried up to six times, backing off from 1s to 30s (or the
-  API's `retry-after`). Each retry is shown on screen and logged. Requests the API rejects as invalid are not retried.
+- Overloads, rate limits, 5xx errors, timeouts and dropped connections or streams are retried up to six times,
+  backing off from ~1s to ~30s with jitter (or the API's `retry-after`, when it is under a minute). Each retry
+  is shown on screen and logged. Requests the API rejects as invalid are not retried.
 - A turn the API pauses on its own continues.
 - The same call with the same result three times in a row is flagged to the model; five times stops the turn.
-- The second-to-last turn of a run carries a warning, so a job that hits the turn limit still closes properly.
+- The second-to-last request of a run carries a warning, so a job that hits the limit (150) still closes properly.
 
 **What happens when**
 
 | When | What runs | Context cost |
 |---|---|---|
 | Session starts | The memory block: global preferences, workflows, projects, where you left off, open jobs, things to confirm. Overflow is reachable by search. | ≤ 800 tokens (`prime.budget`), once |
-| You send a message | Stored word for word, secrets redacted. The first mention of a project adds its card after the cached prefix. | 0, or ≤ 200 once per project |
-| Your message asks for a fix, feature or review | The matching [guide](#coding-guides) is added, once per session. | 0, or ≤ 450 once per guide |
+| You send a message | Stored (up to 4,000 characters), secrets redacted. The first mention of a project adds its card after the cached prefix. | 0, or ≤ 200 once per project |
+| Your message asks for a fix, feature or review | The matching [guide](#coding-guides) is added, once per session. | 0, or ~100–380 once per guide |
 | A command matches a guard | Refused before it runs, with the reason. | 0 |
-| A command prints more than 16k characters | Both ends are shown. The first and last 64 KB (redacted) are saved to the job folder or `~/.sumo-agents/logs/output/`, and the cut names the file so the model can read a range instead of re-running. Kept a week. | 0 |
+| A command prints more than 16k characters | Both ends are shown. The first and last 64K characters (redacted) are saved under `~/.sumo-agents/` (`jobs/<id>/output/`, or `logs/output/` for the chat), and the cut names the file so the model can read a range instead of re-running. Files older than a week are deleted on the next save. | 0 |
 | An edit's `old_str` doesn't match exactly | Retried with the file's line endings, then ignoring trailing spaces, then ignoring indentation (replacement re-indented). Still refused unless the match is unique. The result says how it matched. | 0 |
-| A shell command is gated by a taught workflow (e.g. `--gate 'gh(-axi)? pr create'`) | Held back once; the agent gets the workflow's steps, follows them, then runs it. | 0 until it fires |
-| The agent ends a turn after editing files, but no declared check ran since | It is told which files and which check, and continued once. Screen: `held: 2 files edited, npm test not run`. `git status` doesn't count; a project with no declared check is cleared by any command. | ≤ 60 tokens + 1 request |
+| A shell command is gated by a taught workflow (e.g. `--gate 'gh(-axi)? pr create'`) | Held back once per session (unless its steps already came in with your message); the agent gets the workflow's steps, follows them, then runs it. | 0 until it fires |
+| The chat ends a turn after editing files, but no declared check ran since | It is told which files and which check, and continued once. Screen: `held: 2 files edited, npm test not run`. `git status` doesn't count; a project with no declared check is cleared by any command. Edits made through the shell aren't seen; `guides.auto off` turns this off. | ~50–75 tokens + 1 request |
 | The agent ends a turn on a question | Memory is searched with the question's words. A close match is handed back once and the agent continues; otherwise the question reaches you. | 0 unless memory answers |
-| A turn ends | The scribe is scheduled if a pending turn has a standing instruction, three turns are waiting, or it last ran 5+ minutes ago. Session start and end also sweep pending turns. | 0 |
-| Three sessions finish | The dream pass runs. | 0 |
-| Every model response | One ledger row: tokens in, cached, written, out, cost, and the job or session. `sumo scribe stats` sums them. | 0 |
+| A turn ends | The scribe runs if a pending message reads like a standing rule, three turns are waiting, or it last ran 5+ minutes ago (or never). Session start and end also sweep pending turns. | 0 |
+| A session starts and three finished sessions are waiting | The dream pass starts in the background. | 0 |
+| Every API request (retries, failures and compactions included) | One ledger row: tokens in, cached, written, out, cost, the model that answered, and the job or session. `sumo scribe stats` sums them by kind. | 0 |
 
 ---
 
