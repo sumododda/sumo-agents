@@ -349,15 +349,18 @@ for that kind of work.
 **Auto-matching.** Each guide starts with a `when:` line of trigger words (`fix, bug, broken, failing, crash, …`).
 Your message is matched against them by word stem — no model, no delay. Rules:
 
-- At most one guide per message, and each guide once per session.
+- At most one guide per message, and each guide once per session. (`/fix`, `/feature` and `/review` load their
+  guide every time, even if it was already shown or a taught workflow matched.)
 - Priority: review, then fix, then feature ("review my fix" is a review; "fix the broken add button" is a fix).
 - A taught workflow that matches the same message wins.
 - In the chat, `review` becomes "delegate this to a reviewer", since code written in a session is never judged in it.
 - The screen shows `guide: fix` when one loads. `guides.auto off` disables matching; the commands still work.
-- `test/guides.test.mjs` holds 50 realistic messages with the guide each should load.
+- `test/guides.test.mjs` holds 50 realistic messages with the guide each should load; 7 are known misses the
+  test accepts.
 
-**For jobs:** `sumo job new --guide fix` pastes the guide into the brief. Without `--guide`, a worker gets the
-guide its title and goal ask for (`--guide none` for none), a reviewer always gets `review.md`, a scout gets none.
+**For jobs:** `sumo job new --guide fix` pastes the guide into the brief. Without `--guide`, a worker gets `fix` or
+`feature` if its title and goal ask for one (not when `guides.auto` is off; `--guide none` for none), a reviewer
+always gets `review.md`, and a scout gets none.
 
 ## Verifying a worker's DONE
 
@@ -386,15 +389,18 @@ the job folder.
 | Files changed while checks ran | **Blocks DONE**; verify again once files settle |
 | A secret was added (`ghp_…`, `sk-…`, `AKIA…`, PEM block, JWT) or a secret file (`.env`, `*.pem`, `id_rsa`) is in the change | **Blocks DONE** |
 | A check was already failing at baseline and still is | Allowed; both outputs kept |
-| `look at:` added `eslint-disable`, `@ts-ignore`, `# noqa`, `.skip(`, `t.Skip(` … | Allowed; printed for a human to judge |
+| `look at:` added `eslint-disable`, `@ts-ignore`, `# noqa`, `it.skip` / `test.only`, `t.Skip(` … | Allowed; printed for a human to judge |
+| `look at:` a checker's settings file changed (`tsconfig*.json`, eslint, jest/vitest config, `pytest.ini`, `ruff.toml`, …) | Allowed; printed for a human to judge |
 | `look at:` added `password=`, `token=`, or a long random string | Allowed; printed for a human to judge |
 | `note:` not a git repo, or no check commands | Stated, never guessed |
 
-**Escape hatches.** A refused worker is told how to proceed: fix it, finish as `FAILED`, or `sumo job ask`. If
-the checks can't run on this machine, `--accept "<why>"` takes the work as `DONE (UNVERIFIED …)`. So a plain
-`STATUS: DONE` always means the checks agreed.
+**Escape hatches.** A refused worker is told how to proceed: fix it, finish as `FAILED`, or `sumo job ask`. When
+the checks can't run on this machine, `--accept "<why>"` skips them and takes the work as `DONE (UNVERIFIED …)`.
+So a worker's plain `STATUS: DONE` means every declared check agreed (a project with none says so in a `note:`).
+Only worker jobs are verified; a scout's or reviewer's `DONE` is not.
 
-- A baseline requested after the first edit is refused (it would hide the job's own breakage).
+- In a git project, a baseline requested after the first edit is refused (it would hide the job's own
+  breakage); every failing check then counts as the job's.
 - New test files are always welcome; only pre-existing tests are protected.
 
 **The report** has two extra sections: **Concerns** (finished but unsure) and **Decisions** (each call made on
@@ -409,7 +415,8 @@ sumo job new --project <slug> --agent reviewer --title "review the tree"        
 ```
 
 Put what was asked for on stdin; the review is against that, not taste. The reviewer gets the full change as
-one file (`changes.diff`; `sumo job changes <id>` writes it for any worker job), the original brief, and the
+one file (`changes.diff`; `sumo job changes <id>` writes it for any worker job in a git
+repository), the original brief, and the
 author's report marked as *claims, not facts*.
 
 It reports: asked vs. built · findings, worst first · minor items (listed, never a reason to reopen) · what the
@@ -431,7 +438,7 @@ fetches as `Fetch(…)` with size, and cited pages are listed under the reply.
 - **This is not a hard boundary.** The chat that reads a page also has a shell with your environment; only the
   model's judgment stands between them.
 - **Cost:** a search is $0.01 plus tokens (logged in the ledger); a fetch is tokens only. One search plus one
-  page is ~30k tokens of context, so research across many pages belongs in a scout.
+  page is roughly 30k tokens of context, so research across many pages belongs in a scout.
 - Pages are cut at ~20k tokens; PDFs come whole. No cap on searches per reply.
 - Both tools are called directly, because the newer code-filtered variant is refused on a Claude Code token.
 
@@ -460,13 +467,13 @@ model searches for it, so 40 unused tools cost nothing per turn and the cache is
 only names each server and its tool count. The chat and all jobs get the same tools.
 
 **Permissions.** Every call is checked against an allow list. An unlisted tool asks on the chat's screen:
-`y` once, `a` always (written to the file), `n` refuse, Esc stop the turn. Jobs delegated from the chat ask on
+`y` once, `a` always (written to the file), `n` refuse, Esc stop the turn (for a background job's call, Esc refuses just that call). Jobs delegated from the chat ask on
 the same screen, tagged with their id. With nobody to ask (`sumo job run` in a terminal, or piped chat) the call
 is refused with the `sumo mcp allow` command that would permit it. A refusal is final for that call.
 
 **Behavior.** Output gets the same size cap and redaction as any tool output; images and files are described,
 not sent. A crashed server restarts on the next call; one that fails to connect is reported and skipped for the
-session. Servers connect once per `sumo chat`; config changes apply to the next one.
+session. Servers connect once per `sumo chat`, so server changes apply to the next one; allow-list changes apply at once.
 
 **Not supported yet:** the legacy HTTP+SSE transport, OAuth sign-in to remote servers (use a header token),
 images to the model, MCP resources and prompts.
