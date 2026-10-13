@@ -11,7 +11,7 @@ import { openDb } from '../src/db.mjs';
 import { openWatchTab, reportAgent, startWatcher } from '../src/herdr.mjs';
 import { finish, takeInbox } from '../src/jobs.mjs';
 import { add, UsageError } from '../src/memory.mjs';
-import { paths, REPO_ROOT } from '../src/paths.mjs';
+import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { addProject } from '../src/projects.mjs';
 import { lockFile, pruneStates, stateFile, withoutThinking } from '../src/sessions.mjs';
@@ -446,7 +446,11 @@ test('a delegated job is watched as it works, and what the user tells it reaches
 });
 
 test('a job is not made or run from the shell: the model is pointed at delegate, and other job commands still run', async () => {
-  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+  // The command that is let through runs a real `sumo`: this checkout's, on a PATH that has one wherever the test runs.
+  const bin = mkdtempSync(join(tmpdir(), 'sumo-agents-bin-'));
+  writeFileSync(join(bin, 'sumo'), `#!/bin/sh\nexec '${process.execPath}' --disable-warning=ExperimentalWarning '${ENTRY}' "$@"\n`, { mode: 0o755 });
+  const spawnLog = join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log');
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: spawnLog, PATH: `${bin}:${process.env.PATH}` }, async () => {
     const db = openDb();
     try {
       const { send, seen } = canned([
