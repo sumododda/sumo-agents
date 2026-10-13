@@ -4,3 +4,7 @@ node_modules/
 *.log
 .lavish/
 .ori/
+docs/
+BRIEFING.md
+.claude/
+.DS_Store
