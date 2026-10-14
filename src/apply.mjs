@@ -114,6 +114,12 @@ function lookalike(db, scope, body, exclude) {
   return alike ? { memory: alike, same: false } : null;
 }
 
+/** A guess already put to the user in other words — still waiting, or refused: asked once is enough. */
+function askedBefore(db, scope, body) {
+  const asked = db.prepare(`SELECT * FROM memories WHERE scope = ? AND type != 'procedure' AND state IN ('unconfirmed', 'rejected')`).all(scope);
+  return asked.find((m) => statementOf(m.body) !== statementOf(body) && overlap(body, m.body) >= LOOKS_ALIKE) ?? null;
+}
+
 /**
  * The same sentence is often proposed twice from one turn — once by a retry, once by the chat model saving it directly.
  * A repeat quotes the same words; two rules given in one sentence quote different ones, and are both kept.
@@ -161,6 +167,12 @@ function addStated(db, op, ctx, { supersedes } = {}) {
   // No scope given: what was said in the middle of work on a project belongs to that project.
   const focus = op.scope === undefined && turn ? currentProject(db, turn.session_id) : null;
   const { scope, project } = resolveScope(db, focus ? `project:${focus}` : op.scope);
+  // Nor is a guess kept that shares nothing with the turn it names: that is the assistant's reply, or what is remembered already,
+  // said in the user's name. The slow pass alone may guess past that — a pattern across conversations is what it reads for.
+  const aboutTurn = ctx.source === 'dream' || (turn !== null && overlap(body, turn.text) >= BODY_MATCHES_TURN);
+  if (!verified && !aboutTurn) throw new Rejected(`a guess about nothing the user typed, not kept — ${why}`);
+  const asked = verified ? null : askedBefore(db, scope, body);
+  if (asked) throw new Rejected(`a guess like m${asked.id}, which is ${asked.state} — not kept`);
 
   const again = savedFromTurn(db, turn?.id ?? null, scope, body, supersedes, op.quote);
   if (again) throw new Rejected(`already saved from this turn as m${again.id}`);
@@ -231,8 +243,9 @@ const HANDLERS = {
   gotcha(db, op, ctx) {
     const body = cleanBody(op);
     const { scope, project } = resolveScope(db, op.scope);
+    // A trap met twice is written up twice, in other words: the one already here stands for both.
     const twin = lookalike(db, scope, body);
-    if (twin?.same) throw new Rejected(`already known as m${twin.memory.id}`);
+    if (twin) throw new Rejected(`already known as m${twin.memory.id}`);
     const { memory: saved } = memory.add(db, { type: 'gotcha', body, project, provenance: 'observed', writtenBy: ctx.source, now: ctx.now });
     return `saved ${line(saved)}`;
   },

@@ -509,14 +509,28 @@ export function answer(db, id, text, now = new Date().toISOString()) {
   setOpenStatus(db, id, 'running', now);
 }
 
-/** The lines under "## Learned" in a report, without bullets, minus the ways of saying "nothing". */
+/**
+ * The traps under "## Learned" in a report, minus the ways of saying "nothing". A trap is a bullet with the lines it wraps
+ * onto, or — where nothing is listed — the first paragraph; what stands after them is the report going on, not a trap.
+ */
 function learnedLines(report) {
   const section = /^##\s*Learned\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(report)?.[1] ?? '';
-  return section
-    .split('\n')
-    .map((l) => l.replace(/^\s*[-*\d.)]+\s*/, '').trim())
-    .filter((l) => l.length > 12 && !/^(none|nothing|n\/a)\b/i.test(l))
-    .slice(0, MAX_LEARNED);
+  const BULLET = /^\s*(?:[-*]|\d+[.)])\s+/;
+  const listed = section.split('\n').some((l) => BULLET.test(l));
+  const traps = [];
+  let open = false;
+  for (const raw of section.split('\n')) {
+    const text = raw.replace(BULLET, '').trim();
+    if (!text) {
+      // A blank line ends a trap; with nothing listed, it ends the one paragraph there is.
+      if (!listed && traps.length > 0) break;
+      open = false;
+    } else if (BULLET.test(raw) || (!listed && !open)) {
+      traps.push(text);
+      open = true;
+    } else if (open) traps[traps.length - 1] += ` ${text}`;
+  }
+  return traps.filter((l) => l.length > 12 && !/^(none|nothing|n\/a)\b/i.test(l)).slice(0, MAX_LEARNED);
 }
 
 /**

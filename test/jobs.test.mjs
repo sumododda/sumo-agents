@@ -389,3 +389,37 @@ test('a worker is handed the guide its title and goal ask for; told none, or a s
   s.sumo(['config', 'guides.auto', 'off']);
   assert.doesNotMatch(brief(make('fix the paging', ['--agent', 'worker'])), /How this kind of work is done here/, 'off: only a named guide rides');
 });
+
+test('a trap wrapped over several lines is one memory; what stands after the traps is not one; and a trap memory holds in other words is not filed again', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  withSimba(s);
+  s.sumo(['add', 'gotcha', '`make lint` needs `PATH=$HOME/go/bin:$PATH`.', '--project', 'simba']);
+  s.sumo(['job', 'new', '--project', 'simba', '--title', 'add the column'], { input: TASK });
+  const listed = `## Summary
+Added the column.
+## Learned
+- the scan list in internal/store/paws.go is positional: a column added to the SQL
+  without touching scanPawsRun misaligns every later field
+- \`golangci-lint\` is installed in \`~/go/bin\`, not on the default PATH; \`make lint\` fails unless \`export PATH=$PATH:$HOME/go/bin\`
+
+Model/effort: not visible to me.
+`;
+  const done = s.sumo(['job', 'finish', '1', '--status', 'done'], { input: listed });
+  assert.equal(done.code, 0, done.err);
+  const saved = () => s.sql((db) => db.prepare(`SELECT body FROM memories WHERE written_by = 'worker' ORDER BY id`).all().map((r) => r.body));
+  assert.deepEqual(saved(), ['the scan list in internal/store/paws.go is positional: a column added to the SQL without touching scanPawsRun misaligns every later field']);
+
+  // Written as a paragraph, with no list: its lines are one trap, and the line after it is still not one.
+  s.sumo(['job', 'new', '--project', 'simba', '--title', 'add the test'], { input: TASK });
+  const prose = `## Summary
+Added the test.
+## Learned
+The verify step blocks DONE on any diff to a file already inside test/,
+including a purely additive one, because git reports it as modified.
+
+Model/effort: sonnet, medium.
+`;
+  assert.equal(s.sumo(['job', 'finish', '2', '--status', 'done'], { input: prose }).code, 0);
+  assert.deepEqual(saved().slice(1), ['The verify step blocks DONE on any diff to a file already inside test/, including a purely additive one, because git reports it as modified.']);
+});

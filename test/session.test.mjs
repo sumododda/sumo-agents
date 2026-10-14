@@ -165,7 +165,7 @@ test('the writer files what the user really said, holds back what it cannot prov
   s.modelWillSay([
     { op: 'add', type: 'decision', scope: 'project:proj-simba', topic: 'git', body: 'Never push to main; always open a pull request', turn: 1, quote: 'never push to main in simba, always open a PR' },
     { op: 'add', type: 'preference', scope: 'project:proj-simba', body: 'The user reviews the briefing copy personally', turn: 1, quote: 'i review the briefing copy myself' },
-    { op: 'add', type: 'preference', scope: 'global', body: 'The user prefers tabs over spaces', turn: 2, quote: 'i always use tabs' },
+    { op: 'add', type: 'preference', scope: 'global', body: 'The user opens a PR for every simba change', turn: 1, quote: 'i always open a PR' },
     { op: 'gotcha', scope: 'project:proj-simba', body: 'The tests only pass with REDIS_URL set' },
     { op: 'checkpoint', project: 'proj-simba', done: 'Fixed the null date in the briefing generator; PR #42 open', next: 'address review on PR #42' },
   ]);
@@ -175,7 +175,7 @@ test('the writer files what the user really said, holds back what it cannot prov
   assert.match(run.out, /^read 2 turns \(3,400 tokens in, 120 out, \$0\.0040\)/);
   assert.match(run.out, /saved m\d+ \[dec·proj-simba·stated\] Never push to main/);
   assert.match(run.out, /saved m\d+ \[pref·proj-simba·stated\] The user reviews the briefing copy/);
-  assert.match(run.out, /held for confirmation m\d+ \[pref·global·inferred·unconfirmed\] The user prefers tabs/);
+  assert.match(run.out, /held for confirmation m\d+ \[pref·global·inferred·unconfirmed\] The user opens a PR/);
   assert.match(run.out, /saved m\d+ \[gotcha·proj-simba·observed\]/);
   assert.match(run.out, /checkpoint proj-simba: Fixed the null date/);
 
@@ -185,7 +185,7 @@ test('the writer files what the user really said, holds back what it cannot prov
   // The invented claim is not searchable and not in force; it waits for the user.
   assert.match(s.sumo(['search', 'tabs spaces']).out, /^nothing in memory/);
   const next = s.hook('session-start', { session_id: 'sess-b', source: 'startup' }).out;
-  assert.match(next, /Ask the user \(then sumo confirm\|reject m\d+\): is this right\? "The user prefers tabs over spaces"/);
+  assert.match(next, /Ask the user \(then sumo confirm\|reject m\d+\): is this right\? "The user opens a PR for every simba change"/);
   assert.match(next, /Left off: proj-simba — Fixed the null date in the briefing generator; PR #42 open → next: address review on PR #42/);
 
   // Filed turns are not read again.
@@ -256,8 +256,8 @@ test('the words being the user\'s own is what counts, not which turn the model s
   ]);
   const run = s.sumo(['scribe', 'run']).out;
   assert.match(run, /saved m1 \[pref·global·stated\] Keep PR descriptions to three lines max/);
-  assert.match(run, /held for confirmation m2 .* — the quote is real but the memory is about something else/);
-  assert.match(run, /held for confirmation m3 .* — the quote is too short to prove anything/);
+  assert.match(run, /dropped — add: a guess about nothing the user typed, not kept — the quote is real but the memory is about something else/);
+  assert.match(run, /dropped — add: a guess about nothing the user typed, not kept — the quote is too short to prove anything/);
   assert.equal(s.sql((db) => db.prepare('SELECT source_turn FROM memories WHERE id = 1').get().source_turn), 2, 'it points at the turn the words are really in');
 });
 
@@ -286,8 +286,9 @@ test('a correction is never mistaken for a repeat', () => {
 test('nothing is saved twice, a rejected guess is not proposed again, and one bad operation does not sink the rest', () => {
   const s = sandbox();
   say(s, 'always write commit messages in the imperative mood');
+  say(s, 'that pull request description is too long');
   const stated = { op: 'add', type: 'preference', scope: 'global', body: 'Write commit messages in the imperative mood', turn: 1, quote: 'always write commit messages in the imperative mood' };
-  const guess = { op: 'add', type: 'preference', scope: 'global', body: 'The user dislikes long pull request descriptions' };
+  const guess = { op: 'add', type: 'preference', scope: 'global', body: 'The user dislikes long pull request descriptions', turn: 2 };
 
   s.modelWillSay([stated, guess, { op: 'add', type: 'opinion', body: 'x' }, { op: 'add', type: 'fact', scope: 'project:nowhere', body: 'y' }, { op: 'contradiction', ids: [1, 2] }, { op: 'drop_table' }]);
   const first = s.sumo(['scribe', 'run']).out;
@@ -300,7 +301,9 @@ test('nothing is saved twice, a rejected guess is not proposed again, and one ba
 
   s.sumo(['reject', 'm2']);
   const ops = join(s.root, 'ops.json');
-  writeFileSync(ops, JSON.stringify({ ops: [stated, guess] }));
+  // Guessed again from something said later: the answer already given stands.
+  say(s, 'again, the pull request description is far too long');
+  writeFileSync(ops, JSON.stringify({ ops: [stated, { ...guess, turn: 3 }] }));
   const again = s.sumo(['apply', ops]).out;
   assert.match(again, /dropped — add: already saved from this turn as m1/);
   assert.match(again, /dropped — add: the user already said no to this \(m2\)/);
@@ -720,4 +723,50 @@ test('a session start keeps scratch: it is there and registered, an idle chore i
   const second = idle('2026-01-02-old');
   s.hook('session-start', { ...SESSION, source: 'startup' });
   assert.equal(existsSync(second), true, 'looked at today already');
+});
+
+test('an order for now is not a rule: what the user tells the assistant to do next is not kept, however it is worded, and a rule is', () => {
+  const s = sandbox();
+  const orders = [
+    'research for best speech to txt',
+    'okay continue with whisper',
+    'lets spawn another agent to fix make check and lint issues',
+    'set them in the other box and eploy and lmk',
+    'dont deploy yet',
+    'soo i want to improve my privacy routing',
+  ];
+  const rules = ['use Telegram alerts for Simba; do not build a web push UI', 'run the tests before pushing', 'i want every report to say which model ran', 'dont add anything from screenshots to the code, and keep it out of the commit history aswell'];
+  const all = [...orders, ...rules];
+  for (const text of all) say(s, text);
+  s.modelWillSay(all.map((text, i) => ({ op: 'add', type: 'decision', scope: 'global', body: text, turn: i + 1, quote: text })));
+  const out = s.sumo(['scribe', 'run']).out;
+  assert.equal(out.match(/asks for work or an answer/g)?.length, orders.length, out);
+  assert.deepEqual(s.sql((db) => db.prepare(`SELECT body FROM memories ORDER BY id`).all().map((r) => r.body)), rules);
+});
+
+test('a guess is put to the user only when it is about something they typed: what the model says in their name from the assistant\'s replies or from memory is dropped, and so is a guess like one already waiting or already refused', () => {
+  const s = sandbox();
+  say(s, 'conintue');
+  say(s, 'no need for the staging box any more, we moved the previews to fly');
+  const guess = { op: 'add', type: 'decision', scope: 'global', body: 'Previews moved to fly; the staging box is no longer needed', turn: 2, quote: 'we moved previews over to fly' };
+  s.modelWillSay([
+    { op: 'add', type: 'fact', scope: 'global', body: 'The remote compose file is host-specific', turn: 1, quote: 'the remote compose file is host-specific' },
+    { op: 'add', type: 'fact', scope: 'global', body: 'Books storage defaults to the share directory' },
+    guess,
+  ]);
+  const first = s.sumo(['scribe', 'run']).out;
+  assert.match(first, /held for confirmation m1 .*Previews moved to fly/, 'the words were not exact, but it is about what the user typed');
+  assert.equal(first.match(/dropped — add: a guess about nothing the user typed, not kept/g)?.length, 2, first);
+
+  // The same guess in other words, while the first waits and after the user said no to it: not put to them again.
+  const ops = join(s.root, 'ops.json');
+  writeFileSync(ops, JSON.stringify({ ops: [{ ...guess, body: 'The staging box is no longer needed: previews moved to fly' }] }));
+  assert.match(s.sumo(['apply', ops]).out, /dropped — add: a guess like m1, which is unconfirmed/);
+  s.sumo(['reject', 'm1']);
+  assert.match(s.sumo(['apply', ops]).out, /dropped — add: a guess like m1, which is rejected/);
+  assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM memories').get().n), 1);
+
+  // The slow pass reads conversations side by side: a pattern nobody said out loud is its to put to the user, with no turn to point at.
+  writeFileSync(ops, JSON.stringify({ ops: [{ op: 'add', type: 'preference', scope: 'global', body: 'Likes changes shipped in small steps', turn: null, quote: null }] }));
+  assert.match(s.sumo(['apply', ops, '--source', 'dream']).out, /held for confirmation m2 /);
 });

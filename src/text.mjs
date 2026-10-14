@@ -78,15 +78,20 @@ export function clip(text, max) {
 }
 
 /** Words that mark a sentence as a standing instruction, which is worth filing right away rather than in the next batch. */
-const DURABLE = /\b(always|never|from now on|going forward|remember|don'?t ever|i (prefer|like|want|hate|use)|we (use|moved|switched|decided)|make sure|by default|every time|stop (doing|using))\b/i;
+const DURABLE = /\b(always|never|from now on|going forward|remember|don'?t ever|i (prefer|like|want(?! to\b)|hate|use)|we (use|moved|switched|decided)|make sure|by default|every time|stop (doing|using))\b/i;
 
 export const looksDurable = (text) => DURABLE.test(text);
 
 /**
  * A clause that asks for work or an answer — describe this, fix that, delegate, a question — rather than stating
  * something. Only verbs that are almost never a standing rule: "write tests first" or "keep answers short" are rules.
+ * The words people open an order with (ok, lets, so) do not hide it, and "I want to …" is the next piece of work.
  */
-const REQUEST = /(?:^|[.,:;!?)]\s+|\n\s*)(?:(?:please|now|then|also|and|so)\s+)?(?:describe|explain|delegate|fix|find|investigate|look\s+(?:at|into|for)|show\s+me|tell\s+me|give\s+me|summari[sz]e|debug|continue|(?:can|could|would|will)\s+you)\b|\?\s*$/im;
+const OPENERS = /(?:(?:please|pls|now|then|also|and|so+|ok|okay|yes|yeah|yep|na+h|just|lets|let's|let\s+us)[\s,]+)*/.source;
+const VERBS = /describe|explain|delegate|fix|find|investigate|look\s+(?:at|into|for)|show\s+me|tell\s+me|give\s+me|summari[sz]e|debug|continue|research|install|spawn|implement|proceed|resume|redeploy|restart|rerun|retry|go\s+ahead|carry\s+on|try\s+again|(?:can|could|would|will)\s+you|i\s+(?:want|need|would\s+like|'d\s+like)\s+to/.source;
+/** What marks an order as one for now, whatever its verb: "not … yet" holds something for the moment, "let me know" asks for an answer. */
+const FOR_NOW = /\b(?:not|n't|dont|don't)\b[^.!?\n]*\byet\b|\b(?:lmk|let\s+me\s+know)\b/.source;
+const REQUEST = new RegExp(`(?:^|[.,:;!?)]\\s+|\\n\\s*)${OPENERS}(?:${VERBS})\\b|\\?\\s*$|${FOR_NOW}`, 'im');
 
 /** Words that ask for work or an answer and state nothing that lasts: nothing in them is a memory. */
 export const asksForWork = (text) => REQUEST.test(String(text ?? '')) && !looksDurable(String(text ?? ''));
