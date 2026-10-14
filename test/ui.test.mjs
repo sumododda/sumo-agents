@@ -1441,7 +1441,7 @@ test('the jobs at work stand under the box: Down steps onto one and Enter opens 
       events.emit('job', { job: { id: 42, agent: 'worker', title: 'Fix it', model: 'opus', effort: 'high' } });
       await shows(/╰─+╯\n {2}⏺ main · idle\n {2}⏺ j41 scout — Map it · \d+s · 0 tool calls · working\n {2}⏺ j42 worker — Fix it · \d+s · 0 tool calls · working\n/, 'the chat itself, then both jobs, under the box');
       assert.match(tty.screen(), /↓ enter opens one/, 'how to open one');
-      assert.match(tty.screen(), /0 tool calls · working\n {2}\S[^\n]*\n {2}@j<id> message talks to that job · ↓ enter opens one · \/stop stops it(\n|$)/, 'with jobs at work the route has a line of its own, and the keys the line under it, both from the left');
+      assert.match(tty.screen(), /0 tool calls · working\n {2}@j<id> message talks to that job · ↓ enter opens one · \/stop stops it {2,}opus · high\n {20,}\S[^\n]*(\n|$)/, 'with jobs at work the keys follow the jobs from the left; the route stands at the right, over the place');
       assert.doesNotMatch(tty.screen(), /renderTable/, 'no record until one is opened');
 
       // Down from the box steps onto the first, and on; the last is where it stops, and Up comes back.

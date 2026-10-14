@@ -467,14 +467,14 @@ function Status({ session, leaving, notice, jobs, aside = [], pick = null, open 
   const said = leaving || notice;
   const placed = place && place.length <= room - (said ? hint.length + 2 : 0) ? place : '';
   const hinted = room - (placed ? placed.length + 2 : 0) >= 12 ? hint : '';
-  // With jobs at work the keys are what is needed, and they are long: the route keeps its line, from the left, and they take the line under it.
+  // With jobs at work the keys are what is needed, and they are long: they follow the jobs, from the left, and give way in a
+  // narrow window; the route stands at the right, over the place, so nothing under the jobs reads as one more of them.
   if (jobs.length > 0) {
-    const beside = place && place.length <= room ? place : '';
     return h(
       Box,
       { paddingX: 2, flexDirection: 'column' },
-      h(Box, { justifyContent: 'space-between', gap: 2 }, h(Box, { flexShrink: 0 }, h(Text, { dimColor: true }, route)), beside ? h(Box, { flexShrink: 0 }, h(Text, { dimColor: true }, beside)) : null),
-      h(Text, { dimColor: true, wrap: 'truncate' }, hint),
+      h(Box, { justifyContent: 'space-between', gap: 2 }, h(Box, { flexShrink: 1 }, h(Text, { dimColor: true, wrap: 'truncate' }, hint)), h(Box, { flexShrink: 0 }, h(Text, { dimColor: true }, route))),
+      place && place.length <= columns - 4 ? h(Box, { justifyContent: 'flex-end' }, h(Text, { dimColor: true }, place)) : null,
     );
   }
   return h(
