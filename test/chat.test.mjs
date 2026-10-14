@@ -1443,9 +1443,9 @@ test('the chat offers the MCP tools behind tool search, names the servers to the
       await session.say('echo things');
 
       const first = seen[0];
-      assert.deepEqual(first.tools.map((t) => t.name).slice(0, 6), ['bash', 'str_replace_based_edit_tool', 'delegate', 'web_search', 'web_fetch', 'tool_search_tool_regex']);
-      assert.equal(first.tools.length, 6 + 9);
-      assert.ok(first.tools.slice(6).every((t) => t.defer_loading === true && t.name.startsWith('mcp__demo__')), 'the MCP tools are deferred, so none of them sits in the context');
+      assert.deepEqual(first.tools.map((t) => t.name).slice(0, 7), ['bash', 'str_replace_based_edit_tool', 'delegate', 'ask', 'web_search', 'web_fetch', 'tool_search_tool_regex']);
+      assert.equal(first.tools.length, 7 + 9);
+      assert.ok(first.tools.slice(7).every((t) => t.defer_loading === true && t.name.startsWith('mcp__demo__')), 'the MCP tools are deferred, so none of them sits in the context');
       assert.match(first.system[0].text, /demo \(9 tools\)/, 'the model is told which servers there are');
       assert.doesNotMatch(first.system[0].text, /broken/);
       const told = watched.find((e) => e.type === 'mcp');
@@ -1914,6 +1914,61 @@ test('fan-out has a ceiling: four jobs at work at once, and three turns nobody t
       assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['look everywhere', 'what did they find']);
       assert.ok(paired(session.params.messages));
       await session.settle();
+    } finally {
+      db.close();
+      await closeMcp();
+    }
+  });
+});
+
+test('a question for the user goes out with its options and comes back as their pick or their own words; memory that may answer it holds it back once, and with nobody there it is not asked', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      add(db, { type: 'fact', body: 'My tickets are on the tracker board Atlas', now: NOW });
+      const storage = { question: 'Where should the notes be kept?', options: [{ label: 'SQLite', detail: 'one file, what is here already' }, { label: 'Postgres' }] };
+      const board = { question: 'Which tracker board are your tickets on?', options: [{ label: 'Atlas' }, { label: 'Jira' }] };
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'ask', storage)]),
+        reply('tool_use', [call('t2', 'ask', board)]), // memory may hold this one
+        reply('tool_use', [call('t3', 'ask', board)]), // asked again: an informed choice
+        reply('tool_use', [call('t4', 'ask', { question: 'Go on?', options: [{ label: 'yes' }] })]), // one option is no question
+        reply('tool_use', [call('t5', 'ask', storage)]), // the user turns it away
+        reply('end_turn', [{ type: 'text', text: 'done' }]),
+      ]);
+      const asked = [];
+      const answers = [{ label: 'SQLite' }, { text: 'neither, it moved to Linear' }, 'no'];
+      const ask = async (q) => {
+        asked.push(q);
+        return answers.shift();
+      };
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, ask, now: () => NOW });
+      session.start('startup');
+      await session.say('keep my notes somewhere');
+
+      assert.ok(seen[0].tools.some((t) => t.name === 'ask'), 'the chat is offered the question tool');
+      const result = (i) => seen[i].messages.at(-1).content[0];
+      assert.equal(asked[0].question, storage.question);
+      assert.deepEqual(asked[0].options, storage.options);
+      assert.match(result(1).content, /chose: SQLite/);
+      assert.ok(!result(1).is_error);
+      assert.equal(result(2).is_error, true, 'held back, not asked');
+      assert.match(result(2).content, /memory already holds[\s\S]*tracker board Atlas/);
+      assert.match(result(3).content, /answered: neither, it moved to Linear/);
+      assert.equal(result(4).is_error, true);
+      assert.match(result(4).content, /2–4/);
+      assert.equal(result(5).is_error, true);
+      assert.match(result(5).content, /no answer/);
+      assert.equal(asked.length, 3, 'neither the one memory held back nor the one with a single option reached the user');
+      assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['keep my notes somewhere', 'Where should the notes be kept? → SQLite', 'neither, it moved to Linear'], 'a pick is kept with its question, and what the user typed as they typed it: both are theirs to be remembered by');
+
+      // Piped, or anywhere nobody answers: the model is told so, and decides or ends its turn on the question.
+      const alone = canned([reply('tool_use', [call('t1', 'ask', storage)]), reply('end_turn', [{ type: 'text', text: 'SQLite, then.' }])]);
+      const quiet = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send: alone.send, now: () => NOW });
+      quiet.start('startup');
+      await quiet.say('keep my notes somewhere');
+      assert.equal(alone.seen[1].messages.at(-1).content[0].is_error, true);
+      assert.match(alone.seen[1].messages.at(-1).content[0].content, /nobody is here/);
     } finally {
       db.close();
       await closeMcp();

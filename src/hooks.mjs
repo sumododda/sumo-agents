@@ -35,6 +35,7 @@ export function fieldsOf(p) {
     prompt: p.prompt ?? '',
     toolName: String(p.tool_name ?? '').toLowerCase(),
     command: p.tool_input?.command ?? '',
+    question: p.tool_input?.question ?? '',
     path: p.tool_input?.path ?? p.tool_input?.file_path ?? '',
     agentId: p.agent_id ?? null,
     project: p.project ?? null,
@@ -184,6 +185,12 @@ const HANDLERS = {
    * is to put the steps there at the moment of action, not to argue.
    */
   'pre-tool'(db, e, now) {
+    // A question on its way to the user: what memory holds close to it is read first, and holds it back once.
+    if (e.toolName === 'ask') {
+      ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
+      const known = recallBeforeAsking(db, { sessionId: e.sessionId, agentId: e.agentId, asked: e.question, now });
+      return known.length > 0 ? deny(`Not asked yet: ${alreadyKnown(known)} If none does, ask again.`) : '';
+    }
     if (e.toolName !== 'bash' || !e.command) return '';
     // Teaching or reading a workflow names its own cue; `sumo` must never be gated by what it manages — and nothing else rides through on it.
     const judged = withoutSumoCalls(e.command);

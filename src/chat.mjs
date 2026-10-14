@@ -22,8 +22,8 @@ import { redact } from './redact.mjs';
 import { chooseChatRoute, EFFORTS } from './route.mjs';
 import { verifyCommands } from './scan.mjs';
 import { outcomeLines, runScribe } from './scribe.mjs';
-import { currentProject, describeSaved, findSaved, loadState, lockFile, saveState, savedSessions, sessionLine, shortId, withoutThinking } from './sessions.mjs';
-import { BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
+import { currentProject, describeSaved, findSaved, loadState, lockFile, recordTurn, saveState, savedSessions, sessionLine, shortId, withoutThinking } from './sessions.mjs';
+import { ASK_TOOL, BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { colourEnabled, createRenderer, header, prompt, renderBlock, safeForTerminal, styles, tilde, widthOf } from './tty.mjs';
 import { sourcesOf, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_TOOLS } from './web.mjs';
@@ -226,13 +226,16 @@ function configured(db, key) {
  * for each turn's model when the model is `auto`. `approve` puts an MCP call
  * that is not on the allow list to the user — the chat's own, or a job's run
  * here — and answers `once`, `always` or `no`; without it such a call is refused.
+ * `ask` puts a question of the model's to the user, with its options, and
+ * answers `{ label }` for the one picked or `{ text }` for words of their own —
+ * anything else is no answer; without it the model is told nobody is there.
  * With `background`, a delegated job does not hold the turn: `delegate` answers
  * at once, the job runs beside the conversation with a stop of its own, and its
  * report reaches the model later as an automated event — with its next request
  * if it is at work, else in a turn of its own (`wake`), which whoever watches
  * starts when told `job-report`.
  */
-export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, herdr = runHerdr, env = process.env, route = chooseChatRoute, approve = null, background = false, now = () => new Date().toISOString() } = {}) {
+export function createChat(db, { model, effort, cwd = process.cwd(), send = sendToApi, out = () => {}, activity = () => {}, watch = () => {}, herdr = runHerdr, env = process.env, route = chooseChatRoute, approve = null, ask = null, background = false, now = () => new Date().toISOString() } = {}) {
   // A route the chat was started with holds through a resumed session; one it was not, the saved session brings back.
   const given = { model: model !== undefined, effort: effort !== undefined };
   model ??= configured(db, 'chat.model');
@@ -247,7 +250,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   let routed = null;
   // The guides it names are read from wherever the chat was started: their paths are made absolute, or the model goes looking for them.
   const system = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim().replaceAll(/(?<![\w/])guides\//g, `${join(REPO_ROOT, 'guides')}/`);
-  const own = [BASH_TOOL, EDITOR_TOOL, DELEGATE_TOOL, ...WEB_TOOLS];
+  const own = [BASH_TOOL, EDITOR_TOOL, DELEGATE_TOOL, ASK_TOOL, ...WEB_TOOLS];
   /** The MCP servers of this process, once connected: their tools join the request, deferred, and their names the system prompt. */
   let registry = null;
   const connecting = mcpReady().then((r) => {
@@ -396,9 +399,38 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return project ? contextFor(project) : contextFor({ path: scratchDir() });
   }
 
-  /** The workflow gate, the cheap-model passes and `delegate`; anything else is the tool's own business. */
+  /**
+   * A question for the user. Memory is read first, and holds it back once if it may hold the answer. Then it waits on
+   * the user: a pick is kept as their decision, with the question; what they typed instead is their words, kept as a turn is.
+   */
+  async function askUser(input) {
+    const line = (v) => safeForTerminal(String(v ?? '')).replace(/\s+/g, ' ').trim();
+    const question = safeForTerminal(String(input.question ?? '')).trim();
+    const options = (Array.isArray(input.options) ? input.options : []).map((o) => ({ label: line(o?.label ?? o), ...(line(o?.detail) ? { detail: line(o.detail) } : {}) }));
+    if (!question || options.length < 2 || options.length > 4 || options.some((o) => !o.label)) return { content: 'not asked: give `question` and 2–4 `options`, each with a `label`.', isError: true };
+    const gate = event('pre-tool', { tool_name: ASK_TOOL.name, tool_input: { question } });
+    if (gate) return { content: JSON.parse(gate).deny, isError: true };
+    if (!ask) return { content: 'not asked: nobody is here to answer. Decide it yourself and say what you assumed, or end your turn on the question.', isError: true };
+    const stopped = new Promise((resolve) => stopper.signal.addEventListener('abort', () => resolve('no'), { once: true }));
+    const answer = await Promise.race([ask({ question, options, signal: stopper.signal }), stopped]);
+    const picked = options.find((o) => o.label === answer?.label);
+    if (picked) {
+      // A pick is the user's decision in the model's wording: kept beside what they typed, with the question it answers.
+      recordTurn(db, { sessionId, text: `${question} → ${picked.label}`, now: now() });
+      return { content: `The user chose: ${picked.label}` };
+    }
+    const text = typeof answer?.text === 'string' ? answer.text.trim() : '';
+    if (!text) return { content: 'no answer: the user turned the question away. Do not ask it again; decide it yourself and say what you assumed, or carry on another way.', isError: true };
+    const brought = event('prompt', { prompt: text, context_tokens: lastContext });
+    noteGuides(brought);
+    logLine(transcript, { type: 'user', message: { role: 'user', content: redact(text).text } });
+    return { content: `The user answered: ${text}${brought ? `\n<sumo>\n${brought}\n</sumo>` : ''}` };
+  }
+
+  /** The workflow gate, the cheap-model passes, `delegate` and `ask`; anything else is the tool's own business. */
   async function beforeTool(call) {
     if (call.name === DELEGATE_TOOL.name) return delegate(call.input ?? {}, call.id);
+    if (call.name === ASK_TOOL.name) return askUser(call.input ?? {});
     if (isMcpTool(call.name)) return gateMcp(call, { approve, signal: stopper.signal });
     if (call.name !== BASH_TOOL.name) return null;
     const command = String(call.input?.command ?? '');
@@ -887,6 +919,8 @@ async function screen(db, { model, effort, resume }) {
     watch: (e) => events.emit(e.type, e),
     // A call waiting on the user's word goes to the screen, which answers it with a key.
     approve: (ask) => new Promise((resolve) => events.emit('approve', { ...ask, resolve })),
+    // So does a question of the model's: its options are shown, and a pick or what is typed in the box answers it.
+    ask: (question) => new Promise((resolve) => events.emit('ask', { ...question, resolve })),
   });
   try {
     await runUi({ session, events, resume, notify: configured(db, 'chat.notify') !== 'off' }).waitUntilExit();
@@ -924,7 +958,7 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
       reply.flush();
       write(`\n${s.dim(`  › ${line}`)}\n`);
     },
-    // Piped, nobody answers a question: an MCP call not on the allow list is refused, and a server that failed is said.
+    // Piped, nobody answers a question: one of the model's is not asked, an MCP call not on the allow list is refused, and a server that failed is said.
     watch: (e) => {
       if (e.type === 'retry' && e.job === undefined) return write(`${s.dim(`  › ${retryLine(e)}`)}\n`);
       if (e.type === 'sources') return write(`\n${e.sources.map((page) => s.dim(`  ⎿  ${safeForTerminal(`${page.title} — ${page.url}`).replace(/\s+/g, ' ')}`)).join('\n')}\n`);

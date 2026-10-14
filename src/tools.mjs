@@ -38,6 +38,31 @@ export const DELEGATE_TOOL = {
   },
 };
 
+/** The chat's own: a question only the user can answer, put to them with options to pick from; the pick, or what they typed instead, is the call's answer. */
+export const ASK_TOOL = {
+  name: 'ask',
+  description:
+    'Put a question to the user and wait for the answer. Use it before building, when the request leaves open what to build — scope, behaviour, ' +
+    'which approach — and neither memory nor the code settles it; never for what you can look up, or decide and cheaply undo. ' +
+    'Give 2–4 options, the one you would pick first; the user picks one, or types an answer of their own. ' +
+    'One question a call; several calls in one reply are put one after another.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      question: { type: 'string', description: 'the whole question: the user sees this and the options, nothing else' },
+      options: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: { label: { type: 'string', description: 'a few words' }, detail: { type: 'string', description: 'what choosing it means, in a line' } },
+          required: ['label'],
+        },
+      },
+    },
+    required: ['question', 'options'],
+  },
+};
+
 const OUTPUT_CAP_CHARS = 16_000;
 const VIEW_CAP_LINES = 400;
 const COMMAND_TIMEOUT_MS = 540_000; // the same nine minutes a check gets

@@ -333,6 +333,17 @@ function Ask({ ask, aside = false }) {
   );
 }
 
+/** A question of the model's: its options, the one the arrows are on, and the keys that answer — a pick, or words typed in the box. */
+function Question({ ask }) {
+  return h(
+    Box,
+    { marginTop: 1, flexDirection: 'column' },
+    h(Text, { color: 'yellow' }, `? ${ask.question}`),
+    ...ask.options.map((option, i) => h(Text, { key: i, color: i === ask.at ? ACCENT : undefined }, `  ${i === ask.at ? '❯' : ' '} ${option.label}`, option.detail ? h(Text, { dimColor: true }, ` — ${option.detail}`) : null)),
+    h(Text, { dimColor: true }, '  ↑↓ choose · enter picks · or type your own answer · esc stop'),
+  );
+}
+
 /** One line of a reply; the first of a block carries the mark. */
 function Reply({ text, first }) {
   return h(Box, { marginTop: first ? 1 : 0 }, h(Text, null, first ? '⏺ ' : '  '), h(Text, null, text || ' '));
@@ -1114,14 +1125,22 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       alert(`${state.where.name}: ${ask.server} · ${ask.tool} waits for your answer`);
       redraw();
     };
+    // A question of the model's: shown with its options, the first one picked, until a pick or a typed answer settles it.
+    const onAsk = (ask) => {
+      const standing = { ...ask, at: 0 };
+      state.asks.push(standing);
+      ask.signal?.addEventListener('abort', () => settle(standing, 'no'), { once: true });
+      alert(`${state.where.name}: a question waits for your answer`);
+      redraw();
+    };
     // An MCP server that is not there is the user's to see; the model is simply not offered its tools.
     const onMcp = ({ servers, error }) => {
       if (error) record({ kind: 'error', text: `mcp: ${error}` });
       for (const server of servers.filter((s) => !s.ok)) record({ kind: 'error', text: `mcp ${server.name}: ${server.error} — sumo mcp shows every server` });
     };
-    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('guide', onGuide).on('sources', onSources).on('check', onCheck).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('mcp', onMcp);
+    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('guide', onGuide).on('sources', onSources).on('check', onCheck).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('ask', onAsk).on('mcp', onMcp);
     return () => {
-      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('guide', onGuide).off('sources', onSources).off('check', onCheck).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('mcp', onMcp);
+      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('guide', onGuide).off('sources', onSources).off('check', onCheck).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('ask', onAsk).off('mcp', onMcp);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
       clearTimeout(state.drawSoon);
@@ -1167,8 +1186,16 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       return;
     }
     for (const [one, oneKey] of keysOf(input, key)) {
-      // A question standing takes the key: an answer, or Esc and Ctrl-C, which go on to stop the turn; nothing lands in the box.
-      if (state.asks.length > 0 && !oneKey.escape && !(oneKey.ctrl && (one === 'c' || one === 'd'))) {
+      // A question of the model's: on an empty box the arrows move the pick and Enter takes it. Anything else is the box's,
+      // and Enter there sends what was typed as the answer; Esc and Ctrl-C go on to stop the turn.
+      const asked = state.asks[0]?.options ? state.asks[0] : null;
+      if (asked && !state.ed.text && (oneKey.upArrow || oneKey.downArrow || (oneKey.return && !oneKey.shift && !oneKey.meta))) {
+        if (oneKey.return) settle(asked, { label: asked.options[asked.at].label });
+        else asked.at = Math.max(0, Math.min(asked.options.length - 1, asked.at + (oneKey.downArrow ? 1 : -1)));
+        continue;
+      }
+      // A call standing takes the key: an answer, or Esc and Ctrl-C, which go on to stop the turn; nothing lands in the box.
+      if (!asked && state.asks.length > 0 && !oneKey.escape && !(oneKey.ctrl && (one === 'c' || one === 'd'))) {
         const answer = { y: 'once', a: 'always', n: 'no' }[one];
         if (answer) settle(state.asks[0], answer);
         else notify('y allows it once · a always · n refuses it · esc stops the turn');
@@ -1246,7 +1273,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       // The first step is onto the row that is not on the screen already: a job from the chat, the chat from a job's record.
       if (oneKey.downArrow && pressed.state === state.ed && listed.length > 0) state.pick = state.open === null ? listed[1] : MAIN;
       state.ed = pressed.state;
-      if (pressed.submit !== undefined) submit(pressed.submit);
+      if (pressed.submit !== undefined && asked) settle(asked, { text: pressed.submit });
+      else if (pressed.submit !== undefined) submit(pressed.submit);
     }
     redraw();
   });
@@ -1285,7 +1313,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     ),
     // The silence that is said is the model's: while a command, a job or a question is in hand, the wait is not on it.
     state.working ? h(Working, { messages, first: state.working, tokens: state.tokens, thought: state.thought, quietAfterMs, heard: state.talking && state.running.size === 0 && state.jobs.size === 0 && state.asks.length === 0 ? state.heard : 0 }) : null,
-    state.asks.length > 0 ? h(Ask, { ask: state.asks[0], aside: session.running().includes(state.asks[0].job) }) : null,
+    state.asks.length > 0 ? (state.asks[0].options ? h(Question, { ask: state.asks[0] }) : h(Ask, { ask: state.asks[0], aside: session.running().includes(state.asks[0].job) })) : null,
     // The record of the job that is open, under everything the turn is doing: its end, as it grows.
     state.open !== null ? h(JobOpen, { id: state.open, job: state.jobs.get(state.open), rows }) : null,
     // The logo is the empty room's: once something has been said, the room is the conversation's.

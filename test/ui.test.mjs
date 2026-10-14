@@ -964,6 +964,72 @@ test('an MCP call that needs the user\'s word asks on the screen; a key answers 
   });
 });
 
+test('a question of the model\'s shows its options on the screen: the arrows and Enter pick one, what is typed in the box is an answer of the user\'s own, and Esc stops the turn', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const { send, seen } = transport([
+        { reply: reply('tool_use', [call('t1', 'ask', { question: 'Where should the notes be kept?', options: [{ label: 'SQLite', detail: 'one file' }, { label: 'Postgres' }] })]) },
+        { reply: reply('tool_use', [call('t2', 'ask', { question: 'Which port?', options: [{ label: '8080' }, { label: '3000' }] })]) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'built' }]) },
+        { reply: reply('tool_use', [call('t3', 'ask', { question: 'Ship it?', options: [{ label: 'yes' }, { label: 'not yet' }] })]) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'never said' }]) },
+      ]);
+      const events = new EventEmitter();
+      const session = createChat(db, {
+        model: 'opus',
+        effort: 'high',
+        cwd: tmpdir(),
+        send,
+        out: (t) => events.emit('text', t),
+        watch: (e) => events.emit(e.type, e),
+        ask: (question) => new Promise((resolve) => events.emit('ask', { ...question, resolve })),
+        now: () => NOW,
+      });
+      const tty = fakeTty({ columns: 120 });
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
+      const shows = async (pattern, what) => {
+        for (let i = 0; i < 300; i++) {
+          if (pattern.test(tty.screen())) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
+      };
+      const answerTo = (i) => seen[i].messages.at(-1).content[0].content;
+      try {
+        await tty.type(`keep my notes${ENTER}`);
+        await shows(/\? Where should the notes be kept\?\s*\n\s*❯ SQLite — one file\s*\n\s+Postgres\s*\n\s*↑↓ choose · enter picks · or type your own answer · esc stop/, 'the question, its options, the first one picked');
+        await tty.type('\x1b[B');
+        await shows(/\n\s+SQLite — one file\s*\n\s*❯ Postgres/, 'the pick moved down');
+        await tty.type('\x1b[B', ENTER);
+        await shows(/\? Which port\?/, 'the next question');
+        assert.match(answerTo(1), /chose: Postgres/, 'Down past the last option stays on it');
+
+        await tty.type('9090 on loopback');
+        assert.match(tty.screen(), /│ > 9090 on loopback/, 'an answer of one\'s own is typed in the box');
+        await tty.type(ENTER);
+        await shows(/⏺ built/, 'the end of the turn');
+        assert.match(answerTo(2), /answered: 9090 on loopback/);
+        assert.doesNotMatch(tty.screen(), /\? Which port\?\s*\n\s*❯/, 'an answered question leaves the screen');
+        assert.equal(seen[2].messages.filter((m) => m.role === 'user' && m.content.some?.((b) => b.type === 'text' && /9090/.test(b.text))).length, 0, 'the answer went to the question, not into a turn of its own');
+
+        await tty.type(`ship${ENTER}`);
+        await shows(/\? Ship it\?/, 'the last question');
+        await tty.type(ESC);
+        await shows(/Interrupted/, 'the turn stopped at the question');
+        assert.equal(seen.length, 4, 'nothing more was sent');
+        await tty.type('\x04');
+        await leaves(ui);
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      await closeMcp();
+      db.close();
+    }
+  });
+});
+
 test('the work as it happens: a running command shows what it prints and how long it has run, an edit is a diff in the project\'s own paths, and the turn ends on what it took', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
