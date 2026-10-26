@@ -182,14 +182,14 @@ test('the passes: a writer set to a model that is off fails without calling it; 
 test('a job routed to a model that has since been turned off is not run', () => {
   const s = sandbox();
   s.addProject('demo');
-  s.routerWillSay('fable', 'high', 'novel');
+  s.routerWillSay('opus', 'high', 'hard');
   const created = s.sumo(['job', 'new', '--project', 'demo', '--title', 'x'], { input: 'do the thing' });
   assert.equal(created.code, 0, created.err);
   const id = /created j(\d+)/.exec(created.out)[1];
-  s.sumo(['models', 'disable', 'fable']);
+  s.sumo(['models', 'disable', 'opus']);
   const run = s.sumo(['job', 'run', id], { extraEnv: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
   assert.notEqual(run.code, 0);
-  assert.match(run.err, new RegExp(`j${id} is routed to fable, which is off — sumo models enable fable, or abandon it and create it again`), run.out + run.err);
+  assert.match(run.err, new RegExp(`j${id} is routed to opus, which is off — sumo models enable opus, or abandon it and create it again`), run.out + run.err);
 });
 
 test('discovery that could not reach the API says so rather than blaming the credential, and an answer that is not a list is a failed check', () => {

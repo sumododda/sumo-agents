@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, sep } from 'node:path';
 import { isAdvisorTool } from './advisor.mjs';
-import { compactInput, isMcpTool, splitMcpName } from './mcp.mjs';
+import { compactInput, isMcpTool, splitMcpName, unlabeled } from './mcp.mjs';
 import { REPO_ROOT } from './paths.mjs';
 import { elapsed } from './text.mjs';
 import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
@@ -382,8 +382,8 @@ function diffView(old, now, line, full) {
 export function toolView(call, result = null, { full = false, cwd = null } = {}) {
   const input = call.input ?? {};
   // Folded, the empty lines of what came back are not shown: three of five lines spent on nothing say nothing.
-  const output = () => {
-    const lines = toned(result.content, result.isError ? 'error' : 'plain');
+  const output = (content = result.content) => {
+    const lines = toned(content, result.isError ? 'error' : 'plain');
     if (full) return lines;
     const said = lines.filter((line) => line.text.trim() !== '');
     return said.length === 0 ? [{ text: '(no output)', tone: 'dim' }] : ends(said, false);
@@ -421,7 +421,8 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     const { server, tool } = splitMcpName(call.name);
     const detail = `${tool}(${compactInput(input)})`;
     if (!result) return { title: server, detail, lines: [] };
-    return { title: server, detail, lines: output() };
+    // The line that tells the model whose data this is: here the title says it.
+    return { title: server, detail, lines: output(unlabeled(result.content)) };
   }
   if (isWebTool(call)) {
     // The web: what was searched for or which page was read, and under it the pages found or the page and its size.

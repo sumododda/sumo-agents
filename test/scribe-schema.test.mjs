@@ -12,8 +12,8 @@ test('each memory operation has one closed branch with only its own required fie
   const byOp = Object.fromEntries(branches.map((branch) => [branch.properties.op.enum[0], branch]));
 
   assert.deepEqual(Object.keys(byOp), ['add', 'supersede', 'gotcha', 'checkpoint']);
-  assert.deepEqual(Object.keys(byOp.add.properties), ['op', 'type', 'scope', 'topic', 'body', 'turn', 'quote']);
-  assert.deepEqual(Object.keys(byOp.gotcha.properties), ['op', 'scope', 'body']);
+  assert.deepEqual(Object.keys(byOp.add.properties), ['op', 'type', 'scope', 'topic', 'body', 'turn', 'quote', 'keys']);
+  assert.deepEqual(Object.keys(byOp.gotcha.properties), ['op', 'scope', 'body', 'keys']);
   assert.deepEqual(Object.keys(byOp.checkpoint.properties), ['op', 'project', 'done', 'next']);
   for (const branch of branches) {
     assert.equal(branch.additionalProperties, false);

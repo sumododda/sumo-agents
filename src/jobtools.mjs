@@ -1,7 +1,7 @@
 import { rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ENTRY, paths } from './paths.mjs';
-import { capRedacted, runCommand } from './tools.mjs';
+import { paths, SELF } from './paths.mjs';
+import { capRedacted, checksWrap, runCommand } from './tools.mjs';
 
 /**
  * What a sub-agent notes, asks, reads memory and closes its job with: tools of
@@ -21,7 +21,7 @@ const BASELINE = tool('baseline', "Before your first edit: run the project's che
 const VERIFY = tool('verify', "Run the project's checks now and see the verdict DONE will be given. Takes minutes.");
 const FINISH = tool(
   'finish',
-  "Close the job — the last thing you do, or nobody knows it ended. A worker's DONE runs the project's checks first and is refused while something new fails.",
+  "Close the job — the last thing you do, or nobody knows it ended. A worker's first DONE is answered with the task beside its change, to look over once; the next runs the project's checks and is refused while something new fails.",
   // No way to take the work unverified: that is for the user or the main agent to grant, never the author.
   { status: { type: 'string', enum: ['DONE', 'FAILED'] }, report: text('the report, in the shape the brief gives') },
 );
@@ -33,7 +33,7 @@ export const isJobTool = (call) => NAMES.has(call.name);
 
 /** One word for the shell: left as it is when plain, single-quoted otherwise. */
 const word = (w) => (/^[\w/.:=@%+-]+$/.test(w) ? w : `'${String(w).replaceAll("'", `'\\''`)}'`);
-const sumo = (args) => [process.execPath, '--disable-warning=ExperimentalWarning', ENTRY, ...args].map(word).join(' ');
+const sumo = (args) => [...SELF, ...args].map(word).join(' ');
 
 /** The command a call stands for, and what it reads on stdin. Null for a call missing what it needs. */
 function commandFor(call, job) {
@@ -69,8 +69,10 @@ export async function runJobTool(call, { job, ctx, signal = null }) {
   if (file) writeFileSync(file, command.stdin, { mode: 0o600 });
   try {
     const args = file ? [...command.args, '--from-file', file] : command.args;
-    // The checks give each command its own limit; anything else is quick.
-    const run = await runCommand(sumo(args), { cwd: ctx.cwd, env: ctx.env, signal, timeoutMs: command.checks ? null : 60_000 });
+    // The checks give each command its own limit; anything else is quick. They run the project's code — tests the model may have
+    // written among it — so they run in the sandbox its shell is in, writing only where it may: Sumo's home is one of those places,
+    // so the records are still written. A check that fails only for the sandbox fails so at the baseline and at the end alike.
+    const run = await runCommand(sumo(args), { cwd: ctx.cwd, env: ctx.env, signal, timeoutMs: command.checks ? null : 60_000, wrap: command.checks ? checksWrap(ctx) : null });
     if (run.error) return { content: run.error, isError: true };
     const output = capRedacted(run.output.trim(), undefined, run.omitted);
     return { content: output || '(done)', isError: run.stopped !== null || run.status !== 0 };

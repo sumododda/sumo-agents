@@ -148,7 +148,7 @@ test("the model's shell: a job writes no memory; the chat remembers only what th
     assert.equal(run.code, 2, `${args.join(' ')} → ${run.out}${run.err}`);
     assert.match(run.err, /^sumo: Refused: the model's shell does not change what the user controls/);
   }
-  assert.match(s.sumo(['config', 'chat.effort'], chat).out, /^chat\.effort = high$/m, 'read, not changed');
+  assert.match(s.sumo(['config', 'chat.effort'], chat).out, /^chat\.effort = medium$/m, 'read, not changed');
   assert.equal(s.sumo(['mcp'], chat).code, 0);
   assert.equal(s.sumo(['models'], chat).code, 0);
   assert.equal(s.sumo(['config', 'chat.effort', 'low'], {}).code, 0, 'the user still can');

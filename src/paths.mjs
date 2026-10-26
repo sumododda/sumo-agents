@@ -2,8 +2,15 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-export const ENTRY = join(REPO_ROOT, 'bin', 'sumo.mjs');
+/**
+ * The binary `npm run build:bin` makes runs its code from inside itself (Bun's /$bunfs/), with the files sumo reads
+ * (AGENTS.md, guides, prompts…) laid out in the folder beside it: that folder stands for the repo, the binary for the entry.
+ */
+export const COMPILED = import.meta.url.startsWith('file:///$bunfs/');
+export const REPO_ROOT = COMPILED ? dirname(process.execPath) : resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const ENTRY = COMPILED ? process.execPath : join(REPO_ROOT, 'bin', 'sumo.mjs');
+/** The words that start this sumo again: the binary alone, or this node on the entry. */
+export const SELF = COMPILED ? [ENTRY] : [process.execPath, '--disable-warning=ExperimentalWarning', ENTRY];
 
 /**
  * Everything learned lives here, outside the repo and never in git.

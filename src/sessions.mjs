@@ -14,10 +14,12 @@ const TURN_MAX_CHARS = 4000;
  * Where a session starts costing quality. The numbers are absolute tokens, not
  * a share of the window: what degrades an answer is how much context is in
  * play, and a million-token window degrades at the same sizes a small one does.
+ * It is said early because every request pays for all of it again: a chat averages
+ * some 65k tokens a request, and it is most of what is spent.
  */
 const BANDS = [
   { band: 'act', from: 150_000 },
-  { band: 'watch', from: 80_000 },
+  { band: 'watch', from: 60_000 },
 ];
 
 /** Hooks can arrive in any order and a session can outlive a restart, so every write starts by making sure the row exists. */
@@ -155,12 +157,13 @@ const inK = (tokens) => `${Math.round(tokens / 1000)}k`;
 
 /**
  * What the session is told when it crosses a band. One line, ending with the
- * hint, so a `/compact` can be pasted exactly as it stands.
+ * hint, so a `/compact` can be pasted exactly as it stands. No figure: a count
+ * of its own tokens is what makes a model cut its work short; the screen shows it.
  */
-export function contextNudge(band, tokens, focus) {
+export function contextNudge(band, focus) {
   const hint = `hint: focus on ${focus}; keep decisions and open job ids in a note; drop tool output and file contents.`;
-  if (band === 'act') return `context: ${inK(tokens)} tokens — start fresh now: note where you are (sumo job note; the end of the turn records "Left off"), then tell the user to type /new. ${hint}`;
-  return `context: ${inK(tokens)} tokens — quality drops from here. Finish the piece in hand, then tell the user to type /new: the memory block brings the thread back. ${hint}`;
+  if (band === 'act') return `context: very large — start fresh now: note where you are (sumo job note; the end of the turn records "Left off"), then tell the user to type /new. ${hint}`;
+  return `context: large — quality drops from here. Finish the piece in hand, then tell the user to type /new: the memory block brings the thread back. ${hint}`;
 }
 
 /**
@@ -172,7 +175,7 @@ export function taskEndedNudge(db) {
   const path = db.prepare(`SELECT transcript_path FROM sessions WHERE id NOT LIKE 'job:%' ORDER BY COALESCE(last_turn_at, started_at) DESC LIMIT 1`).get()?.transcript_path ?? null;
   const use = contextUse(path);
   if (!use || !contextBand(use.tokens)) return null;
-  return `this session is at ${inK(use.tokens)} tokens and the task just ended — a good moment for /new; the memory block brings the thread back.`;
+  return 'this session has grown large and the task just ended — a good moment for /new; the memory block brings the thread back.';
 }
 
 /**

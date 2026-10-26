@@ -82,7 +82,7 @@ function sizeNudge(db, e, now) {
   const slug = `context:${band}`;
   if (db.prepare('SELECT 1 FROM session_injections WHERE session_id = ? AND slug = ?').get(e.sessionId, slug)) return '';
   markInjected(db, e.sessionId, slug, now);
-  return contextNudge(band, tokens, focusOf(db, e.sessionId));
+  return contextNudge(band, focusOf(db, e.sessionId));
 }
 
 /**

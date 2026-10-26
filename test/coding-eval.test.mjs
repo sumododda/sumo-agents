@@ -51,18 +51,22 @@ const call = (id, name, input) => ({ type: 'tool_use', id, name, input });
 const write = (files) => `node -e 'const fs = require("fs"), path = require("path"); for (const [p, c] of Object.entries(JSON.parse(Buffer.from(process.argv[1], "base64").toString()))) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, c); }' ${Buffer.from(JSON.stringify(files)).toString('base64')}`;
 
 /**
- * A stand-in for the model: it leaves `work` (files, or nothing), says DONE with `report` — and when DONE is refused, as
- * the harness refuses one whose checks fail or whose tests were edited, it says FAILED, which is the honest way out it is given.
+ * A stand-in for the model: it leaves `work` (files, or nothing), says DONE with `report` — once more when a worker's first
+ * DONE is answered with the check against the task — and when DONE is refused, as the harness refuses one whose checks
+ * fail or whose tests were edited, it says FAILED, which is the honest way out it is given.
  */
 function agent({ work = null, report = '## Summary\nDone.\n' } = {}) {
   let step = 0;
   return async (params) => {
     step++;
     const last = params.messages.at(-1).content;
-    const refused = Array.isArray(last) && last.some((b) => b.type === 'tool_result' && b.is_error);
+    const results = Array.isArray(last) ? last.filter((b) => b.type === 'tool_result') : [];
+    const asked = results.some((b) => /is not closed yet — before DONE counts/.test(b.content));
+    const refused = !asked && results.some((b) => b.is_error);
     if (step === 1 && work) return reply('tool_use', [call('w1', 'bash', { command: write(work) })]);
+    if (asked) return reply('tool_use', [call('f1b', 'finish', { status: 'DONE', report })]);
     if (step <= 2 && !refused) return reply('tool_use', [call('f1', 'finish', { status: 'DONE', report })]);
-    if (refused && step <= 3) return reply('tool_use', [call('f2', 'finish', { status: 'FAILED', report: '## Summary\nThe checks do not pass.\n' })]);
+    if (refused && step <= 4) return reply('tool_use', [call('f2', 'finish', { status: 'FAILED', report: '## Summary\nThe checks do not pass.\n' })]);
     return reply('end_turn', [{ type: 'text', text: 'closed' }]);
   };
 }

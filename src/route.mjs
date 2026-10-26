@@ -1,9 +1,11 @@
-import { usableModels } from './catalog.mjs';
+import { MODELS, usableModels } from './catalog.mjs';
 import { callLocalModel } from './model.mjs';
 import { UsageError } from './memory.mjs';
 import { elapsed } from './text.mjs';
 
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+/** A failed job can always be retried; a done one only once review found enough wrong with it — and either retry goes up. */
+export const RETRY_IMPORTANT_THRESHOLD = 3;
 
 const KINDS = ['mechanical', 'routine', 'hard', 'novel'];
 const SURFACES = ['one spot', 'a few files', 'many interacting parts'];
@@ -182,23 +184,99 @@ async function askFor(db, system, prompt) {
   if (usable.length === 0) throw new UsageError('no model is on — sumo models enable <name>');
   const result = await callLocalModel(db, { system, prompt, schema: routerSchema(usable) });
   if (!result.ok) return { ok: false, error: result.error };
-  const { model, effort, reason } = result.data ?? {};
+  const { model, effort, reason, risky } = result.data ?? {};
   // The same pairing the schema enforces, checked again: a backend without grammar support can still answer anything.
   const fits = usable.includes(model) && (model === 'haiku' ? effort === 'none' : EFFORTS.includes(effort));
   if (!fits || typeof reason !== 'string' || !reason.trim()) return { ok: false, error: `the router answered outside its schema: ${JSON.stringify(result.data)}` };
-  return { ok: true, model, effort, reason: reason.replace(/\s+/g, ' ').trim() };
+  // Whether the work touches security, credentials, money, migrations or concurrency: kept, so such work is reviewed. Only a plain yes is one.
+  return { ok: true, model, effort, reason: reason.replace(/\s+/g, ' ').trim(), risky: risky === true };
+}
+
+// Routes compared on one scale: by model first, cheapest to dearest as the catalog lists them, then by effort.
+// Haiku's 'none' sits below every effort.
+const modelRank = (model) => MODELS.indexOf(model);
+const effortRank = (effort) => EFFORTS.indexOf(effort);
+const compareRoutes = (a, b) => modelRank(a.model) - modelRank(b.model) || effortRank(a.effort) - effortRank(b.effort);
+
+/** One step above a route: the next model up that is on, keeping the effort (medium, off haiku); on the top one, one effort up, max at most. */
+function stepAbove({ model, effort }, usable) {
+  const next = usable.find((m) => modelRank(m) > modelRank(model));
+  if (next) return { model: next, effort: EFFORTS.includes(effort) ? effort : 'medium' };
+  const top = usable.at(-1);
+  if (top === 'haiku') return { model: top, effort: 'none' };
+  return { model: top, effort: EFFORTS[Math.min(effortRank(effort) + 1, EFFORTS.length - 1)] };
 }
 
 /**
- * Chooses a job's model and effort by asking the local router — every job, every retry, no exceptions.
- * Its answer is the route; a router that cannot answer refuses the job, with no default to fall back
- * to. A retry tells the router what the previous attempt ran on and how it ended. Its answer is taken as
- * it is, for every role: the models it may pick are the ones that are on (`sumo models`).
+ * What code does to the router's answer before it is a job's route. The router reads only the task's words, the weakest
+ * thing to route by, and is merely asked to go above what failed; on the ledger, workers that started on fable finished
+ * 2 of 5 at more than twice the price of opus, which finished 5 of 6. So these hold whatever it answers:
+ * - A first attempt starts lower: a worker's never runs on fable while opus is on, and no first attempt runs above high effort.
+ * - A scout's first attempt does not run on haiku while sonnet is on: on the ledger, haiku scouts left 3 of 11 unfinished,
+ *   sonnet and opus ones none of 9 — and haiku caches nothing below 4,096 tokens. It runs on sonnet at low effort instead.
+ * - A retry of a job that failed, or that drew RETRY_IMPORTANT_THRESHOLD Important findings, runs at least one step above it.
+ * - A reviewer pointed at a job runs on at least that job's model, at medium effort or more.
+ * Pure: `retryOf` and `reviews` are the rows (id, model, effort, status, important) of the job retried and the job judged,
+ * or nothing; `usable` is the models that are on, cheapest first. An attempt with no route Sumo knows has nothing to go
+ * above. `policy` says what changed and why, or is null.
  */
-export async function chooseRoute(db, { agent, project, task, title, retryOf }) {
+export function routePolicy({ agent, routed, retryOf: prev, reviews: target, usable }) {
+  let route = { model: routed.model, effort: routed.effort };
+  const why = [];
+  if (!prev) {
+    if (agent === 'worker' && route.model === 'fable' && usable.includes('opus')) {
+      route.model = 'opus';
+      why.push('a first attempt starts on opus, not fable');
+    }
+    if (agent === 'scout' && route.model === 'haiku' && usable.includes('sonnet')) {
+      route = { model: 'sonnet', effort: 'low' };
+      why.push("a scout's first attempt starts on sonnet at low effort, not haiku");
+    }
+    if (effortRank(route.effort) > effortRank('high')) {
+      route.effort = 'high';
+      why.push('a first attempt runs at high effort at most');
+    }
+  } else if (modelRank(prev.model) >= 0 && (prev.status === 'failed' || (prev.important ?? 0) >= RETRY_IMPORTANT_THRESHOLD)) {
+    const floor = stepAbove(prev, usable);
+    if (compareRoutes(floor, route) > 0) {
+      route = floor;
+      const outcome = prev.status === 'failed' ? 'failed' : `drew ${prev.important} Important findings`;
+      why.push(`a retry goes above j${prev.id}'s ${prev.model}/${prev.effort}, which ${outcome}`);
+    }
+  }
+  if (agent === 'reviewer' && target?.model) {
+    if (modelRank(route.model) < modelRank(target.model)) {
+      // The judged job's model, or the nearest one that is on: above it if there is one, else the top one.
+      route.model = usable.find((m) => modelRank(m) >= modelRank(target.model)) ?? usable.at(-1);
+      why.push(`a reviewer is at least as strong as j${target.id}'s ${target.model}`);
+    }
+    if (route.model !== 'haiku' && effortRank(route.effort) < effortRank('medium')) {
+      route.effort = 'medium';
+      why.push('a reviewer runs at medium effort at least');
+    }
+  }
+  return { ...route, policy: why.length === 0 ? null : `${why.join('; ')} (the router said ${routed.model}/${routed.effort})` };
+}
+
+const jobRoute = (db, id) => (id === undefined || id === null ? null : (db.prepare('SELECT id, model, effort, status, important FROM jobs WHERE id = ?').get(id) ?? null));
+
+/**
+ * Chooses a job's model and effort: the local router is asked — every job, every retry, no exceptions — and
+ * `routePolicy` holds its answer to a few rules. A router that cannot answer refuses the job, with no default
+ * to fall back to. A retry tells the router what the previous attempt ran on and how it ended; the models it
+ * may pick are the ones that are on (`sumo models`). Then the policy: a worker's first attempt starts on
+ * opus, not fable, and no first attempt runs above high effort; a retry of a job that failed or drew enough
+ * Important findings runs at least one step above it — the next model up, or on the top one a higher effort —
+ * and never below what the router answered; a reviewer created with `--reviews` runs on at least the judged
+ * job's model, at medium effort or more; a scout's first attempt runs on sonnet at low effort, not haiku, while sonnet is
+ * on. What the policy changed follows the router's reason. `risky` is the router's word on whether the work touches
+ * security, credentials, money, migrations or concurrency — kept with the job, so such work is reviewed once it is done.
+ */
+export async function chooseRoute(db, { agent, project, task, title, retryOf, reviews }) {
   const routed = await askRouter(db, { agent, project, task, title, retryOf });
   if (!routed.ok) throw new UsageError(`the router failed: ${routed.error} — no job was created`);
-  return { model: routed.model, effort: routed.effort, reason: `router: ${routed.reason}` };
+  const { model, effort, policy } = routePolicy({ agent, routed, retryOf: jobRoute(db, retryOf), reviews: jobRoute(db, reviews), usable: usableModels(db) });
+  return { model, effort, reason: `router: ${routed.reason}${policy ? `; policy: ${policy}` : ''}`, risky: routed.risky };
 }
 
 /** The chat's route for one turn on auto, by the same router: its answer or a refusal, nothing in between. */

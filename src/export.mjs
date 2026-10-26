@@ -1,8 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { getMeta, setMeta } from './db.mjs';
 import { paths } from './paths.mjs';
+import { DatabaseSync } from './sqlite.mjs';
 
 const KEEP_BACKUPS = 5;
 export const SECTIONS = [

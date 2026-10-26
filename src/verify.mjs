@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isSecretPath } from './guard.mjs';
 import { UsageError } from './memory.mjs';
@@ -51,7 +51,7 @@ function git(root, args) {
 }
 
 /** A diff as git itself writes it, whatever the user has configured: no external tool, no colour, the usual prefixes — it is parsed, hashed and handed to a reviewer. */
-const DIFF = ['diff', '--no-ext-diff', '--no-color', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/'];
+export const DIFF = ['diff', '--no-ext-diff', '--no-color', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/'];
 
 const lines = (text) => (text ?? '').split('\n').filter(Boolean);
 
@@ -169,21 +169,50 @@ function runChecks(root, commands, dir, prefix) {
     killGroup(run.pid);
     const output = tailOf(file);
     writeFileSync(file, `$ ${command}\n${output}\n${timedOut ? '\n(stopped: it ran past the time limit)\n' : ''}`, { mode: 0o600 });
-    return { name, command, ok: run.status === 0, timedOut, ms: Date.now() - started, file };
+    return { name, command, ok: run.status === 0, status: run.status, timedOut, ms: Date.now() - started, file };
   });
+}
+
+/** A line of a check's log that names a failure: runners print the failing test, or the error, on it. */
+const FAILURE_LINE = /\b(?:fail(?:s|ed|ing|ures?)?|errors?|not ok)\b|[✗✕✖]/i;
+/** A time a runner prints, which differs from one run to the next when nothing else does. */
+const TIMING = /\b\d+(?:\.\d+)?\s?m?s\b/g;
+
+/** How a run of a check ended: its exit status and the lines that name a failure, without their times. Two runs that agree on it failed the same way. */
+const endedAs = (run) =>
+  `${run.status}\n${[...new Set(readFileSync(run.file, 'utf8').split('\n').filter((l) => FAILURE_LINE.test(l)).map((l) => l.replace(TIMING, '').trim()))].sort().join('\n')}`;
+
+/**
+ * The checks that failed, run once more, each beside the run it repeats — its log too, `<log>-again.txt`. One that ran past
+ * its time limit is not run again: that would take as long once more, past the ten minutes a harness gives the command that asked for it.
+ */
+function runAgain(root, failed, dir) {
+  const again = failed.filter((c) => !c.timedOut);
+  const runs = runChecks(root, again, dir, 'again');
+  return new Map(
+    again.map((c, i) => {
+      const file = c.file.replace(/\.txt$/, '-again.txt');
+      renameSync(runs[i].file, file);
+      return [c, { ...runs[i], file }];
+    }),
+  );
 }
 
 /**
  * The checks as they stand before the work. Refused once the tree has moved:
  * a baseline taken after the first edit would call the job's own breakage
- * "already there", which is the one thing it exists to prevent.
+ * "already there", which is the one thing it exists to prevent. A check that
+ * fails is run once more, and two runs that disagree — on the exit status, or
+ * on what they say failed — record it as flaky, with the second run's log.
  */
 export function takeBaseline(root, snap, dir) {
   if (snap && !stillThere(root, snap)) return { refused: 'the recorded start of this job is no longer in the repository, so there is no telling what has changed since' };
   if (snap && changesSince(root, snap).fingerprint !== snap.fingerprint) {
     return { refused: 'files have already changed since this job began, so a baseline now would include your own edits' };
   }
-  return { checks: runChecks(root, verifyCommands(root), dir, 'baseline') };
+  const checks = runChecks(root, verifyCommands(root), dir, 'baseline');
+  const again = runAgain(root, checks.filter((c) => !c.ok), dir);
+  return { checks: checks.map((c) => (again.has(c) && endedAs(again.get(c)) !== endedAs(c) ? { ...c, flaky: true, again: again.get(c).file } : c)) };
 }
 
 /**
@@ -243,9 +272,20 @@ export function verify(root, { snap, baseline, testsMayChange, declared }, dir, 
 
   // By command, not name: `cargo test` and `pytest` are both "test", and each has a start of its own.
   const before = new Map((baseline ?? []).map((c) => [c.command, c]));
-  const checks = runChecks(root, commands, dir, 'verify').map((c) => {
+  const ran = runChecks(root, commands, dir, 'verify');
+  // One that passed when the job began and fails now is run once more before it is held against the job: passing then, it is flaky.
+  // One recorded flaky at the start is not run again: whatever it says, it does not refuse DONE on its own.
+  const again = runAgain(root, ran.filter((c) => !c.ok && before.get(c.command)?.ok), dir);
+  const checks = ran.map((c) => {
     const was = before.get(c.command);
-    const state = c.ok ? 'pass' : was && !was.ok ? 'already-failing' : 'fail';
+    const state = c.ok ? 'pass' : was?.flaky || again.get(c)?.ok ? 'flaky' : was && !was.ok ? 'already-failing' : 'fail';
+    if (state === 'flaky') {
+      flags.push(
+        was.flaky
+          ? `\`${c.command}\` failed, and it was flaky when this job began — DONE is not refused on it; compare ${was.file} with ${c.file}`
+          : `\`${c.command}\` failed, then passed when run again — flaky, so DONE is not refused on it; read ${c.file}`,
+      );
+    }
     if (state === 'fail') {
       const why = c.timedOut ? 'ran past the time limit' : 'fails';
       blocking.push(
@@ -289,6 +329,9 @@ export function verify(root, { snap, baseline, testsMayChange, declared }, dir, 
   return { at: now, ok: blocking.length === 0, fingerprint, checks, blocking, flags, notes };
 }
 
+/** git's own summary of what changed in tracked files since the snapshot: a line a file, at most `count` of them, then its totals. Empty when git cannot say. */
+export const diffStat = (root, snap, count) => git(root, [...DIFF, '--stat', `--stat-count=${count}`, snap.base, '--', '.'])?.trimEnd() ?? '';
+
 /** The whole change as one file — what a reviewer reads instead of re-deriving it with git. */
 export function writeChanges(root, snap, file) {
   if (!stillThere(root, snap)) throw new UsageError(`the recorded start of that work (${snap.base.slice(0, 12)}) is no longer in the repository — there is no change to hand over`);
@@ -316,7 +359,7 @@ export function writeChanges(root, snap, file) {
 
 /** One line per check, for a status line or a report. */
 export function verdictLines(verdict) {
-  const words = { pass: 'passed', fail: 'FAILED', 'already-failing': 'was already failing' };
+  const words = { pass: 'passed', fail: 'FAILED', 'already-failing': 'was already failing', flaky: 'was flaky' };
   return [
     ...verdict.checks.map((c) => `\`${c.command}\` ${words[c.state]}`),
     ...verdict.blocking.map((b) => `blocking: ${b}`),

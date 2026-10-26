@@ -1,14 +1,16 @@
-import { spawn } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, dirname, extname, join, resolve, sep } from 'node:path';
 import { CREDENTIAL_NAMES } from './auth.mjs';
 import { guardCommand, guardPath } from './guard.mjs';
 import { redact } from './redact.mjs';
+import { blockedWrite, readOnlyPlaces, sandboxWrap, unsandboxable, writablePlaces } from './sandbox.mjs';
 
 /**
  * The two tools a job gets, and the policy every call passes through before it
  * runs: command guards, the editor's path jail, output caps, and redaction.
- * Shell commands run with the user's filesystem access; command guards match known patterns.
+ * Shell commands read what the user can; on macOS they write only where the sandbox lets them, and command guards match known patterns.
  */
 
 /** Anthropic-defined, schema-less on the wire: the API knows their shape, so no schema is sent. */
@@ -33,6 +35,7 @@ export const DELEGATE_TOOL = {
       guide: { type: 'string', enum: ['fix', 'feature', 'none'], description: 'carry guides/<guide>.md into the brief; unsaid, a worker gets the one its title and goal ask for, if any' },
       reviews: { type: 'integer', description: 'reviewer only: the worker job whose change to judge; without it, the uncommitted change' },
       tests_may_change: { type: 'boolean', description: 'worker only: existing tests may be edited' },
+      attempts: { type: 'integer', description: 'worker only, for a hard task: 2 or 3 attempts in worktrees of their own, the best verified one kept; costs that many times as much' },
       job: { type: 'integer', description: 'continue this open job; nothing else is given' },
     },
   },
@@ -66,6 +69,10 @@ export const ASK_TOOL = {
 const OUTPUT_CAP_CHARS = 16_000;
 const VIEW_CAP_LINES = 400;
 const COMMAND_TIMEOUT_MS = 540_000; // the same nine minutes a check gets
+/** How long the model's command may print nothing: one waiting on a prompt or a hung server gives the turn back in two minutes, not nine. */
+const IDLE_TIMEOUT_MS = 120_000;
+/** The most a `timeout N` in front of a command can ask for. */
+const ASKED_MAX_S = 1800;
 const MAX_BUFFER_CHARS = 64 * 1024 * 1024;
 /** What is held of a command's output at each end: more than any cap keeps, so the cut is always made by the cap, never here. */
 const KEPT_EACH_END = 64 * 1024;
@@ -96,6 +103,15 @@ function keeper() {
 
 /** The shell a command runs in: bash, which the tool is named for, where there is one. */
 const SHELL = existsSync('/bin/bash') ? '/bin/bash' : true;
+/**
+ * What is spawned for a command: the shell, or — under a wrapper, the sandbox — the wrapper, which execs into bash in
+ * place, so the pid and its process group are the shell's. The sandbox is only on macOS, where there is always a /bin/bash.
+ */
+function spawnShell(command, wrap, options) {
+  return wrap ? spawn(wrap[0], [...wrap.slice(1), '/bin/bash', '-c', command], options) : spawn(command, { ...options, shell: SHELL });
+}
+/** Why a command never started: the reason, and a directory that is gone is the usual one. */
+const unstartedWhy = (cause, cwd) => `the command could not be started: ${cause.message}${cwd && !existsSync(cwd) ? ` — ${cwd} does not exist` : ''}`;
 /** How long the pipes are drained once the shell has gone, for output already on its way. */
 const DRAIN_MS = 200;
 /** `sumo job baseline|verify|finish` run the project's checks, each under its own limit. */
@@ -137,6 +153,30 @@ export function childEnv(env = process.env) {
   return Object.fromEntries(Object.entries(env).filter(([name]) => !CREDENTIAL_NAMES.includes(name)));
 }
 
+/** What keeps git and ssh from waiting on somebody at a keyboard: no password asked, no editor, no pager, ssh in batch mode. */
+const NO_PROMPTS = { GIT_TERMINAL_PROMPT: '0', GIT_EDITOR: 'true', GIT_PAGER: 'cat', PAGER: 'cat', GIT_SSH_COMMAND: 'ssh -o BatchMode=yes' };
+
+/** Whether git's config where a command runs names an ssh command of its own, asked of git once for each directory. */
+const sshCommands = new Map();
+function hasSshCommand(cwd, env) {
+  if (!sshCommands.has(cwd)) {
+    const asked = spawnSync('git', ['config', '--get', 'core.sshCommand'], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PARSE_TIMEOUT_MS });
+    sshCommands.set(cwd, asked.status === 0 && asked.stdout.trim() !== '');
+  }
+  return sshCommands.get(cwd);
+}
+
+/**
+ * The environment of a command of the model's, which nobody answers — its stdin is closed — so it never waits on a
+ * prompt: each of NO_PROMPTS where the environment has not set it already. An ssh command of the user's own, in the
+ * environment or in git's config, is theirs: it stands, and is not replaced by one in batch mode.
+ */
+function unprompted(env, cwd) {
+  const ownSsh = env.GIT_SSH !== undefined || env.GIT_SSH_COMMAND !== undefined || hasSshCommand(cwd, env);
+  const { GIT_SSH_COMMAND, ...rest } = NO_PROMPTS;
+  return { ...rest, ...(ownSsh ? {} : { GIT_SSH_COMMAND }), ...env };
+}
+
 /**
  * Keeps both ends of a long output. The head says what ran and the tail is
  * where runners put the failures; the middle is the part worth losing, and the
@@ -163,10 +203,70 @@ export function capRedacted(text, max = OUTPUT_CAP_CHARS, omitted = 0, kept = nu
     const out = redact(text).text;
     return out.length <= max ? out : cap(out, max);
   }
+  return cutBetween(text, text, text.length - 2 * Math.floor(max / 2) + omitted, max, kept);
+}
+
+/** The start of `head` and the end of `tail`, half the cap each and without their secrets, and the cut between them said. */
+function cutBetween(head, tail, cut, max, kept) {
   const half = Math.floor(max / 2);
-  const head = redact(text.slice(0, half + max)).text.slice(0, half);
-  const tail = redact(text.slice(-(half + max))).text.slice(-half);
-  return `${head}\n${cutMark(text.length - 2 * half + omitted, kept)}\n${tail}`;
+  return `${redact(head.slice(0, half + max)).text.slice(0, half)}\n${cutMark(cut, kept)}\n${redact(tail.slice(-(half + max))).text.slice(-half)}`;
+}
+
+/** The longest a line of output or of a viewed file is shown whole: a minified bundle or a line of JSON past it is its start, and how much was cut. */
+const LINE_CAP_CHARS = 2_000;
+
+/** A line no longer than LINE_CAP_CHARS. Its secrets go before the cut, which could otherwise leave the start of one that is no longer recognised. */
+function cutLine(line) {
+  if (line.length <= LINE_CAP_CHARS) return line;
+  const clean = redact(line).text;
+  return clean.length <= LINE_CAP_CHARS ? clean : `${clean.slice(0, LINE_CAP_CHARS)}[… ${clean.length - LINE_CAP_CHARS} chars cut]`;
+}
+
+/** A line a progress bar rewrote in place with carriage returns, as it was left: its last state that is not blank. One ending in \r\n keeps its ending. */
+function lastState(line) {
+  const end = line.endsWith('\r') ? '\r' : '';
+  const body = end ? line.slice(0, -1) : line;
+  return body.includes('\r') ? `${body.split('\r').findLast((state) => state.trim() !== '') ?? ''}${end}` : line;
+}
+
+/**
+ * What the model is shown of a command's output, before the cap, so the cap keeps more of what was said: each line a
+ * progress bar rewrote as it was left, a run of three or more of the same line as the line and how many more there
+ * were — where that is shorter — and a line too long to read cut to its start. `cut` counts the lines cut short: what
+ * they held is in the spill file only.
+ */
+export function tidy(output) {
+  const lines = output.split('\n').map(lastState);
+  const shown = [];
+  let cut = 0;
+  for (let i = 0; i < lines.length; ) {
+    let end = i + 1;
+    while (end < lines.length && lines[end] === lines[i]) end++;
+    const fold = `[… the same line ${end - i - 1} more times]`;
+    const folded = end - i >= 3 && fold.length < (end - i - 1) * (lines[i].length + 1);
+    const times = folded ? 1 : end - i;
+    if (lines[i].length > LINE_CAP_CHARS) cut += times;
+    shown.push(...Array(times).fill(cutLine(lines[i])), ...(folded ? [fold] : []));
+    i = end;
+  }
+  return { text: shown.join('\n'), cut };
+}
+
+/**
+ * A command's output as the model is shown it: tidied, then capped, the cut said and the way to what was cut — `kept`,
+ * the spill file, when there is one. Of a flood only the two ends were held: each is tidied on its own, and the cut
+ * between them stays where it was. `cut` counts the lines cut short; `capped` is whether the cap cuts too.
+ */
+function shownOf(output, omitted) {
+  const ends = omitted > 0 ? [tidy(output.slice(0, KEPT_EACH_END)), tidy(output.slice(KEPT_EACH_END))] : [tidy(output)];
+  const capped = omitted > 0 || ends[0].text.length > OUTPUT_CAP_CHARS;
+  const show = (kept) => {
+    if (ends.length === 1) return capRedacted(ends[0].text, OUTPUT_CAP_CHARS, 0, kept) + (kept && !capped ? `\n[a line cut short is whole in ${kept}]` : '');
+    const [head, tail] = ends.map((end) => end.text);
+    const half = Math.floor(OUTPUT_CAP_CHARS / 2);
+    return cutBetween(head, tail, Math.max(0, head.length - half) + omitted + Math.max(0, tail.length - half), OUTPUT_CAP_CHARS, kept);
+  };
+  return { cut: ends.reduce((n, end) => n + end.cut, 0), capped, show };
 }
 
 /** How long a saved output is kept: long enough to be read back by a run picked up tomorrow, not a disk full of old logs. */
@@ -240,10 +340,12 @@ const result = (content, isError = false) => ({ content: redact(String(content))
  * left in the background does not hold the call: once the shell has gone, the
  * output already on its way is drained and the command is over. `onOutput` is
  * handed each piece as it is printed, for a screen that shows the work.
+ * `idleMs` stops a command that has printed nothing for that long; `wrap` is
+ * what the shell runs under — the sandbox.
  */
-export function runCommand(command, { cwd, env, signal = null, timeoutMs = null, onOutput = null }) {
+export function runCommand(command, { cwd, env, signal = null, timeoutMs = null, idleMs = null, onOutput = null, wrap = null }) {
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd, shell: SHELL, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const child = spawnShell(command, wrap, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     if (child.pid) trackGroup(child.pid);
     let drain = null;
     // Each stream, and both together in the order they came, so an error stays beside the step that printed it.
@@ -254,10 +356,19 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null,
     let settled = false;
     const interrupt = () => kill('interrupted');
     const timer = timeoutMs === null ? null : setTimeout(() => kill('timeout'), timeoutMs);
+    // The silence is counted again from every piece of output.
+    let idle = null;
+    const heard = () => {
+      if (idleMs === null) return;
+      clearTimeout(idle);
+      idle = setTimeout(() => kill('idle'), idleMs);
+    };
+    heard();
     const settle = (status, killedBy) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(idle);
       clearTimeout(drain);
       signal?.removeEventListener('abort', interrupt);
       live.delete(child.pid);
@@ -280,6 +391,7 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null,
         size += chunk.length;
         if (size > MAX_BUFFER_CHARS) kill('overflow');
         else {
+          heard();
           kept[name].push(chunk);
           kept.output.push(chunk);
           onOutput?.(chunk);
@@ -288,11 +400,13 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null,
     }
     child.on('error', (cause) => {
       // Never started, so there is no output and no exit to report: the reason is the answer, and a directory that is gone is the usual one.
-      unstarted = `the command could not be started: ${cause.message}${cwd && !existsSync(cwd) ? ` — ${cwd} does not exist` : ''}`;
+      unstarted = unstartedWhy(cause, cwd);
       settle(null, null);
     });
     child.on('close', settle);
     child.on('exit', (status, killedBy) => {
+      // The shell is gone: what is still draining is not a silence to stop.
+      clearTimeout(idle);
       if (stopped) release(status, killedBy);
       else drain = setTimeout(() => release(status, killedBy), DRAIN_MS);
     });
@@ -301,27 +415,192 @@ export function runCommand(command, { cwd, env, signal = null, timeoutMs = null,
   });
 }
 
-/** A shell command, in the project directory, without the secrets, refused when the guard says so. */
-export async function runBash({ command, restart }, ctx, { signal = null, timeoutMs = COMMAND_TIMEOUT_MS, onOutput = null } = {}) {
+/** Said once in a process whose shell cannot be sandboxed: with the first result that would have been. */
+let toldUnsandboxed = false;
+
+/**
+ * The sandbox a command of the model's runs under: on unless the context turns it off (`sandbox: false`, from the
+ * user's `shell.sandbox off`), where there is one, and with the network past this machine closed when the context says
+ * so (`network: false`, from `shell.network off`). `wrap` is null when it runs without; `note` says why, the first time.
+ */
+function jailOf(ctx) {
+  if (ctx.sandbox === false) return { wrap: null, writable: [], readOnly: [], note: '' };
+  const why = unsandboxable();
+  if (why) {
+    const note = toldUnsandboxed ? '' : `\n(the shell is not sandboxed: ${why} — a command can write wherever the user can)`;
+    toldUnsandboxed = true;
+    return { wrap: null, writable: [], readOnly: [], note };
+  }
+  const writable = writablePlaces(ctx.roots);
+  const readOnly = readOnlyPlaces(ctx.roots);
+  const offline = ctx.network === false;
+  return { wrap: sandboxWrap(writable, { readOnly, network: !offline }), writable, readOnly, offline, note: '' };
+}
+
+/** What a job's own tools run the project's checks under: the sandbox its shell is in, or nothing where the shell has none. */
+export const checksWrap = (ctx) => (ctx.sandbox === false || unsandboxable() ? null : jailOf(ctx).wrap);
+
+/** `timeout <N> ` in front of a command, N in seconds or with a unit, in its plainest spelling only: flags are the binary's business. */
+const ASKED = /^\s*timeout\s+(\d+)([smh]?)\s+(?=\S)/;
+const UNIT_S = { '': 1, s: 1, m: 60, h: 3600 };
+
+/**
+ * The limit a command asks for with `timeout N` in front, at most half an hour: both how long it may run and how long
+ * it may be silent. macOS has no `timeout`: without one on the PATH the prefix is taken off, and the limit is kept here
+ * alone. Null for a command that asks for nothing.
+ */
+export function askedLimit(command, path) {
+  const asked = ASKED.exec(command);
+  if (!asked) return null;
+  const seconds = Math.min(Number(asked[1]) * UNIT_S[asked[2]] || ASKED_MAX_S, ASKED_MAX_S);
+  return { ms: seconds * 1000, command: onPath('timeout', path) ? command : command.slice(asked[0].length) };
+}
+
+/** Whether a program is on a PATH, looked for once for each PATH. */
+const found = new Map();
+function onPath(name, path = '') {
+  const key = `${name}\0${path}`;
+  if (!found.has(key)) {
+    const runnable = (file) => {
+      try {
+        accessSync(file, constants.X_OK);
+        return statSync(file).isFile();
+      } catch {
+        return false;
+      }
+    };
+    found.set(key, path.split(delimiter).some((dir) => dir && runnable(join(dir, name))));
+  }
+  return found.get(key);
+}
+
+/**
+ * The command without its last `&`, when it ends in one that stands alone — not `&&`, `|&` or `>&`, and not quoted,
+ * escaped or in a comment: the model asking for it to run in the background. Read conservatively — one line, no
+ * here-document — so a command that only might mean it runs as it always has. Null otherwise.
+ */
+export function backgrounded(command) {
+  const text = command.trimEnd();
+  if (!text.endsWith('&') || text.includes('\n') || text.includes('<<')) return null;
+  let quote = null;
+  for (let i = 0; i < text.length - 1; i++) {
+    const c = text[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (c === '\\' && quote === '"') i++;
+    } else if (c === '\\') i++;
+    else if (c === "'" || c === '"') quote = c;
+    // A comment runs to the end of the line, and the & with it.
+    else if (c === '#' && (i === 0 || /[\s;&|(]/.test(text[i - 1]))) return null;
+  }
+  const rest = text.slice(0, -1);
+  return quote || /[&|<>\\]$/.test(rest) || !rest.trim() ? null : rest.trimEnd();
+}
+
+/**
+ * A command left to run in the background: in a process group of its own, under the same sandbox, its output to a log
+ * beside the outputs kept for reading, and the call answered at once. Its group goes when this process does, and with
+ * the job that started it (`ctx.background`); a `timeout N` it asked for still stops it.
+ */
+async function runInBackground(command, ctx, { env, jail }) {
+  const asked = askedLimit(command, env.PATH);
+  const dir = ctx.spill ?? tmpdir();
+  let log;
+  let fd;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    log = join(dir, `${Date.now()}-${process.pid}-${spilled++}.log`);
+    fd = openSync(log, 'a', 0o600);
+  } catch (cause) {
+    return result(`the command could not be started in the background: there is nowhere to write its log (${cause.message})`, true);
+  }
+  let child;
+  try {
+    child = spawnShell(asked?.command ?? command, jail.wrap, { cwd: ctx.cwd, env, stdio: ['ignore', fd, fd], detached: true });
+  } finally {
+    closeSync(fd);
+  }
+  const unstarted = await new Promise((resolve) => {
+    child.once('spawn', () => resolve(null));
+    child.once('error', resolve);
+  });
+  if (unstarted) return result(unstartedWhy(unstarted, ctx.cwd), true);
+  const { pid } = child;
+  trackGroup(pid);
+  ctx.background?.add(pid);
+  const timer = asked ? setTimeout(() => killGroup(pid), asked.ms).unref() : null;
+  child.on('exit', () => {
+    clearTimeout(timer);
+    live.delete(pid);
+    ctx.background?.delete(pid);
+  });
+  // Nothing here waits on it: it runs until it ends, is stopped, or what started it goes.
+  child.unref();
+  return result(`started in the background (pid ${pid}); its output goes to ${log} — read it with \`tail -n 50 ${log}\`. It is stopped when the job or the chat that started it ends.${jail.note}`);
+}
+
+/** A limit as it is said: in minutes when it is whole minutes, else in seconds. */
+const span = (ms) => (ms >= 60_000 && ms % 60_000 === 0 ? `${ms / 60_000} minute${ms === 60_000 ? '' : 's'}` : `${ms / 1000} second${ms === 1000 ? '' : 's'}`);
+
+/**
+ * A shell command, in the project directory, without the secrets, refused when the guard says so, and in the sandbox
+ * where there is one. It is stopped when it runs past its limit or prints nothing for two minutes — a `timeout N` in
+ * front sets both — and one ending in a lone `&` is left running in the background, with a log.
+ */
+export async function runBash({ command, restart }, ctx, { signal = null, timeoutMs = COMMAND_TIMEOUT_MS, idleMs = IDLE_TIMEOUT_MS, onOutput = null } = {}) {
   // The tool is specified as one session the model may restart; here every call is its own shell, so there is nothing to restart.
   if (restart) return result('Bash session restarted: every command already runs in a fresh shell, in the project directory');
   if (typeof command !== 'string' || !command.trim()) return result('bash needs a command', true);
   const refused = guardCommand(command, { cwd: ctx.cwd });
   if (refused) return result(refused, true);
+  const env = unprompted(ctx.env ?? childEnv(), ctx.cwd);
+  const jail = jailOf(ctx);
+  const behind = backgrounded(command);
+  if (behind !== null) return runInBackground(behind, ctx, { env, jail });
   // The commands that run the project's checks give each check its own limit; one limit over all of them would cut a verdict off half-way.
-  const limit = OWN_LIMITS.test(command) ? null : timeoutMs;
-  const run = await runCommand(command, { cwd: ctx.cwd, env: ctx.env ?? childEnv(), signal, timeoutMs: limit, onOutput });
-  if (run.error) return result(run.error, true);
+  // A check may work for minutes without a word, so they are not held to a silence either.
+  const own = OWN_LIMITS.test(command);
+  const asked = own ? null : askedLimit(command, env.PATH);
+  const limit = own ? null : (asked?.ms ?? timeoutMs);
+  // A silence as long as the whole limit can never come first: a command that asked for its limit has only the one.
+  const quiet = own || asked ? null : idleMs;
+  const run = await runCommand(asked?.command ?? command, { cwd: ctx.cwd, env, signal, timeoutMs: limit, idleMs: quiet, onOutput, wrap: jail.wrap });
+  if (run.error) return result(run.error + jail.note, true);
   const failed = run.stopped !== null || run.status !== 0;
   const output = run.output.trimEnd();
   const tail =
-    run.stopped === 'timeout' ? `\n(stopped: it ran past ${timeoutMs / 60_000} minutes)`
+    run.stopped === 'timeout' ? `\n(stopped: it ran past ${span(limit)})`
+    : run.stopped === 'idle' ? `\n(stopped: it printed nothing for ${span(quiet)} — to wait longer, run it again as \`timeout 600 ${command}\`, or in the background with a trailing \`&\` and read its log)`
     : run.stopped === 'interrupted' ? `\n(${INTERRUPTED})`
     : run.stopped === 'overflow' ? `\n(stopped: it printed more than ${MAX_BUFFER_CHARS / 1024 / 1024} MB — narrow the command: tail, grep, or a line range)`
     : failed ? `\n(exit ${run.status ?? run.signal})` : '';
-  // Output the model is shown only the ends of is kept whole — as much as was held — where it can read a range of it.
-  const kept = ctx.spill && (output.length > OUTPUT_CAP_CHARS || run.omitted > 0) ? spill(ctx.spill, output, run.omitted) : null;
-  return result(capRedacted(output, OUTPUT_CAP_CHARS, run.omitted, kept) + tail, failed);
+  // Output the model is shown only the ends of, or with a line cut short, is kept as it was printed — as much as was
+  // held — where it can read a range of it.
+  const tidied = shownOf(output, run.omitted);
+  const kept = ctx.spill && (tidied.capped || tidied.cut > 0) ? spill(ctx.spill, output, run.omitted) : null;
+  const shown = tidied.show(kept) + tail;
+  if (jail.wrap && run.stopped === null && run.status !== 0 && blockedWrite(output)) return blocked(command, shown, ctx, jail, { signal, timeoutMs, idleMs, onOutput });
+  return result(shown + jail.note, failed);
+}
+
+/**
+ * A command the sandbox kept from writing: what it printed, and where it may write. Somebody there (`ctx.approve`, the
+ * question an MCP call off the allow list is put with) may let that exact command run once more, outside the sandbox —
+ * the guard has passed it already. With nobody there, the model is told to report it.
+ */
+async function blocked(command, shown, ctx, jail, options) {
+  const except = jail.readOnly.length > 0 ? `, except git's hooks and config: ${jail.readOnly.join(', ')}` : '';
+  const offline = jail.offline ? ' — and nothing past this machine can be reached: the user turned the network off (shell.network)' : '';
+  const said = `${shown}\n(the sandbox blocked a write outside the project — only these can be written: ${jail.writable.join(', ')}${except}${offline})`;
+  if (!ctx.approve) return result(`${said}\n(nobody is here to allow it outside the sandbox: report it, with the command, so the user can run it themselves)`, true);
+  const { signal } = options;
+  const stopped = new Promise((resolve) => signal?.addEventListener('abort', () => resolve('no'), { once: true }));
+  // Asked as what it is — this one run outside the sandbox, yes or no — never as an MCP call that could be allowed always.
+  const answer = signal?.aborted ? 'no' : await Promise.race([ctx.approve({ name: BASH_TOOL.name, server: 'bash', tool: 'outside the sandbox', input: { command }, unsandboxed: true, signal }), stopped]);
+  // Always is once here: what is allowed is this one run, never the sandbox off.
+  if (answer !== 'once' && answer !== 'always') return result(`${said}\n(the user declined running it outside the sandbox: do not run it again; carry on another way, or ask the user)`, true);
+  const again = await runBash({ command }, { ...ctx, sandbox: false }, options);
+  return { ...again, content: `(the sandbox blocked a write outside the project; the user let it run again outside the sandbox)\n${again.content}` };
 }
 
 /** How much of a file is looked at to tell a binary from text: a NUL byte in its first pages is one. */
@@ -337,13 +616,13 @@ function view(path, range) {
   from = Math.max(1, from);
   to = to === -1 ? lines.length : Math.min(lines.length, to);
   // The window ends at the last whole line that fits the cap a command's output has, so a long file is never shown
-  // with a hole in it and the next view carries on from a line. Only a first line too long for the cap is cut inside.
+  // with a hole in it and the next view carries on from a line. Only a line too long to read — a minified file's — is cut inside.
   const shown = [];
   let size = 0;
   for (const [i, line] of lines.slice(from - 1, Math.min(to, from - 1 + VIEW_CAP_LINES)).entries()) {
-    const numbered = `${from + i}\t${line}`;
+    const numbered = `${from + i}\t${cutLine(line)}`;
     if (shown.length > 0 && size + numbered.length + 1 > OUTPUT_CAP_CHARS) break;
-    shown.push(shown.length === 0 ? cap(numbered) : numbered);
+    shown.push(numbered);
     size += numbered.length + 1;
   }
   const cut = to - (from - 1 + shown.length);
@@ -407,6 +686,211 @@ function changeOf(text, { start, end }, replacement) {
   return { line: text.slice(0, from).split('\n').length, old: lines(text.slice(from, to)), new: lines(`${text.slice(from, start)}${replacement}${text.slice(end, to)}`) };
 }
 
+/** A file as it stood when the model last looked: a change on disk since moves one or the other. */
+const stampOf = (path) => {
+  const { mtimeMs, size } = statSync(path);
+  return { mtimeMs, size };
+};
+
+/** What the model has seen of each file in this context — viewed, or written by the editor — kept for as long as the context is. */
+const seenIn = (ctx) => (ctx.seen ??= new Map());
+
+/** The line an edit opens with when its file changed on disk since the model saw it: the edit was made against what it remembers. */
+function changedSince(path, ctx) {
+  const was = ctx.seen?.get(path);
+  if (!was) return null;
+  const now = stampOf(path);
+  return now.mtimeMs !== was.mtimeMs || now.size !== was.size ? `${path} changed on disk since you last viewed it; view it again if this edit depends on the rest of it.` : null;
+}
+
+/** How long a parse check may take before it is let go unanswered. */
+const PARSE_TIMEOUT_MS = 5_000;
+/** How many lines of a parse error are shown: where it is and what it is, not a stack. */
+const PARSE_ERROR_LINES = 5;
+/**
+ * Python's own parser, its error without a traceback; isolated, so a file in the project named like a module is not run,
+ * and writing no bytecode. The bytes are parsed, so the file's own coding line decides how they read, not the locale.
+ */
+const PY_PARSE = 'import ast,sys,traceback\ntry: ast.parse(open(sys.argv[1], "rb").read(), sys.argv[1])\nexcept Exception as e: sys.exit("".join(traceback.format_exception_only(type(e), e)))';
+
+/**
+ * Why a file does not parse, as its parser says it in a few lines — or null: it parses, it is of no kind checked here,
+ * or the parser is missing or too slow to say. `.js .mjs .cjs` by `node --check`, `.json` here, `.py` and `.go` by
+ * their own tools when they are on the PATH.
+ */
+function parseError(path, ctx) {
+  const env = ctx.env ?? childEnv();
+  const ext = extname(path);
+  let run;
+  if (ext === '.json') {
+    try {
+      JSON.parse(readFileSync(path, 'utf8'));
+      return null;
+    } catch (cause) {
+      return cause.message;
+    }
+  }
+  // The binary Bun builds is no node to check a script with: it asks the node on PATH, if there is one.
+  if (['.js', '.mjs', '.cjs'].includes(ext) && (!process.versions.bun || onPath('node', env.PATH))) run = [process.versions.bun ? 'node' : process.execPath, ['--check', path]];
+  else if (ext === '.py' && onPath('python3', env.PATH)) run = ['python3', ['-I', '-B', '-c', PY_PARSE, path]];
+  else if (ext === '.go' && onPath('gofmt', env.PATH)) run = ['gofmt', ['-e', '-l', path]];
+  else return null;
+  const out = spawnSync(run[0], run[1], { env, encoding: 'utf8', timeout: PARSE_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'] });
+  if (out.error || out.status === null || out.status === 0) return null;
+  const lines = `${out.stderr}\n${out.stdout}`.split('\n').filter((l) => l.trim());
+  return lines.length > 0 ? lines.slice(0, PARSE_ERROR_LINES).map((l) => l.slice(0, 200)).join('\n') : `the parser stopped with status ${out.status}`;
+}
+
+/** How many of a session's turns /undo can walk back through; older ones are let go as new ones are kept. */
+const UNDO_TURNS = 20;
+/** How long the undo of a session nothing has touched is kept: as long as the session can be resumed. */
+const UNDO_KEEP_MS = 30 * 24 * 3_600_000;
+const MANIFEST = 'manifest.json';
+
+/** A session's kept turns, oldest first: folders named by their number. */
+function undoTurns(sessionDir) {
+  try {
+    return readdirSync(sessionDir).filter((name) => /^\d+$/.test(name)).map(Number).sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+/** The folder the coming turn's undo goes in — made only when the editor first changes a file in it. */
+export const nextUndoTurn = (sessionDir) => join(sessionDir, String((undoTurns(sessionDir).at(-1) ?? 0) + 1));
+
+const readManifest = (turnDir) => {
+  try {
+    return JSON.parse(readFileSync(join(turnDir, MANIFEST), 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * After the editor's first change to a file in a turn: what the file held before it (`before`, its bytes), or that it
+ * was not there (null), kept in the turn's folder for /undo, readable by the user alone. A later change to it in the same
+ * turn keeps nothing — /undo goes back to before the turn. The turn that starts a folder lets go of the oldest beyond
+ * UNDO_TURNS, and of the undo of sessions long untouched.
+ */
+function keepForUndo(turnDir, path, before) {
+  const manifest = readManifest(turnDir) ?? [];
+  if (manifest.some((entry) => entry.path === path)) return;
+  if (manifest.length === 0) {
+    const sessionDir = dirname(turnDir);
+    mkdirSync(turnDir, { recursive: true, mode: 0o700 });
+    for (const old of undoTurns(sessionDir).slice(0, -UNDO_TURNS)) rmSync(join(sessionDir, String(old)), { recursive: true, force: true });
+    const home = dirname(sessionDir);
+    for (const name of readdirSync(home)) {
+      const other = join(home, name);
+      if (other !== sessionDir && Date.now() - statSync(other).mtimeMs > UNDO_KEEP_MS) rmSync(other, { recursive: true, force: true });
+    }
+  }
+  const kept = before === null ? null : String(manifest.length);
+  if (kept !== null) writeFileSync(join(turnDir, kept), before, { mode: 0o600 });
+  manifest.push({ path, kept, mode: kept === null ? null : statSync(path).mode & 0o777 });
+  writeFileSync(join(turnDir, MANIFEST), JSON.stringify(manifest), { mode: 0o600 });
+}
+
+/**
+ * /undo: every file the session's last kept turn changed, put back as it was before that turn — a file it created is
+ * deleted — and the turn let go, so the next /undo reaches the one before. Null when there is none to undo.
+ */
+export function undoLast(sessionDir) {
+  for (const n of undoTurns(sessionDir).reverse()) {
+    const turnDir = join(sessionDir, String(n));
+    const manifest = readManifest(turnDir);
+    if (!manifest) {
+      rmSync(turnDir, { recursive: true, force: true });
+      continue;
+    }
+    const done = { restored: [], deleted: [] };
+    for (const { path, kept, mode } of manifest) {
+      if (kept === null) {
+        rmSync(path, { force: true });
+        done.deleted.push(path);
+      } else {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, readFileSync(join(turnDir, kept)), { mode: mode ?? 0o644 });
+        done.restored.push(path);
+      }
+    }
+    rmSync(turnDir, { recursive: true, force: true });
+    return done;
+  }
+  return null;
+}
+
+/**
+ * One change to a file by the editor, and what is owed around it: what the file held is kept for /undo (`ctx.undo`, the
+ * chat's turn folder), a change on disk since the model saw it is said first, and a parse the change broke — one that held
+ * before it — is said after. `created`: the file was not there, so it parsed before as far as anyone is concerned.
+ */
+function change(path, ctx, write, { created = false } = {}) {
+  const stale = created ? null : changedSince(path, ctx);
+  const before = ctx.undo && !created ? readFileSync(path) : null;
+  const broken = created ? null : parseError(path, ctx);
+  write();
+  // Kept once the write has gone through: a change refused — a create of a file already there — has nothing to undo. A keep
+  // that fails is said, not thrown: the change is made, and a model told it failed would make it twice.
+  let unkept = null;
+  try {
+    if (ctx.undo) keepForUndo(ctx.undo, path, before);
+  } catch (cause) {
+    unkept = `(this change could not be kept for /undo: ${cause.message})`;
+  }
+  if (created || ctx.seen?.has(path)) seenIn(ctx).set(path, stampOf(path));
+  const now = broken === null ? parseError(path, ctx) : null;
+  return (said) => [stale, said, unkept, now && `The file no longer parses:\n${now}`].filter(Boolean).join('\n');
+}
+
+/** A whole line that is one comment — `//`, `#`, `/* *\/`, `<!-- -->`, `--`, JSX's `{/* *\/}` — and what it says. */
+const COMMENT_LINE = /^(?:\/\/+|#+|\/\*+|<!--|--|\{\/\*+)\s*(.*?)\s*(?:\*+\/\}?|-->)?$/;
+/** The block comments that close on their line: only dots in one is a gap left in the code, where `// ...` alone may be a deliberate stub. */
+const CLOSED_COMMENT = /(?:\*\/\}?|-->)$/;
+const DOTS = /\.{3,}|…/g;
+/** That what was left out stays as it was: optional after `rest of the code`; needed after `other methods` with no dots around it, which could be a heading. */
+const STAYS = String.raw`(?:\s+(?:is\s+|are\s+|stays\s+|remains\s+|goes\s+)?(unchanged|the same|as before|as is|omitted|here|goes here|follows|not shown))?`;
+/** What a gap stands for. */
+const STUFF = String.raw`(?:code|file|function|functions|method|methods|class|implementation|component|module|body|content|contents|imports?|tests?|logic|lines?|cases|fields|properties|props|styles)`;
+const REST_OF = new RegExp(String.raw`^(?:(?:the|and|all)\s+)?(?:rest|remainder)\s+of\s+(?:the\s+|this\s+|your\s+)?(?:\w+\s+)?${STUFF}${STAYS}$`);
+const KEPT_AS_IS = new RegExp(String.raw`^(?:(?:the|all)\s+)?(?:existing|previous|original|other|remaining|unchanged|same)\s+(?:\w+\s+)?${STUFF}${STAYS}$`);
+const UNCHANGED = /^(?:unchanged|no changes|as before|same as before)$/;
+/** Files whose text is prose for a reader: an example in one shows code with its gaps on purpose. */
+const PROSE = ['.md', '.mdx', '.markdown', '.txt', '.rst', '.adoc'];
+/** The longest a line that stands for code is: a gap is said in a few words, and a longer line is never read for one. */
+const GAP_MAX_CHARS = 200;
+
+/**
+ * Whether a line stands for code instead of holding it — `// ... rest of the code unchanged`, `# ... existing code ...`,
+ * `/* rest of file *\/`, `// (unchanged)`, `<!-- ... -->` — as a model writes one when it means "keep what is there".
+ * Gemini CLI refuses the same; read narrowly here: a whole line, a comment or dots around it, and nothing in it but the gap. A
+ * `...` in code or prose, a comment that only mentions the rest of something, and `// ...` alone are never one.
+ */
+function standsForCode(line) {
+  const trimmed = line.trim();
+  if (trimmed.length > GAP_MAX_CHARS) return false;
+  const comment = COMMENT_LINE.exec(trimmed);
+  const said = comment ? comment[1] : trimmed;
+  const dotted = /^(?:\.{3}|…)|(?:\.{3}|…)$/.test(said);
+  const words = said.replace(DOTS, ' ').replace(/^[\s([{]+|[\s)\]}.,;:]+$/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const kept = KEPT_AS_IS.exec(words);
+  // Bare, only dots around the words make it one: `...existing code...`; a spread such as `...rest,` never reads as words.
+  if (!comment) return dotted && (REST_OF.test(words) || kept !== null);
+  if (words === '') return dotted && CLOSED_COMMENT.test(trimmed);
+  return REST_OF.test(words) || UNCHANGED.test(words) || (kept !== null && (dotted || kept[1] !== undefined));
+}
+
+/** Why an edit's new text is not written: a line of it stands for code, and the file — `had`, as it is — does not already hold that line. Null when none does. */
+function placeholderIn(path, field, text, had = '') {
+  if (PROSE.includes(extname(path).toLowerCase())) return null;
+  const lines = String(text ?? '').split('\n').filter(standsForCode);
+  if (lines.length === 0) return null;
+  const there = new Set(had.split('\n').map((l) => l.trim()));
+  const gap = lines.find((l) => !there.has(l.trim()));
+  return gap === undefined ? null : `not written: ${field} has a line that stands for code instead of holding it — ${JSON.stringify(gap.trim())} — and the file would hold that line, not the code. Write the code out in full; to leave code as it is, leave it out of the edit.`;
+}
+
 /** The text editor's four commands, each inside the jail; secret files are neither shown nor written. */
 export function runEditor(input, ctx) {
   let path;
@@ -425,21 +909,41 @@ export function runEditor(input, ctx) {
         return result(`${path} can be read, not changed — only files in the project (${ctx.roots[0]}) are edited`, true);
       }
     }
+    // What git runs by itself — a hook on the next commit, a command its config names — runs outside the sandbox: the shell cannot write it, nor can this.
+    if (input.command !== 'view') {
+      const at = realAncestor(path);
+      const kept = readOnlyPlaces(ctx.roots).find((place) => path === place || path.startsWith(`${place}${sep}`) || at === place || at.startsWith(`${place}${sep}`));
+      if (kept) return result(`${path} is git's own hooks or configuration: not changed here — what git runs by itself would run outside the sandbox. Say in your report what it needs.`, true);
+    }
     switch (input.command) {
-      case 'view':
+      case 'view': {
         if (secret) return result(secret, true);
         if (!existsSync(path)) return result(`${path} does not exist`, true);
-        return view(path, input.view_range);
-      case 'create':
+        const shown = view(path, input.view_range);
+        if (!shown.isError && statSync(path).isFile()) seenIn(ctx).set(path, stampOf(path));
+        return shown;
+      }
+      case 'create': {
         if (secret) return result(secret, true);
+        const gap = placeholderIn(path, 'file_text', input.file_text);
+        if (gap) return result(gap, true);
+        // The write below refuses a file that is there anyway; said here in words that tell the model what to do instead.
+        if (existsSync(path) && statSync(path).isFile()) {
+          const held = readFileSync(path, 'utf8');
+          const lines = held.split('\n').length - (held.endsWith('\n') ? 1 : 0);
+          return result(`${path} already exists (${lines} line${lines === 1 ? '' : 's'}): change the lines that change with str_replace or insert — a file is never rewritten whole`, true);
+        }
         mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, String(input.file_text ?? ''), { flag: 'wx' });
-        return result(`created ${path}`);
+        const said = change(path, ctx, () => writeFileSync(path, String(input.file_text ?? ''), { flag: 'wx' }), { created: true });
+        return result(said(`created ${path}`));
+      }
       case 'str_replace': {
         if (secret) return result(secret, true);
         if (!input.old_str) return result('str_replace needs old_str', true);
         if (input.new_str !== undefined && input.old_str === input.new_str) return result('old_str and new_str are the same — nothing would change', true);
         const text = readFileSync(path, 'utf8');
+        const gap = placeholderIn(path, 'new_str', input.new_str, text);
+        if (gap) return result(gap, true);
         const where = locate(text, input.old_str);
         if (!where) return result(`old_str was not found in ${path}`, true);
         if (where.hits !== 1) return result(`old_str appears ${where.hits} times in ${path} — include more context so it is unique`, true);
@@ -448,8 +952,8 @@ export function runEditor(input, ctx) {
           if (text.includes('\r\n')) replacement = replacement.replace(/\r?\n/g, '\r\n');
           if (where.reindent) replacement = where.reindent(replacement);
         }
-        writeFileSync(path, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`);
-        return { ...result(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`), edit: changeOf(text, where, replacement) };
+        const said = change(path, ctx, () => writeFileSync(path, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`));
+        return { ...result(said(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`)), edit: changeOf(text, where, replacement) };
       }
       case 'insert': {
         if (secret) return result(secret, true);
@@ -459,11 +963,13 @@ export function runEditor(input, ctx) {
         // The tool sends the text as insert_text, a line with its newline; new_str is what an earlier version of the tool sent.
         const text = input.insert_text ?? input.new_str;
         if (typeof text !== 'string') return result('insert needs insert_text: the text to insert', true);
+        const gap = placeholderIn(path, input.insert_text === undefined ? 'new_str' : 'insert_text', text, lines.join('\n'));
+        if (gap) return result(gap, true);
         // A file ending in a newline splits to a last empty piece, which is not a line to insert after.
         const at = Math.max(0, Math.min(lines.at(-1) === '' ? lines.length - 1 : lines.length, line));
         lines.splice(at, 0, text.replace(/\n$/, ''));
-        writeFileSync(path, lines.join('\n'));
-        return { ...result(`inserted into ${path} after line ${at}`), edit: { line: at + 1, old: '', new: redact(text.replace(/\n$/, '')).text } };
+        const said = change(path, ctx, () => writeFileSync(path, lines.join('\n')));
+        return { ...result(said(`inserted into ${path} after line ${at}`)), edit: { line: at + 1, old: '', new: redact(text.replace(/\n$/, '')).text } };
       }
       default:
         return result(`unknown command ${input.command}`, true);

@@ -466,7 +466,7 @@ test('a session that has grown big says so once per band, with the compact hint 
   grownTo(file, 90_000);
   assert.equal(
     say(s, 'keep going', session).out,
-    `context: 90k tokens — quality drops from here. Finish the piece in hand, then tell the user to type /new: the memory block brings the thread back. ${hint}`,
+    `context: large — quality drops from here. Finish the piece in hand, then tell the user to type /new: the memory block brings the thread back. ${hint}`,
   );
 
   grownTo(file, 100_000);
@@ -477,7 +477,7 @@ test('a session that has grown big says so once per band, with the compact hint 
   grownTo(file, 155_000);
   assert.equal(
     say(s, 'one more thing', session).out,
-    'context: 155k tokens — start fresh now: note where you are (sumo job note; the end of the turn records "Left off"), then tell the user to type /new. ' +
+    'context: very large — start fresh now: note where you are (sumo job note; the end of the turn records "Left off"), then tell the user to type /new. ' +
       'hint: focus on migrate to pnpm; keep decisions and open job ids in a note; drop tool output and file contents.',
   );
 });
@@ -497,7 +497,7 @@ test('a task that ends in a big session ends with the nudge to start fresh', () 
   const file = join(s.root, 'boundary.jsonl');
   grownTo(file, 120_000);
   say(s, 'start the pnpm migration in simba', { session_id: 'sess-boundary', cwd: '/x', transcript_path: file });
-  const boundary = 'this session is at 120k tokens and the task just ended — a good moment for /new; the memory block brings the thread back.';
+  const boundary = 'this session has grown large and the task just ended — a good moment for /new; the memory block brings the thread back.';
 
   const task = 'Move simba to pnpm.\n## Check\n`make test` exits 0.\n';
   assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm'], { input: task }).code, 0);

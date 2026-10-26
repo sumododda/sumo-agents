@@ -310,10 +310,12 @@ const ASK_INPUT_MAX = 4_000;
 /** A call waiting on the user's word: who asks, what would run with what — the whole input, not its first line — and the keys that answer. */
 function Ask({ ask, aside = false }) {
   const who = ask.job ? `j${ask.job}: ` : '';
-  const whole = JSON.stringify(ask.input ?? {});
+  // A command the sandbox blocked is asked as itself: the command, to run once outside the sandbox — yes or no, never always.
+  const command = ask.unsandboxed ? safeForTerminal(String(ask.input?.command ?? '')) : null;
+  const whole = command ?? JSON.stringify(ask.input ?? {});
   // Short enough for the line, it is on the line; longer, it is laid out under it, every field whole, up to the cut.
-  const short = whole.length <= INPUT_SHOWN;
-  const laid = short ? [] : JSON.stringify(ask.input ?? {}, null, 2).split('\n');
+  const short = whole.length <= INPUT_SHOWN && !whole.includes('\n');
+  const laid = short ? [] : command !== null ? command.split('\n') : JSON.stringify(ask.input ?? {}, null, 2).split('\n');
   const kept = [];
   let size = 0;
   for (const line of laid) {
@@ -326,10 +328,10 @@ function Ask({ ask, aside = false }) {
   return h(
     Box,
     { marginTop: 1, flexDirection: 'column' },
-    h(Text, { color: 'yellow' }, `⚠ ${who}allow ${ask.server} · ${ask.tool}(${short ? whole : '…'})?`),
+    h(Text, { color: 'yellow' }, command !== null ? `⚠ ${who}run this once outside the sandbox?${short ? ` ${whole}` : ''}` : `⚠ ${who}allow ${ask.server} · ${ask.tool}(${short ? whole : '…'})?`),
     ...kept.map((line, i) => h(Text, { key: i, color: 'yellow', wrap: 'truncate-end' }, `  ${line}`)),
     cut > 0 ? h(Text, { color: 'yellow', dimColor: true }, `  … ${cut} more line${cut === 1 ? '' : 's'} of input not shown — n, and ask the model for less`) : null,
-    h(Text, { dimColor: true }, `  y once · a always · n no · esc ${aside ? 'no' : 'stop'}`),
+    h(Text, { dimColor: true }, `  ${command !== null ? 'y yes · n no' : 'y once · a always · n no'} · esc ${aside ? 'no' : 'stop'}`),
   );
 }
 
@@ -792,9 +794,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         record({ kind: 'user', text: line });
         return record({ kind: 'reply', raw: helpText(session.commands), own: true });
       }
-      if (control === 'model' || control === 'memory' || control === 'mcp') {
+      if (control === 'model' || control === 'memory' || control === 'mcp' || control === 'undo') {
         record({ kind: 'user', text: line });
-        const text = control === 'model' ? session.route(args) : control === 'mcp' ? (await session.mcp()).join('\n') : await session.memoryPage();
+        const text = control === 'model' ? session.route(args) : control === 'undo' ? session.undo() : control === 'mcp' ? (await session.mcp()).join('\n') : await session.memoryPage();
         return record({ kind: 'note', text });
       }
       record({ kind: 'user', text: line });
@@ -1034,6 +1036,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     // A request being sent again, or a job's conversation summarized to make room: said where the work shows, with the job's id.
     const onRetry = (r) => record({ kind: 'note', text: `${r.job ? `j${r.job}: ` : ''}${retryLine(r)}` });
     const onCompact = (c) => record({ kind: 'note', text: `${c.job ? `j${c.job}: ` : ''}${compactLine(c)}` });
+    // The session has passed what it may cost before it is said: said once, where the retries are.
+    const onBudget = ({ text }) => record({ kind: 'note', text });
     const onTool = ({ call, job }) => {
       const at = state.jobs.get(job);
       if (at) at.calls++;
@@ -1122,7 +1126,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     const onApprove = (ask) => {
       state.asks.push(ask);
       ask.signal?.addEventListener('abort', () => settle(ask, 'no'), { once: true });
-      alert(`${state.where.name}: ${ask.server} · ${ask.tool} waits for your answer`);
+      alert(`${state.where.name}: ${ask.unsandboxed ? 'a command waits to run outside the sandbox' : `${ask.server} · ${ask.tool} waits for your answer`}`);
       redraw();
     };
     // A question of the model's: shown with its options, the first one picked, until a pick or a typed answer settles it.
@@ -1138,9 +1142,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       if (error) record({ kind: 'error', text: `mcp: ${error}` });
       for (const server of servers.filter((s) => !s.ok)) record({ kind: 'error', text: `mcp ${server.name}: ${server.error} — sumo mcp shows every server` });
     };
-    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('guide', onGuide).on('sources', onSources).on('check', onCheck).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('ask', onAsk).on('mcp', onMcp);
+    events.on('text', onText).on('thinking', onThinking).on('retry', onRetry).on('compact', onCompact).on('budget', onBudget).on('tool', onTool).on('output', onOutput).on('heard', onHeard).on('guide', onGuide).on('sources', onSources).on('check', onCheck).on('result', onResult).on('usage', onUsage).on('job', onJob).on('tab-failed', onTabFailed).on('job-end', onJobEnd).on('job-report', onJobReport).on('approve', onApprove).on('ask', onAsk).on('mcp', onMcp);
     return () => {
-      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('guide', onGuide).off('sources', onSources).off('check', onCheck).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('ask', onAsk).off('mcp', onMcp);
+      events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('budget', onBudget).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('guide', onGuide).off('sources', onSources).off('check', onCheck).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('ask', onAsk).off('mcp', onMcp);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
       clearTimeout(state.drawSoon);
@@ -1196,9 +1200,11 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       }
       // A call standing takes the key: an answer, or Esc and Ctrl-C, which go on to stop the turn; nothing lands in the box.
       if (!asked && state.asks.length > 0 && !oneKey.escape && !(oneKey.ctrl && (one === 'c' || one === 'd'))) {
-        const answer = { y: 'once', a: 'always', n: 'no' }[one];
+        // A run outside the sandbox is this one run or none: there is no always for it.
+        const unsandboxed = state.asks[0].unsandboxed;
+        const answer = (unsandboxed ? { y: 'once', n: 'no' } : { y: 'once', a: 'always', n: 'no' })[one];
         if (answer) settle(state.asks[0], answer);
-        else notify('y allows it once · a always · n refuses it · esc stops the turn');
+        else notify(unsandboxed ? 'y runs it once outside the sandbox · n refuses it · esc stops the turn' : 'y allows it once · a always · n refuses it · esc stops the turn');
         continue;
       }
       // A question from a job in the background: Esc refuses that one call, and stops nothing.

@@ -47,7 +47,14 @@ function rewriteState(s, id, change) {
 }
 
 const newWorker = (s, extra = []) => s.sumo(['job', 'new', '--project', 'gitproj', '--title', 'return 2', ...extra], { input: TASK });
-const finish = (s, id = '1', extra = []) => s.sumo(['job', 'finish', id, '--status', 'DONE', ...extra], { input: REPORT });
+/** A worker's first DONE is answered with the check against the task, and nothing is run: what these tests judge comes after it. */
+const CHECK_ASKED = /is not closed yet — before DONE counts, check the work against the task/;
+const pastCheck = (s, id = '1') => assert.match(s.sumo(['job', 'finish', id, '--status', 'DONE'], { input: REPORT }).err, CHECK_ASKED);
+const finish = (s, id = '1', extra = []) => {
+  const run = () => s.sumo(['job', 'finish', id, '--status', 'DONE', ...extra], { input: REPORT });
+  const first = run();
+  return CHECK_ASKED.test(first.err) ? run() : first;
+};
 
 test('a passing check that changes the tree cannot certify the changed files', () => {
   const s = sandbox();
@@ -256,14 +263,14 @@ test('a reviewer is handed the change as one file, what was asked, and the autho
   assert.equal(s.sumo(['job', 'new', '--project', 'gitproj', '--reviews', '1', '--title', 'x'], { input: 'x' }).code, 2, '--reviews is a reviewer flag');
 });
 
-test('a second worker in the same working tree is called out when it is created', () => {
+test('a second worker in a git project is told it works in a worktree of its own when it is created', () => {
   const s = sandbox();
   s.routerWillSay('sonnet', 'medium');
   gitProject(s);
-  assert.doesNotMatch(newWorker(s).out, /already a running worker/);
-  assert.match(newWorker(s).out, /note: j1 "return 2" is already a running worker in proj-git — two workers in one working tree overwrite each other/);
+  assert.doesNotMatch(newWorker(s).out, /already a/);
+  assert.match(newWorker(s).out, /note: j1 "return 2" is already a worker in proj-git — this one works in a worktree of its own, \S+\/jobs\/2\/tree, and its change is brought back/);
   s.sumo(['job', 'new', '--project', 'gitproj', '--agent', 'scout', '--title', 'look'], { input: TASK });
-  assert.doesNotMatch(s.sumo(['job', 'new', '--project', 'gitproj', '--agent', 'scout', '--title', 'look again'], { input: TASK }).out, /already a running worker/, 'scouts only read');
+  assert.doesNotMatch(s.sumo(['job', 'new', '--project', 'gitproj', '--agent', 'scout', '--title', 'look again'], { input: TASK }).out, /already a/, 'scouts only read');
 });
 
 test('jobs from before reviewers existed survive the upgrade, and no job id is ever handed out twice', () => {
@@ -497,11 +504,15 @@ test('two checks of one name are told apart: each is judged against its own base
   s.sumo(['job', 'new', '--project', 'mixed', '--title', 'x'], { input: TASK });
   assert.match(s.sumo(['job', 'baseline', '1'], withBin).out, /^`cargo test` passes\n`pytest` ALREADY FAILS/);
   writeFileSync(join(dir, 'rust-status'), 'broken\n');
+  pastCheck(s);
   const refused = s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT, ...withBin });
   assert.equal(refused.code, 2, refused.out);
   assert.match(refused.err, /blocking: `cargo test` fails, and it passed when this job began/);
   const logs = readdirSync(join(s.home, 'jobs', '1')).filter((f) => f.endsWith('.txt')).sort();
-  assert.deepEqual(logs, ['baseline-test-2.txt', 'baseline-test.txt', 'verify-test-2.txt', 'verify-test.txt']);
+  // A failing check is run once more — at the baseline the one already failing, at the end the one that passed then — and that run's log sits beside its first.
+  assert.deepEqual(logs, ['baseline-test-2-again.txt', 'baseline-test-2.txt', 'baseline-test.txt', 'verify-test-2.txt', 'verify-test-again.txt', 'verify-test.txt']);
+  assert.match(readFileSync(join(s.home, 'jobs', '1', 'baseline-test-2-again.txt'), 'utf8'), /^\$ pytest\npytest ran/);
+  assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test-again.txt'), 'utf8'), /^\$ cargo test\ncargo ran/);
   assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test.txt'), 'utf8'), /^\$ cargo test\ncargo ran/);
   assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test-2.txt'), 'utf8'), /^\$ pytest\npytest ran/);
 });
@@ -554,6 +565,7 @@ test('a job abandoned while its checks run stays abandoned: finishing it afterwa
   s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s, { recipe: '@touch started; while [ ! -f go ]; do sleep 0.1; done; test "$$(cat status)" = ok' });
   newWorker(s);
+  pastCheck(s);
   const run = sumoAside(s, ['job', 'finish', '1', '--status', 'DONE']);
   let err = '';
   run.stderr.on('data', (d) => (err += d));

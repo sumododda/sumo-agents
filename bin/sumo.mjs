@@ -3,8 +3,10 @@ import tls from 'node:tls';
 
 // Node reads the environment setting at startup. Add system CAs to this process
 // before loading the CLI, and enable the startup setting for its descendants.
+// Bun has no setDefaultCACertificates: the binary it builds is started with
+// --use-system-ca instead (scripts/build-bin.mjs).
 process.env.NODE_USE_SYSTEM_CA = '1';
-tls.setDefaultCACertificates([
+tls.setDefaultCACertificates?.([
   ...tls.getCACertificates('default'),
   ...tls.getCACertificates('system'),
 ]);

@@ -1,7 +1,7 @@
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { paths } from './paths.mjs';
+import { DatabaseSync } from './sqlite.mjs';
 
 /**
  * One entry per schema version, applied in order and never edited once shipped.
@@ -230,6 +230,45 @@ const MIGRATIONS = [
     'job_id INTEGER',
     'session_id TEXT',
   ]),
+
+  // 8 — a memory may carry search terms beside the user's words: what it is about, in words it does not use itself.
+  // They are searched, never shown as the user's words. A full-text table takes no new column, so the index is made
+  // again with them, and filled from every memory already stored.
+  (db) => {
+    addColumnsIfMissing(db, 'memories', ['keys TEXT']);
+    db.exec(`
+      DROP TRIGGER IF EXISTS memories_fts_insert;
+      DROP TRIGGER IF EXISTS memories_fts_delete;
+      DROP TRIGGER IF EXISTS memories_fts_update;
+      DROP TABLE IF EXISTS memories_fts;
+
+      CREATE VIRTUAL TABLE memories_fts USING fts5(
+        title, cue, body, topic, keys,
+        content='memories', content_rowid='id', tokenize='porter unicode61'
+      );
+      INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+
+      CREATE TRIGGER memories_fts_insert AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, title, cue, body, topic, keys)
+        VALUES (new.id, new.title, new.cue, new.body, new.topic, new.keys);
+      END;
+
+      CREATE TRIGGER memories_fts_delete AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, title, cue, body, topic, keys)
+        VALUES ('delete', old.id, old.title, old.cue, old.body, old.topic, old.keys);
+      END;
+
+      CREATE TRIGGER memories_fts_update AFTER UPDATE OF title, cue, body, topic, keys ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, title, cue, body, topic, keys)
+        VALUES ('delete', old.id, old.title, old.cue, old.body, old.topic, old.keys);
+        INSERT INTO memories_fts(rowid, title, cue, body, topic, keys)
+        VALUES (new.id, new.title, new.cue, new.body, new.topic, new.keys);
+      END;
+    `);
+  },
+  // 9 — whether the router called a job's work risky (security, credentials, money, migrations, concurrency): 1 or 0, so such
+  // work is reviewed once it is done. Nullable: a job routed before this migration was never asked.
+  (db) => addColumnsIfMissing(db, 'jobs', ['risky INTEGER']),
 ];
 
 /**

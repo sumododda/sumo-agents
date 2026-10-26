@@ -8,9 +8,9 @@ import { ago } from './card.mjs';
 import { getMeta } from './db.mjs';
 import { runDream } from './dream.mjs';
 import { openWatchTab, runHerdr } from './herdr.mjs';
-import { appendLive, endLive, getJob, newJob, parseJobId, reportOf, startLive, tell as tellJob } from './jobs.mjs';
+import { appendLive, attemptsSettled, endLive, getJob, newJob, parseJobId, reportOf, runFollowed, startLive, tell as tellJob, treeOf } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
-import { contextFor, converse, paramsFor, runJob, runLines, sendToApi, stopReason, TAMPER_REFUSED, tampersMarker, textOf, thinkingFor, withMcp, withServers } from './loop.mjs';
+import { contextFor, converse, networkOn, paramsFor, runJob, runLines, sandboxOn, sendToApi, stopReason, TAMPER_REFUSED, tampersMarker, textOf, thinkingFor, withMcp, withServers } from './loop.mjs';
 import { closeMcp, compactInput, gateMcp, isMcpTool, mcpLines, mcpReady, splitMcpName } from './mcp.mjs';
 import { assertOn, MODEL_IDS, MODELS, modelId, usableModels } from './catalog.mjs';
 import { takeLock } from './lock.mjs';
@@ -23,9 +23,11 @@ import { chooseChatRoute, EFFORTS } from './route.mjs';
 import { verifyCommands } from './scan.mjs';
 import { outcomeLines, runScribe } from './scribe.mjs';
 import { currentProject, describeSaved, findSaved, loadState, lockFile, recordTurn, saveState, savedSessions, sessionLine, shortId, withoutThinking } from './sessions.mjs';
-import { ASK_TOOL, BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, runCommand } from './tools.mjs';
+import { ASK_TOOL, BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, nextUndoTurn, runCommand, undoLast } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
-import { colourEnabled, createRenderer, header, prompt, renderBlock, safeForTerminal, styles, tilde, widthOf } from './tty.mjs';
+import { estimateTokens, head } from './text.mjs';
+import { colourEnabled, createRenderer, header, pathFrom, prompt, renderBlock, safeForTerminal, styles, tilde, widthOf } from './tty.mjs';
+import { hasCommit } from './verify.mjs';
 import { sourcesOf, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_TOOLS } from './web.mjs';
 
 /**
@@ -75,6 +77,7 @@ export function commandList(db, { effortNow = () => null, saved = () => [], runn
     { name: 'mcp', hint: 'the MCP servers: connected or not, their tools, what may run unasked' },
     { name: 'resume', hint: 'pick a saved session up where it stopped', choices: (given) => (given.length === 0 ? saved().map((s) => ({ name: shortId(s.id), hint: s.hint })) : []) },
     { name: 'copy', hint: 'the last reply to the clipboard, as it was written; `code` for its last code block', choices: (given) => (given.length === 0 ? ['code'] : []) },
+    { name: 'undo', hint: "put back the files the editor changed in the last turn that changed any; again for the turn before — bash's changes are not tracked" },
     { name: 'stop', hint: 'stop a job at work in the background', choices: (given) => (given.length === 0 ? running().map((id) => `j${id}`) : []) },
     { name: 'help', hint: 'the commands and the keys' },
     { name: 'new', hint: 'start a fresh session' },
@@ -106,6 +109,24 @@ const eventBlock = (text) => ({ type: 'text', text: `<event>\n${text}\n</event>`
 const MAX_WOKEN = 3;
 /** Jobs at work here at once: each report can start a turn, and each turn can delegate again. */
 const MAX_JOBS = 4;
+/** About how much of a job's report the chat's model is given; the rest is a command away, and the screen shows it whole. */
+const REPORT_TOKENS = 1500;
+/** The sections code adds at the end of a report: the checks' verdict, and where a worktree's change went. */
+const ADDED_BY_CODE = /\n## (?:Verified by code|Accepted without verification|Worktree|Attempts)\b/;
+
+/**
+ * A job's report as the chat's model is given it: whole when it fits in REPORT_TOKENS; otherwise the head of what its
+ * author wrote, what code added after it whole — the verdict, whether the change was brought back — and a last line
+ * that says where the whole report is.
+ */
+function reportForModel(report, id) {
+  if (estimateTokens(report) <= REPORT_TOKENS) return report;
+  const at = report.search(ADDED_BY_CODE);
+  const added = at === -1 ? '' : report.slice(at);
+  const last = `The report is cut to fit; the whole of it: sumo job show ${id}`;
+  const room = Math.max(0, REPORT_TOKENS * 4 - added.length - last.length - 40);
+  return `${head(at === -1 ? report : report.slice(0, at), room).trimEnd()}\n[… cut]${added}\n${last}`;
+}
 
 /** One line per tool call, so the user can watch the work: the command, or the edit and its file. */
 export function describeCall(call) {
@@ -203,6 +224,8 @@ export function jobPrinter(write, s, { width = 98, clean = (text) => text } = {}
 export const retryLine = ({ attempt, limit, delayMs, reason }) => `retrying in ${Math.max(1, Math.round(delayMs / 1000))}s (${attempt} of ${limit}) — ${reason}`;
 /** A conversation summarized to make room, in one line: how big it had grown. */
 export const compactLine = ({ before }) => `the conversation was summarized at ${Math.round(before / 1000)}k tokens to make room, and goes on from the summary`;
+/** A session past its budget, in one line: what it has cost, how to start afresh, and how to move the line. */
+export const budgetLine = (cost) => `this session has cost $${cost.toFixed(2)} — /new starts a fresh one; sumo config chat.budget changes when this is said`;
 
 /** The session log, one JSON line per message, the shape the scribe reads assistant replies from and the gauge reads usage from. */
 function logLine(file, entry) {
@@ -212,6 +235,14 @@ function logLine(file, entry) {
 function configured(db, key) {
   return getMeta(db, `config.${key}`) ?? CONFIG_DEFAULTS[key];
 }
+
+/** The chat's own tools, in a fixed order so its cached prefix never moves; the MCP servers' come after them. */
+export const CHAT_TOOLS = [BASH_TOOL, EDITOR_TOOL, DELEGATE_TOOL, ASK_TOOL, ...WEB_TOOLS];
+/**
+ * The chat's system prompt: AGENTS.md. The guides it names are read from wherever the chat was started: their paths are
+ * made absolute, or the model goes looking for them.
+ */
+export const chatSystem = () => readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim().replaceAll(/(?<![\w/])guides\//g, `${join(REPO_ROOT, 'guides')}/`);
 
 /**
  * One chat session's state and policy, apart from the terminal, so it can be
@@ -248,9 +279,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   if (modelId(model) === MODEL_IDS.haiku) effort = 'none';
   /** On auto, the route the last turn ran on; null otherwise. */
   let routed = null;
-  // The guides it names are read from wherever the chat was started: their paths are made absolute, or the model goes looking for them.
-  const system = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').trim().replaceAll(/(?<![\w/])guides\//g, `${join(REPO_ROOT, 'guides')}/`);
-  const own = [BASH_TOOL, EDITOR_TOOL, DELEGATE_TOOL, ASK_TOOL, ...WEB_TOOLS];
+  const system = chatSystem();
+  const own = CHAT_TOOLS;
   /** The MCP servers of this process, once connected: their tools join the request, deferred, and their names the system prompt. */
   let registry = null;
   const connecting = mcpReady().then((r) => {
@@ -268,8 +298,12 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   let lock = null;
   /** Whether there is anything to save yet: a session nobody has spoken to is not kept. */
   let spoken = false;
-  /** Said to the model with the next turn: that the session was picked up again. */
+  /** Said to the model with the next turn: that the session was picked up again, or that /undo put files back. */
   let note = null;
+  /** The files the model has viewed or written in this session, as they stood then: an edit to one changed on disk since says so. */
+  let seen = new Map();
+  /** Whether the screen has said what this session cost: once a session, when it first passes `chat.budget`. */
+  let costSaid = false;
   /** The jobs running here, each with what the user has said to it that it has not read yet. */
   const jobs = new Map();
   /** The projects a worker is running in: two in one working tree overwrite each other. */
@@ -319,7 +353,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     lock = held ?? takeLock(lockFile(sessionId), busy(sessionId));
     ledger.sessionId = sessionId;
     lastContext = saved?.contextTokens ?? 0;
+    costSaid = false;
     project = null;
+    seen = new Map();
     spoken = Boolean(saved);
     transcript = join(paths().logs, 'sessions', `${sessionId}.jsonl`);
     const block = handleEvent(db, 'session-start', { session_id: sessionId, cwd, transcript_path: transcript, source }, now());
@@ -392,11 +428,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
 
   const event = (name, payload) => handleEvent(db, name, { session_id: sessionId, cwd, transcript_path: transcript, ...payload }, now());
 
+  /** Where this session's turns keep what the editor changed, for /undo. */
+  const undoDir = () => join(paths().logs, 'undo', sessionId);
+
   /** The project the work is in: the one whose card came in last, else none (tools then run in scratch, wherever the chat was started). */
   function workspace() {
     const slug = currentProject(db, sessionId);
     if (slug && project?.slug !== slug) project = getProject(db, slug);
-    return project ? contextFor(project) : contextFor({ path: scratchDir() });
+    return contextFor(project ?? { path: scratchDir() }, { sandbox: sandboxOn(db), network: networkOn(db) });
   }
 
   /**
@@ -450,17 +489,19 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   /**
    * `delegate`: a job is made from the brief, or an open one picked up, and run here on its own route. The chat waits
    * for its report — or, working in the background, is answered at once and reads the report when it comes. Calls in
-   * one reply run side by side, but a worker has its project's working tree to itself.
+   * one reply run side by side, but a worker has its project's working tree to itself — in a git project, a second one
+   * is given a worktree of its own. Several `attempts` run side by side too, and are answered for once, together.
    * `callId` is the delegate call's own, so a screen can show the job under the call that started it.
    */
   async function delegate(input, callId = null) {
+    const asked = (input.job === undefined || input.job === null) && [2, 3].includes(input.attempts) ? input.attempts : 1;
     // Counted where a run begins, before anything is awaited: five calls in one reply are judged one after another, not all at once.
-    if (jobs.size >= MAX_JOBS) throw new UsageError(`${[...jobs.keys()].map((j) => `j${j}`).join(', ')} are at work already — ${MAX_JOBS} at once is the most; wait for a report`);
+    if (jobs.size + asked > MAX_JOBS) throw new UsageError(`${[...jobs.keys()].map((j) => `j${j}`).join(', ')} are at work already — ${MAX_JOBS} at once is the most; wait for a report`);
     const own = background ? new AbortController() : null;
     const signal = own?.signal ?? stopper.signal;
     let claimed = null;
-    const claim = (agent, slug) => {
-      if (agent !== 'worker') return;
+    const claim = (agent, slug, shared) => {
+      if (agent !== 'worker' || !shared) return;
       if (workers.has(slug)) throw new UsageError(`a worker is already running in ${slug} — two in one working tree overwrite each other; wait for its report`);
       workers.add(slug);
       claimed = slug;
@@ -469,19 +510,23 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       if (claimed) workers.delete(claimed);
     };
     let id;
+    /** The other attempts made beside the first, when several were asked for. */
+    let siblings = [];
     let warnings = [];
     try {
       if (input.job !== undefined && input.job !== null) {
         const job = getJob(db, parseJobId(input.job));
-        claim(job.agent, job.project);
+        claim(job.agent, job.project, treeOf(db, job.id) === null);
         id = job.id;
       } else {
         const agent = input.agent ?? 'worker';
         const project = getProject(db, input.project ?? '');
         if (!project) throw new UsageError(`no project "${input.project ?? ''}" — the delegate call names one by its slug`);
-        claim(agent, project.slug);
+        claim(agent, project.slug, !hasCommit(project.path));
         activity(`briefing a ${agent}…`);
-        ({ job: { id }, warnings } = await newJob(db, { project: project.slug, title: input.title, agent, task: input.task, guide: input.guide, reviews: input.reviews ?? undefined, testsMayChange: Boolean(input.tests_may_change), now: now() }));
+        const made = await newJob(db, { project: project.slug, title: input.title, agent, task: input.task, guide: input.guide, reviews: input.reviews ?? undefined, testsMayChange: Boolean(input.tests_may_change), attempts: input.attempts ?? 1, now: now() });
+        ({ job: { id }, warnings } = made);
+        siblings = (made.jobs ?? []).slice(1).map((job) => job.id);
       }
     } catch (cause) {
       release();
@@ -489,33 +534,70 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     }
     let begun;
     const started = new Promise((resolve) => (begun = resolve));
-    const work = runHere(id, warnings, { signal, callId, begun }).finally(release);
+    const ids = [id, ...siblings];
+    // A job made to follow this one — its retry, or its review — is at work under the same call, and stopped with it.
+    const follow = (next) => {
+      ids.push(next);
+      if (own) stops.set(next, own);
+    };
+    const work = (siblings.length === 0 ? runFollowedHere(id, warnings, { signal, callId, begun }, follow) : runAttempts(ids, warnings, { signal, callId, begun })).finally(release);
     if (!own) return work;
 
     // In the background. A job that cannot start says so as the call's own answer; one that has started answers later.
-    stops.set(id, own);
+    // Attempts share one stop: stopping one stops them all.
+    for (const each of ids) stops.set(each, own);
     const first = await Promise.race([started, work.then(() => null, (cause) => ({ cause }))]);
     if (first?.cause) {
-      stops.delete(id);
+      for (const each of ids) stops.delete(each);
       throw first.cause;
     }
     const run = work
       .then((result) => result, (cause) => ({ content: `j${id} stopped on an error: ${cause.message}`, isError: true }))
       .then((result) => {
-        stops.delete(id);
+        for (const each of ids) stops.delete(each);
         runs.delete(run);
-        const quiet = stoppedByUser.delete(id);
-        reports.push({ id, quiet, text: `An automated event, not a message from the user: j${id} has reported.\n${result.content}` });
+        const quiet = ids.filter((each) => stoppedByUser.delete(each)).length > 0;
+        reports.push({ id, quiet, text: `An automated event, not a message from the user: ${ids.map((each) => `j${each}`).join(', ')} ${ids.length === 1 ? 'has' : 'have'} reported.\n${result.content}` });
         watch({ type: 'job-report', job: id, result, quiet });
       });
     runs.add(run);
     const job = getJob(db, id);
+    const beside = siblings.length === 0 ? '' : `, with ${siblings.map((each) => `j${each}`).join(' and ')} beside it: attempts at the same task, reported on together`;
     return {
       content:
-        `j${id} is running in the background (${job.agent} · ${routeOf(job)} — ${job.title}). Its report will reach you later, as an automated event marked as ` +
+        `j${id} is running in the background (${job.agent} · ${routeOf(job)} — ${job.title})${beside}. Its report will reach you later, as an automated event marked as ` +
         'not from the user: with your next request if you are still at work, otherwise in a turn of its own. Until then you know nothing of what it found — ' +
         'do not guess its result, and do not do its work yourself. Carry on with what does not depend on it, or end your turn and say it is running.',
     };
+  }
+
+  /** Attempts at one task, run side by side and answered for once, when all have ended: what was kept first, then how each went. */
+  async function runAttempts(ids, warnings, options) {
+    const ended = await Promise.allSettled(ids.map((each) => runHere(each, [], options)));
+    const kept = attemptsSettled(db, ids[0]) ?? ['Not every attempt closed, so none was picked or brought back yet.'];
+    const each = ended.map((e, i) => (e.status === 'fulfilled' ? e.value.content : `j${ids[i]} stopped on an error: ${e.reason?.message}`));
+    return { content: capRedacted([[...warnings, `Attempts ${ids.map((j) => `j${j}`).join(', ')}:`, ...kept].join('\n'), ...each].join('\n\n')) };
+  }
+
+  /**
+   * One job run here, and what follows it unasked — a retry one step up of a first attempt that failed, a review of
+   * risky work done (`runFollowed`, src/jobs.mjs) — answered for once. A retry stands in for the attempt that failed,
+   * after the line that says so; a review comes after the work it judged. `onFollow` hears each job made, before it runs.
+   */
+  async function runFollowedHere(id, warnings, options, onFollow) {
+    const ran = await runFollowed(db, id, (each, said = warnings) => runHere(each, said, options), { signal: options.signal, onFollow, now });
+    if (ran.length === 1) return ran[0].result;
+    let parts = [];
+    let shown = [];
+    let job = null;
+    for (const step of ran) {
+      // The attempt that failed is one line now; its report is a command away.
+      if (step.kind === 'retry') [parts, shown, job] = [[], [], null];
+      parts.push([step.line, step.result?.content ?? (step.error ? `j${step.id} stopped on an error: ${step.error}` : '')].filter(Boolean).join('\n'));
+      shown.push([step.line, step.result?.job?.report].filter(Boolean).join('\n'));
+      job ??= step.result?.job ?? null;
+    }
+    return { content: parts.join('\n\n'), job: job && { ...job, report: shown.join('\n\n') } };
   }
 
   /** One job, run here to its end: watched as it works, written down for `sumo job watch`, and answered with how it went and what it reported. */
@@ -549,7 +631,10 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           live.onResult(call, result);
           watch({ type: 'result', call, result, job: id });
         },
-        onTurn: live.onTurn,
+        onTurn: (response, totals) => {
+          live.onTurn(response, totals);
+          overBudget();
+        },
         onThinking: (_delta, snapshot) => watch({ type: 'thinking', job: id, text: snapshot }),
         onRetry: (r) => {
           live.onRetry(r);
@@ -562,10 +647,10 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       });
       ended = runLines(outcome);
       const report = reportOf(id);
-      // Model-written, like any tool output: redacted before it reaches the chat's context. `job` is how it went, for the screen only.
+      // Model-written, like any tool output: redacted before it reaches the chat's context, and cut to fit there. `job` is how it went, for the screen only.
       const { job, turns, totals } = outcome;
       return {
-        content: capRedacted([...warnings, ...ended, ...(report ? ['', report] : [])].join('\n')),
+        content: capRedacted([...warnings, ...ended, ...(report ? ['', reportForModel(report, id)] : [])].join('\n')),
         job: { id, status: job.status, seconds: Math.round((Date.now() - began) / 1000), turns, toolCalls: totals.toolCalls, costUsd: totals.costUsd, model: job.model, effort: job.effort, report: report ? redact(report).text : '' },
       };
     } catch (cause) {
@@ -743,11 +828,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     // The log keeps what memory keeps: the user's words without their secrets — and an event as an event.
     logLine(transcript, automated ? { type: 'event', text: redact(text).text } : { type: 'user', message: { role: 'user', content: redact(text).text } });
 
+    // What the editor changes in this turn is kept for /undo in one folder, however many requests the turn takes.
+    const undoFolder = nextUndoTurn(undoDir());
     let continued = false;
     for (;;) {
       const outcome = await converse(db, params, {
         send: sendAs,
-        ctx: workspace(),
+        // A command the sandbox kept from writing is put to the user as an MCP call off the allow list is, for one run outside it.
+        ctx: { ...workspace(), seen, undo: undoFolder, approve },
         ledger,
         beforeTool,
         concurrent: (call) => call.name === DELEGATE_TOOL.name,
@@ -770,6 +858,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           lastContext = totals.contextTokens;
           logLine(transcript, { type: 'assistant', message: { role: 'assistant', model: response.model ?? params.model, usage: response.usage, content: response.content } });
           watch({ type: 'usage', totals });
+          overBudget();
           // What the reply rests on, said under it: the pages it cites.
           const sources = sourcesOf(response.content);
           if (sources.length > 0) watch({ type: 'sources', sources });
@@ -799,6 +888,24 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     }
   }
 
+  /**
+   * `/undo`: the files the editor changed in the last turn that changed any, put back as they were before it — one it
+   * created is deleted — and the model told so with its next turn. Another walks back one turn more. The shell's changes
+   * are not seen, so they are not undone.
+   */
+  function undo() {
+    const done = undoLast(undoDir());
+    if (!done) return 'nothing to undo: the editor has changed no file in this session — changes made through bash are not tracked';
+    const { cwd: at } = workspace();
+    const names = (list) => {
+      const shown = list.map((path) => pathFrom(path, at));
+      return shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
+    };
+    const what = [done.restored.length > 0 && `restored ${names(done.restored)}`, done.deleted.length > 0 && `deleted ${names(done.deleted)}, which that turn created`].filter(Boolean).join('; ');
+    note = [note, `the user ran /undo: ${what}. View a file again before you edit it.`].filter(Boolean).join('\n');
+    return `undid the last turn that changed files: ${what} — changes made through bash are not tracked, so they stay`;
+  }
+
   /** `! <command>`: the user runs it themselves, where the model would be refused; the model sees what it printed. */
   async function shell(command) {
     stopper = new AbortController();
@@ -820,7 +927,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     if (!m) return { text: line };
     const [, name, args = ''] = m;
     if (name === 'exit' || name === 'quit') return { control: 'quit' };
-    if (name === 'new' || name === 'memory') return { control: name };
+    if (name === 'new' || name === 'memory' || name === 'undo') return { control: name };
     if (name === 'model' || name === 'resume' || name === 'mcp' || name === 'copy' || name === 'help' || name === 'stop') return { control: name, args: args.trim() };
     const make = Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
     return make ? { ...make(args.trim()), said: args.trim() } : { error: `no such command /${name} — one of: ${commands.map((c) => `/${c.name}`).join(' ')}` };
@@ -852,6 +959,20 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   /** What this session's requests have cost so far, the jobs it delegated included: the ledger's own sum. */
   const spent = () => (sessionId ? db.prepare('SELECT COALESCE(SUM(cost_usd), 0) AS cost FROM model_runs WHERE session_id = ?').get(sessionId).cost : 0);
 
+  /**
+   * The session's cost said to the user the first time it passes `chat.budget` — on the screen, where a retry is said,
+   * and never to the model: what to spend is the user's to weigh. Asked after every reply, a delegated job's included.
+   */
+  function overBudget() {
+    const budget = Number(configured(db, 'chat.budget'));
+    if (costSaid || !(budget > 0)) return;
+    const cost = spent();
+    if (cost < budget) return;
+    costSaid = true;
+    activity(budgetLine(cost));
+    watch({ type: 'budget', text: budgetLine(cost) });
+  }
+
   function end() {
     event('session-end', {});
     if (lock) rmSync(lock, { force: true });
@@ -876,6 +997,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     spent,
     tell,
     shell,
+    undo,
     expand,
     memoryPage,
     mcp,
@@ -1016,8 +1138,8 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
           show('', resumed);
           continue;
         }
-        if (control === 'model' || control === 'memory' || control === 'mcp') {
-          result(control === 'model' ? session.route(args) : control === 'mcp' ? (await session.mcp()).join('\n     ') : await session.memoryPage());
+        if (control === 'model' || control === 'memory' || control === 'mcp' || control === 'undo') {
+          result(control === 'model' ? session.route(args) : control === 'undo' ? session.undo() : control === 'mcp' ? (await session.mcp()).join('\n     ') : await session.memoryPage());
           continue;
         }
         write('\n');

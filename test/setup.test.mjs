@@ -161,7 +161,8 @@ test('doctor wants ANTHROPIC_API_KEY for the cheap-model passes, unless a stand-
   const binDir = join(s.root, 'bin');
   mkdirSync(binDir);
   s.sumo(['setup', '--bin-dir', binDir, '--no-model']);
-  const env = { PATH: `${binDir}:${process.env.PATH}` };
+  // A key makes doctor count the prompt with the API: here the API is a port nothing listens on, so nothing leaves the machine.
+  const env = { PATH: `${binDir}:${process.env.PATH}`, ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' };
 
   // The sandbox sets SUMO_AGENTS_MODEL_CMD, so no key is needed and none is asked for.
   assert.match(s.sumo(['doctor'], { extraEnv: env }).out, /^ok {4}ANTHROPIC_API_KEY/m);
@@ -171,6 +172,7 @@ test('doctor wants ANTHROPIC_API_KEY for the cheap-model passes, unless a stand-
 
   const keyed = s.sumo(['doctor'], { extraEnv: { ...env, SUMO_AGENTS_MODEL_CMD: '', ANTHROPIC_API_KEY: 'sk-ant-test' } });
   assert.match(keyed.out, /^ok {4}ANTHROPIC_API_KEY/m, keyed.out);
+  assert.match(keyed.out, /^warn {2}prompt: not counted — /m, 'an API that cannot be reached is said, and fails nothing');
 });
 
 test('doctor accepts a Claude Code OAuth token, including one mistakenly exported as an API key', () => {
@@ -178,7 +180,8 @@ test('doctor accepts a Claude Code OAuth token, including one mistakenly exporte
   const binDir = join(s.root, 'bin');
   mkdirSync(binDir);
   s.sumo(['setup', '--bin-dir', binDir, '--no-model']);
-  const env = { PATH: `${binDir}:${process.env.PATH}`, SUMO_AGENTS_MODEL_CMD: '', ANTHROPIC_API_KEY: '' };
+  // Doctor counts the prompt with any credential: the API here is a port nothing listens on, so nothing leaves the machine.
+  const env = { PATH: `${binDir}:${process.env.PATH}`, SUMO_AGENTS_MODEL_CMD: '', ANTHROPIC_API_KEY: '', ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' };
 
   const named = s.sumo(['doctor'], { extraEnv: { ...env, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat-named' } });
   assert.match(named.out, /^ok {4}ANTHROPIC_API_KEY.*CLAUDE_CODE_OAUTH_TOKEN/m, named.out);

@@ -6,7 +6,9 @@
 //   node --disable-warning=ExperimentalWarning probes/coding-eval.mjs                     every task, routed by the router
 //   node … probes/coding-eval.mjs --route sonnet/medium       the same model for every task: the harness is what varies
 //   node … probes/coding-eval.mjs --route sonnet/medium --advisor   the same, with jobs.advisor on: each job may ask the next model up
+//   node … probes/coding-eval.mjs --route sonnet/medium --no-guides the same, with guides.auto off: does a written procedure help or hurt?
 //   node … probes/coding-eval.mjs --task cart-quantity,who-calls --runs 3 --json out.json
+//   node … probes/coding-eval.mjs --hard --route sonnet/medium       the harder tasks instead, for when every route passes the first eight
 //   node … probes/coding-eval.mjs --list
 // Each task is a small project written out fresh, handed to a job as a brief, and scored by what the job never saw:
 // hidden tests against the tree it left, the files it was told not to touch, and — for a scout — what its report says.
@@ -26,9 +28,10 @@ import { closeMcp } from '../src/mcp.mjs';
 import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { EFFORTS } from '../src/route.mjs';
-import { MODELS } from '../src/catalog.mjs';
+import { MODELS, setModel } from '../src/catalog.mjs';
 import { CONFIG_DEFAULTS } from '../src/setup.mjs';
 import { elapsed } from '../src/text.mjs';
+import { HARD_TASKS } from './coding-eval-hard.mjs';
 import { TASKS } from './coding-eval-tasks.mjs';
 
 const HIDDEN = 'eval-hidden';
@@ -157,14 +160,15 @@ function parseArgs(argv) {
   const [model, effort] = route ? route.split('/') : [];
   if (route && (!MODELS.includes(model) || (model === 'haiku' ? effort !== 'none' : !EFFORTS.includes(effort)))) throw new Error(`--route is a model and an effort, like sonnet/medium or haiku/none — not "${route}"`);
   const wanted = value('task')?.split(',');
-  const unknown = (wanted ?? []).filter((id) => !TASKS.some((t) => t.id === id));
+  const every = [...TASKS, ...HARD_TASKS];
+  const unknown = (wanted ?? []).filter((id) => !every.some((t) => t.id === id));
   if (unknown.length > 0) throw new Error(`no such task: ${unknown.join(', ')} — see --list`);
-  return { list: argv.includes('--list'), advisor: argv.includes('--advisor'), route: route ? { model, effort } : null, runs: Number(value('runs') ?? 1), json: value('json'), tasks: wanted ? TASKS.filter((t) => wanted.includes(t.id)) : TASKS };
+  return { list: argv.includes('--list'), advisor: argv.includes('--advisor'), guides: !argv.includes('--no-guides'), route: route ? { model, effort } : null, runs: Number(value('runs') ?? 1), json: value('json'), tasks: wanted ? every.filter((t) => wanted.includes(t.id)) : argv.includes('--hard') ? HARD_TASKS : TASKS };
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (args.list) return console.log(TASKS.map((t) => `${t.id.padEnd(20)} ${t.agent.padEnd(6)} ${t.title}`).join('\n'));
+  if (args.list) return console.log([...TASKS, ...HARD_TASKS.map((t) => ({ ...t, title: `${t.title} (--hard)` }))].map((t) => `${t.id.padEnd(20)} ${t.agent.padEnd(6)} ${t.title}`).join('\n'));
   if (!resolveAnthropicCredential()) throw new Error('the eval runs real jobs: export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this shell first');
   // The real home is only read: which router model it has, and where llama-server is. Every job runs in a home made for this run.
   const real = paths();
@@ -187,8 +191,11 @@ async function main() {
     setMeta(db, 'config.model.file', modelFile);
     // The models that are off on this machine are off here too: the router must not pick one the credential does not have.
     if (switches) setMeta(db, 'models.state', switches);
+    // A pinned route is the one model asked for by name: on in this home, whatever its switch says here, or nothing would run.
+    if (args.route) setModel(db, args.route.model, true);
     if (args.advisor) setMeta(db, 'config.jobs.advisor', 'on');
-    console.log(`coding eval — ${args.tasks.length} task${args.tasks.length === 1 ? '' : 's'} × ${args.runs}, ${args.route ? `pinned to ${args.route.model}/${args.route.effort}` : 'routed by the router'}${args.advisor ? ', with the advisor' : ''}\n`);
+    if (!args.guides) setMeta(db, 'config.guides.auto', 'off');
+    console.log(`coding eval — ${args.tasks.length} task${args.tasks.length === 1 ? '' : 's'} × ${args.runs}, ${args.route ? `pinned to ${args.route.model}/${args.route.effort}` : 'routed by the router'}${args.advisor ? ', with the advisor' : ''}${args.guides ? '' : ', guides off'}\n`);
     for (let run = 1; run <= args.runs; run++) {
       for (const task of args.tasks) {
         const result = await runTask(db, task, { route: args.route, slug: args.runs === 1 ? task.id : `${task.id}-${run}` });
@@ -197,7 +204,7 @@ async function main() {
       }
     }
     console.log(`\n${summary(results)}`);
-    if (args.json) writeFileSync(args.json, `${JSON.stringify({ at: new Date().toISOString(), route: args.route, advisor: args.advisor, results }, null, 2)}\n`);
+    if (args.json) writeFileSync(args.json, `${JSON.stringify({ at: new Date().toISOString(), route: args.route, advisor: args.advisor, guides: args.guides, results }, null, 2)}\n`);
   } finally {
     stopLocalServer(db);
     db.close();

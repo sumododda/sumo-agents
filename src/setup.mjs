@@ -8,12 +8,12 @@ import { basename, delimiter, isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
-import { resolveAnthropicCredential } from './auth.mjs';
-import { assertOn, discoverModels, discoverySummary, knownModel, MODELS, modelsChecked, modelStates } from './catalog.mjs';
+import { anthropicClient, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
+import { assertOn, describeApiError, discoverModels, discoverySummary, knownModel, MODELS, modelsChecked, modelStates } from './catalog.mjs';
 import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mjs';
 import { stopLocalServer } from './local-server.mjs';
 import { UsageError } from './memory.mjs';
-import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
+import { COMPILED, ENTRY, paths, REPO_ROOT } from './paths.mjs';
 
 const NODE_REQUIREMENT = '22.19+ or 24.6+';
 // route.mjs's EFFORTS, spelled out: importing it would close a cycle (route → model → setup). A test keeps them equal.
@@ -25,10 +25,17 @@ export const CONFIG_DEFAULTS = {
   'scribe.model': 'local',
   'dream.model': 'local',
   'chat.model': 'opus',
-  'chat.effort': 'high',
+  'chat.effort': 'medium',
   'chat.notify': 'on',
+  'chat.budget': '5',
   'guides.auto': 'on',
   'jobs.advisor': 'off',
+  'jobs.budget': '10',
+  'jobs.escalate': 'on',
+  'jobs.review': 'risky',
+  'shell.sandbox': 'on',
+  'jobs.minutes': '60',
+  'shell.network': 'on',
   'projects.home': '~',
   'scratch.days': '14',
   'model.source': 'https://huggingface.co',
@@ -44,7 +51,8 @@ export const CONFIG_DEFAULTS = {
 function launcherScript() {
   // Single quotes keep a `$`, backtick or `"` in either path literal; a `'` is closed, escaped and reopened.
   const quote = (s) => `'${s.replaceAll("'", `'\\''`)}'`;
-  return `#!/bin/sh\nexport NODE_USE_SYSTEM_CA=1\nexec ${quote(process.execPath)} --disable-warning=ExperimentalWarning ${quote(ENTRY)} "$@"\n`;
+  const self = COMPILED ? quote(ENTRY) : `${quote(process.execPath)} --disable-warning=ExperimentalWarning ${quote(ENTRY)}`;
+  return `#!/bin/sh\nexport NODE_USE_SYSTEM_CA=1\nexec ${self} "$@"\n`;
 }
 
 /** A directory already on PATH, inside the home folder, that a command can be linked into without sudo. */
@@ -302,7 +310,7 @@ function commandOnPath(name) {
 }
 
 /** Each check is [ok, label, how to fix]. `warn` checks never fail the run. */
-export function doctor() {
+export async function doctor() {
   const p = paths();
   const checks = [];
   const check = (ok, label, fix, warn = false) => checks.push({ ok, label, fix, warn });
@@ -314,7 +322,9 @@ export function doctor() {
 
   const [major, minor] = process.versions.node.split('.').map(Number);
   const nodeOk = (major === 22 && minor >= 19) || (major === 24 && minor >= 6) || major > 24;
-  check(nodeOk, `node ${process.versions.node}`, `needs Node ${NODE_REQUIREMENT}`);
+  // The binary Bun builds carries its own runtime, whatever Node version that says it is.
+  if (process.versions.bun) check(true, `bun ${process.versions.bun} (a built binary: no Node needed)`, '');
+  else check(nodeOk, `node ${process.versions.node}`, `needs Node ${NODE_REQUIREMENT}`);
 
   let db = null;
   // Read here, inside the one guarded open: a database that will not open is a failed check, not the end of the report.
@@ -373,6 +383,9 @@ export function doctor() {
     'ANTHROPIC_API_KEY is set or CLAUDE_CODE_OAUTH_TOKEN is set (chat, jobs, and the passes\' fallback)',
     'export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that starts sessions and hooks',
   );
+  // What every request of each role pays for before its first word: the first number of the ledger, and never a failed check.
+  const chatModel = stored.configured.find(([key]) => key === 'chat.model')?.[1];
+  checks.push(await promptCheck(MODELS.includes(chatModel) ? chatModel : CONFIG_DEFAULTS['chat.model']));
 
   // Not a warning: every job is routed by it, and without an answer no job can be created.
   const standIn = process.env.SUMO_AGENTS_MODEL_CMD;
@@ -387,6 +400,37 @@ export function doctor() {
   }
 
   return checks;
+}
+
+/** How long doctor waits for a count: it is one request, and a doctor that hangs tells nobody anything. */
+const COUNT_TIMEOUT_MS = 15_000;
+
+/**
+ * The fixed prompt of each role — its tools and its system prompt, with a one-word turn after them, as the endpoint takes
+ * no empty conversation — counted by the API's free count_tokens, every role on the chat's model so the numbers compare.
+ * The MCP servers' tools are left out: connecting them is not doctor's to do, and they go deferred, outside the prefix.
+ * Without a credential, or on any error, it is a warning that says why nothing was counted.
+ */
+async function promptCheck(model) {
+  const skipped = (why) => ({ ok: false, warn: true, label: 'prompt: not counted', fix: why });
+  const credential = resolveAnthropicCredential();
+  if (!credential) return skipped('no Anthropic credential to count with');
+  try {
+    // Loaded here: the loop and the chat import this module, and only doctor needs them from it.
+    const { jobParams, paramsFor } = await import('./loop.mjs');
+    const { CHAT_TOOLS, chatSystem } = await import('./chat.mjs');
+    const requests = [
+      ['chat', paramsFor({ model, tools: CHAT_TOOLS, system: chatSystem(), text: 'hi' })],
+      ...['worker', 'scout', 'reviewer'].map((agent) => [agent, jobParams({ job: { agent, model }, text: 'hi' })]),
+    ];
+    const client = anthropicClient({ timeout: COUNT_TIMEOUT_MS, maxRetries: 0 }, credential);
+    // Sent as each role sends it, less what only bounds a reply.
+    const counts = await Promise.all(requests.map(([, { max_tokens: _bound, ...params }]) => client.beta.messages.countTokens(authenticatedRequest(params, credential))));
+    const said = requests.map(([role], i) => `${role} ${counts[i].input_tokens.toLocaleString('en-US')}`).join(' · ');
+    return { ok: true, warn: false, label: `prompt: ${said} tokens on ${model}, without MCP tools`, fix: '' };
+  } catch (cause) {
+    return skipped(describeApiError(cause));
+  }
 }
 
 /** A checkout says its commit; an installed package says its version. */
@@ -422,6 +466,10 @@ export function config(key, value) {
     if (value !== undefined) {
       // A budget that is not a number would be no budget at all: every session's block would carry every preference.
       if (key === 'prime.budget') positiveInteger(value, 'prime.budget needs a positive number');
+      // A cap that is not a number of dollars would be read as the default without a word; 0 is a choice, no cap at all.
+      if (key === 'jobs.budget' && !/^\d+(\.\d+)?$/.test(value)) throw new UsageError('jobs.budget needs a number of dollars, 0 or more: what one job may spend before it is stopped, 0 for no cap');
+      // The same for a limit in time: whole minutes, and 0 for none.
+      if (key === 'jobs.minutes' && !/^\d+$/.test(value)) throw new UsageError('jobs.minutes needs a whole number of minutes, 0 or more: how long one job may run before it is stopped, 0 for no limit');
       // Zero or a word would let go of every chore at the next session start, or of none ever.
       if (key === 'scratch.days') positiveInteger(value, 'scratch.days needs a positive number: the days a chore nothing is written in is kept');
       // Where a new project is made: a place that is not there, or that moves with the shell's directory, is no answer to "where".
@@ -432,8 +480,16 @@ export function config(key, value) {
       // Sent with every chat turn: a word the API does not take would fail each one, not this command.
       if (key === 'chat.effort' && !CHAT_EFFORTS.includes(value)) throw new UsageError(`no such effort "${value}" — one of: ${CHAT_EFFORTS.join(', ')}`);
       if (key === 'chat.notify' && value !== 'on' && value !== 'off') throw new UsageError('chat.notify is on or off: the bell and the notification when a long turn ends behind another window');
+      // A word would be no budget at all, and the line it holds back would never be said.
+      if (key === 'chat.budget' && !/^\d+(\.\d+)?$/.test(value)) throw new UsageError('chat.budget is a sum in US dollars, like 5 or 2.50 (0 for never): what a chat session costs before the screen says so, once');
       if (key === 'guides.auto' && value !== 'on' && value !== 'off') throw new UsageError('guides.auto is on or off: a guide riding in with the message that asks for its kind of work, and a turn held for an edit nothing checked');
       if (key === 'jobs.advisor' && value !== 'on' && value !== 'off') throw new UsageError('jobs.advisor is on or off: a job asking the next model up for advice, from inside its own request');
+      if (key === 'jobs.escalate' && value !== 'on' && value !== 'off') throw new UsageError('jobs.escalate is on or off: a worker\'s first attempt that fails retried once, one step up, without being asked');
+      if (key === 'jobs.review' && !['risky', 'all', 'off'].includes(value)) {
+        throw new UsageError('jobs.review is risky, all or off: which workers that finish DONE, verified, are reviewed without being asked — the ones the router called risky, every one, or none');
+      }
+      if (key === 'shell.sandbox' && value !== 'on' && value !== 'off') throw new UsageError('shell.sandbox is on or off: the model\'s shell writing only in the project, the temporary folders and the tool caches, on macOS');
+      if (key === 'shell.network' && value !== 'on' && value !== 'off') throw new UsageError('shell.network is on or off: the sandboxed shell reaching past this machine — off, it reaches only loopback and local sockets');
       // Stored for every later setup: one that is not a URL would fail each of them.
       if (key === 'model.source') sourceOrRefuse(value);
       // The file name decides where the bytes land and what the server is asked for: a name, never a path.
@@ -450,6 +506,11 @@ export function config(key, value) {
         assertOn(db, value);
       }
       setMeta(db, `config.${key}`, value);
+      // Read once a process, so a shell that edits the database cannot switch them off under itself: a chat already open keeps
+      // what it read, for the jobs it starts too.
+      if (key === 'shell.sandbox' || key === 'shell.network') {
+        return [shown(key), 'takes effect in chats and `sumo job run`s started from now on — a chat already open keeps its setting, for the jobs it starts too, until it is started again'];
+      }
     }
     return [shown(key)];
   } finally {

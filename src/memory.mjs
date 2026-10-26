@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getMeta, setMeta, tx } from './db.mjs';
 import { redact } from './redact.mjs';
-import { clip, ftsQuery, overlap, sharedStems } from './text.mjs';
+import { clip, ftsQuery, overlap, sharedStems, stem, words } from './text.mjs';
 import { matchWithin } from './workflows.mjs';
 
 /** How much of a search that found nothing is kept as the record of it. */
@@ -16,6 +16,9 @@ const DECAY_DAYS = { fact: 365, gotcha: 365 };
 const PROJECT_MATCH_BOOST = 1.5;
 const OTHER_PROJECT_PENALTY = 0.5;
 const SIMILAR_OVERLAP = 0.5;
+/** How many search terms a memory carries beside its words, and how long one may be. */
+const KEYS_KEPT = 6;
+const KEY_CHARS = 32;
 
 /** Commands no gate may ever catch: a pattern that matches these would hold back everything. */
 const NEVER_GATED = ['', 'ls', 'cd src', 'git status', 'cat README.md'];
@@ -98,6 +101,26 @@ export function storedBody(type, text) {
 }
 
 /**
+ * A memory's search terms as they are stored, or null: what it is about, in words its body does not use — "lint" for
+ * "always run eslint --fix before you commit". A model writes them, so each is checked here and a bad one is dropped,
+ * never the memory: not text, longer than a term, secret-looking, a repeat, or only words the body has already.
+ */
+export function storedKeys(raw, body) {
+  const given = (Array.isArray(raw) ? raw : [raw]).filter((k) => typeof k === 'string').flatMap((k) => k.split(','));
+  const known = new Set(words(body).map(stem));
+  const kept = [];
+  for (const term of given) {
+    const key = term.replace(/\s+/g, ' ').trim();
+    // Before it is lowercased: a token's mixed case is part of what gives it away.
+    if (!key || key.length > KEY_CHARS || redact(key).count > 0 || kept.includes(key.toLowerCase())) continue;
+    if (words(key).every((w) => known.has(stem(w)))) continue;
+    kept.push(key.toLowerCase());
+    if (kept.length === KEYS_KEPT) break;
+  }
+  return kept.length > 0 ? kept.join(', ') : null;
+}
+
+/**
  * Stores one memory. Returns it with any active memories that look like the
  * same statement, so the caller can supersede instead of piling up duplicates.
  */
@@ -123,9 +146,9 @@ export function add(db, input) {
 
     const { lastInsertRowid } = db
       .prepare(
-        `INSERT INTO memories (type, scope, title, cue, gate, body, topic, provenance, state, pinned, importance,
+        `INSERT INTO memories (type, scope, title, cue, gate, body, topic, keys, provenance, state, pinned, importance,
                                scan_key, written_by, source_session, source_turn, source_quote, valid_from, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.type,
@@ -135,6 +158,7 @@ export function add(db, input) {
         gate,
         body,
         input.topic?.trim().toLowerCase() || null,
+        storedKeys(input.keys, body),
         provenance,
         provenance === 'inferred' ? 'unconfirmed' : 'active',
         input.pin ? 1 : 0,
@@ -237,6 +261,8 @@ export function markHits(db, ids, now) {
  * the caller learns where to look without one project's memory leaking into
  * another's work. `record: false` is for a search nobody asked for: it counts
  * no hits and keeps no misses, and the caller decides what was used.
+ * `since` and `before` (ISO times) hold it to a time: since, what was said or
+ * last changed — replaced, let go — at or after it; before, what was said before it.
  */
 export function search(db, query, opts = {}) {
   const match = ftsQuery(query);
@@ -256,6 +282,15 @@ export function search(db, query, opts = {}) {
     where.push('m.type = ?');
     params.push(opts.type);
   }
+  if (opts.since) {
+    where.push('(m.created_at >= ? OR m.invalid_at >= ?)');
+    params.push(opts.since, opts.since);
+  }
+  // A memory is changed only after it is said: one said before then is all that happened before then.
+  if (opts.before) {
+    where.push('m.created_at < ?');
+    params.push(opts.before);
+  }
 
   const rows = db
     .prepare(
@@ -267,7 +302,7 @@ export function search(db, query, opts = {}) {
   const inScope = (row) => opts.everywhere || row.scope === 'global' || row.scope === projectScope;
   // OR-ed words match on any one of them. Fine for words a caller picked; a caller searching with
   // words nobody picked — a sentence lifted from a reply — sets a floor on how many must be shared.
-  const close = (row) => !opts.minShared || sharedStems(query, `${row.title ?? ''} ${row.cue ?? ''} ${row.body}`) >= opts.minShared;
+  const close = (row) => !opts.minShared || sharedStems(query, `${row.title ?? ''} ${row.cue ?? ''} ${row.body} ${row.keys ?? ''}`) >= opts.minShared;
   const candidates = rows.filter((row) => inScope(row) && close(row));
   // Not Math.min(...ranks): spread into arguments, a broad query's rows overflow the call stack.
   const bestRank = candidates.reduce((best, row) => Math.min(best, row.rank), Infinity);

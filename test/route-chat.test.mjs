@@ -59,7 +59,7 @@ test('a scout\'s job is put to the router as reading, a worker\'s and a reviewer
       const { project } = addProject(db, root, { slug: 'simba', now: '2026-09-30T12:00:00.000Z' });
       answer(routerAnswer, { kind: 'routine', surface: 'a few files', risky: false, model: 'sonnet', effort: 'medium', reason: 'a summary of what is there' });
       const saw = async (agent) => {
-        assert.deepEqual(await chooseRoute(db, { agent, project, title: 'Describe what simba does', task: 'Say what it does.' }), { model: 'sonnet', effort: 'medium', reason: 'router: a summary of what is there' });
+        assert.deepEqual(await chooseRoute(db, { agent, project, title: 'Describe what simba does', task: 'Say what it does.' }), { model: 'sonnet', effort: 'medium', reason: 'router: a summary of what is there', risky: false });
         return JSON.parse(readFileSync(routerSaw, 'utf8'));
       };
       const scout = await saw('scout');

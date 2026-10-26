@@ -2,12 +2,14 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { join } from 'node:path';
 import { getMeta } from './db.mjs';
 import { SECTIONS } from './export.mjs';
 import * as memory from './memory.mjs';
 import { UsageError } from './memory.mjs';
+import { REPO_ROOT } from './paths.mjs';
 
-const PAGE = readFileSync(new URL('./page.html', import.meta.url), 'utf8');
+const PAGE = readFileSync(join(REPO_ROOT, 'src', 'page.html'), 'utf8');
 const MAX_BODY = 64 * 1024;
 
 /** What the page may do. Erasing for good is not here: `sumo forget --purge` stays a command someone types. */

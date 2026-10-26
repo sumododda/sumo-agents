@@ -18,6 +18,9 @@ The public CLI.
 Which lockfile entries changed.
 `;
 
+/** A worker's first DONE is answered with the check against the task and closes nothing: what these tests are about comes after it. */
+const pastCheck = (s, id) => assert.match(s.sumo(['job', 'finish', id, '--status', 'DONE'], { input: '## Summary\nx\n' }).err, new RegExp(`j${id} is not closed yet`));
+
 function withSimba(s) {
   const dir = join(s.root, 'proj-simba');
   mkdirSync(dir, { recursive: true });
@@ -57,7 +60,7 @@ test('a brief carries the task, what memory knows about the project, and how to 
   assert.match(jobTools('worker').find((t) => t.name === 'search_memory').description, /You never write it\./);
   assert.match(brief, /## The user's standing rules — they hold here too\n- m\d+ Never add AI attribution to commits/, "the user's own rules go with every job, not only the project's");
   assert.match(brief, /each major milestone.*`note`/, 'a worker notes milestones without being asked');
-  assert.match(systemPrompt(), /Every message and the report: short, facts only, no preamble/, 'reports stay terse — said in every job\'s system prompt');
+  assert.match(systemPrompt(), /Every message and the report: short, facts only, each backed by a tool result from this run; no preamble/, 'reports stay terse, and claim only what a tool showed — said in every job\'s system prompt');
 });
 
 test('a scout is told plainly that it cannot edit, and a task without a check is called out', () => {
@@ -93,6 +96,7 @@ test('a blocked worker asks, the answer is recorded, and a fresh worker in anoth
   assert.match(s.sumo(['job', 'tell', '1'], { input: '  ' }).err, /the message is empty/);
   assert.match(s.sumo(['job', 'brief', '1']).out, /## The task/, 'the brief itself does not carry the inbox');
 
+  pastCheck(s, '1');
   assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: 'x' }).code, 0, 'a worker may still finish while a question is open');
   assert.match(s.sumo(['job', 'tell', '1'], { input: 'late' }).err, /j1 is done — it cannot be told anything/);
 });
@@ -134,6 +138,7 @@ package-lock.json — removed
 - time-zone tests need SIMBA_TZ exported
 - none
 `;
+  pastCheck(s, '1');
   const done = s.sumo(['job', 'finish', '1', '--status', 'done'], { input: report });
   assert.equal(done.code, 0, done.err);
   assert.match(done.out, /^STATUS: DONE — j1\n {2}saved m\d+ \[gotcha·proj-simba·observed\] pnpm needs `shamefully-hoist=true`/);
@@ -161,6 +166,7 @@ test('a chore in scratch: the brief says how scratch is used, a worker finishes 
   assert.match(brief, /Work only inside: .*\/home\/scratch /);
   assert.match(brief, /one folder per chore/);
 
+  pastCheck(s, '1');
   const done = s.sumo(['job', 'finish', '1', '--status', 'done'], { input: '## Summary\nRenamed 40 scans.\n## Learned\n- the scanner writes names in Latin-1\n' });
   assert.equal(done.code, 0, done.err);
   assert.match(done.out, /^STATUS: DONE — j1/);
@@ -405,6 +411,7 @@ Added the column.
 
 Model/effort: not visible to me.
 `;
+  pastCheck(s, '1');
   const done = s.sumo(['job', 'finish', '1', '--status', 'done'], { input: listed });
   assert.equal(done.code, 0, done.err);
   const saved = () => s.sql((db) => db.prepare(`SELECT body FROM memories WHERE written_by = 'worker' ORDER BY id`).all().map((r) => r.body));
@@ -420,6 +427,7 @@ including a purely additive one, because git reports it as modified.
 
 Model/effort: sonnet, medium.
 `;
+  pastCheck(s, '2');
   assert.equal(s.sumo(['job', 'finish', '2', '--status', 'done'], { input: prose }).code, 0);
   assert.deepEqual(saved().slice(1), ['The verify step blocks DONE on any diff to a file already inside test/, including a purely additive one, because git reports it as modified.']);
 });

@@ -6,6 +6,7 @@ From the USER's turns only:
 - add — a standing preference, rule, decision or durable fact the user stated. Supply `type`, `scope`, `topic`, `body`, `turn` and `quote`. `type` is preference (how they want things done), decision (a choice that was made, with its reason if given) or fact (something true about them, their setup or a project that the code itself cannot tell you).
 - supersede — the same fields, plus `old`: the number of the existing memory it replaces.
 One memory per statement: a sentence that gives three rules becomes three operations. `turn` is the N in [tN]; `quote` is an exact, contiguous run of words copied from that turn, long enough to be unmistakable. Write `body` as one plain standing sentence ("Never push to main; always open a pull request"), never as a report of the conversation ("the user said…").
+`keys`: up to 6 search terms a memory is about that its `body` does not use (a rule about eslint: lint, linter), or [].
 
 From the ASSISTANT's replies only:
 - gotcha — a trap found while working that would cost time again: supply `scope` and `body`. Not what was built, and nothing the code or its tests already record.

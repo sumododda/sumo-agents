@@ -25,6 +25,12 @@ function gitProject(s) {
   return { dir, write: (file, text) => writeFileSync(join(dir, file), text) };
 }
 
+/** A worker's DONE: the first is answered with the check against the task and closes nothing; the second goes on to the checks. */
+const finishWorker = (s, id) => {
+  assert.match(s.sumo(['job', 'finish', id, '--status', 'DONE'], { input: REPORT }).err, new RegExp(`j${id} is not closed yet`));
+  return s.sumo(['job', 'finish', id, '--status', 'DONE'], { input: REPORT });
+};
+
 const newWorker = (s, extra = [], route = ['sonnet', 'low']) => {
   s.routerWillSay(...route);
   return s.sumo(['job', 'new', '--project', 'routeproj', '--title', 'return 2', ...extra], { input: TASK });
@@ -35,7 +41,7 @@ test('a review\'s numbered Findings become the reviewed job\'s "important", visi
   const p = gitProject(s);
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
-  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  assert.equal(finishWorker(s, '1').code, 0);
 
   s.routerWillSay('opus', 'high');
   s.sumo(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'The thing must return 2.' });
@@ -64,7 +70,7 @@ test('a review that finds nothing under "## Findings" stores important: 0', () =
   const p = gitProject(s);
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
-  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  assert.equal(finishWorker(s, '1').code, 0);
   s.routerWillSay('opus', 'high');
   s.sumo(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'x' });
   const clean = '## Summary\nMatches.\n## Asked vs built\nMatches.\n## Findings\nNone.\n## Minor\nNone.\n## Could not verify\nNothing.\n';
@@ -82,7 +88,7 @@ test('retry refuses a job that is still running, and one that is done without en
 
   const p = gitProject(s);
   p.write('src.js', 'export const thing = 2;\n');
-  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  assert.equal(finishWorker(s, '1').code, 0);
   const notEnough = s.sumo(['job', 'retry', '1']);
   assert.equal(notEnough.code, 2);
   assert.match(notEnough.err, /j1 is done \(important: 0\) — only a failed job/);
@@ -147,7 +153,7 @@ test('sumo job stats groups finished jobs by model and effort', () => {
   const s = sandbox();
   gitProject(s);
   newWorker(s, ['--title', 'a']);
-  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  assert.equal(finishWorker(s, '1').code, 0);
   newWorker(s, ['--title', 'b'], ['opus', 'high']);
   assert.equal(s.sumo(['job', 'finish', '2', '--status', 'FAILED'], { input: '## Summary\nno.\n' }).code, 0);
 
@@ -167,7 +173,7 @@ test("reviews written in this project's own format are counted: j23 scores 3 and
   const p = gitProject(s);
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
-  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  assert.equal(finishWorker(s, '1').code, 0);
 
   // j23's findings are unnumbered paragraphs that open with <file:line>; j26's are a numbered list.
   s.routerWillSay('opus', 'high');
@@ -186,7 +192,7 @@ test('the reviewer brief asks for findings as a numbered list', () => {
   const p = gitProject(s);
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
-  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  assert.equal(finishWorker(s, '1').code, 0);
   s.routerWillSay('opus', 'high');
   s.sumo(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'x' });
   assert.match(s.sumo(['job', 'brief', '2']).out, /## Findings\s+numbered, worst first: `1\. <file:line> —/);
@@ -197,7 +203,7 @@ test('a retried reviewer still reviews the job the original was pointed at', () 
   const p = gitProject(s);
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
-  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT }).code, 0);
+  assert.equal(finishWorker(s, '1').code, 0);
   s.routerWillSay('opus', 'high');
   assert.equal(s.sumo(['job', 'new', '--project', 'routeproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'x' }).code, 0);
   assert.equal(s.sumo(['job', 'finish', '2', '--status', 'FAILED'], { input: '## Summary\nRan out of context.\n' }).code, 0);

@@ -1,3 +1,4 @@
+import { markHits } from './memory.mjs';
 import { aliasesOf, getProject, isScratch, scratchRules } from './projects.mjs';
 import { clip, estimateTokens } from './text.mjs';
 
@@ -32,17 +33,18 @@ export function card(db, nameOrAlias, { budget = CARD_BUDGET_TOKENS, now = new D
 
   const candidates = [];
   let order = 0;
-  const offer = (priority, text) => candidates.push({ priority, order: order++, text: clip(text, LINE_MAX) });
+  // A line that is a memory carries its id, so what the card shows can be counted as used.
+  const offer = (priority, text, id = null) => candidates.push({ priority, order: order++, text: clip(text, LINE_MAX), id });
 
-  for (const m of rows.filter((r) => r.scan_key)) offer(SCAN_PRIORITY[m.scan_key] ?? 11, m.body);
-  for (const m of rows.filter((r) => !r.scan_key && (r.type === 'preference' || r.type === 'decision'))) offer(PRIORITY.rule, `rule m${m.id}: ${m.body}`);
+  for (const m of rows.filter((r) => r.scan_key)) offer(SCAN_PRIORITY[m.scan_key] ?? 11, m.body, m.id);
+  for (const m of rows.filter((r) => !r.scan_key && (r.type === 'preference' || r.type === 'decision'))) offer(PRIORITY.rule, `rule m${m.id}: ${m.body}`, m.id);
 
   const last = db.prepare('SELECT * FROM checkpoints WHERE project = ? ORDER BY ts DESC, id DESC LIMIT 1').get(project.slug);
   if (last) offer(PRIORITY.last, `last (${ago(last.ts, now)}): ${last.done}${last.next_step ? ` → next: ${last.next_step}` : ''}`);
 
-  for (const m of rows.filter((r) => r.type === 'gotcha')) offer(PRIORITY.gotcha, `gotcha m${m.id}: ${m.body}`);
-  for (const m of rows.filter((r) => r.type === 'procedure')) offer(PRIORITY.workflow, `workflow m${m.id}: "${m.title}"${m.cue ? ` (when: ${m.cue})` : ''} — follow it: sumo show m${m.id}`);
-  for (const m of rows.filter((r) => !r.scan_key && r.type === 'fact')) offer(PRIORITY.fact, `fact m${m.id}: ${m.body}`);
+  for (const m of rows.filter((r) => r.type === 'gotcha')) offer(PRIORITY.gotcha, `gotcha m${m.id}: ${m.body}`, m.id);
+  for (const m of rows.filter((r) => r.type === 'procedure')) offer(PRIORITY.workflow, `workflow m${m.id}: "${m.title}"${m.cue ? ` (when: ${m.cue})` : ''} — follow it: sumo show m${m.id}`, m.id);
+  for (const m of rows.filter((r) => !r.scan_key && r.type === 'fact')) offer(PRIORITY.fact, `fact m${m.id}: ${m.body}`, m.id);
 
   const aliases = aliasesOf(db, project.slug);
   const header = `<project ${project.slug}${project.status === 'archived' ? ' (archived)' : ''}> ${project.path}${aliases.length ? ` · also called: ${aliases.join(', ')}` : ''}`;
@@ -60,6 +62,9 @@ export function card(db, nameOrAlias, { budget = CARD_BUDGET_TOKENS, now = new D
     used += cost;
     kept.push(line);
   }
+
+  // What the card puts in front of someone is used; what it leaves out is not, and stays a search away.
+  markHits(db, kept.flatMap((l) => (l.id === null ? [] : [l.id])), now);
 
   const dropped = candidates.length - kept.length;
   const body = kept.sort((a, b) => a.priority - b.priority || a.order - b.order).map((l) => l.text);

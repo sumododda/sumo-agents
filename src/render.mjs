@@ -31,6 +31,7 @@ export function detail(m) {
   if (m.cue) out.push(`when: ${m.cue}`);
   if (m.gate) out.push(`gate: ${m.gate}   (shell commands matching this wait until these steps have been shown)`);
   if (m.topic) out.push(`topic: ${m.topic}`);
+  if (m.keys) out.push(`keys: ${m.keys}   (search terms the writer added — not the user's words)`);
   out.push(`since: ${m.valid_from.slice(0, 10)}${m.invalid_at ? ` · until: ${m.invalid_at.slice(0, 10)}` : ''}`);
   if (m.superseded_by !== null) out.push(`superseded by: m${m.superseded_by}`);
   if (m.source_quote) out.push(`quote: "${m.source_quote}"`);

@@ -26,13 +26,14 @@ const MAX_API_ANSWER_TOKENS = 8192;
 const STRUCTURED_OUTPUTS_BETA = 'structured-outputs-2025-12-15';
 
 /** US dollars per million tokens: input, output, and what a cache read costs relative to input. */
-const PRICES = {
+export const PRICES = {
   'claude-haiku-4-5-20251001': { input: 1, output: 5, cacheRead: 0.1 },
   'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.1 },
   'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.05 },
   'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.025 },
 };
-const CACHE_WRITE = 1.25;
+/** What writing to the cache costs relative to input: the five-minute cache every request here writes. */
+export const CACHE_WRITE = 1.25;
 
 /** What one response cost, from its usage and the price list; 0 for a model the list does not know. */
 export function costOf(model, usage) {
@@ -165,7 +166,7 @@ function describeLocal(status, body) {
  * ledger; `kind` tells a stand-in which of them is asking. The stand-in path uses spawnSync, exactly
  * like callModel, so tests never wait on a promise that depends on a real server.
  */
-export async function callLocalModel(db, { system, prompt, schema, kind = 'local', think = false, maxTokens = MAX_ANSWER_TOKENS, log = true }) {
+export async function callLocalModel(db, { system, prompt, schema, kind = 'local', think = false, maxTokens = MAX_ANSWER_TOKENS, log = true, timeoutMs = TIMEOUT_MS }) {
   const now = new Date().toISOString();
   const modelFile = getMeta(db, 'config.model.file') ?? CONFIG_DEFAULTS['model.file'];
   const modelLabel = `local:${modelFile}`;
@@ -179,7 +180,7 @@ export async function callLocalModel(db, { system, prompt, schema, kind = 'local
     const run = spawnSync(standIn, [], {
       input: JSON.stringify({ system, prompt, schema, model: 'local', kind, think, maxTokens }),
       encoding: 'utf8',
-      timeout: TIMEOUT_MS,
+      timeout: timeoutMs,
       maxBuffer: 16 * 1024 * 1024,
     });
     return record(envelopeToResult(run, standIn));
@@ -200,7 +201,7 @@ export async function callLocalModel(db, { system, prompt, schema, kind = 'local
     const res = await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
       body: JSON.stringify({
         model: modelIdOf(modelFile),
         messages: [

@@ -11,6 +11,8 @@ import { modelStats } from '../src/scribe.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const NOW = '2026-09-30T12:00:00.000Z';
+/** The schema version before the migration that added the cache columns: later migrations come after it, not in its place. */
+const BEFORE_CACHE_COLUMNS = 6;
 const usage = (extra = {}) => ({ inputTokens: 100, outputTokens: 10, costUsd: 0.001, ...extra });
 
 test('a ledger from before the cache columns migrates, keeps its rows, and reads them back as NULL', async () => {
@@ -20,7 +22,7 @@ test('a ledger from before the cache columns migrates, keeps its rows, and reads
     logRun(db, { kind: 'scribe', model: 'haiku', result: { ok: true, usage: usage() }, note: 'old row', now: NOW });
     // Put model_runs back to the shape it had in the previous release.
     for (const column of ['cache_read_tokens', 'cache_creation_tokens', 'job_id', 'session_id']) db.exec(`ALTER TABLE model_runs DROP COLUMN ${column}`);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`);
+    db.exec(`PRAGMA user_version = ${BEFORE_CACHE_COLUMNS}`);
     db.close();
 
     db = openDb(file);
@@ -45,7 +47,7 @@ test('a half-applied upgrade that already has some of the cache columns adds onl
     let db = openDb(file);
     logRun(db, { kind: 'scribe', model: 'haiku', result: { ok: true, usage: usage() }, note: 'old row', now: NOW });
     for (const column of ['job_id', 'session_id']) db.exec(`ALTER TABLE model_runs DROP COLUMN ${column}`);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`);
+    db.exec(`PRAGMA user_version = ${BEFORE_CACHE_COLUMNS}`);
     db.close();
 
     db = openDb(file);

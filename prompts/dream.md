@@ -8,5 +8,6 @@ Each conversation was already filed as it happened. Your job is only what become
 - gotcha, checkpoint — only when one is clearly missing.
 
 Write every `body` as one plain standing sentence. Scope: `project:<name>` when it is about that project or was said while working in it; `global` only for how the user wants things done everywhere.
+`keys`: up to 6 search terms a memory is about that its `body` does not use (a rule about eslint: lint, linter), or [].
 
 Be conservative: a wrong memory costs more than a missing one. Most passes change nothing. Then return {"ops": []}.

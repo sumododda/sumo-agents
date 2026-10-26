@@ -48,7 +48,7 @@ async function withRouter(answer, fn) {
 test('the router is asked every time, and its answer is the route', async () => {
   await withRouter({ model: 'opus', effort: 'high', reason: 'novel bug, needs judgment' }, async (db, project) => {
     const route = await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
-    assert.deepEqual(route, { model: 'opus', effort: 'high', reason: 'router: novel bug, needs judgment' });
+    assert.deepEqual(route, { model: 'opus', effort: 'high', reason: 'router: novel bug, needs judgment', risky: false });
   });
 });
 
@@ -67,9 +67,9 @@ test('an answer outside the schema is a failure, not a default', async () => {
 test('nothing raises the router\'s answer: no reviewer floor, no security floor', async () => {
   await withRouter({ model: 'sonnet', effort: 'low', reason: 'small' }, async (db, project) => {
     const reviewer = await chooseRoute(db, { agent: 'reviewer', project, title: 'x', task: 'y' });
-    assert.deepEqual(reviewer, { model: 'sonnet', effort: 'low', reason: 'router: small' });
+    assert.deepEqual(reviewer, { model: 'sonnet', effort: 'low', reason: 'router: small', risky: false });
     const security = await chooseRoute(db, { agent: 'worker', project, title: 'rotate the API key', task: 'handles the payment migration' });
-    assert.deepEqual(security, { model: 'sonnet', effort: 'low', reason: 'router: small' });
+    assert.deepEqual(security, { model: 'sonnet', effort: 'low', reason: 'router: small', risky: false });
   });
 });
 
@@ -77,16 +77,22 @@ test('a project rule no longer decides — the router does', async () => {
   await withRouter({ model: 'sonnet', effort: 'medium', reason: 'routine' }, async (db, project) => {
     memory.add(db, { type: 'decision', project: project.slug, body: 'worker model opus effort xhigh' });
     const route = await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
-    assert.deepEqual(route, { model: 'sonnet', effort: 'medium', reason: 'router: routine' });
+    assert.deepEqual(route, { model: 'sonnet', effort: 'medium', reason: 'router: routine', risky: false });
   });
 });
 
 test('a scout is routed like every job: what the router says is what it runs on', async () => {
   await withRouter({ model: 'opus', effort: 'high', reason: 'deep trace' }, async (db, project) => {
-    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'opus', effort: 'high', reason: 'router: deep trace' });
+    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'opus', effort: 'high', reason: 'router: deep trace', risky: false });
   });
   await withRouter({ model: 'haiku', effort: 'none', reason: 'a quick look' }, async (db, project) => {
-    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'haiku', effort: 'none', reason: 'router: a quick look' });
+    // While sonnet is on, a scout's first attempt does not run on haiku: the policy says so after the router's reason.
+    assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), {
+      model: 'sonnet',
+      effort: 'low',
+      reason: "router: a quick look; policy: a scout's first attempt starts on sonnet at low effort, not haiku (the router said haiku/none)",
+      risky: false,
+    });
   });
   await withRouter(undefined, async (db, project) => {
     await assert.rejects(chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), /the router failed/);
@@ -102,7 +108,7 @@ test('an effort that does not fit the model is outside the schema: haiku takes n
     await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /the router failed: the router answered outside its schema/);
   });
   await withRouter({ model: 'haiku', effort: 'none', reason: 'mechanical' }, async (db, project) => {
-    assert.deepEqual(await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), { model: 'haiku', effort: 'none', reason: 'router: mechanical' });
+    assert.deepEqual(await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), { model: 'haiku', effort: 'none', reason: 'router: mechanical', risky: false });
   });
 });
 

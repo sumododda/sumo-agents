@@ -13,6 +13,8 @@ const MAX_LEFT_OFF = 3;
 const MAX_CONFIRM = 3;
 const MAX_NOTICES = 2;
 const SCRIBE_FAILURES_TO_WARN = 3;
+/** A preference never used, and said more days ago than this, is the first to leave the block when room is short. */
+const UNUSED_DAYS = 60;
 
 // Only a whole leading directory: /Users/sumo2 is not inside /Users/sumo.
 const tilde = (path) => (path === homedir() || path.startsWith(`${homedir()}/`) ? `~${path.slice(homedir().length)}` : path);
@@ -39,7 +41,7 @@ export function prime(db, { budget, now = new Date().toISOString() } = {}) {
   sections.splice(2, 0, scratchLine(db));
   const fixed = sections.flat();
   const spent = estimateTokens([open, ...fixed, close].join('\n'));
-  const prefs = preferences(db, limit - spent);
+  const prefs = preferences(db, limit - spent, now);
 
   const lines = [open, ...prefs, ...fixed, close];
   if (prefs.length + remembered === 0) lines.splice(1, 0, 'Nothing remembered yet. It fills in as the user talks.');
@@ -57,14 +59,21 @@ export function prime(db, { budget, now = new Date().toISOString() } = {}) {
   return wrap([...kept, more]);
 }
 
-/** The user's global preferences and decisions under a budget: a heading, then one line each. */
-export function preferences(db, room) {
+/**
+ * The user's global preferences and decisions under a budget: a heading, then one line each. Pinned come first, then
+ * the weightier kind; within those, what was used last — found by a search, or handed over before a question — comes
+ * first, and one not used yet counts from the day it was said. So where room is short, one never used and said more
+ * than UNUSED_DAYS ago leaves first, then the least recently used. Left out is not lost: a search finds it, and being
+ * found brings it back.
+ */
+export function preferences(db, room, now = new Date().toISOString()) {
+  const unusedSince = new Date(Date.parse(now) - UNUSED_DAYS * 86_400_000).toISOString();
   const rows = db
     .prepare(
       `SELECT * FROM memories WHERE scope = 'global' AND state = 'active' AND type IN ('preference', 'decision')
-       ORDER BY pinned DESC, importance DESC, hits DESC, id DESC`,
+       ORDER BY pinned DESC, importance DESC, (last_hit_at IS NULL AND created_at < ?), COALESCE(last_hit_at, created_at) DESC, hits DESC, id DESC`,
     )
-    .all();
+    .all(unusedSince);
   if (rows.length === 0) return [];
 
   // Room for the heading, written at its longest, is set aside before any line is chosen.

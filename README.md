@@ -46,7 +46,17 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 
 - Destructive commands (`rm -rf ~`, `git reset --hard`, dropping a table) and commands that print secrets
   are refused in code before they run. `! <command>` runs one yourself.
-- The agent's shell gets your whole environment except the Anthropic credential.
+- On macOS the agent's shell runs in a sandbox: it writes only in the project, the temporary folders, Sumo's
+  home and the tool caches, never in git's hooks or config. A write it blocks is put to you once to run
+  outside it. `sumo config shell.network off` also keeps it off the network.
+- The agent's shell gets your whole environment except the Anthropic credential. It never waits on a prompt,
+  stops a command silent for 2 minutes (`timeout 600 <cmd>` asks for longer), and runs a command ending in
+  `&` in the background with its own log.
+- A worker's first DONE is answered with its task beside its change to check; the second runs your checks.
+  A failed first attempt is retried once on the next model up, and risky work is reviewed, without asking.
+  A second worker on a git project works in a worktree of its own.
+- A job's run stops at $10 or 60 minutes (`jobs.budget`, `jobs.minutes`). `sumo cost` shows where the money went.
+- `/undo` puts back the files the last chat turn changed with the editor.
 - Only your words become memory. Web pages, files and tool output are never filed as yours.
 - The local model, Qwen3-4B through llama.cpp, routes jobs and writes memory for $0 and sleeps when idle.
 
@@ -57,9 +67,16 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 | Key | Default | What it does |
 |---|---|---|
 | `chat.model` | `opus` | What the chat runs on. `auto` lets the local router pick per turn. |
-| `chat.effort` | `high` | Effort when the chat model is fixed. |
+| `chat.effort` | `medium` | Effort when the chat model is fixed. |
+| `chat.budget` | `5` | Dollars a chat session costs before the screen says so; `0` never. |
 | `projects.home` | `~` | Where new projects are created. |
+| `jobs.budget` | `10` | Dollars one job may spend before it is stopped; `0` for no cap. |
+| `jobs.minutes` | `60` | Minutes one job may run before it is stopped; `0` for no limit. |
+| `jobs.escalate` | `on` | A worker's failed first attempt is retried once on the next model up. |
+| `jobs.review` | `risky` | Which verified work gets a reviewer without asking: `risky`, `all` or `off`. |
 | `jobs.advisor` | `off` | `on` lets a job ask the next model up for advice. |
+| `shell.sandbox` | `on` | The agent's shell in the macOS sandbox. Read when a chat or job starts. |
+| `shell.network` | `on` | `off` keeps the sandboxed shell to this machine. |
 
 The full list, the API model switches and the environment variables are in
 [Install](https://github.com/sumododda/sumo-agents/wiki/Install#configuration).
@@ -82,7 +99,11 @@ git clone https://github.com/sumododda/sumo-agents.git ~/sumo-agents && cd ~/sum
 npm ci
 node bin/sumo.mjs setup    # points `sumo` at this clone instead of the package
 npm test                   # offline suite, no real model calls
+npm run build:bin          # optional: a standalone binary in dist/sumo-agents/ (needs Bun); move the folder whole
 ```
+
+`node probes/coding-eval.mjs --route sonnet/medium` runs real jobs on small tasks and scores them with hidden
+tests; `--hard` runs the harder set, `--no-guides` and `--advisor` change one thing at a time. It costs money.
 
 A release is a commit on `main` that raises the version in `package.json`. The workflow runs the suite
 and publishes it to npm. Probes, the coding eval and the repository layout are in

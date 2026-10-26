@@ -8,7 +8,7 @@ import { MODELS, offLine, usableModels } from './catalog.mjs';
 import { getMeta, openDb, setMeta, tx } from './db.mjs';
 import { localServerStatus } from './local-server.mjs';
 import { callModel, failure, logRun } from './model.mjs';
-import { ENTRY, paths, REPO_ROOT } from './paths.mjs';
+import { paths, REPO_ROOT, SELF } from './paths.mjs';
 import { aliasesOf, listProjects } from './projects.mjs';
 import { line } from './render.mjs';
 import { currentProject, markScribed, pendingTurns } from './sessions.mjs';
@@ -64,7 +64,7 @@ export function spawnDetached(args) {
     appendFileSync(process.env.SUMO_AGENTS_SPAWN_LOG, `${args.join(' ')}\n`);
     return;
   }
-  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', ENTRY, ...args], {
+  const child = spawn(SELF[0], [...SELF.slice(1), ...args], {
     detached: true,
     stdio: 'ignore',
     env: process.env,
@@ -155,18 +155,20 @@ export function opsSchema(db, ops) {
     body: { type: 'string', description: 'one plain sentence, written as a standing fact or rule' },
     turn: { type: ['integer', 'null'], description: 'the number from the [tN] tag, or null when this is an inferred pattern' },
     quote: { type: ['string', 'null'], description: 'an exact run of words from that user turn, or null when this is an inferred pattern' },
+    // Required like the rest, and may be empty: an optional field is a combination more for the grammar to compile.
+    keys: { type: 'array', items: { type: 'string' }, description: 'up to 6 short lowercase search terms it is about that are not words of body, or []' },
   };
   const branch = (op, properties) => {
     const all = { op: { type: 'string', enum: [op] }, ...properties };
     return { type: 'object', properties: all, required: Object.keys(all), additionalProperties: false };
   };
   const branches = {
-    add: branch('add', { type: field.type, scope: field.scope, topic: field.topic, body: field.body, turn: field.turn, quote: field.quote }),
+    add: branch('add', { type: field.type, scope: field.scope, topic: field.topic, body: field.body, turn: field.turn, quote: field.quote, keys: field.keys }),
     supersede: branch('supersede', {
       old: { type: 'integer', description: 'the id of the existing memory this replaces' },
-      type: field.type, scope: field.scope, topic: field.topic, body: field.body, turn: field.turn, quote: field.quote,
+      type: field.type, scope: field.scope, topic: field.topic, body: field.body, turn: field.turn, quote: field.quote, keys: field.keys,
     }),
-    gotcha: branch('gotcha', { scope: field.scope, body: field.body }),
+    gotcha: branch('gotcha', { scope: field.scope, body: field.body, keys: field.keys }),
     checkpoint: slugs.length > 0
       ? branch('checkpoint', { project: { type: 'string', enum: slugs }, done: { type: 'string' }, next: { type: ['string', 'null'] } })
       : null,

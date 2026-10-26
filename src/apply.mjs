@@ -25,6 +25,16 @@ const SAME_STATEMENT = 0.8;
 /** "use eslint for linting" / "use biome for linting": three words of four. Close enough to ask about, too different to call a repeat. */
 const LOOKS_ALIKE = 0.7;
 
+/**
+ * How much of memory the slow pass may retire in one go. A playbook a model was asked to rewrite whole shrank to a
+ * fraction of itself, and the agent did worse with it than with none. A few replacements a pass — a correction the user
+ * kept repeating — are its job; past either bound it is rewriting, and none of its replacements is taken.
+ */
+const MAX_RETIRED = 10;
+const MAX_RETIRED_SHARE = 0.25;
+/** What retires a memory. Everything else a pass may do only adds. */
+const RETIRING = ['supersede'];
+
 const OPS_BY_SOURCE = {
   scribe: ['add', 'supersede', 'gotcha', 'checkpoint'],
   dream: ['add', 'supersede', 'gotcha', 'checkpoint', 'contradiction', 'procedure'],
@@ -198,6 +208,8 @@ function addStated(db, op, ctx, { supersedes } = {}) {
     body,
     project,
     topic: typeof op.topic === 'string' ? op.topic : undefined,
+    // Search terms only, checked where they are stored: a bad one is dropped there, never the memory.
+    keys: op.keys,
     provenance: verified ? 'stated' : 'inferred',
     // A guess must never be able to hide something true: only a verified statement supersedes.
     supersedes: verified ? supersedes : undefined,
@@ -246,7 +258,7 @@ const HANDLERS = {
     // A trap met twice is written up twice, in other words: the one already here stands for both.
     const twin = lookalike(db, scope, body);
     if (twin) throw new Rejected(`already known as m${twin.memory.id}`);
-    const { memory: saved } = memory.add(db, { type: 'gotcha', body, project, provenance: 'observed', writtenBy: ctx.source, now: ctx.now });
+    const { memory: saved } = memory.add(db, { type: 'gotcha', body, project, keys: op.keys, provenance: 'observed', writtenBy: ctx.source, now: ctx.now });
     return `saved ${line(saved)}`;
   },
 
@@ -293,29 +305,64 @@ const HANDLERS = {
   },
 };
 
+/** Each operation in turn. With `refused` — why — every one that would retire a memory is dropped for that reason. */
+function applyEach(db, ops, ctx, refused = null) {
+  const applied = [];
+  const dropped = [];
+  const allowed = OPS_BY_SOURCE[ctx.source] ?? [];
+  for (const op of ops) {
+    const name = op?.op;
+    try {
+      if (!allowed.includes(name)) throw new Rejected(`operation "${name}" is not allowed from ${ctx.source}`);
+      if (refused && RETIRING.includes(name)) {
+        const old = idOf(op.old);
+        throw new Rejected(`${Number.isNaN(old) ? 'what it replaces' : `m${old}`} is left as it is — ${refused}`);
+      }
+      applied.push(HANDLERS[name](db, op, ctx));
+    } catch (cause) {
+      // Rejected and UsageError are verdicts on the model's suggestion; anything else is a bug and must surface.
+      if (!(cause instanceof Rejected) && !(cause instanceof memory.UsageError)) throw cause;
+      dropped.push(`${name ?? '?'}: ${cause.message}`);
+    }
+  }
+  return { applied, dropped };
+}
+
+/** Why the memories retired since `before` (id → scope of every active memory then) are too many to take, or null. */
+function tooWide(db, before) {
+  const still = new Set(db.prepare(`SELECT id FROM memories WHERE state = 'active'`).all().map((m) => m.id));
+  const retired = [...before].filter(([id]) => !still.has(id)).map(([, scope]) => scope);
+  const wide = ': a rewrite that wide is not taken from a model';
+  if (retired.length > MAX_RETIRED) return `this pass would retire ${retired.length} memories at once, more than ${MAX_RETIRED}${wide}`;
+  const had = [...before.values()];
+  for (const scope of new Set(retired)) {
+    const gone = retired.filter((s) => s === scope).length;
+    const total = had.filter((s) => s === scope).length;
+    // One at a time is never a rewrite: a scope of three must still be able to have one of them replaced.
+    if (gone > 1 && gone > total * MAX_RETIRED_SHARE) return `this pass would retire ${gone} of the ${total} memories in ${scope}, more than a quarter${wide}`;
+  }
+  return null;
+}
+
 /**
  * @param ops      what the model returned
  * @param ctx.source   'scribe' | 'dream' — decides which operations are even allowed
  * @param ctx.turns    Map of turn id → user_turns row the model was shown
  */
 export function applyOps(db, ops, ctx) {
-  const applied = [];
-  const dropped = [];
-  if (!Array.isArray(ops)) return { applied, dropped: ['the answer had no list of operations'] };
-  const allowed = OPS_BY_SOURCE[ctx.source] ?? [];
+  if (!Array.isArray(ops)) return { applied: [], dropped: ['the answer had no list of operations'] };
 
-  tx(db, () => {
-    for (const op of ops) {
-      const name = op?.op;
-      try {
-        if (!allowed.includes(name)) throw new Rejected(`operation "${name}" is not allowed from ${ctx.source}`);
-        applied.push(HANDLERS[name](db, op, ctx));
-      } catch (cause) {
-        // Rejected and UsageError are verdicts on the model's suggestion; anything else is a bug and must surface.
-        if (!(cause instanceof Rejected) && !(cause instanceof memory.UsageError)) throw cause;
-        dropped.push(`${name ?? '?'}: ${cause.message}`);
-      }
-    }
+  return tx(db, () => {
+    if (ctx.source !== 'dream') return applyEach(db, ops, ctx);
+    // The slow pass's answer is tried first and counted, then kept or undone: what it would retire is known exactly
+    // that way — a replacement that is only a guess, or aimed at the wrong memory, retires nothing. Too wide, it is
+    // applied again without what retires anything, and what it adds is kept.
+    const before = new Map(db.prepare(`SELECT id, scope FROM memories WHERE state = 'active'`).all().map((m) => [m.id, m.scope]));
+    db.exec('SAVEPOINT dream_ops');
+    const tried = applyEach(db, ops, ctx);
+    const refused = tooWide(db, before);
+    if (refused) db.exec('ROLLBACK TO dream_ops');
+    db.exec('RELEASE dream_ops');
+    return refused ? applyEach(db, ops, ctx, refused) : tried;
   });
-  return { applied, dropped };
 }

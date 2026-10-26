@@ -9,6 +9,7 @@ import { dreamStatus, runDream } from './dream.mjs';
 import { backup, exportJson, exportMarkdown, purgeFromBackups } from './export.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
 import { chat, jobPrinter } from './chat.mjs';
+import { costLines } from './cost.mjs';
 import { closeJobTab, reportAgent, runHerdr } from './herdr.mjs';
 import { runHook } from './hooks.mjs';
 import { runJob as runJobLoop, runLines } from './loop.mjs';
@@ -31,7 +32,7 @@ import { verdictLines } from './verify.mjs';
 const HELP = `sumo — local memory for the sumo-agents process
 
   sumo chat [--model M] [--effort E] [--resume [id]]   talk: the chat, with this memory behind it
-  sumo search <query> [--project S] [--type T] [--everywhere] [--all] [--turns] [-n N]
+  sumo search <query> [--project S] [--type T] [--everywhere] [--all] [--turns] [--since <YYYY-MM-DD|Nd>] [--before <YYYY-MM-DD>] [-n N]
   sumo add <type> "<text>" [--project S] [--topic T] [--pin] [--supersedes ID] [--observed]
         types: preference · fact · decision · gotcha
   sumo learn "<title>" --cue "<action>" [--gate '<regex>'] [--project S]    workflow steps on stdin
@@ -46,7 +47,7 @@ const HELP = `sumo — local memory for the sumo-agents process
         finish ID --status DONE|FAILED · show ID · list [--all] · abandon ID · retry ID · stats
   sumo prime            the block a session starts with
   sumo scribe run|show|status|stats  sumo dream run|status       the cheap-model passes
-  sumo export [--json]  sumo backup
+  sumo export [--json]  sumo backup    sumo cost [--days N] [--project S]   where the money went
   sumo models [discover | enable <name> | disable <name>]     the API models: which are here, which are on
   sumo mcp [add <name> -- <command> [args…] | add <name> --url U | remove N | tools N | allow N <tool>|all | revoke N <tool>|all]
         MCP servers: their tools reach the chat and every job; a tool not allowed asks first
@@ -70,7 +71,7 @@ EOF
  */
 const USAGE = {
   chat: 'sumo chat [--model auto|<model>] [--effort <effort>] [--resume [id]]    (piped: plain lines, the memory block first; --resume picks a saved session up, the newest without an id)',
-  search: 'sumo search <query> [--project S] [--type T] [--everywhere] [--all] [--turns] [-n N]',
+  search: 'sumo search <query> [--project S] [--type T] [--everywhere] [--all] [--turns] [--since <YYYY-MM-DD|Nd>] [--before <YYYY-MM-DD>] [-n N]    (--since: said or changed since that day, or in the last N days; --before: said before that day)',
   add: `sumo add preference|fact|decision|gotcha "<one sentence>" [--project S] [--topic T] [--pin] [--supersedes ID] [--observed]
 a workflow (steps to repeat) is saved with sumo learn instead:
 ${LEARN_USAGE}`,
@@ -89,8 +90,10 @@ sumo project show <name> | list [--all] | rescan <name> | alias <name> <alias> |
         [--guide fix|feature|review|none]   carry guides/<name>.md into the brief (unsaid: what the title and goal ask for)
         [--reviews <id>]                 reviewer: judge that job's change (default: what is uncommitted)
         [--tests-may-change]             worker: this task is allowed to edit tests that already exist
+        [--attempts 2|3]                 worker: that many attempts, each in a worktree of its own; the best verified one is kept
 sumo job brief|show|abandon <id>
 sumo job run <id>             runs the job here, in Sumo's own loop, on its route; it closes itself as its brief says
+                              then, unasked: a first attempt that failed is retried one step up (jobs.escalate), risky work done is reviewed (jobs.review)
 sumo job watch <id>           what a job running in the chat is doing, as it does it (a Herdr tab shows this)
 sumo job note|ask|answer|tell <id>                               (text on stdin; tell: a message a running job reads next)
 sumo job baseline <id>        the project's checks, before the work
@@ -102,6 +105,7 @@ sumo job stats [--project S]  jobs, done, failed, reviewed, avg important, and w
 sumo job list [--all]`,
   prime: 'sumo prime [--budget N]',
   scribe: 'sumo scribe run|show|status|stats',
+  cost: 'sumo cost [--days N] [--project S]    what the requests cost, by kind and model: fresh input, cache reads, cache writes and output; then the cache rewrites — context written again while the cache should still have held it',
   dream: 'sumo dream run|status',
   apply: 'sumo apply <ops.json> [--source scribe|dream]',
   export: 'sumo export [--json]',
@@ -148,7 +152,7 @@ const WORKFLOW_NAMES = ['workflow', 'procedure'];
 
 /** value: flags that take an argument; bool: flags that don't. Anything else is a typo and says so. */
 const COMMANDS = {
-  search: { value: ['project', 'type', 'n'], bool: ['everywhere', 'all', 'turns'], run: runSearch },
+  search: { value: ['project', 'type', 'n', 'since', 'before'], bool: ['everywhere', 'all', 'turns'], run: runSearch },
   add: { value: ['project', 'topic', 'supersedes'], bool: ['pin', 'observed'], run: runAdd },
   learn: { value: ['project', 'cue', 'gate', 'from-file'], bool: [], run: runLearn },
   gate: { value: [], bool: [], run: runGate },
@@ -160,9 +164,10 @@ const COMMANDS = {
   reject: { value: [], bool: [], run: (db, { args }) => [`rejected ${line(memory.reject(db, memory.parseId(args[0])))}`] },
   memory: { value: [], bool: [], run: runMemoryPage },
   project: { value: ['slug'], multi: ['alias'], bool: ['all'], run: runProject },
-  job: { value: ['project', 'title', 'agent', 'status', 'from-file', 'guide', 'reviews', 'accept'], bool: ['all', 'tests-may-change'], run: runJob },
+  job: { value: ['project', 'title', 'agent', 'status', 'from-file', 'guide', 'reviews', 'accept', 'attempts'], bool: ['all', 'tests-may-change'], run: runJob },
   prime: { value: ['budget'], bool: [], run: (db, { flags }) => [prime(db, { budget: flags.budget === undefined ? undefined : positiveInteger(flags.budget, '--budget needs a positive number') })] },
   scribe: { value: [], bool: [], run: runScribeCommand },
+  cost: { value: ['days', 'project'], bool: [], run: (db, { flags }) => costLines(db, { days: flags.days === undefined ? undefined : positiveInteger(flags.days, '--days needs a positive number'), project: flags.project }) },
   dream: { value: [], bool: [], run: runDreamCommand },
   apply: { value: ['source'], bool: [], run: runApply },
   export: { value: [], bool: ['json', 'md'], run: runExport },
@@ -214,11 +219,31 @@ function need(args, count, command) {
   if (args.length < count) throw new UsageError(`usage: ${USAGE[command]}`);
 }
 
+const DAY_MS = 86_400_000;
+
+/**
+ * A day as typed after --since or --before: 2026-10-01 is the start of that day in UTC, the day every date memory shows
+ * is in. Where `back` allows it, 7d is that many days back from now.
+ */
+function dayFlag(raw, flag, { back = false } = {}) {
+  if (raw === undefined) return undefined;
+  const days = back ? /^(\d+)d$/.exec(raw) : null;
+  const time = days && Number(days[1]) > 0 ? new Date(Date.now() - Number(days[1]) * DAY_MS) : null;
+  if (time && !Number.isNaN(time.getTime())) return time.toISOString();
+  // A day that does not exist, 2026-02-30, would roll over into the next month: it is a typo, and said as one.
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? new Date(`${raw}T00:00:00.000Z`) : null;
+  if (day && !Number.isNaN(day.getTime()) && day.toISOString().startsWith(raw)) return day.toISOString();
+  throw new UsageError(`${flag} takes a day (YYYY-MM-DD)${back ? ' or a number of days back (7d)' : ''}, not "${raw}"`);
+}
+
 function runSearch(db, { args, flags }) {
   need(args, 1, 'search');
   const limit = flags.n === undefined ? undefined : positiveInteger(flags.n, '-n needs a positive number');
+  const since = dayFlag(flags.since, '--since', { back: true });
+  const before = dayFlag(flags.before, '--before');
 
   if (flags.turns) {
+    if (since || before) throw new UsageError('--since and --before hold memories to a time, not what the user typed — leave out --turns, or the dates');
     const match = ftsQuery(args.join(' '));
     if (!match) throw new UsageError('nothing to search for');
     const turns = searchTurns(db, match, limit);
@@ -230,6 +255,8 @@ function runSearch(db, { args, flags }) {
     type: WORKFLOW_NAMES.includes(flags.type) ? 'procedure' : flags.type,
     everywhere: flags.everywhere,
     all: flags.all,
+    since,
+    before,
     limit,
   });
 
@@ -354,8 +381,16 @@ function stdinText(flags) {
   return process.stdin.isTTY ? '' : readFileSync(0, 'utf8');
 }
 
-/** The lines `new` and `retry` both print: the job, its route, and exactly what to start it with. */
-function createdLines(job, warnings) {
+/** The lines `new` and `retry` both print: the job, its route, and exactly what to start it with. Several attempts are one line each. */
+function createdLines(job, warnings, attempts = null) {
+  if (attempts) {
+    return [
+      ...attempts.map((a) => `created ${jobs.jobLine(a)}`),
+      ...warnings,
+      `route: ${job.model}/${job.effort} — ${job.route_reason}`,
+      `run each: ${attempts.map((a) => `sumo job run ${a.id}`).join(' · ')} — once all have closed, the best verified one is brought back`,
+    ];
+  }
   return [
     `created ${jobs.jobLine(job)}`,
     ...warnings,
@@ -436,11 +471,14 @@ function copyFrom(file, at, decoder) {
   }
 }
 
+/** A job closed from a shell has its worktree settled here — unless it is the job's own shell, whose run settles it once the run ends. */
+const settleHere = (db, id) => (process.env.SUMO_JOB === String(id) ? [] : jobs.settle(db, id));
+
 async function runJob(db, { args, flags }) {
   const [sub, rawId] = args;
   if (sub === 'new') {
     if (!flags.project) throw new UsageError(`usage: ${USAGE.job}`);
-    const { job, warnings } = await jobs.newJob(db, {
+    const { job, jobs: attempts, warnings } = await jobs.newJob(db, {
       project: flags.project,
       title: flags.title,
       agent: flags.agent,
@@ -448,8 +486,9 @@ async function runJob(db, { args, flags }) {
       guide: flags.guide,
       reviews: flags.reviews === undefined ? undefined : jobs.parseJobId(flags.reviews),
       testsMayChange: Boolean(flags['tests-may-change']),
+      attempts: flags.attempts === undefined ? 1 : Number(flags.attempts),
     });
-    return createdLines(job, warnings);
+    return createdLines(job, warnings, attempts);
   }
   if (sub === 'list') {
     const all = jobs.listJobs(db, { all: flags.all });
@@ -487,14 +526,25 @@ async function runJob(db, { args, flags }) {
       const stop = new AbortController();
       const interrupt = () => stop.abort();
       process.once('SIGINT', interrupt);
-      let outcome;
+      // What follows the job unasked — a retry one step up of a first attempt that failed, a review of risky work done — runs
+      // here after it, the same way, and each is said in turn. The job's tab is the first one's: what is typed there goes to it.
+      let ran;
+      let last;
       try {
-        outcome = await runJobLoop(db, id, { ...watch, signal: stop.signal, ...(process.stdout.isTTY ? { onStart: (job) => tabBegins(db, job, watch.onStart) } : {}) });
+        ran = await jobs.runFollowed(
+          db,
+          id,
+          async (each, warnings = []) => {
+            last = await runJobLoop(db, each, { ...watch, signal: stop.signal, ...(process.stdout.isTTY && each === id ? { onStart: (job) => tabBegins(db, job, watch.onStart) } : {}) });
+            return [...warnings, ...runLines(last), ...last.settled];
+          },
+          { signal: stop.signal },
+        );
       } finally {
         process.off('SIGINT', interrupt);
       }
-      const lines = runLines(outcome).map(safeForTerminal);
-      tabEnds(outcome.job, lines[0]);
+      const lines = ran.flatMap((step) => [...(step.line ? ['', step.line] : []), ...(step.result ?? []), ...(step.error ? [`j${step.id} stopped on an error: ${step.error}`] : [])]).map(safeForTerminal);
+      tabEnds(last.job, runLines(last)[0]);
       return lines;
     }
     case 'show':
@@ -516,7 +566,7 @@ async function runJob(db, { args, flags }) {
     case 'abandon':
       jobs.abandon(db, id);
       // A task just ended: if the session is already big, this is the cheapest moment to start a fresh one.
-      return [`abandoned j${id}`, ...[taskEndedNudge(db)].filter(Boolean)];
+      return [`abandoned j${id}`, ...(await settleHere(db, id)), ...[taskEndedNudge(db)].filter(Boolean)];
     case 'baseline':
       return jobs.baseline(db, id);
     case 'verify': {
@@ -538,6 +588,7 @@ async function runJob(db, { args, flags }) {
         `STATUS: ${job.status === 'done' ? 'DONE' : 'FAILED'}${unverified ? ' (UNVERIFIED — taken without running the checks)' : ''} — j${id}`,
         ...(verdict?.flags ?? []).map((f) => `  look at: ${f}`),
         ...learned.applied.map((l) => `  ${l}`),
+        ...(await settleHere(db, id)),
         ...[taskEndedNudge(db)].filter(Boolean),
       ];
     }
@@ -684,8 +735,8 @@ function runBackup(db) {
   return [`backed up to ${file}${pruned > 0 ? ` (removed ${pruned} old)` : ''}`];
 }
 
-function runDoctor() {
-  const checks = doctor();
+async function runDoctor() {
+  const checks = await doctor();
   // On a terminal the mark is coloured, so a failure stands out of a column of oks; piped, it is the same words.
   const s = styles(colourEnabled());
   for (const c of checks) {
@@ -735,7 +786,7 @@ export async function main(argv) {
         db.close();
       }
     }
-    if (command === 'doctor') return runDoctor();
+    if (command === 'doctor') return await runDoctor();
     if (command === 'config') {
       const { args } = parse(rest, { value: [], bool: [] });
       if (args[1] !== undefined && fromTool()) throw new UsageError(OWNER_ONLY);

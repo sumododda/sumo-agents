@@ -1,4 +1,4 @@
-const STOPWORDS = new Set(
+export const STOPWORDS = new Set(
   `a an and are as at be but by do does for from has have how i if in into is it its me my no not of
    on or our so that the their them then there these this to us was we what when where which who why
    will with you your`.split(/\s+/),
