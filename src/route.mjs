@@ -1,4 +1,6 @@
 import { MODELS, usableModels } from './catalog.mjs';
+import { getMeta } from './db.mjs';
+import { CONFIG_DEFAULTS } from './setup.mjs';
 import { callLocalModel } from './model.mjs';
 import { UsageError } from './memory.mjs';
 import { elapsed } from './text.mjs';
@@ -148,7 +150,7 @@ function routerPrompt(db, { agent, project, task, title, retryOf }) {
   return [
     `role: ${agent}`,
     `project: ${project.slug}${stack ? ` (${stack})` : ''}`,
-    `models: ${usableModels(db).join(', ')}`,
+    `models: ${jobModels(db).join(', ')}`,
     ...(retryOf === undefined ? [] : [retryLine(db, retryOf)].filter(Boolean)),
     'history:',
     historyText(db, project.slug),
@@ -177,10 +179,20 @@ function chatRouterPrompt(db, { project, text }) {
   return [`project: ${project ? `${project.slug}${stack ? ` (${stack})` : ''}` : 'none'}`, `models: ${usableModels(db).join(', ')}`, 'turn:', String(text ?? '').slice(0, TASK_CUT)].join('\n');
 }
 
-const askRouter = (db, { agent, project, task, title, retryOf }) => askFor(db, agent === 'scout' ? SCOUT_ROUTER_SYSTEM : ROUTER_SYSTEM, routerPrompt(db, { agent, project, task, title, retryOf }));
+/** The smallest model a job may run on (`jobs.floor`); haiku, the cheapest, holds nothing back. */
+export const jobFloor = (db) => getMeta(db, 'config.jobs.floor') ?? CONFIG_DEFAULTS['jobs.floor'];
 
-async function askFor(db, system, prompt) {
+/** The models a job may be routed to: the ones that are on, from the floor up — or all of them, when none at or above it is on. */
+export function jobModels(db) {
   const usable = usableModels(db);
+  const above = usable.filter((m) => MODELS.indexOf(m) >= MODELS.indexOf(jobFloor(db)));
+  return above.length > 0 ? above : usable;
+}
+
+const askRouter = (db, { agent, project, task, title, retryOf }) => askFor(db, agent === 'scout' ? SCOUT_ROUTER_SYSTEM : ROUTER_SYSTEM, routerPrompt(db, { agent, project, task, title, retryOf }), jobModels(db));
+
+async function askFor(db, system, prompt, models = usableModels(db)) {
+  const usable = models;
   if (usable.length === 0) throw new UsageError('no model is on — sumo models enable <name>');
   const result = await callLocalModel(db, { system, prompt, schema: routerSchema(usable) });
   if (!result.ok) return { ok: false, error: result.error };
@@ -220,9 +232,17 @@ function stepAbove({ model, effort }, usable) {
  * or nothing; `usable` is the models that are on, cheapest first. An attempt with no route Sumo knows has nothing to go
  * above. `policy` says what changed and why, or is null.
  */
-export function routePolicy({ agent, routed, retryOf: prev, reviews: target, usable }) {
+export function routePolicy({ agent, routed, retryOf: prev, reviews: target, usable, floor = null }) {
   let route = { model: routed.model, effort: routed.effort };
   const why = [];
+  // The user's floor before anything else: a job never starts on a model below it while one at or above it is on.
+  if (floor && modelRank(route.model) < modelRank(floor)) {
+    const up = usable.find((m) => modelRank(m) >= modelRank(floor));
+    if (up) {
+      route = { model: up, effort: up === 'haiku' ? 'none' : EFFORTS.includes(route.effort) ? route.effort : 'medium' };
+      why.push(`jobs.floor is ${floor}`);
+    }
+  }
   if (!prev) {
     if (agent === 'worker' && route.model === 'fable' && usable.includes('opus')) {
       route.model = 'opus';
@@ -275,7 +295,7 @@ const jobRoute = (db, id) => (id === undefined || id === null ? null : (db.prepa
 export async function chooseRoute(db, { agent, project, task, title, retryOf, reviews }) {
   const routed = await askRouter(db, { agent, project, task, title, retryOf });
   if (!routed.ok) throw new UsageError(`the router failed: ${routed.error} — no job was created`);
-  const { model, effort, policy } = routePolicy({ agent, routed, retryOf: jobRoute(db, retryOf), reviews: jobRoute(db, reviews), usable: usableModels(db) });
+  const { model, effort, policy } = routePolicy({ agent, routed, retryOf: jobRoute(db, retryOf), reviews: jobRoute(db, reviews), usable: usableModels(db), floor: jobFloor(db) });
   return { model, effort, reason: `router: ${routed.reason}${policy ? `; policy: ${policy}` : ''}`, risky: routed.risky };
 }
 

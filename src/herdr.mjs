@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { paths } from './paths.mjs';
+import { existsSync } from 'node:fs';
+import { paths, SELF } from './paths.mjs';
 
 /**
  * Herdr is where a delegated job can be watched. The job itself runs in the chat's process; inside Herdr it also
@@ -37,7 +38,9 @@ export function openWatchTab(herdr, { job, project, env = process.env, onFail = 
   if (tab.error) throw new Error(tab.error);
   // Marked as the tab's own, so the watcher may close it behind a job that is done; the home goes with the command,
   // or a chat on another home would be watched from the default one.
-  const command = `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${shellWord(paths().home)} ${shellWord(paths().launcher)} job watch ${job.id}`;
+  // The launcher setup made, where there is one; else this very sumo, node and entry by their full paths — a clone not set up yet still has a watcher.
+  const sumo = existsSync(paths().launcher) ? shellWord(paths().launcher) : SELF.map(shellWord).join(' ');
+  const command = `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${shellWord(paths().home)} ${sumo} job watch ${job.id}`;
   startWatcher(herdr, { pane: tab.id, job: job.id, command, sleep })
     .then((started) => started || onFail('its Herdr tab never started the watcher'))
     .catch((cause) => onFail(cause.message));

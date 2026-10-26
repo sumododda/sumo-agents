@@ -408,7 +408,7 @@ test('a job told something from outside its process reads it with its next reque
       assert.match(heard[1].text, /skip the tests/);
       assert.deepEqual(readdirSync(join(paths().jobs, String(id), 'inbox')), [], 'taken off the disk');
       // What it said is drawn as the chat draws a reply, set in under its line; each call has the top of what came back under it.
-      assert.deepEqual(printed, [`⏺ j${id} scout · haiku — demo job\n`, '  looking\n', '  ⏺ $ echo hi\n', '    ⎿  hi\n', '  done looking:\n    • one\n\n  ┌───┬───┐\n  │ a │ b │\n  ├───┼───┤\n  │ 1 │ 2 │\n  └───┴───┘\n']);
+      assert.deepEqual(printed, [`⏺ j${id} scout · haiku — demo job\n`, '  looking\n', '  ⏺ Bash(echo hi)\n', '    ⎿  hi\n', '  done looking:\n    • one\n\n  ┌───┬───┐\n  │ a │ b │\n  ├───┼───┤\n  │ 1 │ 2 │\n  └───┴───┘\n']);
 
       db.prepare(`UPDATE jobs SET status = 'done' WHERE id = ?`).run(id);
       assert.throws(() => tell(db, id, 'too late', NOW), /is done — it cannot be told anything/);

@@ -167,6 +167,24 @@ export function detect(db, text) {
   return [...found];
 }
 
+/**
+ * The registered project a directory is in — the project itself or a folder inside it, the deepest when one holds another —
+ * or null. A path reached through a link is read as where it leads, as a project's own path is.
+ */
+export function projectAt(db, dir) {
+  let at;
+  try {
+    at = realpathSync(resolve(dir));
+  } catch {
+    at = resolve(dir);
+  }
+  const inside = db
+    .prepare(`SELECT slug, path FROM projects WHERE status = 'active'`)
+    .all()
+    .filter(({ path }) => at === path || at.startsWith(path.endsWith('/') ? path : `${path}/`));
+  return inside.sort((a, b) => b.path.length - a.path.length)[0]?.slug ?? null;
+}
+
 /** The project for work that belongs to none. It lives in Sumo's own home, and a chore in it is kept only while it is worked on. */
 export const SCRATCH = 'scratch';
 const DAY_MS = 24 * 3_600_000;

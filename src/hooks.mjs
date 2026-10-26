@@ -7,7 +7,7 @@ import { guardCommand, guardPath } from './guard.mjs';
 import { autoGuides, firingGuides, matchGuide, renderGuide } from './guides.mjs';
 import { paths } from './paths.mjs';
 import { prime } from './prime.mjs';
-import { detect, keepScratch, touch } from './projects.mjs';
+import { detect, keepScratch, projectAt, touch } from './projects.mjs';
 import { closingQuestions, recallBeforeAsking } from './recall.mjs';
 import { line } from './render.mjs';
 import { shouldRun, spawnDetached } from './scribe.mjs';
@@ -159,7 +159,10 @@ const HANDLERS = {
 
     const shown = new Set(injectedSlugs(db, e.sessionId));
     const cards = [];
-    for (const slug of detect(db, e.prompt)) {
+    // A session started inside a project, whose first words name none, is about that project: it is the one meant.
+    const named = detect(db, e.prompt);
+    const here = named.length === 0 && shown.size === 0 && e.cwd ? projectAt(db, e.cwd) : null;
+    for (const slug of here ? [here] : named) {
       touch(db, slug, now);
       // Every mention is stamped, not only the first: the project named last is the one the session is about, also when its card was shown before.
       markInjected(db, e.sessionId, slug, now);

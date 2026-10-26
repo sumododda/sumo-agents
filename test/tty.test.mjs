@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { createRenderer, flow, header, logoLines, messageAt, pickMessage, prompt, renderBlock, renderLine, spinnerMessages, styles, sunset, toolView, transcript, wrap } from '../src/tty.mjs';
+import { createRenderer, explained, flow, header, highlight, linked, logoLines, markdownOf, messageAt, pickMessage, prompt, renderBlock, renderLine, renderTable, spinnerMessages, styles, sunset, toolView, transcript, withoutColourCodes, wrap } from '../src/tty.mjs';
 
 const on = styles(true);
 const off = styles(false);
@@ -20,7 +20,11 @@ describe('the chat terminal rendering', () => {
     assert.equal(wrap('aaa bbb ccc ddd', 7), 'aaa bbb\nccc ddd');
     assert.equal(wrap(`${on.bold('aaa')} bbb ccc`, 7), `${on.bold('aaa')} bbb\nccc`, 'escape codes take no width');
     assert.equal(renderLine('- one two three four five', off, { width: 14 }), '  • one two\n    three four\n    five');
-    assert.equal(renderLine('x'.repeat(50), off, { width: 10 }), 'x'.repeat(50), 'a word longer than the width is left whole');
+    // Left whole, the screen breaks it anyway — at the edge of its box, under nothing: cut here, it goes on under its indent.
+    assert.equal(renderLine('x'.repeat(25), off, { width: 10 }), 'xxxxxxxxxx\nxxxxxxxxxx\nxxxxx', 'a word longer than the width is cut at the edge');
+    assert.equal(renderLine(`- see ${'y'.repeat(20)} now`, off, { width: 14 }), '  • see\n    yyyyyyyyyy\n    yyyyyyyyyy\n    now', 'and goes on under the item it is in');
+    assert.equal(wrap(`a ${on.bold('b'.repeat(12))}`, 8), `a\n${on.bold('bbbbbbbb\n\x1b[1mbbbb')}`, 'a colour code takes no room in a cut, and the style goes on in the next row');
+    assert.equal(renderLine('  // a comment that is long', off, { width: 20, fence: true }), '      // a comment\n      that is long', 'a code line goes on at its own indent');
   });
 
   it('renders streamed text line by line, keeping a partial line until it ends', () => {
@@ -168,7 +172,11 @@ describe('the chat terminal rendering', () => {
     const view = { name: 'str_replace_based_edit_tool', input: { command: 'view', path: '/p/a.mjs', view_range: [1, 40] } };
     assert.deepEqual(toolView(view, { content: '1\ta\n2\tb', isError: false }), { title: 'Read', detail: '/p/a.mjs:1-40', lines: [{ text: '2 lines', tone: 'dim' }] });
     const create = { name: 'str_replace_based_edit_tool', input: { command: 'create', path: '/p/new.mjs', file_text: 'x\ny\n' } };
-    assert.deepEqual(toolView(create, { content: 'created /p/new.mjs', isError: false }), { title: 'Write', detail: '/p/new.mjs', lines: [{ text: '2 lines', tone: 'dim' }] });
+    // A new file is shown by its top, as what came; past four lines, how many more.
+    assert.deepEqual(toolView(create, { content: 'created /p/new.mjs', isError: false }), { title: 'Write', detail: '/p/new.mjs', lines: [{ text: '+ x', tone: 'add' }, { text: '+ y', tone: 'add' }] });
+    const longer = { ...create, input: { ...create.input, file_text: 'a\nb\nc\nd\ne\nf\n' } };
+    assert.deepEqual(toolView(longer, { content: 'created', isError: false }).lines.map((l) => l.text), ['+ a', '+ b', '+ c', '+ d', '… +2 lines']);
+    assert.deepEqual(toolView({ ...create, input: { ...create.input, file_text: '' } }, { content: 'created', isError: false }).lines, [{ text: '(empty)', tone: 'dim' }]);
   });
 
   it('holds a table until it is whole, then draws it with its columns lined up', () => {
@@ -299,7 +307,7 @@ describe('the markdown a model writes', () => {
     const lit = [];
     const coloured = createRenderer((t) => lit.push(t), styles(true));
     coloured.write('```js\nconst x = 1;\n```\n');
-    assert.equal(lit[1], '    const x = 1;\n', 'the code at full weight');
+    assert.equal(lit[1], '    \x1b[35mconst\x1b[39m x = \x1b[33m1\x1b[39m;\n', 'the code at full weight, in its language\'s colours');
     assert.match(lit[0], /\x1b\[2m/, 'the frame dim');
   });
 
@@ -316,8 +324,8 @@ describe('the markdown a model writes', () => {
     assert.deepEqual(toolView(call, { content, job }).lines, [
       { text: '✓ j41 done · 3 turns · 9 tool calls · $0.02 · sonnet/low', tone: 'add' },
       { text: 'It lives in tty.mjs.', tone: 'plain' },
-      { text: '- tables', tone: 'plain' },
-      { text: '- lines', tone: 'plain' },
+      { text: '• tables', tone: 'plain' },
+      { text: '• lines', tone: 'plain' },
       { text: '… +2 lines', tone: 'dim' },
     ]);
     const failed = toolView(call, { content, job: { ...job, status: 'failed', report: '' } }).lines;
@@ -388,7 +396,9 @@ describe('what the screen leaves out of a tool call, because it says nothing', (
   it('the empty lines of what came back are not shown folded, and are in full', () => {
     const bash = { name: 'bash', input: { command: 'npm test' } };
     const out = '\n> shop@1.0.0 test\n> node --test\n\n\nok 1\n\nok 2\n\n# pass 2\n# fail 0\n';
-    assert.deepEqual(toolView(bash, { content: out, isError: false }).lines.map((l) => l.text), ['> shop@1.0.0 test', '> node --test', '… +1 line', 'ok 2', '# pass 2', '# fail 0']);
+    // Six lines are all shown: folding one away would take the row it stood on.
+    assert.deepEqual(toolView(bash, { content: out, isError: false }).lines.map((l) => l.text), ['> shop@1.0.0 test', '> node --test', 'ok 1', 'ok 2', '# pass 2', '# fail 0']);
+    assert.deepEqual(toolView(bash, { content: `${out}ok 3\n`, isError: false }).lines.map((l) => l.text), ['> shop@1.0.0 test', '> node --test', '… +2 lines', '# pass 2', '# fail 0', 'ok 3'], 'two lines or more are folded');
     assert.equal(toolView(bash, { content: out, isError: false }, { full: true }).lines.length, out.split('\n').length);
     assert.deepEqual(toolView(bash, { content: ' \n\n', isError: false }).lines, [{ text: '(no output)', tone: 'dim' }]);
   });
@@ -399,6 +409,106 @@ describe('what the screen leaves out of a tool call, because it says nothing', (
     assert.deepEqual(toolView(call, started).lines, [{ text: 'running in the background — its report comes here when it is done', tone: 'dim' }]);
     assert.match(toolView(call, started, { full: true }).lines[0].text, /^j7 is running in the background \(scout/, 'in full, what the model was told');
     const job = { id: 7, status: 'done', seconds: 8, turns: 4, toolCalls: 3, costUsd: 0.02, model: 'sonnet', effort: 'low', report: '## Summary\n\nOnly `page` calls it.\n\n## Files\nsrc/paginate.js\nline 8\nline 2\n' };
-    assert.deepEqual(toolView(call, { content: 'STATUS: DONE', job }).lines.map((l) => l.text), ['✓ j7 done · 8s · 4 turns · 3 tool calls · $0.02 · sonnet/low', 'Only `page` calls it.', 'src/paginate.js', 'line 8', '… +1 line']);
+    assert.deepEqual(toolView(call, { content: 'STATUS: DONE', job }).lines.map((l) => l.text), ['✓ j7 done · 8s · 4 turns · 3 tool calls · $0.02 · sonnet/low', 'Only page calls it.', 'Files: src/paginate.js', 'line 8', 'line 2'], 'a report one line past the top is shown whole, as it reads; a short line takes its heading in front');
+    // Attempts reported together come as markdown without a job: shown as they read, headings kept as words.
+    const together = toolView({ name: 'delegate', input: { job: 5, report: true, agent: 'worker', title: 'x' } }, { content: 'Attempts j5, j6:\n## Kept\nj5\n## Verified by code\n- `npm test` passed', isError: false });
+    assert.deepEqual(together.lines.map((l) => l.text), ['Attempts j5, j6:', 'Kept: j5', 'Verified by code', '• npm test passed']);
+    const verdict = { ...job, report: '## Verdict\nThe change does what was asked.\n## Problems\nNone.\n' };
+    assert.deepEqual(toolView(call, { content: 'STATUS: DONE', job: verdict }).lines.map((l) => l.text).slice(1), ['The change does what was asked.', 'Problems: None.'], 'not a "None." on its own');
+    // A job the user stopped is said to have been stopped, not left open.
+    const open = { ...job, status: 'running' };
+    assert.equal(toolView({ name: 'delegate', input: { job: 7, report: true, stopped: true } }, { content: '', job: open }).lines[0].text.slice(0, 22), '■ j7 stopped by you · ');
+    assert.equal(toolView({ name: 'delegate', input: { job: 7, report: true } }, { content: '', job: open }).lines[0].text.slice(0, 20), '○ j7 never closed · ');
+    // A table's rule is not shown, its rows are their cells, and a file in the project is named from there.
+    const tabled = { ...job, report: '| fn | where |\n|---|---|\n| page | /work/src/page.js:3 |\n' };
+    assert.deepEqual(toolView(call, { content: 'STATUS: DONE', job: tabled }, { cwd: '/work' }).lines.map((l) => l.text).slice(1), ['fn · where', 'page · src/page.js:3']);
+    // A report that came in from the background is titled as one, by who sent it.
+    assert.deepEqual([toolView({ name: 'delegate', input: { job: 7, report: true, agent: 'scout', title: 'Find callers' } }, { content: 'STATUS: DONE', job }).title, toolView({ name: 'delegate', input: { job: 7, report: true, agent: 'scout', title: 'Find callers' } }, { content: 'STATUS: DONE', job }).detail], ['Report', 'j7 scout · Find callers']);
+    const longer = { ...job, report: `${job.report}line 1\n` };
+    assert.deepEqual(toolView(call, { content: 'STATUS: DONE', job: longer }).lines.map((l) => l.text).slice(-2), ['line 8', '… +2 lines']);
+  });
+});
+
+describe('code, links and tables, as a reader wants them', () => {
+  const plain = (t) => t.replace(/\x1b\[[0-9;]*m/g, '');
+  it('colours code in the language its block names: keywords, strings, numbers, comments — one over several lines too', () => {
+    assert.equal(highlight('const s = "a // b"; // note', 'js', on), '\x1b[35mconst\x1b[39m s = \x1b[32m"a // b"\x1b[39m; \x1b[2m// note\x1b[22m', 'a comment mark inside a string is the string');
+    assert.equal(highlight('x = 0x1F + 2.5', 'py', on), 'x = \x1b[33m0x1F\x1b[39m + \x1b[33m2.5\x1b[39m');
+    assert.equal(highlight('echo $#  # count', 'sh', on), '\x1b[35mecho\x1b[39m $#  \x1b[2m# count\x1b[22m', 'a # inside a word is not a comment');
+    const code = { comment: false };
+    assert.equal(highlight('a /* open', 'go', on, code), 'a \x1b[2m/* open\x1b[22m');
+    assert.equal(highlight('still */ return', 'go', on, code), '\x1b[2mstill */\x1b[22m \x1b[35mreturn\x1b[39m', 'the comment ran over to the next line');
+    assert.equal(highlight('select * from t', 'sql', on), '\x1b[35mselect\x1b[39m * \x1b[35mfrom\x1b[39m t');
+    assert.equal(highlight('+ added', 'diff', on), '\x1b[32m+ added\x1b[39m');
+    assert.equal(highlight('- gone', 'diff', on), '\x1b[31m- gone\x1b[39m');
+    assert.equal(highlight('if "quoted" 42', 'text', on), 'if "quoted" 42', 'output, a log, plain text: left as it came');
+    assert.equal(highlight('if x', '', on), 'if x');
+    const out = [];
+    const r = createRenderer((t) => out.push(t), on);
+    r.write('```ts\nlet a = 1;\n```\nlet a = 1;\n');
+    assert.match(out.join(''), /\x1b\[35mlet\x1b\[39m a = \x1b\[33m1\x1b\[39m;\n\x1b\[2m {4}└─\x1b\[22m\nlet a = 1;\n$/, 'inside the block only');
+  });
+
+  it('makes an address a link the terminal opens, cut in two where it is wrapped and still one link each side; a pager gets none', () => {
+    const withLinks = styles(true, { links: true });
+    const url = 'https://example.com/a_long/path_with/underscores';
+    const line = renderLine(`see ${url} now`, withLinks, { width: 30 });
+    const opens = [...line.matchAll(/\x1b\]8;;([^\x07]*)\x07/g)].map((m) => m[1]);
+    assert.ok(opens.filter(Boolean).every((u) => u === url) && opens.filter(Boolean).length >= 2, 'every piece opens the whole address');
+    assert.equal(plain(line.replace(/\x1b\]8;;[^\x07]*\x07/g, '')), 'see\nhttps://example.com/a_long/pat\nh_with/underscores now', 'the words as they read, the underscores not taken for italics');
+    assert.ok(line.split('\n').every((row) => row.replace(/\x1b\]8;;[^\x07]*\x07|\x1b\[[0-9;]*m/g, '').length <= 30), 'a link takes no room');
+    assert.equal(renderLine(`see ${url}`, on, { width: 100 }), `see ${url}`, 'without links asked for, an address is the text alone');
+    assert.equal(linked('at https://e.com/x.', withLinks), 'at \x1b]8;;https://e.com/x\x07https://e.com/x\x1b]8;;\x07.', 'in a line that is not markdown too, without the stop after it');
+    assert.match(renderLine('[the docs](https://x.y/z)', withLinks), /^the docs \x1b\[2m\(\x1b\]8;;https:\/\/x\.y\/z\x07https:\/\/x\.y\/z\x1b\]8;;\x07\)\x1b\[22m$/);
+  });
+
+  it('gives a table\'s columns the room their words need, and turns rows of three columns or more into records when there is not enough', () => {
+    const rows = ['| Key | What it does |', '|---|---|', '| Enter | send — while the model works, it reads the message with its next step |', '| Ctrl-O | the whole conversation in your pager, every command and all its output |'];
+    const drawn = renderTable(rows, off, 60).split('\n');
+    assert.match(drawn[1], /^│ Key {4}│ What it does {2,}│$/, 'the short column keeps to its longest word');
+    assert.ok(drawn.every((l) => l.length <= 60));
+    const wide = ['| File | Lines | What changed |', '|---|---|---|', '| test/app.test.js | 40 | a test for input with no trailing newline |'];
+    assert.equal(renderTable(wide, off, 26), '• File: test/app.test.js\n  Lines: 40\n  What changed: a test for\n    input with no trailing\n    newline');
+  });
+
+  it('says the failures a request meets in words a person acts on, and keeps what came back faint', () => {
+    assert.deepEqual(explained('529 {"type":"error","error":{"type":"overloaded_error"}}'), { text: "error: Anthropic's API is overloaded just now — nothing was lost; send it again in a minute", detail: '529 {"type":"error","error":{"type":"overloaded_error"}}' });
+    assert.match(explained('429 rate_limit_error').text, /rate limited/);
+    assert.match(explained('401 authentication_error: invalid x-api-key').text, /refused the credential/);
+    assert.match(explained('prompt is too long: 210000 tokens > 200000 maximum').text, /no longer fits/);
+    assert.match(explained('fetch failed').text, /no connection/);
+    assert.deepEqual(explained('the tool broke'), { text: 'error: the tool broke' }, 'one it does not know is shown as it came');
+  });
+
+  it('shows what a command printed in colour without its escapes, and output that is a diff as one', () => {
+    assert.equal(withoutColourCodes('⟨U+001B⟩[31mred⟨U+001B⟩[0m ⟨U+202E⟩'), 'red ⟨U+202E⟩', 'colour codes go; any other hidden character keeps its marker');
+    const diff = toolView({ name: 'bash', input: { command: 'git diff' } }, { content: 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new', isError: false }, { full: true }).lines;
+    assert.deepEqual(diff.map((l) => l.tone), ['plain', 'plain', 'plain', 'plain', 'del', 'add']);
+    assert.deepEqual(toolView({ name: 'bash', input: { command: 'cat x' } }, { content: '-a\n+b', isError: false }).lines.map((l) => l.tone), ['plain', 'plain'], 'lines that only start with a sign are not a diff');
+  });
+
+  it('shows a question put to the user as a Question, with the answer under it', () => {
+    const view = toolView({ name: 'ask', input: { question: 'Which port?\nmore', options: [] } }, { content: 'The user chose: 8080', isError: false });
+    assert.deepEqual(view, { title: 'Question', detail: 'Which port?', lines: [{ text: 'The user chose: 8080', tone: 'plain' }] });
+  });
+
+  it('writes the conversation as Markdown: what was said quoted, replies as written, calls and thinking folded under their names', () => {
+    const md = markdownOf(
+      [
+        { kind: 'header', route: 'opus', cwd: '~', block: '' },
+        { kind: 'user', text: 'fix it\nplease' },
+        { kind: 'thought', ms: 4000, text: 'The loop stops short.' },
+        { kind: 'reply', raw: 'On it — **now**.' },
+        { kind: 'tool', call: { name: 'bash', input: { command: 'echo ```' } }, result: { content: '```\nok', isError: false } },
+        { kind: 'error', text: 'error: the API failed', detail: '500' },
+        { kind: 'footer', text: '4s · 1 call' },
+      ],
+      { title: 'Sumo — shop' },
+    );
+    assert.equal(
+      md,
+      '# Sumo — shop\n\n**You**\n\n> fix it\n> please\n\n<details><summary>Thought for 4s</summary>\n\n```\nThe loop stops short.\n```\n\n</details>\n\nOn it — **now**.\n\n<details><summary>Bash(echo ```)</summary>\n\n````\n```\nok\n````\n\n</details>\n\n**error: the API failed** — 500\n\n_4s · 1 call_\n',
+      'a fence longer than any in what it holds',
+    );
   });
 });

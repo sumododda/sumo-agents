@@ -4,8 +4,15 @@
  * function from one state to the next, so the screen only has to draw it.
  */
 
-/** An empty box. `history` is what Up recalls, oldest first; `at` is the entry shown, one past the end for the text being written. */
-export const editor = (history = []) => ({ text: '', cursor: 0, history, at: history.length, draft: '', pick: 0 });
+/**
+ * An empty box. `history` is what Up recalls, oldest first; `at` is the entry shown, one past the end for the text being written.
+ * `undo` is what the text was before each change, newest last; `kill` is the last thing cut, for Ctrl-Y; `search`, while Ctrl-R
+ * looks back through history, what has been typed to find and where it was found.
+ */
+export const editor = (history = [], kill = '') => ({ text: '', cursor: 0, history, at: history.length, draft: '', pick: 0, undo: [], kill, search: null });
+
+/** How many changes Ctrl-_ can take back. */
+const UNDO_KEPT = 100;
 
 /**
  * The menu for what is being typed: the commands a half-typed slash could mean, or, once a command's
@@ -13,8 +20,28 @@ export const editor = (history = []) => ({ text: '', cursor: 0, history, at: his
  * command that offers none. Each entry says what to show (`label`), its hint, and the whole text
  * picking it leaves in the box (`complete`).
  */
+/** How well a few typed letters name a command: from its start best, then anywhere in it, then in order with gaps between; -1 when they do not. */
+function nameRank(name, typed) {
+  if (name.startsWith(typed)) return 0;
+  if (name.includes(typed)) return 1;
+  let at = 0;
+  for (const ch of typed) {
+    at = name.indexOf(ch, at) + 1;
+    if (at === 0) return -1;
+  }
+  return 2;
+}
+
 export function menuFor(text, commands) {
-  if (/^\/\w*$/.test(text)) return commands.filter((c) => c.name.startsWith(text.slice(1))).map((c) => ({ name: c.name, label: `/${c.name}`, hint: c.hint, complete: `/${c.name} ` }));
+  if (/^\/\w*$/.test(text)) {
+    // A command is found by any of its letters, in order: /rsm is /resume. The ones it starts with come first, in the menu's own order.
+    const typed = text.slice(1);
+    return commands
+      .map((c, i) => [nameRank(c.name, typed), i, c])
+      .filter(([rank]) => rank !== -1)
+      .sort((a, b) => a[0] - b[0] || a[1] - b[1])
+      .map(([, , c]) => ({ name: c.name, label: `/${c.name}`, hint: c.hint, complete: `/${c.name} ` }));
+  }
   const m = /^\/(\w+)\s+([^\n]*)$/.exec(text);
   const command = m && commands.find((c) => c.name === m[1] && c.choices);
   if (!command) return [];
@@ -89,7 +116,56 @@ const insert = (state, chunk) => edit(state, state.text.slice(0, state.cursor) +
 const cut = (state, from, to) => edit(state, state.text.slice(0, from) + state.text.slice(to), from);
 
 /** Pasted text goes in whole, its line ends made plain; a newline in it is never Enter. */
-export const paste = (state, text) => insert(state, text.replace(/\r\n?/g, '\n'));
+export const paste = (state, text) => remember(state, insert(state, text.replace(/\r\n?/g, '\n')));
+
+/**
+ * Characters nobody sees that change what text says: direction overrides, zero-width spaces, the invisible tag letters that
+ * can carry a hidden instruction. The joiner and the selectors an emoji is built from are not among them.
+ */
+const INVISIBLE = /[\u200b\u200c\u200e\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff\u{e0000}-\u{e007f}]/gu;
+
+/** Text from the clipboard as the box takes it: without the characters nobody sees, and how many were taken out. */
+export function cleanPaste(text) {
+  const removed = String(text).match(INVISIBLE)?.length ?? 0;
+  return { text: removed ? String(text).replace(INVISIBLE, '') : String(text), removed };
+}
+
+/** A marker standing for something put in the box — an image, a long paste — ending at the cursor: deleted whole, never a character of it. */
+const MARKER_BEFORE = /\[(?:Image #\d+|Pasted text #\d+[^\]\n]*)\] ?$/;
+
+/** The state after a change, carrying what the text was before it so Ctrl-_ can take it back. A run of letters typed is one change. */
+function remember(before, after, typing = false) {
+  if (after.text === before.text) return after;
+  const run = typing && before.typing;
+  const undo = run ? before.undo : [...before.undo, { text: before.text, cursor: before.cursor }].slice(-UNDO_KEPT);
+  return { ...after, undo, typing };
+}
+
+/** What was cut is kept for Ctrl-Y as well as gone from the box. */
+const killed = (state, from, to) => ({ ...cut(state, from, to), kill: state.text.slice(from, to) || state.kill });
+
+/** Ctrl-R: the newest line sent before `below` that holds `query`, put in the box with the cursor where it was found. */
+function find(state, query, below, further = false) {
+  const { search } = state;
+  for (let i = Math.min(below, state.history.length) - 1; i >= 0; i--) {
+    const at = query ? state.history[i].toLowerCase().indexOf(query.toLowerCase()) : -1;
+    if (at !== -1) return { ...state, text: state.history[i], cursor: at, search: { ...search, query, at: i, failed: false, end: false } };
+  }
+  // Nothing further back keeps what was found; nothing at all says so.
+  if (further && search.at !== null) return { ...state, search: { ...search, end: true } };
+  return { ...state, search: { ...search, query, at: null, failed: query !== '', end: false } };
+}
+
+/** A key while Ctrl-R looks back: typing narrows it, Ctrl-R goes further back, Enter keeps what was found, Esc puts the draft back. */
+function searching(state, input, key) {
+  const { search } = state;
+  if (key.escape || (key.ctrl && (input === 'g' || input === 'c'))) return { ...state, text: search.draft.text, cursor: search.draft.cursor, search: null };
+  if (key.ctrl && input === 'r') return find(state, search.query, search.at ?? state.history.length, true);
+  if (key.backspace) return find(state, search.query.slice(0, -1), state.history.length);
+  if (input && !key.ctrl && !key.meta && !key.return && !key.tab) return find(state, search.query + input, state.history.length);
+  // Anything else keeps what was found in the box, to send or to edit.
+  return { ...state, at: state.history.length, search: null };
+}
 
 const BURST_KEYS = { '\r': ['\r', { return: true }], '\t': ['', { tab: true }], '\x7f': ['', { backspace: true }] };
 /** A control character is Ctrl and a letter: 3 is Ctrl-C. */
@@ -141,7 +217,7 @@ function send(state) {
   const text = state.text.trim();
   if (!text) return { state: edit(state, '', 0) };
   const history = state.history.at(-1) === text ? state.history : [...state.history, text];
-  return { state: editor(history), submit: text };
+  return { state: editor(history, state.kill), submit: text };
 }
 
 /**
@@ -150,6 +226,22 @@ function send(state) {
  * sent the text.
  */
 export function press(state, input, key, commands = [], files = null) {
+  if (state.search) return { state: searching(state, input, key) };
+  if (key.ctrl && input === 'r') return { state: find({ ...state, search: { query: '', at: null, failed: false, draft: { text: state.text, cursor: state.cursor } } }, '', state.history.length) };
+  // Ctrl-_ (Ctrl-/ on most keyboards): the text as it was before the last change.
+  if (input === '\x1f') {
+    const last = state.undo.at(-1);
+    return { state: last ? { ...state, text: last.text, cursor: last.cursor, undo: state.undo.slice(0, -1), typing: false, pick: 0 } : state };
+  }
+  const pressed = keyed(state, input, key, commands, files);
+  const typing = !key.ctrl && !key.meta && input.length === 1 && /\S/.test(input) && !key.return && !key.tab;
+  // Sent, the box starts afresh: there is nothing to take back into it. A key that changed nothing hands back the same state:
+  // the screen reads that as Down having left the box.
+  if (pressed.submit !== undefined || pressed.state === state) return pressed;
+  return { ...pressed, state: { ...remember(state, pressed.state, typing), typing } };
+}
+
+function keyed(state, input, key, commands, files) {
   const menu = menuOf(state, commands, files);
   const { text, cursor } = state;
   const word = key.meta || key.ctrl;
@@ -171,7 +263,11 @@ export function press(state, input, key, commands = [], files = null) {
   if (key.rightArrow) return { state: { ...state, cursor: word ? wordRight(state) : cursor + under(state).length } };
   if (key.home) return { state: { ...state, cursor: lineStart(state) } };
   if (key.end) return { state: { ...state, cursor: lineEnd(state) } };
-  if (key.backspace) return { state: cut(state, key.meta ? wordLeft(state) : cursor - before(state).length, cursor) };
+  if (key.backspace && key.meta) return { state: killed(state, wordLeft(state), cursor) };
+  if (key.backspace) {
+    const marker = MARKER_BEFORE.exec(text.slice(0, cursor));
+    return { state: cut(state, marker ? cursor - marker[0].length : cursor - before(state).length, cursor) };
+  }
   if (key.delete) return { state: cut(state, cursor, cursor + under(state).length) };
 
   if (key.ctrl) {
@@ -181,16 +277,21 @@ export function press(state, input, key, commands = [], files = null) {
     if (input === 'u') {
       // At the start of a line nothing of it is before the cursor: the line above goes instead, so pressing it again clears a box of many lines.
       const start = lineStart(state);
-      return { state: cut(state, start === cursor && cursor > 0 ? lineStart({ text: state.text, cursor: cursor - 1 }) : start, cursor) };
+      return { state: killed(state, start === cursor && cursor > 0 ? lineStart({ text: state.text, cursor: cursor - 1 }) : start, cursor) };
     }
-    if (input === 'k') return { state: cut(state, cursor, lineEnd(state)) };
-    if (input === 'w') return { state: cut(state, wordLeft(state), cursor) };
+    if (input === 'k') return { state: killed(state, cursor, lineEnd(state)) };
+    if (input === 'w') return { state: killed(state, wordLeft(state), cursor) };
     if (input === 'd') return { state: cut(state, cursor, cursor + under(state).length) };
+    // What Ctrl-U, Ctrl-K, Ctrl-W or Option-Backspace cut, put back where the cursor is.
+    if (input === 'y') return { state: state.kill ? insert(state, state.kill) : state };
+    if (input === 'b') return { state: { ...state, cursor: cursor - before(state).length } };
+    if (input === 'f') return { state: { ...state, cursor: cursor + under(state).length } };
     return { state };
   }
   if (key.meta) {
     if (input === 'b') return { state: { ...state, cursor: wordLeft(state) } };
     if (input === 'f') return { state: { ...state, cursor: wordRight(state) } };
+    if (input === 'd') return { state: killed(state, cursor, wordRight(state)) };
     return { state };
   }
   if (!input) return { state };

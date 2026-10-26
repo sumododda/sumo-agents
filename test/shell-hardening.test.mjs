@@ -286,11 +286,11 @@ test('on the screen a run outside the sandbox is asked as itself, and only y or 
       };
       try {
         const answered = new Promise((resolve) => events.emit('approve', { name: 'bash', server: 'bash', tool: 'outside the sandbox', input: { command: 'touch ~/outside.txt' }, unsandboxed: true, resolve }));
-        await shows(/⚠ run this once outside the sandbox\? touch ~\/outside\.txt\s+y yes · n no · esc stop/, 'the question');
+        await shows(/⚠ Run this once outside the sandbox\?[\s\S]*│ {3}touch ~\/outside\.txt[\s\S]*│ y yes · n no · esc stop/, 'the question');
         assert.doesNotMatch(tty.screen(), /allow bash|a always/);
         await tty.type('a');
         await shows(/y runs it once outside the sandbox · n refuses it · esc stops the turn/, 'that a is no answer');
-        assert.match(tty.screen(), /run this once outside the sandbox\?/, 'still asked');
+        assert.match(tty.screen(), /Run this once outside the sandbox\?/, 'still asked');
         await tty.type('y');
         assert.equal(await answered, 'once');
         await tty.type('\x04');

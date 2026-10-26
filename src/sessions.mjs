@@ -235,11 +235,12 @@ export function withoutThinking(messages) {
 }
 
 /** Writes the session's state whole, then moves it into place: a crash while writing leaves the last good one. */
-export function saveState({ id, messages, model, effort, routed, cwd, contextTokens, now }) {
+export function saveState({ id, messages, model, effort, routed, cwd, contextTokens, now, pending = [] }) {
   mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
   const file = stateFile(id);
   // The summary first, so a listing can read it without the messages behind it; the route's reason last, since it is prose of any length.
-  const state = { version: 1, id, savedAt: now, contextTokens, model, effort, cwd, messages: keepable(messages), routed };
+  // `pending` is what jobs reported that the model has not read yet: it goes with the session, to be read when it is picked up again.
+  const state = { version: 1, id, savedAt: now, contextTokens, model, effort, cwd, messages: keepable(messages), routed, pending };
   writeFileSync(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 });
   renameSync(`${file}.tmp`, file);
   return file;

@@ -11,7 +11,7 @@ import { openDb } from '../src/db.mjs';
 import { openWatchTab, reportAgent, startWatcher } from '../src/herdr.mjs';
 import { finish, takeInbox } from '../src/jobs.mjs';
 import { add, UsageError } from '../src/memory.mjs';
-import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
+import { ENTRY, paths, REPO_ROOT, SELF } from '../src/paths.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { addProject } from '../src/projects.mjs';
 import { lockFile, pruneStates, stateFile, withoutThinking } from '../src/sessions.mjs';
@@ -615,7 +615,8 @@ test('inside Herdr a delegated job also gets a tab that watches it, while it run
       await until(() => typed, 'the watcher typed into its tab');
 
       assert.deepEqual(calls[0], ['tab', 'create', '--workspace', 'w2', '--cwd', project, '--label', `j${id} scout · look`, '--no-focus']);
-      assert.deepEqual(calls.find((c) => c[1] === 'run'), ['pane', 'run', 'w2:pJ', `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${paths().home} ${paths().launcher} job watch ${id}`], 'the tab watches; the job is not run there');
+      // No launcher in this home — setup never ran — so the watcher is this very sumo, by its node and its entry.
+      assert.deepEqual(calls.find((c) => c[1] === 'run'), ['pane', 'run', 'w2:pJ', `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${paths().home} ${SELF.join(' ')} job watch ${id}`], 'the tab watches; the job is not run there');
       const [first, second] = watched.filter((e) => e.type === 'job').map((e) => e.tab);
       assert.deepEqual(first, { pane: 'w2:pJ' });
       assert.deepEqual(second, { error: '`herdr` is not on PATH' });
@@ -1098,7 +1099,7 @@ test('the commands of the menu work from inside a project: the guide comes with 
 
       // The guide is named, and comes through the prompt hook as an operator message — not a path the tools cannot reach from the project.
       assert.deepEqual(session.expand('/fix the login bug'), { text: 'Fix this: the login bug', said: 'the login bug', guide: 'fix' });
-      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /copy /undo /stop /help /new /exit');
+      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /copy /undo /stop /context /export /thinking /help /new /exit');
 
       const dream = session.expand('/dream');
       await session.say(dream.text, dream.said);
@@ -1219,6 +1220,31 @@ test('piped, /resume alone lists the saved sessions and /resume <id> picks one u
       assert.equal(seen[0].messages[1].content[0].text, 'plan the briefing redesign', 'the model reads the earlier conversation');
       assert.equal(seen[0].messages.at(-2).content[0].text, 'go on');
       assert.match(all, /as we said/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('piped, a command that belongs to the screen is said back and never sent to the model; /context and /clear work', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const { send, seen } = canned([reply('end_turn', [{ type: 'text', text: 'hello back' }])]);
+      const printed = [];
+      const output = new Writable({
+        write(chunk, _encoding, done) {
+          printed.push(String(chunk));
+          done();
+        },
+      });
+      assert.equal(await chat(db, { model: 'opus', effort: 'high', send, input: Readable.from(['/help\n', '/copy\n', '/export\n', '/context\n', 'hi\n', '/clear\n']), output }), 0);
+      const all = printed.join('');
+      for (const name of ['help', 'copy', 'export']) assert.match(all, new RegExp(`⎿  /${name} is for the chat on a terminal screen`));
+      assert.match(all, /Context 0 tokens/, '/context answers here too');
+      assert.equal(seen.length, 1, 'only what was said went to the model');
+      assert.equal(seen[0].messages.at(-1).content[0].text, 'hi');
+      assert.equal(all.match(/sumo {2}route/g).length, 2, '/clear starts a fresh session, as /new does');
     } finally {
       db.close();
     }
@@ -1595,8 +1621,9 @@ test('what the screen asks the session: the commands it adds, where the work is,
       assert.deepEqual(session.expand('/help'), { control: 'help', args: '' });
       assert.ok(session.commands.some((c) => c.name === 'copy') && session.commands.some((c) => c.name === 'help'), 'both are in the menu');
 
+      assert.deepEqual(session.where(), { cwd: realpathSync(paths().scratch), name: 'scratch', branch: null }, 'no project yet: scratch');
       addProject(db, root, { slug: 'cart', now: NOW });
-      assert.deepEqual(session.where(), { cwd: realpathSync(paths().scratch), name: 'scratch', branch: null }, 'no project named yet: scratch, wherever the chat was started');
+      assert.deepEqual(session.where(), { cwd: root, name: 'cart', branch: 'fix/cart-total' }, 'started inside a project, the work is there before it is named');
       assert.equal(session.spent(), 0);
       await session.say('go on with cart');
       assert.deepEqual(session.where(), { cwd: root, name: 'cart', branch: 'fix/cart-total' }, 'the project named, and its branch');
@@ -1973,6 +2000,96 @@ test('a question for the user goes out with its options and comes back as their 
     } finally {
       db.close();
       await closeMcp();
+    }
+  });
+});
+
+test('the MCP servers\' tools reach the first request even when /mcp was looked at before anything was said', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      mkdirSync(paths().home, { recursive: true, mode: 0o700 });
+      writeConfig({ mcpServers: { demo: { command: process.execPath, args: [join(REPO_ROOT, 'test', 'fixtures', 'fake-mcp-server.mjs')] } } });
+      const { send, seen } = canned([reply('end_turn', [{ type: 'text', text: 'ok' }])]);
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
+      session.start('startup');
+      assert.match((await session.mcp()).join('\n'), /demo/, 'the servers, looked at first');
+      await session.say('use the echo tool');
+      assert.ok(JSON.stringify(seen[0].tools).includes('mcp__demo__echo'), 'and their tools still went with the first request');
+      session.end();
+    } finally {
+      await closeMcp();
+      db.close();
+    }
+  });
+});
+
+test('a job the user stopped just before the chat closed is still said to the model when the session is picked up again', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      scoutJob(db, 'sumo-agents-bg-');
+      const again = anotherJob(db);
+      const forever = opens();
+      const first = split({
+        chat: [{ reply: reply('tool_use', [call('t1', 'delegate', { job: again })]) }, { reply: reply('end_turn', [{ type: 'text', text: 'it runs' }]) }],
+        job: [{ reply: reply('end_turn', [{ type: 'text', text: 'never said' }]), gate: forever.gate }],
+      });
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: first.send, background: true, now: () => NOW });
+      session.start('startup');
+      await session.say('check again');
+      assert.deepEqual(session.running(), [again]);
+      // Stopped, and the chat closed before anything else was said: the report has not been read.
+      session.stop(again);
+      await until(() => session.running().length === 0, 'the stopped job to end');
+      const id = session.sessionId;
+      session.end();
+
+      const later = split({ chat: [{ reply: reply('end_turn', [{ type: 'text', text: 'it was stopped' }]) }], job: [] });
+      const picked = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: later.send, background: true, now: () => NOW });
+      picked.resume(id.slice(0, 8));
+      await picked.say('is it still running?');
+      const sent = later.seen.chat[0].messages.findLast((m) => m.role === 'user' && Array.isArray(m.content) && m.content.some((c) => c.text === 'is it still running?')).content;
+      assert.equal(sent[0].text, 'is it still running?');
+      assert.match(sent[1].text, new RegExp(`^<event>\\nAn automated event, not a message from the user: j${again} has reported\\.[\\s\\S]*stopped: interrupted by the user`), 'the stop, read with the first message after the session was picked up');
+      picked.end();
+    } finally {
+      db.close();
+      await closeMcp();
+    }
+  });
+});
+
+test('a chat started inside a project is in that project from the start: its card comes with the first message that names none, and its tools run there', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-here-')));
+      mkdirSync(join(root, 'src'));
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
+      addProject(db, root, { slug: 'simba', now: NOW });
+      const { send, seen } = canned([reply('tool_use', [call('t1', 'bash', { command: 'pwd' })]), reply('end_turn', [{ type: 'text', text: 'here' }]), reply('end_turn', [{ type: 'text', text: 'and there' }])]);
+      // Started in a folder inside it.
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: join(root, 'src'), send, now: () => NOW });
+      session.start('startup');
+      assert.equal(session.where().name, 'simba', 'the margin says the project before anything is said');
+      await session.say('where am I?');
+      assert.match(seen[0].messages.find((m) => m.role === 'system' && /^<project simba> /.test(m.content))?.content ?? '', /^<project simba> /, 'its card, with the first message');
+      assert.equal(seen[1].messages.at(-1).content[0].content.split('\n')[0], root, 'the tools run in the project');
+      // A project named later is the one the work moves to.
+      const other = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-there-')));
+      addProject(db, other, { slug: 'kitbag', now: NOW });
+      await session.say('now look at kitbag');
+      assert.equal(session.where().name, 'kitbag');
+      session.end();
+
+      // Started nowhere in particular, it is scratch until a project is named, as before.
+      const elsewhere = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: canned([]).send, now: () => NOW });
+      elsewhere.start('startup');
+      assert.equal(elsewhere.where().name, 'scratch');
+      elsewhere.end();
+    } finally {
+      db.close();
     }
   });
 });

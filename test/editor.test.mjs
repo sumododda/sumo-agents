@@ -1,7 +1,7 @@
 // The input box of the chat: what each key does to the text, the history, and the command menu.
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { editor, keysOf, matchFiles, mentionAt, menuFor, menuOf, paste, press } from '../src/editor.mjs';
+import { cleanPaste, editor, keysOf, matchFiles, mentionAt, menuFor, menuOf, paste, press } from '../src/editor.mjs';
 
 const COMMANDS = [{ name: 'fix' }, { name: 'feature' }, { name: 'dream' }];
 const type = (state, text) => [...text].reduce((s, ch) => press(s, ch, {}).state, state);
@@ -270,5 +270,99 @@ describe('naming a file with @', () => {
     // The slash menu is as it was, and without a list of files nothing is offered.
     assert.deepEqual(menuOf(type(editor(), '/f'), COMMANDS, files).map((m) => m.label), ['/fix', '/feature']);
     assert.deepEqual(menuOf(s, COMMANDS), []);
+  });
+});
+
+describe('taking a change back, and putting back what was cut', () => {
+  const UNDO = '\x1f';
+  it('undoes with Ctrl-_: a run of letters typed is one change, a space or a cut another', () => {
+    let s = type(editor(), 'hello world');
+    assert.equal(s.text, 'hello world');
+    s = key(s, {}, UNDO);
+    assert.equal(s.text, 'hello ', 'the last word, typed in one run, goes at once');
+    s = key(s, {}, UNDO);
+    assert.equal(s.text, 'hello', 'then the space');
+    s = key(s, { ctrl: true }, 'w');
+    assert.equal(s.text, '');
+    s = key(s, {}, UNDO);
+    assert.deepEqual([s.text, s.cursor], ['hello', 5], 'a cut comes back, the cursor where it was');
+    s = key(key(s, {}, UNDO), {}, UNDO);
+    assert.equal(s.text, '', 'past the first change there is nothing more to take back');
+  });
+
+  it('keeps what Ctrl-U, Ctrl-K, Ctrl-W, Option-Backspace and Option-D cut, for Ctrl-Y to put back', () => {
+    let s = type(editor(), 'one two three');
+    s = key(s, { ctrl: true }, 'w');
+    assert.equal(s.kill, 'three');
+    s = key(s, { ctrl: true }, 'a');
+    s = key(s, { meta: true }, 'd');
+    assert.deepEqual([s.text, s.kill], [' two ', 'one'], 'Option-D cuts the word after the cursor');
+    s = key(s, { ctrl: true }, 'e');
+    s = key(s, { ctrl: true }, 'y');
+    assert.equal(s.text, ' two one', 'Ctrl-Y puts the last cut back where the cursor is');
+    s = key(s, { ctrl: true }, 'u');
+    assert.deepEqual([s.text, s.kill], ['', ' two one']);
+    const sent = press(type(s, 'x'), '\r', ENTER);
+    assert.equal(key(sent.state, { ctrl: true }, 'y').text, ' two one', 'what was cut outlives a message sent');
+  });
+
+  it('moves a character at a time with Ctrl-B and Ctrl-F', () => {
+    let s = type(editor(), 'abc');
+    s = key(key(s, { ctrl: true }, 'b'), { ctrl: true }, 'b');
+    assert.equal(s.cursor, 1);
+    s = key(s, { ctrl: true }, 'f');
+    assert.equal(s.cursor, 2);
+  });
+
+  it('deletes a marker for an image or a long paste whole with Backspace, never a character of it', () => {
+    assert.equal(key(paste(editor(), 'see [Image #2] '), { backspace: true }).text, 'see ');
+    assert.equal(key(paste(editor(), 'and [Pasted text #1 +40 lines]'), { backspace: true }).text, 'and ');
+    assert.equal(key(paste(editor(), 'plain [text]'), { backspace: true }).text, 'plain [text', 'brackets that are no marker go a character at a time');
+  });
+});
+
+describe('Ctrl-R: looking back through what was sent', () => {
+  const history = ['git status', 'npm test', 'fix the parser', 'npm run lint'];
+  const R = { ctrl: true };
+  it('finds the newest line holding what is typed, then older ones, and says when there are no more', () => {
+    let s = type(editor(history), 'my draft');
+    s = key(s, R, 'r');
+    assert.deepEqual(s.search.query, '');
+    s = type(s, 'np');
+    assert.deepEqual([s.text, s.search.at], ['npm run lint', 3]);
+    s = key(s, R, 'r');
+    assert.deepEqual([s.text, s.search.at], ['npm test', 1], 'Ctrl-R again goes further back');
+    s = key(s, R, 'r');
+    assert.deepEqual([s.text, s.search.end, s.search.failed], ['npm test', true, false], 'nothing further back keeps what was found');
+    s = type(s, 'zz');
+    assert.equal(s.search.failed, true, 'what nothing holds is said');
+    s = key(s, { backspace: true });
+    s = key(s, { backspace: true });
+    assert.equal(s.text, 'npm run lint', 'and taking letters away finds again from the newest');
+  });
+
+  it('keeps what it found on Enter, to send or edit; Esc and Ctrl-C put the draft back', () => {
+    let s = type(editor(history), 'my draft');
+    s = type(key(s, R, 'r'), 'fix');
+    const kept = press(s, '\r', ENTER);
+    assert.deepEqual([kept.submit, kept.state.text, kept.state.search], [undefined, 'fix the parser', null], 'Enter keeps it in the box and sends nothing');
+    for (const k of [[{ escape: true }, ''], [{ ctrl: true }, 'c'], [{ ctrl: true }, 'g']]) {
+      const back = key(type(key(s, R, 'r'), 'git'), ...k);
+      assert.deepEqual([back.text, back.search], ['my draft', null]);
+    }
+  });
+});
+
+describe('what the box takes from a paste, and finds in a command', () => {
+  it('takes out the characters nobody sees — direction overrides, zero-width spaces, hidden tag letters — and keeps the emoji joiners', () => {
+    assert.deepEqual(cleanPaste('a\u202eb\u200bc\u{E0041}d'), { text: 'abcd', removed: 3 });
+    assert.deepEqual(cleanPaste('👨‍👩‍👧 ✔️'), { text: '👨‍👩‍👧 ✔️', removed: 0 }, 'the joiner and the selector an emoji is made of stay');
+  });
+
+  it('finds a command by its letters in order, the ones it starts with first', () => {
+    const commands = [{ name: 'review' }, { name: 'resume' }, { name: 'model' }, { name: 'memory' }];
+    assert.deepEqual(menuFor('/rsm', commands).map((m) => m.name), ['resume']);
+    assert.deepEqual(menuFor('/m', commands).map((m) => m.name), ['model', 'memory', 'resume'], 'a command that starts with it, then one that holds it');
+    assert.deepEqual(menuFor('/xyz', commands), []);
   });
 });

@@ -32,7 +32,8 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 
 ## Your first session
 
-- Just talk. Name the project you mean; the first time, Sumo confirms its path and registers it.
+- Just talk. Name the project you mean; the first time, Sumo confirms its path and registers it. Started inside a
+  registered project, the chat works there from the start.
 - Say how you like things done. "Always run the linter before you commit" is remembered in your words and
   loaded next time.
 - `/fix`, `/feature` and `/review` load a short written procedure for that kind of work. They also load on
@@ -40,7 +41,9 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 - Big work is delegated without being asked. A row for the job appears under the box, you keep talking,
   and its report comes back into the conversation.
 - `/new` starts a fresh session, and a new task deserves one. `/resume` picks an old one up. `/help` lists
-  the rest.
+  the rest, and `?` on an empty box shows the keys you reach for most.
+- Ctrl-R searches what you sent before. `/context` shows how full the context is and what the session has cost.
+  `/export` writes the conversation to a Markdown file.
 
 ## Good to know
 
@@ -69,8 +72,10 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 | `chat.model` | `opus` | What the chat runs on. `auto` lets the local router pick per turn. |
 | `chat.effort` | `medium` | Effort when the chat model is fixed. |
 | `chat.budget` | `5` | Dollars a chat session costs before the screen says so; `0` never. |
+| `chat.motion` | `on` | `off` keeps the working line still: no colours flowing through it. |
 | `projects.home` | `~` | Where new projects are created. |
 | `jobs.budget` | `10` | Dollars one job may spend before it is stopped; `0` for no cap. |
+| `jobs.floor` | `haiku` | The smallest model a job may run on: `sonnet` keeps every job off Haiku, `opus` puts them all on Opus or Fable. |
 | `jobs.minutes` | `60` | Minutes one job may run before it is stopped; `0` for no limit. |
 | `jobs.escalate` | `on` | A worker's failed first attempt is retried once on the next model up. |
 | `jobs.review` | `risky` | Which verified work gets a reviewer without asking: `risky`, `all` or `off`. |

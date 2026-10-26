@@ -27,10 +27,12 @@ export const CONFIG_DEFAULTS = {
   'chat.model': 'opus',
   'chat.effort': 'medium',
   'chat.notify': 'on',
+  'chat.motion': 'on',
   'chat.budget': '5',
   'guides.auto': 'on',
   'jobs.advisor': 'off',
   'jobs.budget': '10',
+  'jobs.floor': 'haiku',
   'jobs.escalate': 'on',
   'jobs.review': 'risky',
   'shell.sandbox': 'on',
@@ -480,11 +482,13 @@ export function config(key, value) {
       // Sent with every chat turn: a word the API does not take would fail each one, not this command.
       if (key === 'chat.effort' && !CHAT_EFFORTS.includes(value)) throw new UsageError(`no such effort "${value}" — one of: ${CHAT_EFFORTS.join(', ')}`);
       if (key === 'chat.notify' && value !== 'on' && value !== 'off') throw new UsageError('chat.notify is on or off: the bell and the notification when a long turn ends behind another window');
+      if (key === 'chat.motion' && value !== 'on' && value !== 'off') throw new UsageError('chat.motion is on or off: the colours flowing through the working line — off, it stands still');
       // A word would be no budget at all, and the line it holds back would never be said.
       if (key === 'chat.budget' && !/^\d+(\.\d+)?$/.test(value)) throw new UsageError('chat.budget is a sum in US dollars, like 5 or 2.50 (0 for never): what a chat session costs before the screen says so, once');
       if (key === 'guides.auto' && value !== 'on' && value !== 'off') throw new UsageError('guides.auto is on or off: a guide riding in with the message that asks for its kind of work, and a turn held for an edit nothing checked');
       if (key === 'jobs.advisor' && value !== 'on' && value !== 'off') throw new UsageError('jobs.advisor is on or off: a job asking the next model up for advice, from inside its own request');
       if (key === 'jobs.escalate' && value !== 'on' && value !== 'off') throw new UsageError('jobs.escalate is on or off: a worker\'s first attempt that fails retried once, one step up, without being asked');
+      if (key === 'jobs.floor' && !['haiku', 'sonnet', 'opus', 'fable'].includes(value)) throw new UsageError('jobs.floor is haiku, sonnet, opus or fable: the smallest model a job may run on — haiku holds nothing back');
       if (key === 'jobs.review' && !['risky', 'all', 'off'].includes(value)) {
         throw new UsageError('jobs.review is risky, all or off: which workers that finish DONE, verified, are reviewed without being asked — the ones the router called risky, every one, or none');
       }

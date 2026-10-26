@@ -7,10 +7,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { MODELS, setModel } from '../src/catalog.mjs';
-import { openDb } from '../src/db.mjs';
+import { openDb, setMeta } from '../src/db.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { chooseRoute, routePolicy } from '../src/route.mjs';
+import { chooseRoute, jobModels, routePolicy } from '../src/route.mjs';
 import { CONFIG_DEFAULTS } from '../src/setup.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 import { sandbox } from './helpers.mjs';
@@ -201,4 +201,33 @@ test('sumo job retry goes above the attempt that failed, and a reviewer with --r
 test('the chat\'s default effort is medium', () => {
   assert.equal(CONFIG_DEFAULTS['chat.effort'], 'medium');
   assert.match(sandbox().sumo(['config', 'chat.effort']).out, /^chat\.effort = medium$/m);
+});
+
+test('jobs.floor: no job starts on a model below the one the user set, and the router is offered only the models from there up', () => {
+  // Below the floor, a job goes up to the cheapest model on at or above it, keeping its effort; haiku's none becomes medium.
+  const raised = routePolicy({ agent: 'worker', routed: routed('haiku', 'none'), usable: ALL, floor: 'opus' });
+  assert.equal(route(raised), 'opus/medium');
+  assert.equal(raised.policy, 'jobs.floor is opus (the router said haiku/none)');
+  assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('sonnet', 'high'), usable: ALL, floor: 'opus' })), 'opus/high');
+  // At or above it, the router's answer stands; so does everything when the floor is haiku, or no model at or above it is on.
+  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('opus', 'low'), usable: ALL, floor: 'sonnet' })), 'opus/low');
+  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('haiku', 'none'), usable: ALL, floor: 'haiku' })), 'haiku/none');
+  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('sonnet', 'low'), usable: ['haiku', 'sonnet'], floor: 'opus' })), 'sonnet/low');
+  // The scout's own rule still holds above a lower floor.
+  assert.equal(route(routePolicy({ agent: 'scout', routed: routed('haiku', 'none'), usable: ALL, floor: 'haiku' })), 'sonnet/low');
+
+  withHome(freshHome(), {}, () => {
+    const db = openDb();
+    try {
+      assert.deepEqual(jobModels(db), ALL, 'by default every model that is on');
+      setMeta(db, 'config.jobs.floor', 'opus');
+      assert.deepEqual(jobModels(db), ['opus', 'fable'], 'from the floor up');
+      setModel(db, 'opus', false, '2026-10-26T00:00:00.000Z');
+      setModel(db, 'fable', false, '2026-10-26T00:00:00.000Z');
+      assert.deepEqual(jobModels(db), ['haiku', 'sonnet'], 'none on at or above it: every model that is on, rather than none');
+    } finally {
+      db.close();
+    }
+  });
+  assert.equal(CONFIG_DEFAULTS['jobs.floor'], 'haiku');
 });

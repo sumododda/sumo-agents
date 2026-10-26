@@ -5,7 +5,7 @@ import { isAdvisorTool } from './advisor.mjs';
 import { compactInput, isMcpTool, splitMcpName, unlabeled } from './mcp.mjs';
 import { REPO_ROOT } from './paths.mjs';
 import { elapsed } from './text.mjs';
-import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
+import { ASK_TOOL, BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
 import { isWebTool, WEB_SEARCH_TOOL } from './web.mjs';
 
 /**
@@ -16,14 +16,22 @@ import { isWebTool, WEB_SEARCH_TOOL } from './web.mjs';
  * terminal or NO_COLOR is set, so a pipe gets plain text.
  */
 
-const CODES = { bold: ['1', '22'], dim: ['2', '22'], italic: ['3', '23'], underline: ['4', '24'], strike: ['9', '29'], cyan: ['36', '39'], yellow: ['33', '39'], red: ['31', '39'], green: ['32', '39'] };
+const CODES = { bold: ['1', '22'], dim: ['2', '22'], italic: ['3', '23'], underline: ['4', '24'], strike: ['9', '29'], cyan: ['36', '39'], yellow: ['33', '39'], red: ['31', '39'], green: ['32', '39'], magenta: ['35', '39'], blue: ['34', '39'] };
 const MAX_WIDTH = 100;
 const MIN_WIDTH = 40;
 
-/** The style functions, each a no-op when colour is off. */
-export function styles(enabled) {
+/** A link's ends (OSC 8): the terminal makes the text between them open the address, however the lines it is drawn on are broken. */
+const LINK_OPEN = (url) => `\x1b]8;;${url}\x07`;
+const LINK_CLOSE = '\x1b]8;;\x07';
+
+/**
+ * The style functions, each a no-op when colour is off. `links` makes `link` an address the terminal opens on a click; a
+ * terminal that does not know them draws the text alone, but a pager does not, so the screen asks for them and nothing else.
+ */
+export function styles(enabled, { links = false } = {}) {
   const s = {};
   for (const [name, [on, off]] of Object.entries(CODES)) s[name] = enabled ? (t) => `\x1b[${on}m${t}\x1b[${off}m` : (t) => t;
+  s.link = enabled && links ? (url, text = url) => `${LINK_OPEN(url)}${text}${LINK_CLOSE}` : (_url, text = _url) => text;
   return s;
 }
 
@@ -39,29 +47,45 @@ const columnsOf = (ch) => (WIDE.test(ch) ? 2 : 1);
 
 /** The columns text takes on a terminal, colour codes not counted: a wide character is two, so a table around it lines up. */
 const visible = (t) => {
-  const plain = t.replace(/\x1b\[[0-9;]*m/g, '');
+  const plain = t.replace(/\x1b\[[0-9;]*m|\x1b\]8;[^\x07]*\x07/g, '');
   if (!/[^\x00-\x7e]/.test(plain)) return plain.length;
   let width = 0;
   for (const { segment } of GRAPHEMES.segment(plain)) width += columnsOf(segment);
   return width;
 };
 
-/** Word-wraps styled text to `width`, measuring only what is visible; continuation lines carry `indent`. */
+/**
+ * Word-wraps styled text to `width`, measuring only what is visible; continuation lines carry `indent`. A word wider than
+ * a line — an address, a path — is cut at the edge and goes on under the indent: no line is left for the terminal to break.
+ */
 export function wrap(text, width, indent = '') {
   if (visible(text) <= width) return text;
   const lead = /^\s*/.exec(text)[0];
+  // An indent that leaves no room is dropped: a word goes on at the edge rather than not at all.
+  const hang = visible(indent) < width - 1 ? indent : '';
   const lines = [];
   let line = lead;
   for (const word of text.slice(lead.length).split(' ')) {
     const next = line === lead ? `${lead}${word}` : `${line} ${word}`;
     if (line !== lead && visible(next) > width) {
       lines.push(line);
-      line = `${indent}${word}`;
+      line = `${hang}${word}`;
     } else line = next;
+    while (visible(line) > width) {
+      const [head, ...rest] = cut(line, width);
+      lines.push(head);
+      line = `${hang}${rest.join('')}`;
+    }
   }
   lines.push(line);
   return lines.join('\n');
 }
+
+/** An address in text: up to the space after it, without the stop or bracket a sentence puts after it. */
+const ADDRESS = /\bhttps?:\/\/[^\s<>()[\]`]*[^\s<>()[\]`.,;:!?'"]/g;
+
+/** Text with each address in it made a link, for lines that are not markdown: what a tool gave back, a note. */
+export const linked = (text, s) => String(text).replace(ADDRESS, (url) => s.link(url));
 
 /** A character after a backslash is meant as itself, not as a mark. */
 const ESCAPED = /\\([\\`*_~[\]()<>#|!])/g;
@@ -78,8 +102,10 @@ export function inline(line, s) {
   const out = line
     .replace(/(?<!\\)`([^`]+)`/g, (_, code) => keep(s.cyan(code)))
     .replace(ESCAPED, (_, ch) => keep(ch))
-    .replace(/<(https?:\/\/[^>\s]+)>/g, (_, url) => keep(url))
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, text, url) => (text === url ? keep(url) : `${text} ${keep(s.dim(`(${url})`))}`))
+    .replace(/<(https?:\/\/[^>\s]+)>/g, (_, url) => keep(s.link(url)))
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, text, url) => (text === url ? keep(s.link(url)) : `${text} ${keep(s.dim(`(${s.link(url)})`))}`))
+    // An address in the words is one link, kept from the marks: its underscores are not italics.
+    .replace(ADDRESS, (url) => keep(s.link(url)))
     .replace(/\*\*\*(?!\s)([^*]+?)(?<!\s)\*\*\*/g, (_, t) => s.bold(s.italic(t)))
     .replace(/\*\*(?!\s)([^*]+?)(?<!\s)\*\*/g, (_, t) => s.bold(t))
     .replace(/(?<![\w_])__(?!\s)([^_]+?)(?<!\s)__(?![\w_])/g, (_, t) => s.bold(t))
@@ -104,13 +130,77 @@ export function hangOf(line) {
   return `${item[1]}${' '.repeat(/\d/.test(item[2]) ? item[2].length + 3 : 4)}`;
 }
 
+const words = (list) => new Set(list.split(' '));
+const C_LIKE = 'break case continue default do else for goto if return switch while true false null';
+/**
+ * The languages a code block is coloured in: how a comment starts, which quotes make a string, and the words the language
+ * keeps for itself. Anything else — output, a log, plain text — is left as it came: colour guessed onto it would mislead.
+ */
+const LANGUAGES = (() => {
+  const js = { line: '//', block: true, quotes: '"\'`', words: words(`${C_LIKE} as async await catch class const debugger delete export extends finally from function import in instanceof let new of static super this throw try typeof undefined var void with yield interface type enum implements private public protected readonly declare namespace abstract keyof satisfies`) };
+  const py = { line: '#', quotes: '"\'', words: words('and as assert async await break class continue def del elif else except False finally for from global if import in is lambda None nonlocal not or pass raise return self True try while with yield match case') };
+  const sh = { line: '#', quotes: '"\'', words: words('if then else elif fi for while until do done case esac in function return local export readonly set unset echo exit source alias cd') };
+  const go = { line: '//', block: true, quotes: '"\'`', words: words(`${C_LIKE} chan const defer fallthrough func go import interface map package range select struct type var nil iota`) };
+  const rust = { line: '//', block: true, quotes: '"', words: words(`${C_LIKE} as async await const crate dyn enum extern fn impl in let loop match mod move mut pub ref self Self static struct super trait type unsafe use where Some None Ok Err`) };
+  const c = { line: '//', block: true, quotes: '"\'', words: words(`${C_LIKE} auto char class const double enum extern float int long namespace new private protected public register short signed sizeof static struct template this throw try catch typedef union unsigned using virtual void volatile bool include define nullptr import package final abstract extends implements interface var val fun let func guard struct override`) };
+  const ruby = { line: '#', quotes: '"\'', words: words('alias and begin break case class def defined do else elsif end ensure false for if in module next nil not or redo rescue retry return self super then true undef unless until when while yield require') };
+  const sql = { line: '--', block: true, quotes: '\'"', words: words('select from where and or not insert into values update set delete create table index drop alter join left right inner outer on as group by order having limit offset distinct union all null is in like between case when then else end primary key references default exists'), caseless: true };
+  const conf = { line: '#', quotes: '"\'', words: words('true false null yes no on off') };
+  const named = { js, javascript: js, jsx: js, mjs: js, cjs: js, ts: js, typescript: js, tsx: js, json: { quotes: '"', words: words('true false null') }, py: py, python: py, sh, bash: sh, zsh: sh, shell: sh, go, golang: go, rs: rust, rust, c, h: c, cpp: c, 'c++': c, cc: c, java: c, kotlin: c, kt: c, swift: c, cs: c, csharp: c, rb: ruby, ruby, sql, yaml: conf, yml: conf, toml: conf, ini: conf };
+  return named;
+})();
+
+/**
+ * A line of code in its language's colours: comments faint, strings green, numbers yellow, the language's own words
+ * magenta. `code` carries a block comment over from the line before; a diff is its changes, green and red.
+ */
+export function highlight(line, lang, s, code = null) {
+  if (lang === 'diff' || lang === 'patch') return /^\+(?!\+\+ )/.test(line) ? s.green(line) : /^-(?!-- )/.test(line) ? s.red(line) : /^@@/.test(line) ? s.cyan(line) : line;
+  const language = LANGUAGES[lang];
+  if (!language || !line) return line;
+  const state = code ?? { comment: false };
+  let out = '';
+  let at = 0;
+  if (state.comment) {
+    const end = line.indexOf('*/');
+    if (end === -1) return s.dim(line);
+    out = s.dim(line.slice(0, end + 2));
+    at = end + 2;
+    state.comment = false;
+  }
+  const quotes = [...language.quotes].map((q) => `${q === '`' ? '`' : `\\${q}`}(?:[^${q === '`' ? '`' : `\\${q}`}\\\\]|\\\\.)*${q === '`' ? '`' : `\\${q}`}`).join('|');
+  const comment = language.line === '#' ? '(?:^|(?<=\\s))#.*' : language.line ? `${language.line.replace(/\//g, '\\/')}.*` : '(?!)';
+  const pattern = new RegExp(`(${comment})|(${language.block ? '\\/\\*' : '(?!)'})|(${quotes || '(?!)'})|(\\b0x[0-9a-fA-F]+\\b|\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b)|(\\b[A-Za-z_][\\w]*\\b)`, 'g');
+  pattern.lastIndex = at;
+  for (let m; (m = pattern.exec(line)); ) {
+    out += line.slice(at, m.index);
+    at = m.index + m[0].length;
+    if (m[1] !== undefined) out += s.dim(m[0]);
+    else if (m[2] !== undefined) {
+      const end = line.indexOf('*/', at);
+      if (end === -1) {
+        out += s.dim(line.slice(m.index));
+        state.comment = true;
+        return out;
+      }
+      out += s.dim(line.slice(m.index, end + 2));
+      at = end + 2;
+      pattern.lastIndex = at;
+    } else if (m[3] !== undefined) out += s.green(m[0]);
+    else if (m[4] !== undefined) out += s.yellow(m[0]);
+    else out += language.words.has(language.caseless ? m[0].toLowerCase() : m[0]) ? s.magenta(m[0]) : m[0];
+  }
+  return out + line.slice(at);
+}
+
 /**
  * One line of a reply: block-level marks replaced by weight and indent, then wrapped with a hanging indent.
  * `hang` is the indent of the list item a line may go on with: an indented line that is not an item of its own is drawn there.
  */
-export function renderLine(line, s, { fence = false, width = MAX_WIDTH, hang = null } = {}) {
+export function renderLine(line, s, { fence = false, width = MAX_WIDTH, hang = null, lang = '', code = null } = {}) {
   // Code is what is read most closely: the frame around it is faint, the code is not.
-  if (fence) return `    ${line}`;
+  // A line too long for the window goes on under itself, at its own indent, so the code keeps its shape.
+  if (fence) return wrap(`    ${highlight(line, lang, s, code)}`, width, `    ${/^\s*/.exec(line)[0]}`);
   const heading = /^(#{1,6})\s+(.*)$/.exec(line);
   if (heading) return wrap(heading[1].length === 1 ? s.bold(s.underline(inline(heading[2], s))) : s.bold(inline(heading[2], s)), width);
   const item = LIST_ITEM.exec(line);
@@ -135,24 +225,49 @@ const cellsOf = (row) => row.trim().slice(1, -1).split(/(?<!\\)\|/).map((c) => c
 
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
-/** A line cut into pieces no wider than `width`, between characters: an emoji, even one joined from several, stays whole. */
+/** What each closing code ends: the opening codes it closes. */
+const CLOSES = { 0: /.*/, 22: /^(1|2)$/, 23: /^3$/, 24: /^4$/, 27: /^7$/, 29: /^9$/, 39: /^(3[0-7]|9[0-7]|38;.*)$/, 49: /^(4[0-7]|10[0-7]|48;.*)$/ };
+/** The styles open after `code`, given the ones open before it. */
+function styledAfter(on, code) {
+  const n = code.slice(2, -1) || '0';
+  const closes = CLOSES[n];
+  return closes ? on.filter((open) => !closes.test(open.slice(2, -1))) : [...on, code];
+}
+
+/**
+ * A line cut into pieces no wider than `width`, between characters: an emoji, even one joined from several, stays whole,
+ * and a colour code takes no room — it stays with the character after it.
+ */
 function cut(line, width) {
   const pieces = [''];
   let used = 0;
-  for (const { segment: ch } of GRAPHEMES.segment(line)) {
-    if (pieces.at(-1) && used + columnsOf(ch) > width) {
-      pieces.push('');
-      used = 0;
+  // A link cut in two is closed at the end of one piece and opened again at the start of the next: both halves open it.
+  // So is a style: the next piece starts in the colour the last one ended in, since each row is drawn on its own.
+  let link = null;
+  let on = [];
+  for (const [token] of line.matchAll(/\x1b\[[0-9;]*m|\x1b\]8;[^\x07]*\x07|[^\x1b]+|\x1b/g)) {
+    if (token.length > 1 && token[0] === '\x1b') {
+      if (token[1] === ']') link = token === LINK_CLOSE ? null : token;
+      else on = styledAfter(on, token);
+      pieces[pieces.length - 1] += token;
+      continue;
     }
-    pieces[pieces.length - 1] += ch;
-    used += columnsOf(ch);
+    for (const { segment: ch } of GRAPHEMES.segment(token)) {
+      if (used > 0 && used + columnsOf(ch) > width) {
+        if (link) pieces[pieces.length - 1] += LINK_CLOSE;
+        pieces.push(`${on.join('')}${link ?? ''}`);
+        used = 0;
+      }
+      pieces[pieces.length - 1] += ch;
+      used += columnsOf(ch);
+    }
   }
   return pieces;
 }
 
-/** A text folded to `width`, as its rows; a word wider than that is cut, so nothing drawn from them runs past the edge. */
-export function fold(text, width) {
-  return wrap(text, width)
+/** A text folded to `width`, as its rows, the ones after the first at `indent`; a word wider than that is cut, so nothing drawn from them runs past the edge. */
+export function fold(text, width, indent = '') {
+  return wrap(text, width, indent)
     .split('\n')
     .flatMap((line) => (visible(line) <= width ? [line] : cut(line, width)));
 }
@@ -176,7 +291,26 @@ export function renderTable(rows, s, width) {
   const table = [head, ...body].map((row) => Array.from({ length: columns }, (_, i) => row[i] ?? ''));
   const widths = Array.from({ length: columns }, (_, i) => Math.max(1, ...table.map((row) => visible(inline(row[i], s)))));
   const room = width - (3 * columns + 1);
-  while (widths.reduce((a, b) => a + b, 0) > room && Math.max(...widths) > MIN_COLUMN) widths[widths.indexOf(Math.max(...widths))]--;
+  const sum = (list) => list.reduce((a, b) => a + b, 0);
+  if (sum(widths) > room) {
+    // Too wide: each column keeps its longest word whole if it can, and the room left over goes to the columns with the most
+    // to say, by how much more they have — so a column of short keys is not padded out to match a column of sentences.
+    const least = widths.map((most, i) => Math.min(most, Math.max(MIN_COLUMN, ...table.map((row) => Math.max(0, ...inline(row[i], NO_STYLE).split(/\s+/).map(visible))))));
+    const spare = room - sum(least);
+    // Three columns or more that cannot keep their words whole would fold into a ladder of word ends: each row is shown as
+    // a record instead — the column's name, then the cell — one under the other.
+    if (spare < 0 && columns >= 3 && body.length > 0) {
+      return body.map((row) => head.map((name, i) => wrap(`${i === 0 ? s.dim('•') : ' '} ${s.bold(inline(name, s))}: ${inline(row[i] ?? '', s)}`, width, '    ')).join('\n')).join('\n\n');
+    }
+    if (spare >= 0) {
+      const wants = widths.map((most, i) => most - least[i]);
+      const given = least.map((w, i) => w + Math.floor((spare * wants[i]) / Math.max(1, sum(wants))));
+      // What rounding left goes to the columns that want the most, one each.
+      for (let left = room - sum(given), i = 0; left > 0 && i < columns; i++, left--) given[wants.indexOf(Math.max(...wants.filter((_, k) => given[k] < widths[k])))]++;
+      widths.splice(0, columns, ...given.map((w, i) => Math.min(w, widths[i])));
+    } else widths.splice(0, columns, ...least);
+    while (sum(widths) > room && Math.max(...widths) > MIN_COLUMN) widths[widths.indexOf(Math.max(...widths))]--;
+  }
 
   const edge = (left, mid, right) => s.dim(`${left}${widths.map((w) => '─'.repeat(w + 2)).join(mid)}${right}`);
   const bar = s.dim('│');
@@ -205,15 +339,20 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
   let rows = [];
   /** The indent of the list item the lines are in, until a line comes out of it. */
   let hang = null;
+  /** The language the code block in hand is in, and where its colouring has got to: a comment can run over lines. */
+  let lang = '';
+  let code = { comment: false };
   const line = (raw) => {
     const marks = /^\s*```\s*(\S*)/.exec(raw);
     if (marks) {
       fence = !fence;
       hang = null;
+      lang = fence ? marks[1].toLowerCase() : '';
+      code = { comment: false };
       return s.dim(fence ? `    ┌─${marks[1] ? ` ${marks[1]}` : ''}` : '    └─');
     }
     if (!fence) hang = hangOf(raw) ?? (/^\s+\S/.test(raw) || raw.trim() === '' ? hang : null);
-    return renderLine(raw, s, { fence, width, hang: hangOf(raw) === null ? hang : null });
+    return renderLine(raw, s, { fence, width, hang: hangOf(raw) === null ? hang : null, lang, code });
   };
   /** The rows held so far: a table once its rule has come, the lines they were otherwise. */
   const held = () => (rows.length >= 2 && TABLE_RULE.test(rows[1]) ? renderTable(rows, s, width) : rows.map((r) => renderLine(r, s, { width })).join('\n'));
@@ -244,14 +383,25 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
       rows = [];
       fence = false;
       hang = null;
+      lang = '';
+      code = { comment: false };
     },
     /** What has not been written yet, rendered as far as it has got: the rows of a table, and the line still arriving. */
     get tail() {
       const going = /^\s+\S/.test(tail) && hangOf(tail) === null ? hang : null;
-      return [rows.length > 0 ? held() : '', tail && !/^\s*```/.test(tail) ? renderLine(tail, s, { fence, width, hang: going }) : ''].filter(Boolean).join('\n');
+      return [rows.length > 0 ? held() : '', tail && !/^\s*```/.test(tail) ? renderLine(tail, s, { fence, width, hang: going, lang, code: { ...code } }) : ''].filter(Boolean).join('\n');
     },
   };
 }
+
+/** This sumo's version, from its package.json; empty where there is none to read, as beside a standalone binary. */
+export const VERSION = (() => {
+  try {
+    return String(JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')).version ?? '');
+  } catch {
+    return '';
+  }
+})();
 
 /** The words shown while the model works: yours, one a line, in spinner.txt at the top of the repo. */
 export const SPINNER_FILE = join(REPO_ROOT, 'spinner.txt');
@@ -317,17 +467,18 @@ const SHOWN_TAIL_LINES = 3;
 const SHOWN_DIFF_LINES = 12;
 const SHOWN_COMMAND_LINES = 3;
 const SHOWN_COMMAND_CHARS = 240;
+const SHOWN_WRITE_LINES = 4;
 
 const more = (n) => ({ text: `… +${n} line${n === 1 ? '' : 's'}`, tone: 'dim' });
 
-/** The top of a list of lines, and how many more there were. */
+/** The top of a list of lines, and how many more there were. One more line is shown, not folded: its fold would take its row. */
 function top(lines, max) {
-  return lines.length > max ? [...lines.slice(0, max), more(lines.length - max)] : lines;
+  return lines.length > max + 1 ? [...lines.slice(0, max), more(lines.length - max)] : lines;
 }
 
 /** Both ends of what a command printed, and how many lines lie between: a run says how it went in its last lines. */
 function ends(lines, full) {
-  if (full || lines.length <= SHOWN_HEAD_LINES + SHOWN_TAIL_LINES) return lines;
+  if (full || lines.length <= SHOWN_HEAD_LINES + SHOWN_TAIL_LINES + 1) return lines;
   return [...lines.slice(0, SHOWN_HEAD_LINES), more(lines.length - SHOWN_HEAD_LINES - SHOWN_TAIL_LINES), ...lines.slice(-SHOWN_TAIL_LINES)];
 }
 
@@ -338,9 +489,15 @@ export const tilde = (path, home = homedir()) => (path === home ? '~' : String(p
 export const pathFrom = (path, cwd) => (cwd && path === cwd ? '.' : cwd && String(path).startsWith(`${cwd}${sep}`) ? String(path).slice(cwd.length + 1) : tilde(path));
 
 /** How a delegated job ended, for the line that sums it up: its mark, the word for it, and its colour. */
-const JOB_ENDS = { done: ['✓', 'done', 'add'], failed: ['✗', 'failed', 'error'], needs_input: ['?', 'needs your answer', 'ask'], open: ['○', 'never closed', 'dim'] };
+const JOB_ENDS = { done: ['✓', 'done', 'add'], failed: ['✗', 'failed', 'error'], needs_input: ['?', 'needs your answer', 'ask'], open: ['○', 'never closed', 'dim'], stopped: ['■', 'stopped by you', 'dim'] };
 
-const toned = (text, tone) => String(text).split('\n').map((t) => ({ text: t, tone }));
+/**
+ * What a command printed in colour reaches the model with its escapes shown as markers (⟨U+001B⟩[31m); on the screen
+ * they are noise in the words, and go. Any other hidden character keeps its marker.
+ */
+export const withoutColourCodes = (text) => String(text).replace(/⟨U\+001B⟩\[[0-?]*[ -/]*[@-~]|⟨U\+001B⟩\][^\n]*?(?:⟨U\+0007⟩|⟨U\+001B⟩\\)/g, '');
+
+const toned = (text, tone) => withoutColourCodes(text).split('\n').map((t) => ({ text: t, tone }));
 const count = (text) => [{ text: `${text === '' ? 0 : text.replace(/\n$/, '').split('\n').length} lines`, tone: 'dim' }];
 
 /**
@@ -373,6 +530,33 @@ function diffView(old, now, line, full) {
 }
 
 /**
+ * A report as it reads, a line each: no table rules, a table's row its cells, no marks, a file in the project named from
+ * there. A heading is dropped — or, with `headings: 'keep'`, kept as its words; either way a line of three words or fewer
+ * under one ("None.", "Matches.") says nothing without it, and takes it in front.
+ */
+function readable(text, cwd = null, { headings = 'drop' } = {}) {
+  const lines = [];
+  let heading = null;
+  for (const raw of String(text ?? '').split('\n')) {
+    if (!raw.trim() || TABLE_RULE.test(raw)) continue;
+    const head = /^#{1,6}\s+(.*)$/.exec(raw);
+    if (head) {
+      heading = inline(head[1], NO_STYLE).replace(/:\s*$/, '');
+      if (headings === 'keep') lines.push(heading);
+      continue;
+    }
+    const line = inline(TABLE_ROW.test(raw) ? cellsOf(raw).filter(Boolean).join(' · ') : raw.replace(/^(\s*)[-*+]\s+/, '$1• '), NO_STYLE);
+    const named = cwd ? line.replaceAll(`${cwd}${sep}`, '') : line;
+    if (heading && named.trim().split(/\s+/).length <= 3) {
+      if (headings === 'keep') lines.pop();
+      lines.push(`${heading}: ${named.trim()}`);
+    } else lines.push(named);
+    heading = null;
+  }
+  return lines;
+}
+
+/**
  * A tool call for the screen: what ran, and under it the part of the result
  * worth a glance — both ends of a command's output, an edit as a diff, a read
  * or a write as its size. Without a result it is the call alone; `full` is
@@ -384,6 +568,8 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
   // Folded, the empty lines of what came back are not shown: three of five lines spent on nothing say nothing.
   const output = (content = result.content) => {
     const lines = toned(content, result.isError ? 'error' : 'plain');
+    // What reads as a diff — `git diff`, a patch — is drawn as one: what went red, what came green.
+    if (!result.isError && /^(?:diff --git |@@ -\d)/m.test(content)) for (const line of lines) line.tone = /^\+(?!\+\+ )/.test(line.text) ? 'add' : /^-(?!-- )/.test(line.text) ? 'del' : line.tone;
     if (full) return lines;
     const said = lines.filter((line) => line.text.trim() !== '');
     return said.length === 0 ? [{ text: '(no output)', tone: 'dim' }] : ends(said, false);
@@ -401,20 +587,26 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     return { title: 'Bash', detail, lines: output() };
   }
   if (call.name === DELEGATE_TOOL.name) {
-    const detail = input.job !== undefined ? `j${input.job}` : `${input.agent ?? 'worker'} · ${input.title ?? ''}`;
-    if (!result) return { title: 'Delegate', detail, lines: [] };
+    // A report a job in the background sent back is titled as one, by who sent it; a call is the delegation itself.
+    const title = input.report ? 'Report' : 'Delegate';
+    const detail = input.job !== undefined ? `j${input.job}${input.report && input.agent ? ` ${input.agent} · ${input.title ?? ''}` : ''}` : `${input.agent ?? 'worker'} · ${input.title ?? ''}`;
+    if (!result) return { title, detail, lines: [] };
     // Started in the background: what the call answered is for the model — how to wait, what not to guess. The screen says the one thing it means.
-    if (!full && !result.isError && /^j\d+ is running in the background/.test(result.content)) return { title: 'Delegate', detail, lines: [{ text: 'running in the background — its report comes here when it is done', tone: 'dim' }] };
-    if (!result.job || full) return { title: 'Delegate', detail, lines: output() };
+    if (!full && !result.isError && /^j\d+ is running in the background/.test(result.content)) return { title, detail, lines: [{ text: 'running in the background — its report comes here when it is done', tone: 'dim' }] };
+    if (full) return { title, detail, lines: output() };
+    // Several attempts report together, in markdown: shown as it reads, like a single job's report.
+    if (!result.job) return { title, detail, lines: output(result.isError ? result.content : readable(result.content, cwd, { headings: 'keep' }).join('\n')) };
     // A job that ran: how it went in one line, then the top of what it reported.
     const { job } = result;
-    const [mark, said, tone] = JOB_ENDS[job.status] ?? JOB_ENDS.open;
+    // Stopped by the user before it closed itself, it was stopped — not left open.
+    const [mark, said, tone] = input.stopped && !['done', 'failed', 'needs_input'].includes(job.status) ? JOB_ENDS.stopped : (JOB_ENDS[job.status] ?? JOB_ENDS.open);
     const route = job.effort && job.effort !== 'none' ? `${job.model}/${job.effort}` : job.model;
     // How long it took comes first: it is what the wait was.
     const summary = `${mark} j${job.id} ${said}${job.seconds === undefined ? '' : ` · ${elapsed(job.seconds * 1000)}`} · ${job.turns} turn${job.turns === 1 ? '' : 's'} · ${job.toolCalls} tool call${job.toolCalls === 1 ? '' : 's'} · $${job.costUsd.toFixed(2)} · ${route}`;
-    // The top of the report is its first words, not the heading over them.
-    const report = String(job.report ?? '').split('\n').filter((line) => line.trim() && !/^#{1,6}\s/.test(line));
-    return { title: 'Delegate', detail, lines: [{ text: summary, tone }, ...top(report.map((text) => ({ text, tone: 'plain' })), SHOWN_REPORT_LINES)] };
+    // The top of the report is its first words, as they read: not the heading over them, not a table's rule, not its marks;
+    // a table's row is its cells, and a file in the project is named from there.
+    const report = readable(job.report, cwd);
+    return { title, detail, lines: [{ text: summary, tone }, ...top(report.map((text) => ({ text, tone: 'plain' })), SHOWN_REPORT_LINES)] };
   }
   if (isMcpTool(call.name)) {
     // A server's tool: the server as the title, the tool with its input as the detail, what came back under it.
@@ -433,6 +625,11 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     // The advisor: who was asked. The advice is the model's alone to read, so under it only that it came, or why it did not.
     return { title: 'Advisor', detail: String(input.asked ?? ''), lines: result ? output() : [] };
   }
+  if (call.name === ASK_TOOL.name) {
+    // A question put to the user: the question, and under it what they answered.
+    const question = String(input.question ?? '').split('\n')[0];
+    return { title: 'Question', detail: question, lines: result ? output() : [] };
+  }
   if (call.name !== EDITOR_TOOL.name) {
     // A job's own tools: what it was given in a line, what came back under it.
     const given = String(input.status ?? input.query ?? input.question ?? input.text ?? '').split('\n')[0].slice(0, 80);
@@ -446,12 +643,35 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
   if (result.isError) return { title, detail, lines: output() };
   const added = (text) => toned(text, 'add').map((l) => ({ ...l, text: `+ ${l.text}` }));
   if (input.command === 'view') return { title, detail, lines: full ? toned(result.content, 'plain') : count(result.content) };
-  if (input.command === 'create') return { title, detail, lines: full ? added(String(input.file_text ?? '').replace(/\n$/, '')) : count(String(input.file_text ?? '')) };
+  // A new file is shown by its top, as what came: what was written is what is checked first.
+  if (input.command === 'create') {
+    const text = String(input.file_text ?? '').replace(/\n$/, '');
+    if (!text) return { title, detail, lines: [{ text: '(empty)', tone: 'dim' }] };
+    return { title, detail, lines: full ? added(text) : top(added(text), SHOWN_WRITE_LINES) };
+  }
   // The editor says where the old text began and what the file had there; a result that does not is drawn from what the model sent.
   const came = input.command === 'insert' ? (input.insert_text ?? input.new_str ?? '').replace(/\n$/, '') : (input.new_str ?? '');
   const edit = result.edit ?? { line: null, old: input.command === 'str_replace' ? (input.old_str ?? '') : '', new: came };
   const diff = diffView(edit.old, edit.new, edit.line ?? null, full);
   return { title, detail: diff.at === null ? detail : `${detail}:${diff.at}`, stat: diff.stat, lines: diff.lines };
+}
+
+/** The failures a request meets most, in the words a person acts on: what happened, and what to do about it. */
+const FAILURES = [
+  [/overloaded|\b529\b/i, "Anthropic's API is overloaded just now — nothing was lost; send it again in a minute"],
+  [/rate.?limit|\b429\b/i, 'rate limited by the API — wait a minute and send it again, or /model to another model'],
+  [/credit balance|billing|payment/i, 'the API account has no credit left — top it up, then send it again'],
+  [/\b401\b|authentication|x-api-key|invalid.*token|oauth/i, 'the API refused the credential — check ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, then sumo doctor'],
+  [/prompt is too long|context.{0,20}(window|length|limit)|too many tokens/i, 'the conversation no longer fits the model — /new starts fresh; the memory brings the thread back'],
+  [/ENOTFOUND|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|fetch failed|socket hang up|network|connection error/i, 'no connection to the API — check the network, then send it again'],
+  [/\b5\d\d\b|internal server error|api_error/i, 'the API failed on its side — send it again'],
+];
+
+/** A failure for the screen: in words when it is one of the known ones, with what came back kept faint under it; as it came otherwise. */
+export function explained(message) {
+  const said = String(message ?? '').replace(/\s+/g, ' ').trim();
+  const known = FAILURES.find(([pattern]) => pattern.test(said));
+  return known ? { text: `error: ${known[1]}`, detail: said.length > 200 ? `${said.slice(0, 199)}…` : said } : { text: `error: ${said}` };
 }
 
 /**
@@ -476,11 +696,40 @@ export function transcript(log, s, { width = MAX_WIDTH, cwd = null } = {}) {
       out.push('', `${entry.result.isError ? s.red('⏺') : s.green('⏺')} ${s.bold(view.title)}(${untab(view.detail).split('\n').join('\n  ')})${stat}`, ...under(view.lines));
     } else if (entry.kind === 'shell') out.push(...under(toolView({ name: BASH_TOOL.name }, entry.result, { full: true }).lines));
     else if (entry.kind === 'job') out.push('', `⏺ ${s.bold(`j${entry.id}`)} ${entry.agent} · ${entry.route} — ${entry.title}`);
-    else if (entry.kind === 'error') out.push('', s.red(entry.text));
+    else if (entry.kind === 'error') out.push('', s.red(entry.text), ...(entry.detail ? [s.dim(`  ${entry.detail}`)] : []));
+    else if (entry.kind === 'thought') out.push('', s.dim(`✻ Thought for ${elapsed(entry.ms)}`), ...String(entry.text ?? '').trim().split('\n').filter(Boolean).map((line) => s.dim(s.italic(`  ${line}`))));
     else if (entry.kind === 'footer') out.push('', s.dim(`  ${entry.text}`));
     else if (entry.kind === 'note') out.push(s.dim(`  ⎿  ${entry.text.split('\n').join('\n     ')}`));
   }
   return `${out.join('\n').replace(/^\n/, '')}\n`;
+}
+
+/** A fence for text that may hold fences of its own: longer than any run of backticks in it. */
+const fenceFor = (text) => '`'.repeat(Math.max(3, ...[...String(text).matchAll(/`+/g)].map((m) => m[0].length + 1)));
+
+/**
+ * The conversation as Markdown, for `/export`: what was said quoted, each reply as the model wrote it, each call folded
+ * away under its name with all it gave back, the thinking under how long it took. Nothing is coloured; it is a file to keep.
+ */
+export function markdownOf(log, { cwd = null, title = 'Sumo' } = {}) {
+  const out = [`# ${title}`];
+  const folded = (summary, body) => {
+    const fence = fenceFor(body);
+    out.push('', `<details><summary>${summary.replace(/</g, '&lt;')}</summary>`, '', fence, body, fence, '', '</details>');
+  };
+  for (const entry of log) {
+    if (entry.kind === 'user') out.push('', '**You**', '', ...entry.text.split('\n').map((line) => `> ${line}`));
+    else if (entry.kind === 'reply') out.push('', entry.raw.trim());
+    else if (entry.kind === 'tool') {
+      const view = toolView(entry.call, entry.result, { full: true, cwd });
+      folded(`${view.title}(${view.detail.split('\n')[0]})${entry.result.isError ? ' — failed' : ''}`, view.lines.map((line) => line.text).join('\n'));
+    } else if (entry.kind === 'shell') folded('! command', String(entry.result.content));
+    else if (entry.kind === 'thought') folded(`Thought for ${elapsed(entry.ms)}`, String(entry.text ?? '').trim());
+    else if (entry.kind === 'job') out.push('', `**j${entry.id}** ${entry.agent} · ${entry.route} — ${entry.title}`);
+    else if (entry.kind === 'error') out.push('', `**${entry.text}**${entry.detail ? ` — ${entry.detail}` : ''}`);
+    else if (entry.kind === 'note' || entry.kind === 'footer') out.push('', ...entry.text.split('\n').map((line) => `_${line}_`));
+  }
+  return `${out.join('\n')}\n`;
 }
 
 const kindOf = (raw) => (/^Ask the user/.test(raw) ? 'ask' : /^Warning/.test(raw) ? 'warning' : /^Left off/.test(raw) ? 'left' : /^- m\d+ /.test(raw) ? 'item' : raw);
