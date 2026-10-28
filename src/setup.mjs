@@ -735,7 +735,7 @@ export function config(key, value) {
       if (key === 'chat.effort' && !CHAT_EFFORTS.includes(value)) throw new UsageError(`no such effort "${value}" — one of: ${CHAT_EFFORTS.join(', ')}`);
       if (key === 'chat.notify' && value !== 'on' && value !== 'off') throw new UsageError('chat.notify is on or off: the bell and the notification when a long turn ends behind another window');
       if (key === 'chat.screen' && !['full', 'still', 'plain'].includes(value)) {
-        throw new UsageError('chat.screen is full, still or plain: colours flowing through the working line, the same standing still, or drawn for a screen reader — plain marks, no frames, nothing moving');
+        throw new UsageError('chat.screen is full, still or plain: a spinner turning on the working line, the same standing still, or drawn for a screen reader — plain marks, no frames, nothing moving');
       }
       // A word would be no budget at all, and the line it holds back would never be said.
       if (key === 'chat.budget' && !/^\d+(\.\d+)?$/.test(value)) throw new UsageError('chat.budget is a sum in US dollars, like 5 or 2.50 (0 for never): what a chat session costs before the screen says so, once');

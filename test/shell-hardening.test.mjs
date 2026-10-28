@@ -288,27 +288,27 @@ test('on the screen a run outside the sandbox is asked as itself, and only y or 
         const answered = new Promise((resolve) => events.emit('approve', { name: 'bash', server: 'bash', tool: 'outside the sandbox', input: { command: 'touch ~/outside.txt' }, unsandboxed: true, blocked: 'touch: /home/me/outside.txt: Operation not permitted', resolve }));
         // A second question behind it is counted under the first, and comes up once the first is answered.
         const behind = new Promise((resolve) => events.emit('approve', { name: 'mcp__slack__send', server: 'slack', tool: 'send', input: { text: 'hi' }, job: 4, resolve }));
-        await shows(/⚠ Run this once outside the sandbox\?[\s\S]*│ {3}the sandbox refused: touch: \/home\/me\/outside\.txt: Operation not permitted[\s\S]*│ {3}touch ~\/outside\.txt[\s\S]*│ y yes · n no · r no, say why · esc to interrupt/, 'the question, with what the sandbox refused');
+        await shows(/ask \? Run this once outside the sandbox\?[\s\S]*│ the sandbox refused: touch: \/home\/me\/outside\.txt: Operation not permitted[\s\S]*│ {3}touch ~\/outside\.txt[\s\S]*│ y yes · n no · r no, say why · esc to interrupt/, 'the question, with what the sandbox refused');
         assert.doesNotMatch(tty.screen(), /allow bash|a always/);
         await tty.type('a');
         await shows(/│ y runs it once outside the sandbox · n refuses it · r with why · esc interrupts the turn · 1 more waiting/, 'that a is no answer, in the panel');
         assert.match(tty.screen(), /Run this once outside the sandbox\?/, 'still asked');
         await tty.type('y');
         assert.equal(await answered, 'once');
-        await shows(/j4: Allow slack · send\?[\s\S]*│ y once · a always · n no · r no, say why · esc (to interrupt|no)\s+│/, 'the question behind it, alone');
+        await shows(/j4: Allow slack · send\?[\s\S]*│ y once · a always · n no · r no, say why · esc (to interrupt|no)$/m, 'the question behind it, alone');
         await tty.type('n');
         assert.equal(await behind, 'no');
 
         // A change outside the project is asked as the change: the file, what goes out and what comes in; a opens the file for the session.
         const edited = new Promise((resolve) => events.emit('approve', { name: 'str_replace_based_edit_tool', server: 'editor', tool: 'outside the project', input: { command: 'str_replace', path: '/Users/me/app/config.toml', old_str: 'a = 1', new_str: 'a = 2' }, path: '/Users/me/app/config.toml', outside: true, guarded: null, directory: '/Users/me/app', resolve }));
-        await shows(/⚠ Change this file outside the project\?[\s\S]*│ {3}change \/Users\/me\/app\/config\.toml[\s\S]*│ {3}- a = 1[\s\S]*│ {3}\+ a = 2[\s\S]*│ y once · a this file, session · d all of app\/, session · n no · r no, say why · esc to interrupt/, 'the change asked');
+        await shows(/ask \? Change this file outside the project\?[\s\S]*│ {3}change \/Users\/me\/app\/config\.toml[\s\S]*│ {3}- a = 1[\s\S]*│ {3}\+ a = 2[\s\S]*│ y once · a this file, session · d all of app\/, session · n no · r no, say why · esc to interrupt/, 'the change asked');
         await tty.type('x');
         await shows(/y changes it once · a this file, session · d all of app\/, session · n refuses it/, 'what the keys do');
         await tty.type('d');
         assert.equal(await edited, 'directory');
         // A guarded file is this once or not: a and d answer nothing on it.
         const guarded = new Promise((resolve) => events.emit('approve', { name: 'str_replace_based_edit_tool', server: 'editor', tool: 'a guarded file', input: { command: 'insert', path: '/Users/me/.zshrc', insert_line: 0, insert_text: 'export X=1\n' }, path: '/Users/me/.zshrc', outside: true, guarded: 'your shell reads it when it starts', resolve }));
-        await shows(/⚠ Change this guarded file\? your shell reads it when it starts[\s\S]*│ {3}insert into \/Users\/me\/\.zshrc after line 0[\s\S]*│ {3}\+ export X=1[\s\S]*│ y once · n no · r no, say why · esc to interrupt/, 'the guarded file asked');
+        await shows(/ask \? Change this guarded file\? your shell reads it when it starts[\s\S]*│ {3}insert into \/Users\/me\/\.zshrc after line 0[\s\S]*│ {3}\+ export X=1[\s\S]*│ y once · n no · r no, say why · esc to interrupt/, 'the guarded file asked');
         await tty.type('a');
         await shows(/y changes it once · n refuses it · r with why · esc interrupts the turn/, 'that a is no answer on a guarded file');
         assert.match(tty.screen(), /Change this guarded file\?/, 'still asked');

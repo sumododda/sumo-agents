@@ -18,7 +18,7 @@ import { closeMcp, DECLINED, readConfig, writeConfig } from '../src/mcp.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { cap, capRedacted, childEnv, EDITOR_TOOL, jailed, runBash, runEditor, runTool } from '../src/tools.mjs';
-import { styles, toolView } from '../src/tty.mjs';
+import { ledger, styles, toolView } from '../src/tty.mjs';
 import { sourcesOf, WEB_TOOLS } from '../src/web.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
@@ -129,8 +129,8 @@ test('a search and a fetch run on the API\'s side: each is said as a call and it
       assert.deepEqual(cut.said, ['call search: node lts', 'failed s1: not finished: the request ended first']);
 
       assert.deepEqual(sourcesOf(content), [{ title: 'Node.js releases', url: page }], 'a page cited twice is a source once');
-      assert.deepEqual(toolView(content[0], { content: `Node.js releases — ${page}`, isError: false }), { title: 'Search', detail: 'node lts', lines: [{ text: `Node.js releases — ${page}`, tone: 'plain' }] });
-      assert.deepEqual(toolView(content[2]), { title: 'Fetch', detail: page, lines: [] });
+      assert.deepEqual(toolView(content[0], { content: `Node.js releases — ${page}`, isError: false }), { title: 'search', detail: 'node lts', lines: [{ text: `Node.js releases — ${page}`, tone: 'plain' }] });
+      assert.deepEqual(toolView(content[2]), { title: 'fetch', detail: page, lines: [] });
     } finally {
       db.close();
     }
@@ -414,8 +414,10 @@ test('a job told something from outside its process reads it with its next reque
       assert.deepEqual(heard.map((b) => b.type), ['tool_result', 'text']);
       assert.match(heard[1].text, /skip the tests/);
       assert.deepEqual(readdirSync(join(paths().jobs, String(id), 'inbox')), [], 'taken off the disk');
-      // What it said is drawn as the chat draws a reply, set in under its line; each call has the top of what came back under it.
-      assert.deepEqual(printed, [`⏺ j${id} scout · haiku — demo job\n`, '  looking\n', '  ⏺ Bash(echo hi)\n', '    ⎿  hi\n', '  done looking:\n    • one\n\n  ┌───┬───┐\n  │ a │ b │\n  ├───┼───┤\n  │ 1 │ 2 │\n  └───┴───┘\n']);
+      // Set in the chat's ledger: the job named in the gutter, what it said as the chat draws a reply, each call named by
+      // what it does, with the top of what came back under its words.
+      const words = ' '.repeat(9);
+      assert.deepEqual(printed, [`${ledger(`j${id}`)}scout · haiku — demo job\n`, '  sumo   looking\n', '   run   echo hi\n', `${' '.repeat(11)}hi\n`, `  sumo   done looking:\n${words}  • one\n\n${words}┌───┬───┐\n${words}│ a │ b │\n${words}├───┼───┤\n${words}│ 1 │ 2 │\n${words}└───┴───┘\n`]);
 
       db.prepare(`UPDATE jobs SET status = 'done' WHERE id = ?`).run(id);
       assert.throws(() => tell(db, id, 'too late', NOW), /is done — it cannot be told anything/);
@@ -1506,7 +1508,7 @@ test('a job may ask a stronger model from inside a request — the next one up t
       const down = watching();
       await converse(db, advised(), { send: async () => reply('end_turn', [ask, { ...advice, content: { type: 'advisor_tool_result_error', error_code: 'overloaded' } }, { type: 'text', text: 'on my own, then' }]), ctx, ledger: { kind: 'worker' }, now: () => NOW, onTool: down.onTool, onResult: down.onResult });
       assert.deepEqual(down.said, ['call advisor: opus', 'failed a1: advisor failed: overloaded']);
-      assert.deepEqual(toolView({ ...ask, input: { asked: 'opus' } }, { content: 'advice given', isError: false }), { title: 'Advisor', detail: 'opus', lines: [{ text: 'advice given', tone: 'plain' }] });
+      assert.deepEqual(toolView({ ...ask, input: { asked: 'opus' } }, { content: 'advice given', isError: false }), { title: 'advise', detail: 'opus', lines: [{ text: 'advice given', tone: 'plain' }] });
 
       // Asked at every step: the tool cannot be taken away mid-conversation, so the job is told once, and then stopped.
       let n = 0;

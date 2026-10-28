@@ -349,8 +349,9 @@ test('an MCP call on the screen: the server and the tool with what it was given,
   assert.equal(isMcpTool('bash'), false);
   assert.equal(describeCall(call), 'slack · post_message({"channel":"#dev","text":"deploy done"})');
   const view = toolView(call, { content: 'ok\nposted', isError: false });
-  assert.equal(view.title, 'slack');
-  assert.equal(view.detail, 'post_message({"channel":"#dev","text":"deploy done"})');
+  // Named mcp in the ledger's gutter; the server leads what it was given, so whose call it is is said in words.
+  assert.equal(view.title, 'mcp');
+  assert.equal(view.detail, 'slack · post_message({"channel":"#dev","text":"deploy done"})');
   assert.deepEqual(view.lines.map((l) => l.text), ['ok', 'posted']);
   const long = toolView({ ...call, input: { text: 'x'.repeat(300) } });
   assert.ok(long.detail.length < 140, 'a long input is cut on the screen');

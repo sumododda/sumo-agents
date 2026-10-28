@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { describe, it, test } from 'node:test';
-import { chat, createChat, injection } from '../src/chat.mjs';
+import { chat, createChat, farewell, injection, jobPrinter } from '../src/chat.mjs';
 import { MODEL_IDS, setModel } from '../src/catalog.mjs';
 import { openDb } from '../src/db.mjs';
 import { openWatchTab, reportAgent, startWatcher } from '../src/herdr.mjs';
@@ -15,6 +15,7 @@ import { ENTRY, paths, REPO_ROOT, SELF } from '../src/paths.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { addProject } from '../src/projects.mjs';
 import { lockFile, pruneStates, shortId, stateFile, withoutThinking } from '../src/sessions.mjs';
+import { styles } from '../src/tty.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const NOW = '2026-09-30T12:00:00.000Z';
@@ -1299,7 +1300,7 @@ test('piped, /resume alone lists the saved sessions and /resume <id> picks one u
       // The piped chat keeps real time, so how long ago is whatever it is today.
       assert.match(all, new RegExp(`>   ${short} · (?:just now|\\d+[hd] ago) · no project · “plan the briefing redesign” · 1 turn · \\d+k tokens\n`), 'the list');
       assert.match(all, /no saved session starts with "nope" — one of: /);
-      assert.match(all, new RegExp(`⎿  resumed ${short} · (?:just now|\\d+[hd] ago) · no project`));
+      assert.match(all, new RegExp(` {4}resumed ${short} · (?:just now|\\d+[hd] ago) · no project`));
       assert.equal(seen.length, 1);
       assert.equal(seen[0].messages[1].content[0].text, 'plan the briefing redesign', 'the model reads the earlier conversation');
       assert.equal(seen[0].messages.at(-2).content[0].text, 'go on');
@@ -1325,13 +1326,13 @@ test('piped, a command that belongs to the screen is said back and never sent to
       });
       assert.equal(await chat(db, { model: 'opus', effort: 'high', send, input: Readable.from(['/help\n', '/copy\n', '/export\n', '/context\n', 'hi\n', '/handoff\n', '/clear\n']), output }), 0);
       const all = printed.join('');
-      for (const name of ['help', 'copy', 'export']) assert.match(all, new RegExp(`⎿  /${name} is for the chat on a terminal screen`));
+      for (const name of ['help', 'copy', 'export']) assert.match(all, new RegExp(` {4}/${name} is for the chat on a terminal screen`));
       assert.match(all, /Context 0 tokens/, '/context answers here too');
       assert.equal(seen.length, 2, 'only what was said went to the model, and the hand-off request');
       assert.equal(seen[0].messages.at(-1).content[0].text, 'hi');
       assert.match(seen[1].compaction?.instructions ?? '', /^Write a hand-off/, '/handoff asks for the summary');
       assert.match(all, /the thread so far[\s\S]*handed off from [0-9a-f]+: the hand-off rides in with your next message/);
-      assert.equal(all.match(/sumo {2}route/g).length, 3, '/handoff and /clear each start a fresh session, as /new does');
+      assert.equal(all.match(/^ {2}sumo {3}opus · high/gm).length, 3, '/handoff and /clear each start a fresh session, as /new does');
     } finally {
       db.close();
     }
@@ -1561,6 +1562,16 @@ describe('the watcher in a job\'s Herdr tab', () => {
     assert.equal(calls.filter((c) => c === 'pane run').length, 3);
   });
 
+  it('counts the watcher started when its tab shows the record\'s first line, the job named in the gutter — and j3 is not j32 there either', async () => {
+    const written = [];
+    jobPrinter((t) => written.push(t), styles(false)).onStart({ id: 32, agent: 'scout', model: 'sonnet', effort: 'low', title: 'map the parser' });
+    // A Herdr that cannot say what runs in the pane: only the screen tells.
+    const showing = (screen) => (args) => (args[1] === 'read' ? { status: 0, stdout: screen } : args[1] === 'run' ? { status: 0, stdout: '' } : { status: 0, stdout: JSON.stringify({ result: { process_info: { shell_pid: 7, foreground_processes: [{ pid: 7, cmdline: '-zsh' }] } } }) });
+    const screen = `% sumo job watch 32\n${written.join('')}`;
+    assert.equal(await startWatcher(showing(screen), { pane: 'w2:p1', job: 32, command: 'sumo job watch 32', sleep }), true);
+    assert.equal(await startWatcher(showing(screen), { pane: 'w2:p1', job: 3, command: 'sumo job watch 3', sleep }), false);
+  });
+
   it('opens the tab at once and tells the chat later when its watcher never started', async () => {
     const { herdr } = pane({ starts: false });
     const opening = (args) => (args[0] === 'tab' ? { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:p1' } } }) } : herdr(args));
@@ -1647,7 +1658,7 @@ test('the chat offers the MCP tools behind tool search, names the servers to the
         },
       });
       await chat(db, { model: 'opus', effort: 'high', send: () => assert.fail('nothing is asked of the model'), input: Readable.from(['/mcp\n']), output });
-      assert.match(printed.join(''), /⎿  demo\s+stdio: [\s\S]*9 tools · allowed: echo/);
+      assert.match(printed.join(''), / {4}demo\s+stdio: [\s\S]*9 tools · allowed: echo/);
     } finally {
       await closeMcp();
       db.close();
@@ -2275,4 +2286,13 @@ test('a chat started inside a project is in that project from the start: its car
       db.close();
     }
   });
+});
+
+test('the way back in is said as the screen closes, folded under its margin in a narrow window, never back at the edge', () => {
+  const off = styles(false);
+  assert.equal(farewell({ id: 'ab12cd34', cost: 0.01, columns: 80 }, off), '\n  sumo chat --resume ab12cd34\n  picks this session up again · it cost $0.01\n\n');
+  const narrow = farewell({ id: 'ab12cd34', cost: 0.01, columns: 40 }, off).split('\n').filter(Boolean);
+  assert.ok(narrow.every((row) => row.startsWith('  ') && row.length <= 40), narrow.join('\n'));
+  assert.equal(narrow.join(' ').replace(/\s+/g, ' ').trim(), 'sumo chat --resume ab12cd34 picks this session up again · it cost $0.01');
+  assert.doesNotMatch(farewell({ id: 'ab12cd34', cost: 0, columns: 80 }, off), /cost/, 'nothing said of a cost under a cent');
 });

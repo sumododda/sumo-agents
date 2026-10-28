@@ -213,6 +213,6 @@ test('/undo is a command of the menu and of help, and runs in the piped chat', a
       },
     });
     assert.equal(await chat(db, { model: 'opus', effort: 'high', send: canned([]).send, input: Readable.from(['/undo\n']), output }), 0);
-    assert.match(printed.join(''), /⎿ {2}nothing to undo: the editor has changed no file in this session/);
+    assert.match(printed.join(''), / {4}nothing to undo: the editor has changed no file in this session/);
   });
 });

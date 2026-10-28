@@ -46,7 +46,8 @@ test('the keys under a question are at full weight, not the faintest text in its
       assert.doesNotMatch(keys, /\x1b\[2m/, `the keys at full weight: ${JSON.stringify(keys)}`);
       await tty.type('x');
       await shows(/y changes it once/, 'every key explained');
-      assert.match(row(/y changes it once/), /\x1b\[33m[^\x1b]*y changes it once/, 'in the panel\'s yellow');
+      // The key itself is bold inside the yellow: the colour reaches it all the same.
+      assert.match(row(/y changes it once/), /\x1b\[33m(?:\x1b\[1m)?y(?:\x1b\[22m)? changes it once/, 'in the panel\'s yellow');
       await tty.type('n');
       assert.equal(await answered, 'no');
       await tty.type('/copy', '\r');

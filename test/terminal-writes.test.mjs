@@ -14,7 +14,7 @@ import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 import { fakeTty } from './fixtures/fake-tty.mjs';
 
 test('a line is erased before it is written, never after: a line as wide as the window keeps its last column', () => {
-  const wide = `╭${'─'.repeat(78)}╮`;
+  const wide = '─'.repeat(80);
   assert.equal(eraseFirst(`\x1b[1G${wide}\x1b[K\n`), `\x1b[1G\x1b[K${wide}\n`);
   // Colours inside the line go with it; an empty line, and every other code, are as they were.
   assert.equal(eraseFirst('\x1b[1G\x1b[90m│ x │\x1b[39m\x1b[K\n\x1b[1G\x1b[K\n\x1b[2K\x1b[1A\x1b[E'), '\x1b[1G\x1b[K\x1b[90m│ x │\x1b[39m\n\x1b[1G\x1b[K\n\x1b[2K\x1b[1A\x1b[E');
@@ -79,7 +79,8 @@ test('a keystroke rewrites the line it changed, not the frame — and no line in
     }
     assert.ok(each.every((n) => n > 0 && n < 600), `each key rewrote only what changed: ${each.join(', ')} bytes, against a frame of ${before}`);
     const all = raw.join('');
-    const late = [...all.matchAll(/\x1b\[K/g)].filter((m) => !all.slice(0, m.index).endsWith('\x1b[1G'));
+    // Ink writes a changed line from where it changes: the erase follows the move to that column, before the words.
+    const late = [...all.matchAll(/\x1b\[K/g)].filter((m) => !/\x1b\[\d*G$/.test(all.slice(Math.max(0, m.index - 8), m.index)));
     assert.equal(late.length, 0, 'every erase to the end of a line comes before the line, never after it');
   });
 });
@@ -88,7 +89,7 @@ test('while a question waits, the working line steps aside — the question says
   await chatOn({ columns: 100, rows: 40, debug: true }, async ({ tty, raw, events, settle, finish }) => {
     await tty.type('change my config', '\r');
     await settle(400);
-    assert.match(tty.screen(), /Working… \(/, 'at work first, the words flowing');
+    assert.match(tty.screen(), /Working… {2}\d+s · /, 'at work first, the spinner turning');
     const answered = new Promise((resolve) => events.emit('approve', { name: 'str_replace_based_edit_tool', server: 'editor', tool: 'outside the project', input: { command: 'str_replace', path: '/tmp/x/cfg.toml', old_str: 'a = 1', new_str: 'a = 2' }, path: '/tmp/x/cfg.toml', outside: true, guarded: null, directory: '/tmp/x', resolve }));
     await settle(1300);
     assert.match(tty.screen(), /Change this file outside the project\?/);
@@ -100,7 +101,7 @@ test('while a question waits, the working line steps aside — the question says
     await tty.type('n');
     assert.equal(await answered, 'no');
     await settle(300);
-    assert.match(tty.screen(), /Working… \([1-9]\d*s/, 'answered, it works again — its clock not started over');
+    assert.match(tty.screen(), /Working… {2}[1-9]\d*s/, 'answered, it works again — its clock not started over');
     finish();
   });
 });
@@ -180,9 +181,10 @@ test('a live area that grows past the foot of the window is drawn where it is, w
     const shown = screen.rows();
     assert.ok(raw.every((chunk) => !chunk.includes('\x1b[E')), 'no line is stepped over with a move that cannot scroll');
     // The working line stood above the question's place until the question came, and steps aside for it: no copy of it is left.
-    const working = shown.filter((row) => /^(Waiting for your answer|Working…) \(/.test(row));
+    // Plain, the line has no clock: what follows its words is how to stop the turn.
+    const working = shown.filter((row) => /(Waiting for your answer|Working…) {2}(?:\d+s · )?esc to interrupt/.test(row));
     assert.equal(working.length, 0, `no working line, and no stale copy of one:\n${shown.join('\n')}`);
-    assert.match(shown.join('\n'), /\? Which port[^\n]*\n {2}> 1\. 8080[\s\S]*\n\n> *\n {2}opus · high/, `the question, then the box and the status row under it:\n${shown.join('\n')}`);
+    assert.match(shown.join('\n'), /\? Which port[^\n]*\n {9}> 1\. 8080[\s\S]*\n\n {3}you > *\n {9}opus · high/, `the question, then the box and the status row under it:\n${shown.join('\n')}`);
     finish();
   });
 });
@@ -196,8 +198,8 @@ test('a command answered with a note leaves the box at the foot of the window: t
     const screen = terminal(80, 24);
     for (const chunk of raw) screen.write(chunk);
     const shown = screen.rows();
-    assert.match(shown[1], /^█▀▀ /, `the header where it was, nothing scrolled away:\n${shown.join('\n')}`);
-    assert.match(shown[22], /^ {2}opus · high .*\/ commands/, `the status row on the last row but Ink's own:\n${shown.join('\n')}`);
+    assert.match(shown[1], /^ {2}sumo {3}/, `the header where it was, nothing scrolled away:\n${shown.join('\n')}`);
+    assert.match(shown[22], /^ {9}opus · high .*\/ commands/, `the status row on the last row but Ink's own:\n${shown.join('\n')}`);
   });
 });
 
@@ -207,7 +209,11 @@ test('with NO_COLOR the cursor in the box is still there, in reverse video, and 
     await settle(150);
     await tty.type(...Array(5).fill('\x1b[D'));
     await settle(200);
-    assert.match(raw.join(''), /> hello \x1b\[7mw\x1b\[27morld/, 'the cursor on the w');
+    // Ink writes only the part of the row that changed: the cursor is its reverse video in what was written, the row is the screen's.
+    assert.match(raw.join(''), /\x1b\[7mw\x1b\[27morld/, 'the cursor on the w, in reverse video');
+    const typed = terminal(80, 30);
+    for (const chunk of raw) typed.write(chunk);
+    assert.ok(typed.rows().some((row) => /^ {3}you › hello world/.test(row)), `the row as it reads:\n${typed.rows().join('\n')}`);
     events.emit('tool', { call: { id: 'e1', name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: 'cart.js', old_str: 'let sum = 0;', new_str: 'let sum = 0n;' } } });
     events.emit('result', { call: { id: 'e1', name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: 'cart.js', old_str: 'let sum = 0;', new_str: 'let sum = 0n;' } }, result: { content: 'edited', edit: { line: 2, old: '  let sum = 0;', new: '  let sum = 0n;' } } });
     await settle(300);
@@ -225,7 +231,44 @@ test('/new starts over on a window scrolled clear: the new header at the top, th
     const screen = terminal(80, 24);
     for (const chunk of raw) screen.write(chunk);
     const shown = screen.rows();
-    assert.ok(shown.some((row) => row.startsWith('█▀▀ █ █ █▀▄▀█ █▀█')), `the new header is on the screen:\n${shown.join('\n')}`);
-    assert.match(shown.slice(-5).join('\n'), /^╭─+╮\n│ > [^\n]*│\n╰─+╯\n {2}opus · high[^\n]*\n$/, `the box at the foot, the status under it:\n${shown.join('\n')}`);
+    assert.ok(shown.some((row) => /^ {2}sumo {3}\S/.test(row)), `the new header is on the screen:\n${shown.join('\n')}`);
+    assert.match(shown.slice(-4).join('\n'), /^─{80}\n {3}you › [^\n]*\n {9}opus · high[^\n]*\n$/, `the box at the foot, under its rule, the status under it:\n${shown.join('\n')}`);
+  });
+});
+
+test('a question to approve taller than the window is shown as far as the window goes: the screen and its scrollback are never wiped to draw it, and the keys stay on it', async () => {
+  await chatOn({ columns: 40, rows: 24, debug: false }, async ({ tty, raw, events, settle }) => {
+    await settle(200);
+    const command = Array.from({ length: 40 }, (_, i) => `echo step ${i + 1} of the long build`).join(' && ');
+    const call = { id: 'b1', name: 'bash', input: { command } };
+    events.emit('tool', { call });
+    const from = raw.length;
+    const answered = new Promise((resolve) => events.emit('approve', { name: 'bash', server: 'bash', tool: 'outside the sandbox', input: { command }, unsandboxed: true, blocked: 'touch: /x: Operation not permitted', resolve }));
+    await settle(600);
+    assert.ok(!raw.slice(from).join('').includes('\x1b[3J'), 'the scrollback is never wiped for the question');
+    const screen = terminal(40, 24);
+    for (const chunk of raw) screen.write(chunk);
+    const shown = screen.rows().join('\n');
+    assert.match(shown, /Run this once outside[\s\S]*│ {3}echo step 1 of the long/, `the question, and what would run from its start:\n${shown}`);
+    // The call over the panel is one row while it waits: the panel shows what would run.
+    assert.match(shown, /^ {3}run \? echo step 1 of the long build …$/m, `the waiting call, in a row:\n${shown}`);
+    assert.match(shown, /… [\d,]+ more characters not[\s\S]*shown — n, and ask the model[\s\S]*for less/, `what did not fit, counted:\n${shown}`);
+    assert.match(shown, /│ y yes · n no · r no, say why/, `the keys, on the screen:\n${shown}`);
+    // Taller still — every key explained, then a reason being typed — and still drawn where it is.
+    const later = raw.length;
+    await tty.type('x');
+    await settle(300);
+    await tty.type('r');
+    await settle(200);
+    await tty.type('use the cached build in the project instead of this');
+    await settle(400);
+    assert.ok(!raw.slice(later).join('').includes('\x1b[3J'), 'nor for every key explained, or a reason typed');
+    const typing = terminal(40, 24);
+    for (const chunk of raw) typing.write(chunk);
+    assert.match(typing.rows().join('\n'), /why not\? use the cached[\s\S]*enter refuses with this/, `the reason and its keys, on the screen:\n${typing.rows().join('\n')}`);
+    await tty.type('\x1b');
+    await settle(200);
+    await tty.type('n');
+    assert.equal(await answered, 'no');
   });
 });

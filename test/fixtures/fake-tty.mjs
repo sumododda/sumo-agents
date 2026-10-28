@@ -14,7 +14,10 @@ export function fakeTty({ columns = 80, rows = 40 } = {}) {
     columns,
     rows,
     isTTY: true,
-    write(frame) {
+    write(frame, ...rest) {
+      // A write is done when it is written, as a terminal's stream says by calling back: Ink waits on that to say it has exited.
+      const done = rest.find((arg) => typeof arg === 'function');
+      if (done) setImmediate(done);
       // What draws nothing — a bell, the title, a mode — is not a frame: it is kept apart, and the screen stays what it was.
       if (CONTROL.test(String(frame))) return controls.push(String(frame)) > 0;
       last = String(frame);

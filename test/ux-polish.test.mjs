@@ -73,10 +73,10 @@ test('a turn at 80 columns reads at a glance: reads named by their files, the tu
     await shows(/Done\./, 'the reply');
     await shows(/edited cart\.js/, 'the turn summed up');
     const screen = tty.screen();
-    assert.match(screen, /⏺ Read 2 files \(cart\.js, cart\.test\.js\)\n/, 'one row, the files by their names');
-    // The summing-up keeps its margin on every row it takes.
+    assert.match(screen, /^ {2}read {3}2 files · cart\.js, cart\.test\.js\n/m, 'one row, the files by their names');
+    // The summing-up keeps its margin — the words' column — on every row it takes.
     const summed = screen.split('\n').filter((row) => /edited cart\.js|tokens · \$/.test(row));
-    assert.ok(summed.length > 0 && summed.every((row) => row.startsWith('  ')), summed.join('\n'));
+    assert.ok(summed.length > 0 && summed.every((row) => /^ {9}\S/.test(row)), summed.join('\n'));
     // The status row: the hints that fit, whole — never one broken off.
     const status = screen.trimEnd().split('\n').at(-1);
     assert.doesNotMatch(status, /…\s*$/, status);
@@ -89,7 +89,8 @@ test('the command menu cuts a long description where a clause ends, never in the
     await shows(/\/mcp/, 'the menu');
     const menu = tty.screen();
     assert.match(menu, /\/mcp\s+the MCP servers\s*$/m);
-    assert.match(menu, /\/copy\s+copy the last reply, or its code, to …$/m);
+    // Under the box's words the row has seven columns fewer than the window's margin gave it: cut a word sooner, still between words.
+    assert.match(menu, /\/copy\s+copy the last reply, or its code, …$/m);
     assert.doesNotMatch(menu, /\w…\s*$/m, 'no description broken off mid-word');
   });
 });
@@ -168,7 +169,7 @@ test('a question shows all of what would run: a long line wraps instead of hidin
     // Past the cap, what is left out is counted in characters, a long single line included.
     const big = new Promise((resolve) => events.emit('approve', { name: 'mcp__notes__write', server: 'notes', tool: 'write', input: { text: 'x'.repeat(6000) }, resolve }));
     await shows(/Allow notes · write\?/, 'the second question');
-    assert.match(tty.screen(), /… [\d,]+ more characters of input not shown — n, and ask the model for less/);
+    assert.match(tty.screen(), /… [\d,]+ more characters not shown — n, and ask the model for less/);
     await tty.type('n');
     await big;
   });
