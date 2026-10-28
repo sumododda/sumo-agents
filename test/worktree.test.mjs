@@ -257,7 +257,7 @@ test('attempts: sibling workers on one brief, each in a worktree; once all have 
   const p = gitProject(s);
   const made = s.sumo(['job', 'new', '--project', 'gitproj', '--title', 'return 2', '--attempts', '2'], { input: TASK });
   assert.equal(made.code, 0, made.err);
-  assert.match(made.out, /^created j1 \[worker·proj-git·running\] return 2 \(attempt 1 of 2\)\ncreated j2 \[worker·proj-git·running\] return 2 \(attempt 2 of 2\)\n/);
+  assert.match(made.out, /^created j1 \[worker·proj-git·not started\] return 2 \(attempt 1 of 2\)\ncreated j2 \[worker·proj-git·not started\] return 2 \(attempt 2 of 2\)\n/);
   assert.match(made.out, /run each: sumo job run 1 · sumo job run 2 — once all have closed, the best verified one is brought back/);
   assert.match(s.sumo(['job', 'brief', '1']).out, /## Where you work\nSeveral attempts are made at this task, each in a git worktree of its own/);
   assert.equal(s.sql((db) => db.prepare('SELECT COUNT(DISTINCT route_reason) AS n FROM jobs').get().n), 1, 'routed once, for all of them');

@@ -12,7 +12,7 @@ import { paths, SELF } from './paths.mjs';
 export const runHerdr = (args) => spawnSync('herdr', args, { encoding: 'utf8', timeout: 10_000 });
 
 /** The name a job goes by in Herdr's lists: `j33 scout`. */
-export const agentLabel = (job) => `j${job.id} ${job.agent}`;
+const agentLabel = (job) => `j${job.id} ${job.agent}`;
 
 /**
  * What the job's own process tells Herdr about itself, when it runs in a pane: working while it works, blocked

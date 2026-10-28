@@ -14,7 +14,7 @@ import { add, UsageError } from '../src/memory.mjs';
 import { ENTRY, paths, REPO_ROOT, SELF } from '../src/paths.mjs';
 import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
 import { addProject } from '../src/projects.mjs';
-import { lockFile, pruneStates, stateFile, withoutThinking } from '../src/sessions.mjs';
+import { lockFile, pruneStates, shortId, stateFile, withoutThinking } from '../src/sessions.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const NOW = '2026-09-30T12:00:00.000Z';
@@ -37,7 +37,7 @@ test('operator text goes in as a system message where the model takes one, and a
   assert.deepEqual(injection('card', 'claude-opus-5-5', afterUser), { role: 'system', content: 'card' });
   // The API rejects a system message after an assistant turn, so a stop-hook continuation goes as text.
   assert.deepEqual(injection('card', 'claude-opus-5-5', afterAssistant), { role: 'user', content: [{ type: 'text', text: '<sumo>\ncard\n</sumo>' }] });
-  assert.deepEqual(injection('card', 'claude-haiku-4-5-20251001'), { role: 'user', content: [{ type: 'text', text: '<sumo>\ncard\n</sumo>' }] });
+  assert.deepEqual(injection('card', 'claude-haiku-5-5'), { role: 'user', content: [{ type: 'text', text: '<sumo>\ncard\n</sumo>' }] });
 });
 
 test('a session: the memory block opens it, a project card rides in once, a gated command waits for its workflow, and the log is written', async () => {
@@ -192,7 +192,7 @@ test('a job the model delegates runs in this process, and a question memory can 
       session.start('startup');
       const outcome = await session.say('check simba');
 
-      assert.equal(seen[1].model, 'claude-haiku-4-5-20251001', 'the job ran on its own route, not the chat model');
+      assert.equal(seen[1].model, 'claude-haiku-5-5', 'the job ran on its own route, not the chat model');
       assert.match(seen[2].messages.at(-1).content[0].text, /^You ended without closing the job/);
       assert.match(seen[3].messages.at(-1).content[0].content, /STATUS: never closed — j\d+[\s\S]*scout report/, 'the chat sees how the run ended, and what the job said last');
       assert.equal(outcome.text, 'Atlas it is.');
@@ -256,7 +256,7 @@ test('a watcher is told what ran, what came back and what it cost; an interrupt 
       session.interrupt();
       const stopped = await first;
       assert.equal(stopped.stop, 'interrupted');
-      assert.equal(readFileSync(spawned, 'utf8'), 'scribe run\n', 'a turn the user stopped is still a turn that ended: what they said is filed');
+      assert.equal(readFileSync(spawned, 'utf8'), 'memory run\n', 'a turn the user stopped is still a turn that ended: what they said is filed');
       assert.deepEqual(watched.map((e) => e.type).filter((t) => t !== 'output'), ['usage', 'tool', 'result'], 'the cost comes with the reply, before its tools run');
       assert.ok(watched.findIndex((e) => e.type === 'output') > watched.findIndex((e) => e.type === 'tool'), 'and what a command prints, while it runs');
       assert.equal(watched[0].totals.outputTokens, 40);
@@ -343,7 +343,7 @@ test('a turn stopped before the model answered leaves no operator message strand
       // The job the model starts is stopped by the same key.
       const second = session.say('have a scout look');
       await until(() => seen.length === 3, 'the job to be talking to its model');
-      assert.equal(seen[2].model, 'claude-haiku-4-5-20251001');
+      assert.equal(seen[2].model, 'claude-haiku-5-5');
       session.interrupt();
       assert.equal((await second).stop, 'interrupted');
       assert.match(session.params.messages.at(-1).content[0].content, /interrupted by the user/);
@@ -419,7 +419,7 @@ test('a delegated job is watched as it works, and what the user tells it reaches
       assert.equal(session.tell('and say why'), id);
       open.second();
       await until(() => seen.length >= 4, 'the request that carries the second message');
-      assert.equal(seen[3].model, 'claude-haiku-4-5-20251001');
+      assert.equal(seen[3].model, 'claude-haiku-5-5');
       assert.equal(seen[3].messages.at(-1).role, 'user');
       assert.match(seen[3].messages.at(-1).content[0].text, /and say why/);
 
@@ -703,17 +703,16 @@ test('/model says the route, sets it for the next turn, and refuses a model or e
       assert.equal(seen[0].model, MODEL_IDS.sonnet);
       assert.deepEqual(seen[0].output_config, { effort: 'medium' });
 
-      // The model alone keeps the effort; haiku takes none.
+      // The model alone keeps the effort, haiku too.
       assert.equal(session.route('fable'), 'fable/medium');
-      assert.equal(session.route('haiku'), 'haiku');
+      assert.equal(session.route('haiku'), 'haiku/medium');
       await session.say('again');
       assert.equal(seen[1].model, MODEL_IDS.haiku);
-      assert.equal('output_config' in seen[1], false);
+      assert.deepEqual(seen[1].output_config, { effort: 'medium' });
 
       assert.throws(() => session.route('gpt'), /no such model "gpt" — one of: auto, haiku, sonnet, opus, fable/);
       assert.throws(() => session.route('opus extreme'), /no such effort "extreme" — one of: low, medium, high, xhigh, max/);
-      assert.throws(() => session.route('haiku high'), /haiku takes no effort/);
-      assert.equal(session.route(''), 'haiku', 'a refused change changes nothing');
+      assert.equal(session.route(''), 'haiku/medium', 'a refused change changes nothing');
 
       // A session started afresh keeps the route the user chose.
       session.route('opus low');
@@ -809,6 +808,53 @@ test('a session started afresh starts small and nowhere: the size and the projec
   });
 });
 
+test('/handoff: the model writes the hand-off a job\'s compaction would, a fresh session starts from it, and the next turn carries it in; one that cannot be had leaves the session as it is', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const summary = { stop_reason: 'compaction', content: [{ type: 'compaction', content: 'The task: fix the briefing bug. Done: found it in brief.mjs. Next: the test.', encrypted_content: 'opaque', signature: 'sig' }], usage: { input_tokens: 90_000, output_tokens: 400 }, model: 'claude-opus-5-5' };
+      const { send, seen } = canned([reply('end_turn', [{ type: 'text', text: 'looking' }], { input_tokens: 90_000, output_tokens: 10 }), summary, reply('end_turn', [{ type: 'text', text: 'carrying on' }])]);
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
+      session.start('startup');
+      await assert.rejects(session.handoff(), /nothing to hand off: nothing has been said/);
+      await session.say('fix the briefing bug');
+      const before = session.sessionId;
+      assert.deepEqual(session.expand('/handoff'), { control: 'handoff' });
+
+      const handed = await session.handoff();
+      assert.equal(handed.from, shortId(before));
+      assert.match(handed.text, /^The task: fix the briefing bug/);
+      assert.ok(handed.block.includes('sumo'), 'the memory block of the new session');
+      assert.notEqual(session.sessionId, before);
+      assert.equal(session.contextTokens, 0, 'the new session has read nothing yet');
+      // The request: the old conversation, whole, with the summary asked for under the instructions a job compacts under.
+      const asked = seen[1];
+      assert.match(asked.compaction.instructions, /^Write a hand-off for a model/);
+      assert.ok(asked.betas.includes('compact-2026-09-04'));
+      assert.equal(asked.messages.at(-1).role, 'assistant');
+      assert.equal(db.prepare("SELECT count(*) AS n FROM model_runs WHERE note = 'hand-off' AND output_tokens = 400").get().n, 1, 'the hand-off has a ledger row of its own');
+
+      await session.say('go on');
+      const next = seen[2];
+      const operator = next.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+      assert.match(operator, new RegExp(`hand-off: the session before this one \\(${shortId(before)}\\) ended with this hand-off[\\s\\S]*what it says is done is done\\.\\n\\nThe task: fix the briefing bug`));
+      assert.equal(next.messages.filter((m) => m.role === 'assistant').length, 0, 'the old conversation did not follow');
+
+      // A hand-off the API refuses: this session stays, and the error says what to do instead.
+      const failing = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: async (params) => (params.compaction ? Promise.reject(Object.assign(new Error('529 overloaded'), { status: 529 })) : reply('end_turn', [{ type: 'text', text: 'ok' }])), now: () => NOW });
+      failing.start('startup');
+      await failing.say('hello');
+      const kept = failing.sessionId;
+      await assert.rejects(failing.handoff(), /no hand-off could be written: 529 overloaded — \/new starts fresh/);
+      assert.equal(failing.sessionId, kept, 'the session goes on');
+      failing.end();
+      session.end();
+    } finally {
+      db.close();
+    }
+  });
+});
+
 test('a reply cut off inside a tool call is not run, and still leaves a conversation the next turn can use', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
@@ -850,7 +896,10 @@ test('a message that begins with a path is a message: it is sent as typed, and k
       // A command is still a slash and a word, alone or followed by a space.
       assert.deepEqual(session.expand('/fix the bug'), { text: 'Fix this: the bug', said: 'the bug', guide: 'fix' });
       assert.deepEqual(session.expand('/new'), { control: 'new' });
-      assert.match(session.expand('/nope').error, /no such command \/nope/);
+      assert.match(session.expand('/nope').error, /^no command \/nope — /);
+      assert.equal(session.expand('/modle').error, 'no command /modle — did you mean /model?', 'two keys off: the command it is closest to');
+      assert.equal(session.expand('/HELP').error, 'no command /HELP — did you mean /help?');
+      assert.match(session.expand('/m').error, /^no command \/m — one of: /, 'a letter or two is no guess at a command');
 
       await session.say(session.expand(typed).text);
       assert.equal(seen[0].messages.at(-1).content[0].text, typed);
@@ -916,7 +965,7 @@ test('a command the user runs after a turn that never got its answer leaves no o
   });
 });
 
-test('a model that takes no effort and no operator messages is sent neither, whichever way the chat came to be on it', async () => {
+test('a model that takes no operator messages is sent them as text, whichever way the chat came to be on it', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -924,25 +973,25 @@ test('a model that takes no effort and no operator messages is sent neither, whi
       writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
       addProject(db, root, { slug: 'simba', now: NOW });
 
-      // Started on haiku, with the effort the configuration holds for the other models.
+      // Started on a model Sumo's catalog does not know, by its API id: thinking and effort as for any other, no operator messages.
       const started = canned([reply('end_turn', [{ type: 'text', text: 'hi' }])]);
-      const onHaiku = createChat(db, { model: 'haiku', effort: 'high', cwd: '/', send: started.send, now: () => NOW });
-      onHaiku.start('startup');
-      await onHaiku.say('hello');
-      assert.equal(started.seen[0].model, MODEL_IDS.haiku);
-      assert.equal('output_config' in started.seen[0], false, 'haiku takes no effort setting');
-      assert.equal(onHaiku.effort, 'none');
+      const onOld = createChat(db, { model: 'claude-sonnet-4-6', effort: 'high', cwd: '/', send: started.send, now: () => NOW });
+      onOld.start('startup');
+      await onOld.say('hello');
+      assert.equal(started.seen[0].model, 'claude-sonnet-4-6');
+      assert.deepEqual(started.seen[0].output_config, { effort: 'high' });
+      assert.equal(onOld.effort, 'high');
 
-      // On auto: a turn on sonnet brings a card in as an operator message, and the next turn goes to haiku.
-      const routes = [{ model: 'sonnet', effort: 'medium', reason: 'routine' }, { model: 'haiku', effort: 'none', reason: 'mechanical' }, { model: 'sonnet', effort: 'low', reason: 'routine' }];
+      // On auto: a turn on sonnet brings a card in as an operator message, and the next turn goes to a model that takes none.
+      const routes = [{ model: 'sonnet', effort: 'medium', reason: 'routine' }, { model: 'claude-sonnet-4-6', effort: 'low', reason: 'mechanical' }, { model: 'sonnet', effort: 'low', reason: 'routine' }];
       const { send, seen } = canned([reply('end_turn', [{ type: 'text', text: 'one' }]), reply('end_turn', [{ type: 'text', text: 'two' }]), reply('end_turn', [{ type: 'text', text: 'three' }])]);
       const session = createChat(db, { model: 'auto', cwd: '/', send, route: async () => routes.shift(), now: () => NOW });
       session.start('startup');
       await session.say('fix the briefing bug in simba');
       assert.equal(seen[0].messages.at(-1).role, 'system');
       await session.say('rename that variable');
-      assert.equal(seen[1].model, MODEL_IDS.haiku);
-      assert.deepEqual(seen[1].messages.filter((m) => m.role === 'system'), [], 'haiku is sent the card as text');
+      assert.equal(seen[1].model, 'claude-sonnet-4-6');
+      assert.deepEqual(seen[1].messages.filter((m) => m.role === 'system'), [], 'a model that takes no operator messages is sent the card as text');
       assert.ok(seen[1].messages.some((m) => m.role === 'user' && /^<sumo>\n<project simba> /.test(m.content[0].text)));
       await session.say('and now the hard part');
       assert.equal(seen[2].messages.filter((m) => m.role === 'system').length, 1, 'the conversation itself is unchanged, so the other model still reads it from its cache');
@@ -1014,9 +1063,9 @@ test('a slash command sends its sentence to the model, and keeps only the user\'
       assert.match(seen[0].messages.at(-1).content, /^<guide review>\nCode written in this session is never reviewed in this session/, 'the guide follows, as an operator message');
 
       // A command with nothing after it is nothing the user said.
-      const dream = session.expand('/dream');
-      assert.equal(dream.said, '');
-      await session.say(dream.text, dream.said);
+      const bare = session.expand('/review');
+      assert.equal(bare.said, '');
+      await session.say(bare.text, bare.said);
       assert.deepEqual(db.prepare('SELECT text FROM user_turns ORDER BY id').all().map((r) => r.text), ['the diff on my branch'], 'the canned sentence is the chat\'s, not the user\'s');
     } finally {
       db.close();
@@ -1039,6 +1088,42 @@ test('piped into the chat, every line is a turn: the ones that arrive while anot
       assert.equal(await chat(db, { model: 'opus', effort: 'high', send, input: Readable.from(['first question\nsecond question\nthird question\n']), output }), 0);
       assert.deepEqual(seen.map((p) => p.messages.at(-1).content[0].text), ['first question', 'second question', 'third question']);
       assert.match(printed.join(''), /one[\s\S]*two[\s\S]*three/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('piped, a turn that fails is said on stderr in the screen\'s words, with what to do, and the chat exits 1; a good turn stays on stdout', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      let calls = 0;
+      const send = async (_params, { onText } = {}) => {
+        calls++;
+        if (calls === 1) {
+          onText?.('first answer');
+          return reply('end_turn', [{ type: 'text', text: 'first answer' }]);
+        }
+        throw Object.assign(new Error('401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}'), { status: 401 });
+      };
+      const sink = () => {
+        const seen = [];
+        return { seen, stream: new Writable({ write: (chunk, _e, done) => (seen.push(String(chunk)), done()) }) };
+      };
+      const out = sink();
+      const err = sink();
+      const code = await chat(db, { model: 'opus', effort: 'high', send, input: Readable.from(['hello\nhi again\n']), output: out.stream, errors: err.stream });
+      assert.equal(code, 1, 'a turn failed: the chat says so by its exit code');
+      assert.match(out.seen.join(''), /first answer/);
+      assert.doesNotMatch(out.seen.join(''), /401|authentication_error|error:/, 'the failure is not in what was answered');
+      assert.match(err.seen.join(''), /^error: the API refused the credential — check ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, then sumo doctor$/m);
+      assert.match(err.seen.join(''), /invalid x-api-key/, 'what came back, kept under it');
+      // Every turn answered: exit 0, nothing on stderr.
+      const quiet = sink();
+      const clean = sink();
+      assert.equal(await chat(db, { model: 'opus', effort: 'high', send: async () => reply('end_turn', [{ type: 'text', text: 'fine' }]), input: Readable.from(['hello\n']), output: clean.stream, errors: quiet.stream }), 0);
+      assert.deepEqual(quiet.seen, []);
     } finally {
       db.close();
     }
@@ -1089,21 +1174,20 @@ test('what the user runs themselves is theirs to see in full, and reaches the mo
   });
 });
 
-test('the commands of the menu work from inside a project: the guide comes with the command, and /dream runs here, where the credential is', async () => {
+test('the commands of the menu work from inside a project: the guide comes with the command, and the memory pass the model asks for runs here, where the credential is', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log'), PATH: '/usr/bin:/bin' }, async () => {
     const db = openDb();
     try {
-      const { send, seen } = canned([reply('tool_use', [call('t1', 'bash', { command: 'sumo dream run' })]), reply('end_turn', [{ type: 'text', text: 'nothing changed' }])]);
+      const { send, seen } = canned([reply('tool_use', [call('t1', 'bash', { command: 'sumo memory run --tidy' })]), reply('end_turn', [{ type: 'text', text: 'nothing changed' }])]);
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
       session.start('startup');
 
       // The guide is named, and comes through the prompt hook as an operator message — not a path the tools cannot reach from the project.
       assert.deepEqual(session.expand('/fix the login bug'), { text: 'Fix this: the login bug', said: 'the login bug', guide: 'fix' });
-      assert.equal(session.expand('/toString').error, 'no such command /toString — one of: /fix /feature /review /dream /model /memory /mcp /resume /copy /undo /stop /context /export /thinking /help /new /exit');
+      assert.equal(session.expand('/toString').error, 'no command /toString — one of: /fix /feature /review /model /memory /mcp /resume /copy /undo /stop /context /export /thinking /help /handoff /new /exit');
 
-      const dream = session.expand('/dream');
-      await session.say(dream.text, dream.said);
-      assert.match(seen[1].messages.at(-1).content[0].content, /^nothing to do — |^read \d+ sessions/, 'the pass ran in this process');
+      await session.say('tidy my memory');
+      assert.match(seen[1].messages.at(-1).content[0].content, /^(?:tidy: )?(?:nothing to do — |read \d+ sessions)/m, 'the pass ran in this process, and tidied when asked');
     } finally {
       db.close();
     }
@@ -1230,7 +1314,8 @@ test('piped, a command that belongs to the screen is said back and never sent to
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
-      const { send, seen } = canned([reply('end_turn', [{ type: 'text', text: 'hello back' }])]);
+      const summary = { stop_reason: 'compaction', content: [{ type: 'compaction', content: 'the thread so far', encrypted_content: 'opaque', signature: 'sig' }], usage: { input_tokens: 100, output_tokens: 60 } };
+      const { send, seen } = canned([reply('end_turn', [{ type: 'text', text: 'hello back' }]), summary]);
       const printed = [];
       const output = new Writable({
         write(chunk, _encoding, done) {
@@ -1238,13 +1323,57 @@ test('piped, a command that belongs to the screen is said back and never sent to
           done();
         },
       });
-      assert.equal(await chat(db, { model: 'opus', effort: 'high', send, input: Readable.from(['/help\n', '/copy\n', '/export\n', '/context\n', 'hi\n', '/clear\n']), output }), 0);
+      assert.equal(await chat(db, { model: 'opus', effort: 'high', send, input: Readable.from(['/help\n', '/copy\n', '/export\n', '/context\n', 'hi\n', '/handoff\n', '/clear\n']), output }), 0);
       const all = printed.join('');
       for (const name of ['help', 'copy', 'export']) assert.match(all, new RegExp(`⎿  /${name} is for the chat on a terminal screen`));
       assert.match(all, /Context 0 tokens/, '/context answers here too');
-      assert.equal(seen.length, 1, 'only what was said went to the model');
+      assert.equal(seen.length, 2, 'only what was said went to the model, and the hand-off request');
       assert.equal(seen[0].messages.at(-1).content[0].text, 'hi');
-      assert.equal(all.match(/sumo {2}route/g).length, 2, '/clear starts a fresh session, as /new does');
+      assert.match(seen[1].compaction?.instructions ?? '', /^Write a hand-off/, '/handoff asks for the summary');
+      assert.match(all, /the thread so far[\s\S]*handed off from [0-9a-f]+: the hand-off rides in with your next message/);
+      assert.equal(all.match(/sumo {2}route/g).length, 3, '/handoff and /clear each start a fresh session, as /new does');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('/model with a new effort on the same model says it in the conversation, so the history is still read from the cache; a model switch sets the request\'s own, and says it again when one was said before', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const { send, seen } = canned([1, 2, 3, 4].map((n) => reply('end_turn', [{ type: 'text', text: String(n) }])));
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, now: () => NOW });
+      session.start('startup');
+      await session.say('one');
+      assert.deepEqual(seen[0].output_config, { effort: 'high' });
+      assert.deepEqual(seen[0].betas, ['context-management-2025-06-27', 'server-side-fallback-2026-07-01']);
+
+      assert.equal(session.route('opus low'), 'opus/low');
+      assert.equal(session.route('opus low'), 'opus/low', 'said once: the same effort again is nothing new');
+      await session.say('two');
+      assert.deepEqual(seen[1].output_config, { effort: 'high' }, 'the request\'s own effort is left as it was: changing it would write the whole history to the cache again');
+      const said = seen[1].messages.filter((m) => m.role === 'system');
+      assert.deepEqual(said, [{ role: 'system', content: [], output_config: { effort: 'low' } }]);
+      assert.equal(seen[1].messages.indexOf(said[0]), seen[1].messages.length - 2, 'said right before the turn it is for');
+      assert.deepEqual(seen[1].betas, ['context-management-2025-06-27', 'server-side-fallback-2026-07-01', 'mid-conversation-output-config-2026-07-01']);
+      assert.equal(seen[1].messages.at(-1).content.at(-1).cache_control?.type, 'ephemeral', 'the breakpoint is on the turn, never on the effort');
+
+      // A switch writes the history again whichever way: the request's own effort changes, and, since one was said, it is said again too.
+      assert.equal(session.route('sonnet xhigh'), 'sonnet/xhigh');
+      await session.say('three');
+      assert.equal(seen[2].model, MODEL_IDS.sonnet);
+      assert.deepEqual(seen[2].output_config, { effort: 'xhigh' });
+      assert.deepEqual(seen[2].messages.filter((m) => m.role === 'system').map((m) => m.output_config.effort), ['low', 'xhigh']);
+
+      // The session saved and picked up again starts from the effort in hand, as a request of its own.
+      const short = session.sessionId.slice(0, 8);
+      session.end();
+      const again = createChat(db, { cwd: tmpdir(), send, now: () => NOW });
+      again.resume(short);
+      await again.say('four');
+      assert.equal(seen[3].messages.filter((m) => m.role === 'system' && m.content.length === 0).length, 0, 'a saved conversation comes back without the efforts said in it');
+      assert.deepEqual(seen[3].output_config, { effort: 'xhigh' });
     } finally {
       db.close();
     }
@@ -1303,9 +1432,11 @@ test('a model that is off cannot be chatted on: not by configuration, not by /mo
       assert.throws(() => session.route('fable'), /fable is off — sumo models enable fable/);
       assert.equal(session.route(''), 'opus/high', 'a refused change changes nothing');
       const model = session.commands.find((c) => c.name === 'model');
-      assert.deepEqual(model.choices([]), ['auto', 'haiku', 'sonnet', 'opus']);
+      // Each is offered with what it is for, by its name.
+      const names = (choices) => choices.map((choice) => choice.name);
+      assert.deepEqual(names(model.choices([])), ['auto', 'haiku', 'sonnet', 'opus']);
       setModel(db, 'fable', true, NOW);
-      assert.deepEqual(model.choices([]), ['auto', 'haiku', 'sonnet', 'opus', 'fable'], 'the menu reads the switches as they are now');
+      assert.deepEqual(names(model.choices([])), ['auto', 'haiku', 'sonnet', 'opus', 'fable'], 'the menu reads the switches as they are now');
       assert.equal(session.route('fable'), 'fable/high');
     } finally {
       db.close();
@@ -1326,7 +1457,7 @@ test('Enter on the /model menu after a model keeps the effort in hand, never dro
       assert.equal(picked, '/model sonnet xhigh ');
       assert.equal(session.route('sonnet xhigh'), 'sonnet/xhigh');
       const menu = session.commands.find((c) => c.name === 'model');
-      assert.deepEqual([...menu.choices(['opus'])].sort(), ['high', 'low', 'max', 'medium', 'xhigh'], 'every effort is still offered');
+      assert.deepEqual(menu.choices(['opus']).map((choice) => choice.name).sort(), ['high', 'low', 'max', 'medium', 'xhigh'], 'every effort is still offered');
     } finally {
       db.close();
     }
@@ -1362,7 +1493,7 @@ test('on auto, the /model menu offers first the effort a model alone would keep:
       setMeta(db, 'config.chat.effort', 'low');
       const session = createChat(db, { model: 'auto', cwd: tmpdir(), send: () => assert.fail('never sent'), now: () => '2026-10-05T00:00:00.000Z' });
       session.start('startup');
-      assert.equal(session.commands.find((c) => c.name === 'model').choices(['opus'])[0], 'low');
+      assert.equal(session.commands.find((c) => c.name === 'model').choices(['opus'])[0].name, 'low');
       assert.equal(session.route('opus'), 'opus/low');
     } finally {
       db.close();
@@ -1870,6 +2001,58 @@ test('a turn that edits and stops before the project\'s check ran is held once a
       await session.say('change it again');
       assert.equal(seen.length, 11, 'git status is not the check: held');
       assert.match(held(seen[10].messages).at(-1), /a\.txt was edited and nothing has checked it since/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('an edit that did not land — refused, or its old_str not found — is not an edit nothing checked: the turn ends as the model ended it', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-unlanded-')));
+  writeFileSync(join(dir, 'Makefile'), 'test:\n\t@true\n');
+  writeFileSync(join(dir, 'a.txt'), 'one\n');
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const watched = [];
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'str_replace_based_edit_tool', { command: 'str_replace', path: join(dir, 'a.txt'), old_str: 'missing', new_str: 'x' }), call('t2', 'str_replace_based_edit_tool', { command: 'create', path: '/etc/sumo-elsewhere.conf', file_text: 'x' })]),
+        reply('end_turn', [{ type: 'text', text: 'Neither edit went through.' }]),
+      ]);
+      addProject(db, dir, { slug: 'unlanded', now: NOW });
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: dir, send, watch: (e) => watched.push(e), now: () => NOW });
+      session.start('startup');
+      const said = await session.say('in unlanded, change a.txt');
+      assert.equal(said.text, 'Neither edit went through.');
+      assert.equal(seen.length, 2, 'not held: nothing was edited');
+      assert.deepEqual(watched.filter((e) => e.type === 'check'), []);
+      assert.equal(readFileSync(join(dir, 'a.txt'), 'utf8'), 'one\n');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a file outside the project that the user let change is not the project\'s check to judge: the turn is not held for it', async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-inside-')));
+  const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-held-out-')));
+  writeFileSync(join(dir, 'Makefile'), 'test:\n\t@true\n');
+  writeFileSync(join(elsewhere, 'cfg.toml'), 'a = 1\n');
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const watched = [];
+      const { send, seen } = canned([
+        reply('tool_use', [call('t1', 'str_replace_based_edit_tool', { command: 'str_replace', path: join(elsewhere, 'cfg.toml'), old_str: 'a = 1', new_str: 'a = 2' })]),
+        reply('end_turn', [{ type: 'text', text: 'Changed your config.' }]),
+      ]);
+      addProject(db, dir, { slug: 'inside', now: NOW });
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: dir, send, watch: (e) => watched.push(e), approve: async () => 'once', now: () => NOW });
+      session.start('startup');
+      await session.say('in inside, change my config');
+      assert.equal(readFileSync(join(elsewhere, 'cfg.toml'), 'utf8'), 'a = 2\n', 'the change was made');
+      assert.equal(seen.length, 2, 'not held for the project\'s check');
+      assert.deepEqual(watched.filter((e) => e.type === 'check'), []);
     } finally {
       db.close();
     }

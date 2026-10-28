@@ -4,7 +4,7 @@
 // while the scribe replays something else; a router answer that is not there is a failed call.
 // A pass on the local model names its kind; STUB_LOCAL_FAILS makes every local call fail.
 // Asked which models the API has (kind `models`), it answers from STUB_MODELS; none recorded is a failed call.
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const request = readFileSync(0, 'utf8');
 if (process.env.STUB_CAPTURE) writeFileSync(process.env.STUB_CAPTURE, request);
@@ -27,4 +27,8 @@ if (router && !existsSync(process.env.STUB_ROUTER_ANSWER)) {
   process.stderr.write('no router answer recorded');
   process.exit(1);
 }
-process.stdout.write(readFileSync(router ? process.env.STUB_ROUTER_ANSWER : process.env.STUB_ANSWER, 'utf8'));
+// A pass that makes several calls of different kinds gets an answer of each kind's own when one is recorded
+// beside the usual one (`model-answer.json.<kind>`), and every request is kept in order (`model-saw.json.all`).
+if (process.env.STUB_CAPTURE) appendFileSync(`${process.env.STUB_CAPTURE}.all`, `${request.replace(/\n/g, ' ')}\n`);
+const own = !router && asked.kind && process.env.STUB_ANSWER ? `${process.env.STUB_ANSWER}.${asked.kind}` : null;
+process.stdout.write(readFileSync(router ? process.env.STUB_ROUTER_ANSWER : own && existsSync(own) ? own : process.env.STUB_ANSWER, 'utf8'));

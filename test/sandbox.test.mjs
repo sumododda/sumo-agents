@@ -9,7 +9,7 @@ import { openDb } from '../src/db.mjs';
 import { runJob, sandboxOn } from '../src/loop.mjs';
 import { paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { blockedWrite, sandboxWrap, unsandboxable, writablePlaces } from '../src/sandbox.mjs';
+import { blockedWrite, guardedPlaces, guardedWhy, sandboxWrap, unsandboxable, writablePlaces } from '../src/sandbox.mjs';
 import { askedLimit, backgrounded, childEnv, killGroup, runBash } from '../src/tools.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 import { sandbox as throwaway } from './helpers.mjs';
@@ -77,12 +77,69 @@ test('the sandbox is on unless the user turns it off, and shell.sandbox is on or
   assert.match(s.sumo(['config', 'shell.sandbox', 'on'], { extraEnv: { SUMO_TOOL: '1' } }).err, /Refused: the model's shell does not change/, 'not from the model\'s own shell');
 });
 
+test('turning the sandbox off says plainly what that means; turning it on says nothing more', () => {
+  const s = throwaway();
+  const off = s.sumo(['config', 'shell.sandbox', 'off']);
+  assert.equal(off.code, 0, off.err);
+  assert.deepEqual(off.out.split('\n').slice(0, 2), ['shell.sandbox = off', "warning: the model's shell is no longer held to the project — its commands can write anywhere you can"]);
+  assert.match(off.out, /takes effect in chats/);
+  assert.doesNotMatch(s.sumo(['config', 'shell.sandbox', 'on']).out, /warning/);
+  assert.doesNotMatch(s.sumo(['config', 'shell.network', 'off']).out, /warning/);
+});
+
 // The first command of this file: the note is said once a process, so it is the first result that carries it.
 test('where there is no sandbox, the first command of a process says it ran without one, and no later one does', { skip: unsandboxable() === null && 'there is a sandbox here' }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-unsandboxed-'));
   const ctx = { cwd: root, roots: [root], env };
   assert.match((await runBash({ command: 'echo one' }, ctx)).content, /^one\n\(the shell is not sandboxed: .+ — a command can write wherever the user can\)$/);
   assert.deepEqual(await runBash({ command: 'echo two' }, ctx), { content: 'two', isError: false });
+});
+
+test('the guarded files — read later by the shell, a tool or an editor — are kept from the sandboxed shell as git\'s hooks are, in the project and the home; a directory the user opened is writable', { skip: noSandbox }, async () => {
+  const root = join(scratch, 'guarded-project');
+  const opened = join(scratch, 'opened');
+  mkdirSync(root);
+  mkdirSync(opened);
+  writeFileSync(join(root, '.envrc'), 'export A=1\n');
+  mkdirSync(join(root, '.vscode'));
+  writeFileSync(join(root, '.vscode', 'settings.json'), '{}\n');
+  writeFileSync(join(root, 'plain.txt'), 'x\n');
+  assert.equal(guardedWhy(join(root, '.vscode', 'settings.json'), { roots: [root] }), 'your editor reads it');
+  assert.equal(guardedWhy(join(root, 'packages', 'app', '.vscode', 'settings.json'), { roots: [root] }), null, 'only directly under the project or the home');
+  assert.equal(guardedWhy(join(root, 'plain.txt'), { roots: [root] }), null);
+  // Credentials other programs trust, in the home; and any repository's git directory, however deep and however spelled.
+  const home = join(scratch, 'a-home');
+  assert.equal(guardedWhy(join(home, '.ssh', 'authorized_keys'), { roots: [root], home }), 'it holds credentials other programs trust');
+  assert.equal(guardedWhy(join(home, '.aws', 'config'), { roots: [root], home }), 'it holds credentials other programs trust');
+  assert.equal(guardedWhy(join(home, 'code', 'other', '.git', 'hooks', 'pre-commit'), { roots: [root], home }), 'git runs what is in it, outside the sandbox');
+  assert.equal(guardedWhy(join(home, 'code', 'other', '.GIT', 'config'), { roots: [root], home }), 'git runs what is in it, outside the sandbox');
+  assert.equal(guardedWhy(join(home, 'code', 'other', 'src', 'git.js'), { roots: [root], home }), null);
+  assert.deepEqual(
+    guardedPlaces([root], { home: join(scratch, 'nohome'), sumo: join(scratch, 'nosumo'), env: { PATH: '' } }),
+    [realpathSync(join(root, '.envrc')), realpathSync(join(root, '.vscode')), ...['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env'].map((n) => join(scratch, 'nosumo', n))],
+    "the guarded files that are there, and sumo's own by name whether or not they are",
+  );
+  // Programs' own setup in the home, and anything on the PATH; a project's bin folder is the project's.
+  for (const [rel, why] of [
+    ['.gitconfig', 'git reads it, and runs what it names'],
+    ['.config/git/config', 'git reads it, and runs what it names'],
+    ['Library/LaunchAgents/evil.plist', 'macOS runs it when you log in'],
+    ['.local/bin/git', 'a program there runs as a command'],
+    ['.config/nvim/init.lua', 'a program you use reads it when it starts'],
+  ]) assert.equal(guardedWhy(join(home, rel), { roots: [root], home, env: { PATH: '' } }), why, rel);
+  assert.equal(guardedWhy(join(home, '.config', 'app', 'config.toml'), { roots: [root], home, env: { PATH: '' } }), null, "another program's config is an ordinary file");
+  assert.equal(guardedWhy(join(root, 'bin', 'run.mjs'), { roots: [root], home, env: { PATH: '' } }), null, "a project's bin is the project's");
+  assert.equal(guardedWhy('/opt/tools/bin/deploy', { roots: [root], home, env: { PATH: '/usr/bin:/opt/tools/bin' } }), 'it is on your PATH: a program there runs as a command');
+  const ctx = { cwd: root, roots: [root], env, sandbox: true, opened: new Set([opened]) };
+  for (const command of ['echo x >> .envrc', 'echo x > .vscode/settings.json', 'rm -r .vscode']) {
+    const out = await runBash({ command }, ctx);
+    assert.equal(out.isError, true, command);
+    assert.match(out.content, /operation not permitted/i, command);
+  }
+  assert.equal(readFileSync(join(root, '.envrc'), 'utf8'), 'export A=1\n');
+  assert.equal(existsSync(join(root, '.npmrc')), false, 'a guarded name not there yet is still made: only what exists is carved out');
+  assert.deepEqual(await runBash({ command: `echo y > plain.txt && echo z > ${opened}/made.txt && echo ok` }, ctx), { content: 'ok', isError: false });
+  assert.equal(readFileSync(join(opened, 'made.txt'), 'utf8'), 'z\n');
 });
 
 test('a sandboxed command writes in the project and the temporary folders and nowhere else — what the guard lets through too — and says where it may write', { skip: noSandbox }, async () => {
@@ -125,7 +182,11 @@ test('a sandboxed command writes in the project and the temporary folders and no
   const declined = await runBash({ command: write }, { ...ctx, approve: answering('no') });
   assert.match(declined.content, /\(the user declined running it outside the sandbox: do not run it again; carry on another way, or ask the user\)$/);
   assert.equal(existsSync(join(outside, 'allowed.txt')), false);
+  // The screen is told in a line, not shown the paths and the instructions the model is given.
+  assert.match(declined.shown, /\ndeclined: the sandbox kept it from writing outside the project, and it was not run outside it$/);
+  assert.doesNotMatch(declined.shown, /only these can be written|do not run it again/);
   assert.deepEqual(asked.map((a) => a.input), [{ command: write }]);
+  assert.match(asked[0].blocked, /Operation not permitted|Read-only file system/, 'the question carries what the sandbox refused');
   const allowed = await runBash({ command: write }, { ...ctx, approve: answering('once') });
   assert.deepEqual(allowed, { content: '(the sandbox blocked a write outside the project; the user let it run again outside the sandbox)\nwrote', isError: false });
   assert.equal(readFileSync(join(outside, 'allowed.txt'), 'utf8'), 'x\n');
@@ -278,6 +339,59 @@ test('a job\'s commands left in the background end with the job, and its blocked
         assert.deepEqual(asked.map((a) => [a.job, a.input.command]), [[id, `echo x > ${outside}/j.txt`]]);
         assert.match(results[1].content, /the user declined running it outside the sandbox/);
       }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("sumo's own memory, settings and MCP servers are read-only to the sandboxed shell; a plain sumo command runs as sumo itself, where the model's limits hold", { skip: noSandbox }, async () => {
+  await withHome(freshHome(), {}, async () => {
+    const home = process.env.SUMO_AGENTS_HOME;
+    openDb().close();
+    const root = join(scratch, 'sumo-own');
+    mkdirSync(root);
+    const ctx = { cwd: root, roots: [root], env: { ...env, SUMO_AGENTS_HOME: home, SUMO_TOOL: '1' }, sandbox: true };
+    // Written past the CLI — straight into the database, or a server list made where there was none — the sandbox refuses it.
+    for (const command of [
+      `echo x >> ${home}/memory.db`,
+      `echo '{"mcpServers":{"x":{"command":"/bin/sh","allow":"all"}}}' > ${home}/mcp.json`,
+      `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(process.env.SUMO_AGENTS_HOME + '/memory.db-wal', 'x')"`,
+      `mkdir -p ${home}/bin && echo x > ${home}/bin/sumo`,
+    ]) {
+      const out = await runBash({ command }, ctx);
+      assert.equal(out.isError, true, command);
+      assert.match(out.content, /operation not permitted/i, command);
+    }
+    assert.equal(existsSync(join(home, 'mcp.json')), false, 'no server list was made');
+    // Through the CLI it works, as sumo, outside the sandbox — and what only the user may change is still refused.
+    const searched = await runBash({ command: 'sumo search "nothing here"' }, ctx);
+    assert.equal(searched.isError, false, searched.content);
+    const off = await runBash({ command: 'sumo config shell.sandbox off' }, ctx);
+    assert.equal(off.isError, true);
+    assert.match(off.content, /Refused: the model's shell does not change what the user controls/);
+    // A sumo command the shell would expand or pipe is not taken for one: it stays in the sandbox, which cannot open the database.
+    assert.equal((await runBash({ command: 'sumo search "nothing here" && echo searched' }, ctx)).isError, true);
+  });
+});
+
+test('a workflow taught with a quoted here-document is filed through sumo itself; one whose steps would end it early and run more stays in the sandbox', { skip: noSandbox }, async () => {
+  await withHome(freshHome(), {}, async () => {
+    const home = process.env.SUMO_AGENTS_HOME;
+    openDb().close();
+    const root = join(scratch, 'heredoc');
+    mkdirSync(root);
+    const ctx = { cwd: root, roots: [root], env: { ...env, SUMO_AGENTS_HOME: home, SUMO_TOOL: '1' }, sandbox: true };
+    const taught = await runBash({ command: "sumo learn 'release' --cue 'release it' <<'EOF_STEPS'\n1. run the tests\n2. tag it\nEOF_STEPS" }, ctx);
+    assert.equal(taught.isError, false, taught.content);
+    const marker = join(scratch, 'heredoc-ran.txt');
+    const sneaky = await runBash({ command: `sumo learn 'x' --cue 'y' <<'EOF'\n1. a\nEOF\ntouch ${marker}\nEOF` }, ctx);
+    assert.equal(sneaky.isError, true, 'run in the sandbox, where the database cannot be opened');
+    assert.match(sneaky.content, /the sandbox blocked a write/, 'and said as a blocked write, so the user can be asked');
+    assert.equal(existsSync(marker), false, 'what came after the early end never ran outside the sandbox');
+    const db = openDb();
+    try {
+      assert.deepEqual(db.prepare(`SELECT title FROM memories WHERE type = 'procedure'`).all().map((r) => r.title), ['release'], 'only the honest one was filed');
     } finally {
       db.close();
     }

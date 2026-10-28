@@ -28,7 +28,7 @@ const REVIEW = `## Summary\nIt returns 2, but cannot be trusted as it stands.\n#
 const reply = (stop, content) => ({ stop_reason: stop, content, usage: { input_tokens: 100, output_tokens: 10 }, model: 'claude-sonnet-5-5' });
 const call = (id, name, input) => ({ type: 'tool_use', id, name, input });
 const route = (r) => `${r.model}/${r.effort}`;
-const haiku = { model: 'haiku', effort: 'none', reason: 'a quick look' };
+const haiku = { model: 'haiku', effort: 'low', reason: 'a quick look' };
 
 /** What the local router answers from now on: a route, and whether it called the work risky. */
 const routerSays = (file, model, effort, risky = false) =>
@@ -121,13 +121,13 @@ test("a scout's first attempt runs on sonnet at low effort, not haiku, while son
   assert.deepEqual(routePolicy({ agent: 'scout', routed: haiku, usable: MODELS }), {
     model: 'sonnet',
     effort: 'low',
-    policy: "a scout's first attempt starts on sonnet at low effort, not haiku (the router said haiku/none)",
+    policy: "a scout's first attempt starts on sonnet at low effort, not haiku (the router said haiku/low)",
   });
-  assert.equal(route(routePolicy({ agent: 'scout', routed: haiku, usable: ['haiku', 'opus'] })), 'haiku/none', 'with sonnet off, haiku stays');
+  assert.equal(route(routePolicy({ agent: 'scout', routed: haiku, usable: ['haiku', 'opus'] })), 'haiku/low', 'with sonnet off, haiku stays');
   assert.equal(route(routePolicy({ agent: 'scout', routed: { model: 'opus', effort: 'medium' }, usable: MODELS })), 'opus/medium', 'a scout above haiku is left alone');
-  assert.equal(route(routePolicy({ agent: 'worker', routed: haiku, usable: MODELS })), 'haiku/none', 'a worker on haiku is not a scout');
+  assert.equal(route(routePolicy({ agent: 'worker', routed: haiku, usable: MODELS })), 'haiku/low', 'a worker on haiku is not a scout');
   // A retry goes one step above the attempt that failed, by the retry rule.
-  assert.equal(route(routePolicy({ agent: 'scout', routed: haiku, retryOf: { id: 3, model: 'haiku', effort: 'none', status: 'failed', important: null }, usable: MODELS })), 'sonnet/medium');
+  assert.equal(route(routePolicy({ agent: 'scout', routed: haiku, retryOf: { id: 3, model: 'haiku', effort: 'low', status: 'failed', important: null }, usable: MODELS })), 'sonnet/low');
 });
 
 test("the router's word on risky work comes back with the route and is kept with the job", async () => {
@@ -144,19 +144,13 @@ test("the router's word on risky work comes back with the route and is kept with
   });
 });
 
-test('jobs.escalate is on or off, on by default; jobs.review is risky, all or off, risky by default', () => {
+test('jobs.review is risky, all or off, risky by default', () => {
   const s = sandbox();
-  const listed = s.sumo(['config']).out;
-  assert.match(listed, /^jobs\.escalate = on$/m);
-  assert.match(listed, /^jobs\.review = risky$/m);
-  const escalate = s.sumo(['config', 'jobs.escalate', 'maybe']);
-  assert.notEqual(escalate.code, 0);
-  assert.match(escalate.err, /jobs\.escalate is on or off/);
+  assert.match(s.sumo(['config']).out, /^jobs\.review = risky$/m);
   const review = s.sumo(['config', 'jobs.review', 'some']);
   assert.notEqual(review.code, 0);
   assert.match(review.err, /jobs\.review is risky, all or off/);
   assert.match(s.sumo(['config', 'jobs.review']).out, /^jobs\.review = risky$/m, 'a refused value is not stored');
-  assert.match(s.sumo(['config', 'jobs.escalate', 'off']).out, /^jobs\.escalate = off$/m);
   assert.match(s.sumo(['config', 'jobs.review', 'all']).out, /^jobs\.review = all$/m);
   assert.match(s.sumo(['config', 'jobs.review', 'off']).out, /^jobs\.review = off$/m);
 });
@@ -177,15 +171,10 @@ test('a first attempt that fails is retried once, one step up, without being ask
   assert.match(r.screen.report, /^j1 failed on sonnet\/medium and was retried on opus\/medium/);
 });
 
-test('a retry that fails is not retried again, and with jobs.escalate off a failed attempt is simply reported', async () => {
+test('a retry that fails is not retried again', async () => {
   const twice = await delegated({ jobs: { 1: fails, 2: fails } });
   assert.match(twice.answer, /^j1 failed on sonnet\/medium and was retried on opus\/medium, as j2 — [^\n]*\nSTATUS: FAILED — j2\n/);
   assert.deepEqual(twice.rows.map((j) => j.id), [1, 2], 'no third attempt');
-
-  const off = await delegated({ jobs: { 1: fails }, config: { 'jobs.escalate': 'off' } });
-  assert.match(off.answer, /^STATUS: FAILED — j1\n/);
-  assert.doesNotMatch(off.answer, /retried/);
-  assert.deepEqual(off.rows.map((j) => j.id), [1]);
 });
 
 test('in the background the retry runs under the same call and is stopped with it; its report is one event for both', async () => {
@@ -197,7 +186,7 @@ test('in the background the retry runs under the same call and is stopped with i
 test('risky work done and verified is reviewed without being asked, by a reviewer at least as strong, after the worker\'s report', async () => {
   // The router calls the work risky; asked again for the review, it would put it on haiku.
   const work = (ctx) => {
-    routerSays(ctx.routerFile, 'haiku', 'none');
+    routerSays(ctx.routerFile, 'haiku', 'low');
     succeeds(ctx);
   };
   const r = await delegated({ router: ['sonnet', 'medium', true], jobs: { 1: work, 2: reviews } });
@@ -206,12 +195,13 @@ test('risky work done and verified is reviewed without being asked, by a reviewe
   const [worker, reviewer] = r.rows;
   assert.deepEqual([worker.risky, worker.important], [1, 3], 'the review graded the work');
   assert.deepEqual([reviewer.agent, reviewer.status, route(reviewer)], ['reviewer', 'done', 'sonnet/medium']);
-  assert.match(reviewer.route_reason, /policy: a reviewer is at least as strong as j1's sonnet; a reviewer runs at medium effort at least \(the router said haiku\/none\)/);
+  assert.match(reviewer.route_reason, /policy: a reviewer is at least as strong as j1's sonnet; a reviewer runs at medium effort at least \(the router said haiku\/low\)/);
   assert.deepEqual(JSON.parse(readFileSync(join(r.jobsDir, '2', 'reviews.json'), 'utf8')), { reviews: 1 });
   const brief = readFileSync(join(r.jobsDir, '2', 'brief.md'), 'utf8');
   assert.match(brief, /^# Job j2 — return 2 \(review of j1\)/);
   assert.match(brief, /The router called this work risky — it touches security, credentials, money, migrations or concurrency\./);
   assert.match(brief, /## The change to judge\nWhat was asked: .*jobs\/1\/brief\.md/);
+  assert.match(brief, /Asked, by number — a verdict on each under "Asked vs built", with what in the change shows it:\n  1\. Done: Make the thing return 2\.\n  2\. Ran, and it passed: `make test` exits 0\.\n/, 'the reviewer answers the same numbered list the author did');
   assert.equal(r.screen.id, 1, 'the screen shows the work, with the review under it');
   assert.match(r.screen.report, /The router called j1's work risky, so j2 reviewed j1 on sonnet\/medium:\n## Summary\nIt returns 2, but cannot/);
 });

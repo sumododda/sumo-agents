@@ -14,7 +14,8 @@ export function scopeLabel(scope) {
 
 function tags(m) {
   const parts = [TYPE_TAG[m.type], scopeLabel(m.scope), m.provenance];
-  if (m.state !== 'active') parts.push(m.state);
+  // Stored as invalid; said as what the user did to it.
+  if (m.state !== 'active') parts.push(m.state === 'invalid' ? 'forgotten' : m.state);
   if (m.pinned) parts.push('pinned');
   return `[${parts.join('·')}]`;
 }

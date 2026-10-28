@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { openDb } from '../src/db.mjs';
-import { getJob, newJob } from '../src/jobs.mjs';
+import { checklistOf, getJob, newJob } from '../src/jobs.mjs';
 import { runJob } from '../src/loop.mjs';
 import { closeMcp } from '../src/mcp.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
@@ -16,11 +16,16 @@ import { sandbox } from './helpers.mjs';
 
 const TASK = '## Goal\nMake the thing return 2.\n## Check\n`make test` exits 0.\n';
 const REPORT = '## Summary\nThe thing returns 2.\n## Files changed\nsrc.js — returns 2\n## Check\n`make test` → ok\n';
+/** The task, itemized by number for the author to answer: its goal and its check first, then what every job owes. */
 const CHECKLIST = [
-  '- Every requirement in the task is met.',
-  '- Debug output and scratch files are removed.',
-  '- Tests were changed only if the task allows it.',
-  '- Every claim in the report is backed by a tool result from this run.',
+  '## Answer each by number — what in the change or a tool result shows it — and fix what is not so',
+  '1. Done: Make the thing return 2.',
+  '2. Ran, and it passed: `make test` exits 0.',
+  '3. Debug output and scratch files are removed.',
+  '4. Tests were changed only if the task allows it.',
+  '5. Every claim in the report is backed by a tool result from this run.',
+  '6. The input most likely to break this change is named, and was run.',
+  '7. No change you did not make was reverted or overwritten.',
 ];
 
 /** A committed repository whose one check passes while the file `status` says ok, so a test can break and mend it. */
@@ -58,14 +63,14 @@ test("a worker's first DONE is answered with the task, what changed and what to 
   p.write('debug.log', 'thing is 2?\n');
 
   const first = finish(s, '1');
-  assert.equal(first.code, 2, 'the job is not closed, so the command did not do what it was asked');
+  assert.equal(first.code, 1, 'the job is not closed, so the command did not do what it was asked');
   assert.match(first.err, /j1 is not closed yet/);
   assert.match(first.err, /## The task\n## Goal\nMake the thing return 2\.\n## Check\n`make test` exits 0\./, 'the task as it was given');
   assert.match(first.err, /^ src\.js \| 2 \+-$/m, "git's own summary of the change since the job began");
   assert.match(first.err, /^ new file: debug\.log$/m, 'and what it added that git does not track');
-  for (const line of CHECKLIST) assert.ok(first.err.includes(line), line);
+  assert.ok(first.err.includes(CHECKLIST.join('\n')), `the task as a numbered list to answer, then what every job owes:\n${first.err}`);
   assert.match(first.err, /call `finish` again with the same report, or a corrected one, to go on to verification/);
-  assert.match(s.sumo(['job', 'list']).out, /j1 \[worker·proj-check·running\]/, 'the job is still open');
+  assert.match(s.sumo(['job', 'list']).out, /j1 \[worker·proj-check·not started\]/, 'the job is still open');
   assert.deepEqual(jobFiles(s, '1').filter((f) => f.startsWith('verify-')), [], 'nothing was run yet');
   assert.equal(existsSync(join(s.home, 'jobs', '1', 'report.md')), false);
 
@@ -86,7 +91,7 @@ test('the check is asked once per job, and remembered in its folder: a DONE the 
   assert.match(finish(s, '1').err, /j1 is not closed yet/);
   assert.ok(jobFiles(s, '1').includes('checked'), 'kept on disk, so a run started again does not ask again');
   const refused = finish(s, '1');
-  assert.equal(refused.code, 2);
+  assert.equal(refused.code, 1);
   assert.match(refused.err, /j1 is not done — the project's checks were run, and:/, 'the second DONE is verified as it always was');
 
   p.write('status', 'ok\n');
@@ -126,7 +131,7 @@ test('outside git, the check still gives the task and the list, and says what it
   newJobOf(s);
 
   const first = finish(s, '1');
-  assert.equal(first.code, 2);
+  assert.equal(first.code, 1);
   assert.match(first.err, /## The task\n## Goal\nMake the thing return 2\./);
   assert.match(first.err, /not a git repository — what changed cannot be shown/);
   for (const line of CHECKLIST) assert.ok(first.err.includes(line), line);
@@ -233,4 +238,14 @@ test('long paths are cut to the budget and counted; a clean tree says so; outsid
   const outside = situationOf(readFileSync(join(plain.home, 'jobs', '1', 'brief.md'), 'utf8'));
   assert.match(outside, /^Top level: docs\/ README\.md$/m);
   assert.doesNotMatch(outside, /Branch|git status|Toolchain/);
+});
+
+test('the checklist is the task by number: goal, must-not-change, non-goals and check lines each an item, bullets stripped, "none" and a missing heading skipped, a long section cut, a task without headings one item', () => {
+  const task = ['## Goal', '- Return 2 from thing().', '- Keep the old name exported.', '## Non-goals', 'none', '## Must not change', '1. The public API', '## Check', '`make test` exits 0', '## Report', 'the usual shape'].join('\n');
+  assert.deepEqual(checklistOf(task), ['Done: Return 2 from thing().', 'Done: Keep the old name exported.', 'Unchanged: The public API', 'Ran, and it passed: `make test` exits 0']);
+  assert.deepEqual(checklistOf('Just make it work.'), ['Done: everything the task asks, as it asks it.']);
+  assert.deepEqual(checklistOf(null), ['Done: everything the task asks, as it asks it.']);
+  const items = checklistOf(`## Goal\n${Array.from({ length: 15 }, (_, i) => `- step ${i + 1}`).join('\n')}\n`);
+  assert.equal(items.length, 13);
+  assert.equal(items[12], 'and the 3 more lines under Goal');
 });

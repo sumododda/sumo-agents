@@ -22,6 +22,6 @@ A project is a directory somewhere on this machine, registered once.
 
 **No project** → scratch (`sumo project show scratch`): one folder per chore, named `<date>-<what it is>`. With no
 project named the tools start there; from inside a project, hand the chore to a job with project `scratch`. A folder
-nothing is written in for `sumo config scratch.days` days is deleted — worth keeping → move it out, `sumo project add`.
+nothing is written in for 14 days is deleted — worth keeping → move it out, `sumo project add`.
 
 `sumo project alias <slug> <name>` adds a name · `sumo project archive <slug>` retires one (memories kept).

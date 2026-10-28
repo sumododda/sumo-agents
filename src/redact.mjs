@@ -17,6 +17,12 @@ const PATTERNS = [
   /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
 ];
 
+/**
+ * A credential sent the HTTP way — `Authorization: Bearer <token>`, `Basic <base64>` — whatever its vendor: the scheme is
+ * kept, the credential goes. A token has a digit in it; a long plain word after "basic" in prose is left alone.
+ */
+const AUTH_SCHEME = /\b(Bearer|Basic)\s+(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{16,}/gi;
+
 // The name may be the tail of a longer one (DB_PASSWORD, GITHUB_TOKEN) and may be quoted, as a JSON key is; what follows it must be the assignment itself.
 const ASSIGNMENT = /(password|passwd|secret|token|api[_-]?key|access[_-]?key)(["']?\s*[:=]\s*)(["']?)([^\s"']{6,})\3/gi;
 
@@ -149,6 +155,10 @@ function redactReadable(text) {
     return `${head}${MARK}@`;
   });
   for (const pattern of PATTERNS) out = out.replace(pattern, hit);
+  out = out.replace(AUTH_SCHEME, (_m, scheme) => {
+    count++;
+    return `${scheme} ${MARK}`;
+  });
   out = keyFragments(out, hit);
   out = out.replace(ENV_KEY_QUOTED, (m, name, sep, _quote, value) => {
     if (value.startsWith('${')) return m;

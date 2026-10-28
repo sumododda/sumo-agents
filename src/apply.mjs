@@ -1,8 +1,8 @@
-import { tx } from './db.mjs';
+import { getMeta, setMeta, tx } from './db.mjs';
 import * as memory from './memory.mjs';
 import { line } from './render.mjs';
-import { addCheckpoint, currentProject } from './sessions.mjs';
-import { asksForWork, overlap } from './text.mjs';
+import { addCheckpoint, currentProject, outsideReadsOf } from './sessions.mjs';
+import { asksForWork, onlyAlternative, overlap, sameWayRound, sharedStems } from './text.mjs';
 
 /**
  * The only door through which a model's suggestion becomes a memory.
@@ -22,6 +22,8 @@ const QUOTE_MIN_CHARS = 6;
 /** A paraphrase shares words with its source. Below this, the quote is real but the claim is about something else. */
 const BODY_MATCHES_TURN = 0.34;
 const SAME_STATEMENT = 0.8;
+/** What the slow pass proposes from a sentence already filed is that memory again when it shares this much with it. */
+const ALREADY_FILED = 0.5;
 /** "use eslint for linting" / "use biome for linting": three words of four. Close enough to ask about, too different to call a repeat. */
 const LOOKS_ALIKE = 0.7;
 
@@ -37,7 +39,7 @@ const RETIRING = ['supersede'];
 
 const OPS_BY_SOURCE = {
   scribe: ['add', 'supersede', 'gotcha', 'checkpoint'],
-  dream: ['add', 'supersede', 'gotcha', 'checkpoint', 'contradiction', 'procedure'],
+  dream: ['add', 'supersede', 'gotcha', 'checkpoint', 'contradiction', 'same', 'procedure'],
   // A delegated sub-agent's report: it may tell us about traps it hit, and nothing else.
   worker: ['gotcha'],
 };
@@ -63,6 +65,26 @@ function sentencesAround(text, quote) {
   if (from === -1) return text;
   const to = from + normalize(quote).length;
   return sentences.filter((s, i) => starts[i] < to && starts[i] + s.length > from).join(' ');
+}
+
+/** The clauses of the quote's sentence that the quote touches, whole — split at commas, semicolons, colons, dashes and "but". */
+function clausesAround(text, quote) {
+  const sentence = sentencesAround(text, quote);
+  const q = normalize(quote);
+  const from = sentence.indexOf(q);
+  if (from === -1) return sentence;
+  const to = from + q.length;
+  const parts = [];
+  const cut = /[,;:]|\s[—–-]\s|\sbut\s/g;
+  let start = 0;
+  for (const m of sentence.matchAll(cut)) {
+    parts.push([start, m.index]);
+    start = m.index + m[0].length;
+  }
+  parts.push([start, sentence.length]);
+  // The touched clauses are side by side: one slice of the sentence keeps the commas between them, which say what is set aside.
+  const touched = parts.filter(([a, b]) => a < to && b > from);
+  return sentence.slice(touched[0][0], touched.at(-1)[1]).trim();
 }
 
 function resolveScope(db, scope) {
@@ -93,13 +115,22 @@ function cleanBody(op) {
 function verify(op, body, turns) {
   const named = turns.get(Number(op.turn)) ?? null;
   if (typeof op.quote !== 'string' || !op.quote.trim()) return { turn: named, verified: false, why: 'no quote given' };
-  const quote = normalize(op.quote);
+  // The words, without the quote marks or the full stop a model may put round them.
+  const said = op.quote.trim().replace(/^["'“‘]+|["'”’]+$/g, '').replace(/[.!?]+$/, '');
+  const quote = normalize(said);
   if (quote.length < QUOTE_MIN_CHARS || quote.split(' ').length < QUOTE_MIN_WORDS) return { turn: named, verified: false, why: 'the quote is too short to prove anything' };
 
   const candidates = [...(named ? [named] : []), ...[...turns.values()].filter((t) => t !== named)];
   const source = candidates.find((t) => normalize(t.text).includes(quote));
   if (!source) return { turn: named, verified: false, why: 'the user never typed the quoted words' };
   if (overlap(body, source.text) < BODY_MATCHES_TURN) return { turn: source, verified: false, why: 'the quote is real but the memory is about something else' };
+  // The user's words, turned round — "never" filed from an "always" — are not the user's word. Judged on the clauses the quote
+  // is in, whole: "we use biome now, not eslint" negates the old tool, not the rule; a quote cut short of its "never" still has it.
+  // An alternative set aside ("…, never npm") is looked for in the whole sentence: a quote that stops at the comma left it
+  // there. A quote of nothing but the alternative is judged with the sentence it is set against.
+  const sentence = sentencesAround(source.text, said);
+  const clauses = clausesAround(source.text, said);
+  if (!sameWayRound(body, onlyAlternative(clauses) ? sentence : clauses, sentence)) return { turn: source, verified: false, why: 'the quote is real but the memory says it the other way round' };
   return { turn: source, verified: true, why: null };
 }
 
@@ -145,13 +176,53 @@ function savedFromTurn(db, turnId, scope, body, exclude, quote) {
   return fromTurn.find((m) => statementOf(body) === statementOf(m.body) && quotesAgree(m)) ?? null;
 }
 
+/**
+ * Something only the user can settle about two memories, put in the block until it stops being true: `lookalike` or
+ * `contradiction`, the pair stored lowest id first. One pair is raised once, whatever its kind; false when it already was.
+ */
+export function raiseNotice(db, { kind, a, b, note, now }) {
+  const [lo, hi] = a < b ? [a, b] : [b, a];
+  if (db.prepare('SELECT 1 FROM notices WHERE memory_a = ? AND memory_b = ?').get(lo, hi)) return false;
+  db.prepare('INSERT INTO notices (kind, memory_a, memory_b, note, created_at) VALUES (?, ?, ?, ?, ?)').run(kind, lo, hi, note, now);
+  return true;
+}
+
+/** Where the pairs a pass named wait to be judged on their own. */
+const NAMED_PAIRS = 'dream.named_pairs';
+
+/** The pairs a pass named that wait to be judged on their own, in the order named: `{ label, a, b, note }`, a < b. */
+export function namedPairs(db) {
+  try {
+    const named = JSON.parse(getMeta(db, NAMED_PAIRS) ?? '[]');
+    return Array.isArray(named) ? named.filter((p) => Number.isInteger(p?.a) && Number.isInteger(p?.b)) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** What waits to be judged from here on: those named, less any judged now. */
+export const keepNamed = (db, named) => setMeta(db, NAMED_PAIRS, JSON.stringify(named));
+
+/**
+ * What a pass that read memories by number says of two of them waits until the pair is judged on its own (dream.mjs):
+ * reading sixty memories and a dozen turns, a small model writes one number for another — a turn's for a memory's, a
+ * neighbour's for the one it meant — and a pair it never looked at side by side would be a question for the user. The
+ * reason it is not named, or null: asked once — a pair raised, judged, or waiting already is not named again.
+ */
+export function nameForJudging(db, { label, a, b, note }) {
+  const [lo, hi] = a < b ? [a, b] : [b, a];
+  if (db.prepare('SELECT 1 FROM notices WHERE memory_a = ? AND memory_b = ?').get(lo, hi)) return 'already raised';
+  const judged = db.prepare('SELECT label FROM memory_pairs WHERE a = ? AND b = ?').get(lo, hi);
+  if (judged) return `m${lo} and m${hi} were judged on their own already: ${judged.label}`;
+  const waiting = namedPairs(db);
+  if (waiting.some((p) => p.a === lo && p.b === hi)) return 'already waiting to be judged';
+  keepNamed(db, [...waiting, { label, a: lo, b: hi, note }]);
+  return null;
+}
+
 /** Two active memories that look alike but are not the same: only the user can say whether one replaces the other. */
 function flagLookalike(db, saved, other, now) {
-  const [lo, hi] = saved.id < other.id ? [saved.id, other.id] : [other.id, saved.id];
-  if (db.prepare('SELECT 1 FROM notices WHERE memory_a = ? AND memory_b = ?').get(lo, hi)) return;
-  db.prepare(`INSERT INTO notices (kind, memory_a, memory_b, note, created_at) VALUES ('lookalike', ?, ?, ?, ?)`).run(
-    lo, hi, 'they look alike — if the newer one replaces the older, supersede it; if both hold, leave them', now,
-  );
+  raiseNotice(db, { kind: 'lookalike', a: saved.id, b: other.id, note: 'they look alike — if the newer one replaces the older, supersede it; if both hold, leave them', now });
 }
 
 /** The user has now said, in so many words, what was only a guess: the guess becomes a stated memory. */
@@ -186,6 +257,12 @@ function addStated(db, op, ctx, { supersedes } = {}) {
 
   const again = savedFromTurn(db, turn?.id ?? null, scope, body, supersedes, op.quote);
   if (again) throw new Rejected(`already saved from this turn as m${again.id}`);
+  // The slow pass reads conversations the writer has filed already: a sentence it filed is not filed again in other
+  // words. Another rule from the same sentence, sharing little with what was filed, is one of its own.
+  if (ctx.source === 'dream' && turn && supersedes === undefined) {
+    const filed = db.prepare(`SELECT id, body FROM memories WHERE source_turn = ? AND state = 'active'`).all(turn.id).find((m) => overlap(body, m.body) >= ALREADY_FILED);
+    if (filed) throw new Rejected(`already filed from that sentence: m${filed.id}`);
+  }
 
   // What is being replaced naturally resembles its replacement, so it is left out of the comparison.
   const twin = lookalike(db, scope, body, supersedes);
@@ -258,7 +335,12 @@ const HANDLERS = {
     // A trap met twice is written up twice, in other words: the one already here stands for both.
     const twin = lookalike(db, scope, body);
     if (twin) throw new Rejected(`already known as m${twin.memory.id}`);
-    const { memory: saved } = memory.add(db, { type: 'gotcha', body, project, keys: op.keys, provenance: 'observed', writtenBy: ctx.source, now: ctx.now });
+    // A trap read in a conversation that searched or fetched the web, or called an MCP server, may be what a page told
+    // it: held for the user, never filed as observed. A gotcha names no turn, so every conversation the pass read counts.
+    const outside = outsideReadsOf(db, [ctx.sessionId, ...[...(ctx.turns?.values() ?? [])].map((t) => t.session_id)]);
+    const { memory: saved } = memory.add(db, { type: 'gotcha', body, project, keys: op.keys, provenance: outside.length > 0 ? 'inferred' : 'observed', writtenBy: ctx.source, now: ctx.now });
+    if (outside.length > 0) db.prepare(`UPDATE memories SET held_for = 'outside' WHERE id = ?`).run(saved.id);
+    if (outside.length > 0) return `held for confirmation ${line(saved)} — the conversation read ${outside.join(', ')}, and a trap it passes on may be what it was told`;
     return `saved ${line(saved)}`;
   },
 
@@ -276,16 +358,46 @@ const HANDLERS = {
     return `checkpoint ${project}: ${done}${next ? ` → next: ${next}` : ''}`;
   },
 
-  /** Two memories that cannot both be true. Never resolved here: only the user knows which one is. */
+  /**
+   * Two memories that cannot both be true. Never resolved here: only the user knows which one is. Only memories the pass
+   * was shown, still active, can be named: one it never saw is a wrong number, whatever the note says.
+   */
   contradiction(db, op, ctx) {
     const [a, b] = (Array.isArray(op.ids) ? op.ids : []).map(idOf);
     if (!a || !b || a === b) throw new Rejected('a contradiction names two different memories');
-    for (const id of [a, b]) if (memory.get(db, id).state !== 'active') throw new Rejected(`m${id} is not active`);
+    for (const id of [a, b]) {
+      if (ctx.shown && !ctx.shown.has(id)) throw new Rejected(`m${id} is not one of the memories this pass was shown`);
+      if (memory.get(db, id).state !== 'active') throw new Rejected(`m${id} is not active`);
+    }
+    // Two things that clash are about something in common, or the note says what each is about: a memory sharing no word
+    // with either is a wrong number, not a clash to put to the user.
+    const said = typeof op.note === 'string' ? op.note : '';
+    for (const [x, y] of [[a, b], [b, a]]) {
+      if (sharedStems(memory.get(db, x).body, `${memory.get(db, y).body} ${said}`) === 0) throw new Rejected(`m${x} shares no word with m${y} or the note — not the memory meant`);
+    }
     const [lo, hi] = a < b ? [a, b] : [b, a];
-    if (db.prepare('SELECT 1 FROM notices WHERE memory_a = ? AND memory_b = ?').get(lo, hi)) throw new Rejected('already raised');
     const note = typeof op.note === 'string' && op.note.trim() ? op.note.trim().slice(0, 200) : 'they cannot both be true';
-    db.prepare(`INSERT INTO notices (kind, memory_a, memory_b, note, created_at) VALUES ('contradiction', ?, ?, ?, ?)`).run(lo, hi, note, ctx.now);
+    if (ctx.shown) return judgedFirst(db, { label: 'conflict', lo, hi, note, said: 'cannot both be true' });
+    if (!raiseNotice(db, { kind: 'contradiction', a: lo, b: hi, note, now: ctx.now })) throw new Rejected('already raised');
     return `raised for the user: m${lo} vs m${hi} — ${note}`;
+  },
+
+  /**
+   * Two memories that say one thing in other words — what no word overlap finds. Raised as a look-alike for the user to
+   * settle; nothing is retired here. Only memories the pass was shown, still active, can be named.
+   */
+  same(db, op, ctx) {
+    const [a, b] = (Array.isArray(op.ids) ? op.ids : []).map(idOf);
+    if (!a || !b || a === b) throw new Rejected('same names two different memories');
+    for (const id of [a, b]) {
+      if (ctx.shown && !ctx.shown.has(id)) throw new Rejected(`m${id} is not one of the memories this pass was shown`);
+      if (memory.get(db, id).state !== 'active') throw new Rejected(`m${id} is not active`);
+    }
+    const [lo, hi] = a < b ? [a, b] : [b, a];
+    const note = typeof op.note === 'string' && op.note.trim() ? op.note.replace(/\s+/g, ' ').trim().slice(0, 200) : 'they say one thing in other words';
+    if (ctx.shown) return judgedFirst(db, { label: 'same', lo, hi, note, said: 'say the same thing' });
+    if (!raiseNotice(db, { kind: 'lookalike', a: lo, b: hi, note, now: ctx.now })) throw new Rejected('already raised');
+    return `raised for the user: m${lo} and m${hi} say the same thing — ${note}`;
   },
 
   /** A workflow the model thinks it saw the user repeat. Always a proposal. */
@@ -294,6 +406,11 @@ const HANDLERS = {
     const body = typeof op.body === 'string' ? op.body.trim() : '';
     if (!title || !body) throw new Rejected('a procedure needs a title and steps');
     const { scope, project } = resolveScope(db, op.scope);
+    // A routine is walked through more than once: what starts it, said in one turn only, was a one-off ask. Said nowhere, it is
+    // the model's own words for a pattern, and the user is asked.
+    const trigger = (typeof op.cue === 'string' && op.cue.trim() ? op.cue : title).replace(/\s+/g, ' ').trim();
+    const turns = db.prepare('SELECT text FROM user_turns ORDER BY id DESC LIMIT 2000').all();
+    if (turns.filter((t) => overlap(trigger, t.text) >= SAME_STATEMENT).length === 1) throw new Rejected(`a routine is something done more than once, and "${trigger.slice(0, 80)}" was said once`);
     const existing = db.prepare(`SELECT * FROM memories WHERE scope = ? AND type = 'procedure' AND state IN ('active', 'unconfirmed', 'rejected')`).all(scope);
     const twin = existing.find((m) => overlap(title, m.title) >= SAME_STATEMENT);
     if (twin) throw new Rejected(`a workflow like this exists already (m${twin.id}, ${twin.state})`);
@@ -304,6 +421,13 @@ const HANDLERS = {
     return `held for confirmation ${line(saved)}`;
   },
 };
+
+/** A pair a pass that read memories by number named, put to the pair judge before the user (`nameForJudging`). */
+function judgedFirst(db, { label, lo, hi, note, said }) {
+  const not = nameForJudging(db, { label, a: lo, b: hi, note });
+  if (not) throw new Rejected(not);
+  return `to be judged on their own: m${lo} and m${hi} ${said} — ${note}`;
+}
 
 /** Each operation in turn. With `refused` — why — every one that would retire a memory is dropped for that reason. */
 function applyEach(db, ops, ctx, refused = null) {
@@ -350,10 +474,14 @@ function tooWide(db, before) {
  * @param ctx.turns    Map of turn id → user_turns row the model was shown
  */
 export function applyOps(db, ops, ctx) {
-  if (!Array.isArray(ops)) return { applied: [], dropped: ['the answer had no list of operations'] };
+  if (!Array.isArray(ops)) return { applied: [], dropped: ['the answer had no list of operations'], written: [] };
 
   return tx(db, () => {
-    if (ctx.source !== 'dream') return applyEach(db, ops, ctx);
+    // `written`: the memories this call made, by id. The transaction holds the write lock, so every id past the highest
+    // at its start is this call's — never another process's that finished a moment before or after.
+    const from = db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM memories').get().id;
+    const made = (outcome) => ({ ...outcome, written: db.prepare('SELECT id FROM memories WHERE id > ? ORDER BY id').all(from).map((m) => m.id) });
+    if (ctx.source !== 'dream') return made(applyEach(db, ops, ctx));
     // The slow pass's answer is tried first and counted, then kept or undone: what it would retire is known exactly
     // that way — a replacement that is only a guess, or aimed at the wrong memory, retires nothing. Too wide, it is
     // applied again without what retires anything, and what it adds is kept.
@@ -363,6 +491,6 @@ export function applyOps(db, ops, ctx) {
     const refused = tooWide(db, before);
     if (refused) db.exec('ROLLBACK TO dream_ops');
     db.exec('RELEASE dream_ops');
-    return refused ? applyEach(db, ops, ctx, refused) : tried;
+    return made(refused ? applyEach(db, ops, ctx, refused) : tried);
   });
 }

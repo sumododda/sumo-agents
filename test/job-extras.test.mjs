@@ -190,7 +190,7 @@ test('a check that passed at the baseline and fails at the end is run once more:
   p.runs(['fail', 'fail', 'pass']);
   writeFileSync(join(p.dir, 'src.js'), 'export const thing = 2;\n');
   const refused = done(s, 1);
-  assert.equal(refused.code, 2, refused.out);
+  assert.equal(refused.code, 1, refused.out);
   assert.match(refused.err, /blocking: `make test` fails, and it passed when this job began/);
   assert.deepEqual(p.left(), ['pass'], 'run once more, never twice');
 });

@@ -1,16 +1,19 @@
 // MCP servers: the configuration that names them, the two transports that reach them, what their tools look like to
 // the model, the allow list every call is held to, and the `sumo mcp` commands that manage all of it.
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { describeCall } from '../src/chat.mjs';
-import { allowedBy, closeMcp, connect, DECLINED, gateMcp, isMcpTool, mcpReady, readConfig, setAllow, TOOL_SEARCH, writeConfig } from '../src/mcp.mjs';
-import { paths, REPO_ROOT } from '../src/paths.mjs';
+import { allowedBy, CLAUDE_CODE_TOKEN, closeMcp, connect, DECLINED, gateMcp, isMcpTool, mcpReady, readConfig, setAllow, TOOL_SEARCH, writeConfig } from '../src/mcp.mjs';
+import { UsageError } from '../src/memory.mjs';
+import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { toolView } from '../src/tty.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
-import { sandbox } from './helpers.mjs';
+import { NO_KEY, sandbox } from './helpers.mjs';
 
 const FIXTURE = join(REPO_ROOT, 'test', 'fixtures', 'fake-mcp-server.mjs');
 /** The fake server over stdio, with whatever else the spec needs. */
@@ -69,12 +72,14 @@ test('a server that cannot start, one that never answers, and one that dies mid-
 function fakeHttpMcp() {
   const seen = [];
   let forgetting = false;
+  let refusing = false;
   let sessions = 0;
   const server = createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       seen.push({ method: req.method, headers: req.headers, body: body ? JSON.parse(body) : null });
+      if (refusing) return res.writeHead(401, { 'www-authenticate': 'Bearer' }).end('{"error":"invalid_token"}');
       if (req.method === 'DELETE') return res.writeHead(200).end();
       const msg = JSON.parse(body);
       const sid = req.headers['mcp-session-id'];
@@ -97,7 +102,7 @@ function fakeHttpMcp() {
   });
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
-      resolve({ url: `http://127.0.0.1:${server.address().port}/mcp`, seen, forget: () => (forgetting = true), close: () => new Promise((r) => server.close(r)) });
+      resolve({ url: `http://127.0.0.1:${server.address().port}/mcp`, seen, forget: () => (forgetting = true), refuse: () => (refusing = true), close: () => new Promise((r) => server.close(r)) });
     });
   });
 }
@@ -124,6 +129,53 @@ test('a streamable-HTTP server: the session id and protocol version ride on ever
   assert.equal(web.seen.at(-1).method, 'DELETE', 'the session is ended when the client is done with it');
   assert.equal(web.seen.at(-1).headers['mcp-session-id'], 's1');
   await web.close();
+});
+
+/** Claude Code's credentials file in a directory of its own, holding the logins given. */
+function claudeConfigDir(logins) {
+  const dir = mkdtempSync(join(tmpdir(), 'sumo-agents-claude-'));
+  writeFileSync(join(dir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'sk-ant-oat01-not-this-one' }, mcpOAuth: logins }), { mode: 0o600 });
+  return dir;
+}
+
+test('a server reached with Claude Code\'s login: the bearer token comes from its credentials file, never the configuration; no login, one that has run out, and one the server refuses each say what to run in Claude Code', async () => {
+  const web = await fakeHttpMcp();
+  const spec = { url: web.url, token: CLAUDE_CODE_TOKEN };
+  const login = { serverName: 'slack', serverUrl: web.url, accessToken: 'xoxe.xoxp-1-demo-token', refreshToken: 'xoxe-1-demo-refresh', expiresAt: Date.now() + 60_000, scope: 'chat:write' };
+  const env = { CLAUDE_CONFIG_DIR: claudeConfigDir({ 'slack|abc123': login, 'other|def456': { ...login, serverName: 'other', serverUrl: 'https://elsewhere.test/mcp', accessToken: 'xoxe.xoxp-1-other' } }) };
+  try {
+    const session = await connect('chat', spec, { env });
+    try {
+      assert.deepEqual(session.tools.map((t) => t.name), ['greet']);
+      assert.equal(web.seen[0].headers.authorization, 'Bearer xoxe.xoxp-1-demo-token', 'the login for this URL, found by URL');
+    } finally {
+      await session.close();
+    }
+    // The configuration never holds it: the spec is what is stored, and it names only Claude Code.
+    assert.deepEqual(spec, { url: web.url, token: 'claude-code' });
+
+    // No login for the URL: the two Claude Code commands to run, under the name sumo knows the server by.
+    await assert.rejects(connect('chat', spec, { env: { CLAUDE_CONFIG_DIR: claudeConfigDir({}) } }), (e) => {
+      assert.ok(e instanceof UsageError, 'what to run, not a crash');
+      assert.equal(e.message, `no Claude Code login for ${web.url} — run: claude mcp add --transport http --scope user chat ${web.url}, then: claude mcp login chat`);
+      return true;
+    });
+    // One that has run out: log in again, under the name Claude Code knows it by.
+    await assert.rejects(connect('chat', spec, { env: { CLAUDE_CONFIG_DIR: claudeConfigDir({ 'slack|abc123': { ...login, expiresAt: Date.now() - 1 } }) } }), (e) => {
+      assert.equal(e.message, `Claude Code's login for ${web.url} has run out — run: claude mcp login slack`);
+      return true;
+    });
+    // One the server will not take: the same, and the token is in no error.
+    web.refuse();
+    await assert.rejects(connect('chat', spec, { env }), (e) => {
+      assert.equal(e.message, `${web.url} did not take Claude Code's login — run: claude mcp login slack`);
+      return true;
+    });
+    // Nothing of Claude Code's is read for a server with headers of its own.
+    await assert.rejects(connect('own', { url: web.url, headers: { Authorization: 'Bearer own' } }, { env: { CLAUDE_CONFIG_DIR: claudeConfigDir({}) } }), /HTTP 401/);
+  } finally {
+    await web.close();
+  }
 });
 
 test('the registry: every configured server connected at once, a failed one named and the rest usable; tools deferred, sorted, named for the model, schemas made valid; results capped and redacted; a lost session reconnected', async () => {
@@ -269,6 +321,8 @@ test('the gate: an allowed tool passes; one that is not asks the user once, and 
       const declined = await gateMcp(call, { approve: approve('no') });
       assert.equal(declined.isError, true);
       assert.equal(declined.content, DECLINED);
+      assert.equal(declined.shown, 'declined: not run', 'the screen is told in a line');
+      assert.equal((await gateMcp(call, { approve: approve({ no: 'post it in #general, not a DM' }) })).content, `${DECLINED}\n(the user declined it and said: "post it in #general, not a DM" — do what they said instead)`);
       assert.equal(await gateMcp(call, { approve: approve('always') }), null);
       assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo'], 'always is kept');
       asked.length = 0;
@@ -335,8 +389,28 @@ test('sumo mcp: servers are added without their secrets, listed with their tools
   assert.match(clear.err, /plain http.*clear text.*https:\/\//);
   assert.equal(run(['add', 'tls', '--url', 'https://example.test/mcp']).code, 0);
   assert.equal(run(['remove', 'tls']).code, 0);
+  // A token in the clear would sit in the file: it is refused, with the way to pass it from the shell instead.
+  // Made up, and put together here so no token-shaped string sits in the source for a scanner to stop.
+  const madeUp = ['ghp', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('_');
+  const literal = run(['add', 'leak', '--url', 'https://example.test/mcp', '--header', `Authorization=Bearer ${madeUp}`]);
+  assert.equal(literal.code, 2);
+  assert.match(literal.err, /--header Authorization holds a token in the clear, and the file never does — export it in your shell and write \$\{NAME\} in its place \(--header "Authorization=Bearer \$\{MY_TOKEN\}"\)/);
+  assert.doesNotMatch(readFileSync(file, 'utf8'), /ghp_/);
+  assert.match(run(['add', 'ftp', '--url', 'ftp://example.test/mcp']).err, /--url takes a web address, https:\/\/… — not "ftp:\/\/example\.test\/mcp"/);
+  // A token borrowed from Claude Code: the file says only that, and the listing says whose the token is.
+  const slack = run(['add', 'slack', '--url', 'https://mcp.slack.com/mcp', '--from-claude']);
+  assert.equal(slack.code, 0, slack.err);
+  assert.match(slack.out, /added slack \(http: https:\/\/mcp\.slack\.com\/mcp, with Claude Code's login — log in there first: claude mcp add --transport http --scope user slack https:\/\/mcp\.slack\.com\/mcp, then claude mcp login slack\)/);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).mcpServers.slack, { url: 'https://mcp.slack.com/mcp', token: 'claude-code' });
+  assert.match(run(['add', 'both', '--url', 'https://example.test/mcp', '--from-claude', '--header', 'A=b']).err, /Claude Code or --header, not both/);
+  assert.match(run(['add', 'nourl', '--from-claude', '--', 'x']).err, /--from-claude goes with --url/);
+  /** Claude Code's credentials, with no login for Slack: the listing is told what to run, and the keychain is never asked. */
+  const claude = { extraEnv: { ...secret.extraEnv, CLAUDE_CONFIG_DIR: claudeConfigDir({}) } };
 
-  const listed = run([], secret);
+  const listed = run([], claude);
+  assert.match(listed.out, /slack\s+http: https:\/\/mcp\.slack\.com\/mcp   with Claude Code's login/);
+  assert.match(listed.out, /failed: no Claude Code login for https:\/\/mcp\.slack\.com\/mcp — run: claude mcp add --transport http --scope user slack https:\/\/mcp\.slack\.com\/mcp, then: claude mcp login slack/);
+  assert.equal(run(['remove', 'slack']).code, 0);
   assert.equal(listed.code, 0, listed.err);
   assert.match(listed.out, /demo\s+stdio: .*fake-mcp-server\.mjs/);
   assert.match(listed.out, /env: DEMO_TOKEN/, 'the names the server is given');
@@ -366,6 +440,51 @@ test('sumo mcp: servers are added without their secrets, listed with their tools
   assert.match(s.sumo(['help']).out, /sumo mcp/);
 });
 
+test('sumo mcp exits 1 when every configured server failed, so a script can tell', () => {
+  const s = sandbox();
+  s.sumo(['mcp', 'add', 'gone', '--', '/no/such/binary']);
+  const listed = s.sumo(['mcp']);
+  assert.equal(listed.code, 1);
+  assert.match(listed.out, /gone\s+stdio: \/no\/such\/binary\n\s+failed: /);
+});
+
+test('Ctrl-C while sumo mcp waits on a server ends it as a Ctrl-C does, and the server it started goes with it', async () => {
+  const s = sandbox();
+  const pidFile = join(s.root, 'server.pid');
+  assert.equal(s.sumo(['mcp', 'add', 'slow', '--', '/bin/sh', '-c', `echo $$ > ${pidFile}; exec sleep 300`]).code, 0);
+  const listing = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', ENTRY, 'mcp'], { env: { ...process.env, ...NO_KEY, SUMO_AGENTS_HOME: s.home }, stdio: 'ignore' });
+  const ended = new Promise((resolve) => listing.on('close', (code, signal) => resolve({ code, signal })));
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const settled = async (check) => {
+    for (let i = 0; i < 250 && !check(); i++) await new Promise((r) => setTimeout(r, 20));
+    return check();
+  };
+  try {
+    assert.equal(await settled(() => existsSync(pidFile) && readFileSync(pidFile, 'utf8').trim() !== ''), true, 'the server started');
+    // The server is in a group of its own, so the terminal's Ctrl-C reaches only sumo: sumo has to take it along.
+    listing.kill('SIGINT');
+    assert.deepEqual(await ended, { code: 130, signal: null });
+    const server = Number(readFileSync(pidFile, 'utf8'));
+    assert.equal(await settled(() => !alive(server)), true, 'the server did not outlive the sumo that started it');
+  } finally {
+    listing.kill('SIGKILL');
+    if (existsSync(pidFile)) {
+      try {
+        process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+    }
+  }
+});
+
 test('a call that ran out of time is said to be of unknown outcome, so it is not made again as if it had never run; a server reached in clear text over the network is refused before it connects', async () => {
   await withHome(freshHome(), {}, async () => {
     configure({ demo: stdioSpec({ timeout: 300 }) });
@@ -380,4 +499,22 @@ test('a call that ran out of time is said to be of unknown outcome, so it is not
     await assert.rejects(connect('clear', { url: 'http://example.test/mcp' }), /plain http.*clear text/);
     await assert.rejects(connect('clear', { url: 'http://${HOST}/mcp' }), /plain http/, 'a host a placeholder names is on the network too');
   });
+});
+
+test('a server that answers with a redirect is refused: its headers and the call are never carried to wherever it points', async () => {
+  const caught = [];
+  const elsewhere = createServer((req, res) => {
+    caught.push({ headers: req.headers });
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{}');
+  });
+  await new Promise((r) => elsewhere.listen(0, '127.0.0.1', r));
+  const moving = createServer((req, res) => res.writeHead(307, { location: `http://127.0.0.1:${elsewhere.address().port}/mcp` }).end());
+  await new Promise((r) => moving.listen(0, '127.0.0.1', r));
+  try {
+    await assert.rejects(connect('moving', { url: `http://127.0.0.1:${moving.address().port}/mcp`, headers: { 'x-api-key': 'k-1234567890' } }, { env: {} }), /could not reach .*redirect/i);
+    assert.deepEqual(caught, [], 'nothing reached the place it pointed to');
+  } finally {
+    await new Promise((r) => moving.close(r));
+    await new Promise((r) => elsewhere.close(r));
+  }
 });

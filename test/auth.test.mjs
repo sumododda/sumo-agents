@@ -24,7 +24,7 @@ test('a Claude Code token works in its named variable or when it was put in ANTH
 
 test('an OAuth request carries the two auth betas and Claude Code identity before the caller system prompt', () => {
   const original = {
-    model: 'claude-haiku-4-5-20251001',
+    model: 'claude-haiku-5-5',
     betas: ['context-management-2025-06-27'],
     system: [{ type: 'text', text: 'Sumo rules', cache_control: { type: 'ephemeral' } }],
     messages: [{ role: 'user', content: 'hello' }],
@@ -37,8 +37,28 @@ test('an OAuth request carries the two auth betas and Claude Code identity befor
   assert.deepEqual(original.system, [{ type: 'text', text: 'Sumo rules', cache_control: { type: 'ephemeral' } }], 'the reusable request is not mutated');
 });
 
+// Measured on a Claude Code login (probes/oauth-features.mjs, Oct 28 2026): the fallback, an effort said by a message and
+// structured output without its old beta are all taken there, as on an API key.
+test('an OAuth request keeps the fallback and an effort said in the conversation: that path takes them as an API key does', () => {
+  const said = { role: 'system', content: [], output_config: { effort: 'low' } };
+  const original = {
+    model: 'claude-opus-5-5',
+    betas: ['context-management-2025-06-27', 'server-side-fallback-2026-07-01', 'mid-conversation-output-config-2026-07-01'],
+    fallbacks: 'default',
+    output_config: { effort: 'high' },
+    system: 'rules',
+    messages: [{ role: 'user', content: 'hello' }, { role: 'assistant', content: [{ type: 'text', text: 'hi' }] }, { role: 'system', content: [], output_config: { effort: 'medium' } }, { role: 'user', content: 'more' }, said],
+  };
+  const request = authenticatedRequest(original, { type: 'oauth', token: 'sk-ant-oat-test', source: 'CLAUDE_CODE_OAUTH_TOKEN' });
+  assert.equal(request.fallbacks, 'default');
+  assert.deepEqual(request.betas, ['claude-code-20250219', 'oauth-2025-04-20', 'context-management-2025-06-27', 'server-side-fallback-2026-07-01', 'mid-conversation-output-config-2026-07-01']);
+  assert.deepEqual(request.output_config, { effort: 'high' }, 'the request\'s own effort, with the one said last in the conversation');
+  assert.deepEqual(request.messages, original.messages, 'every message as it was: the effort messages too, so the cache holds');
+  assert.equal(original.messages.length, 5, 'the conversation itself is not changed');
+});
+
 test('API-key requests retain their exact body', () => {
-  const original = { model: 'claude-haiku-4-5-20251001', system: 'rules', messages: [{ role: 'user', content: 'hello' }] };
+  const original = { model: 'claude-haiku-5-5', system: 'rules', messages: [{ role: 'user', content: 'hello' }] };
   const request = authenticatedRequest(original, { type: 'api_key', token: 'sk-ant-api-test', source: 'ANTHROPIC_API_KEY' });
   assert.equal(request, original);
 });

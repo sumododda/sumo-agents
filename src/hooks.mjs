@@ -1,17 +1,17 @@
-import { appendFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
 import { card } from './card.mjs';
 import { getMeta, openDb, setMeta } from './db.mjs';
 import { backup } from './export.mjs';
 import { guardCommand, guardPath } from './guard.mjs';
 import { autoGuides, firingGuides, matchGuide, renderGuide } from './guides.mjs';
-import { paths } from './paths.mjs';
+import { appendLog } from './logs.mjs';
+import { expireUnusedGotchas, GOTCHA_UNUSED_DAYS } from './memory.mjs';
 import { prime } from './prime.mjs';
-import { detect, keepScratch, projectAt, touch } from './projects.mjs';
+import { detect, freshen, keepScratch, projectAt, touch } from './projects.mjs';
 import { closingQuestions, recallBeforeAsking } from './recall.mjs';
 import { line } from './render.mjs';
 import { shouldRun, spawnDetached } from './scribe.mjs';
-import { clearInjections, contextBand, contextNudge, contextUse, currentProject, endSession, ensureSession, injectedSlugs, markInjected, pruneStates, recordTurn, sessionsAwaitingDream } from './sessions.mjs';
+import { tidyDue } from './dream.mjs';
+import { clearInjections, contextBand, contextNudge, contextUse, currentProject, endSession, ensureSession, injectedSlugs, markInjected, pruneStates, recordTurn } from './sessions.mjs';
 import { claim, renderWorkflow, withoutSumoCalls } from './workflows.mjs';
 
 /**
@@ -23,10 +23,9 @@ import { claim, renderWorkflow, withoutSumoCalls } from './workflows.mjs';
  */
 
 const BACKUP_EVERY_MS = 7 * 24 * 3_600_000;
-const SESSIONS_TO_DREAM = 3;
 
 /** The one event shape. Field names are what the payload carries; a missing one is simply absent. */
-export function fieldsOf(p) {
+function fieldsOf(p) {
   return {
     sessionId: p.session_id,
     cwd: p.cwd ?? null,
@@ -53,7 +52,7 @@ const deny = (reason) => JSON.stringify({ deny: reason });
 const isRead = (tool) => tool === 'read' || tool === 'view';
 
 /** The guard, first and without memory: a destructive command or a secret file is refused on sight. */
-export function earlyRefusal(e) {
+function earlyRefusal(e) {
   if (e.toolName === 'bash' && e.command) return guardCommand(e.command, { cwd: e.cwd }) ?? '';
   if (isRead(e.toolName) && e.path) return guardPath(e.path) ?? '';
   return '';
@@ -91,7 +90,7 @@ function sizeNudge(db, e, now) {
  * was shown before, and whatever the switch says: the user asked for it.
  */
 function guideDue(db, e, now, taught) {
-  const name = e.guide ?? (!taught && autoGuides(db) ? matchGuide(e.prompt) : null);
+  const name = e.guide ?? (!taught && autoGuides() ? matchGuide(e.prompt) : null);
   if (!name || !firingGuides().some((g) => g.name === name)) return '';
   const slug = `guide:${name}`;
   if (!e.guide && db.prepare('SELECT 1 FROM session_injections WHERE session_id = ? AND slug = ?').get(e.sessionId, slug)) return '';
@@ -106,7 +105,7 @@ function guideDue(db, e, now, taught) {
  * left alone.
  */
 function unchecked(db, e) {
-  if (e.edited.length === 0 || !autoGuides(db)) return '';
+  if (e.edited.length === 0 || !autoGuides()) return '';
   const first = e.edited.slice(0, 3);
   const rest = e.edited.length > 3 ? `${e.edited.length - 3} more` : first.length > 1 ? first.pop() : null;
   const shown = rest ? `${first.join(', ')} and ${rest}` : first[0];
@@ -125,8 +124,8 @@ const HANDLERS = {
     // A fresh start wipes the cards from context; forgetting they were shown lets them come back.
     if (e.source === 'compact' || e.source === 'new') clearInjections(db, e.sessionId);
 
-    if (shouldRun(db, { event: 'session-start', now })) spawnDetached(['scribe', 'run']);
-    if (sessionsAwaitingDream(db, now, SESSIONS_TO_DREAM).length >= SESSIONS_TO_DREAM) spawnDetached(['dream', 'run']);
+    // One memory pass: it files what waits, and tidies too when conversations have finished or a week has gone by.
+    if (shouldRun(db, { event: 'session-start', now }) || tidyDue(db, now)) spawnDetached(['memory', 'run']);
 
     const last = getMeta(db, 'last_backup');
     if (!last || Date.parse(now) - Date.parse(last) > BACKUP_EVERY_MS) {
@@ -149,8 +148,16 @@ const HANDLERS = {
       // And this: scratch that cannot be made or tidied is said in the hook log; the session still gets its memory.
       logFailure('session-start scratch', cause);
     }
+    try {
+      // A trap nobody was ever shown, filed by an agent and never confirmed, lets go after a while; history keeps it.
+      const expired = expireUnusedGotchas(db, now);
+      if (expired > 0) appendLog('hook.log', `${now} session-start: ${expired} gotcha${expired === 1 ? '' : 's'} never shown in ${GOTCHA_UNUSED_DAYS} days let go (sumo history shows them)\n`);
+    } catch (cause) {
+      logFailure('session-start expire', cause);
+    }
 
-    return prime(db, { now });
+    // The questions put to the user are this session's: about everything, or the project it was started in.
+    return prime(db, { now, project: currentProject(db, e.sessionId) ?? (e.cwd ? projectAt(db, e.cwd) : null) });
   },
 
   prompt(db, e, now) {
@@ -167,7 +174,14 @@ const HANDLERS = {
       // Every mention is stamped, not only the first: the project named last is the one the session is about, also when its card was shown before.
       markInjected(db, e.sessionId, slug, now);
       if (shown.has(slug)) continue;
-      cards.push(card(db, slug, { now }));
+      // The card is built from the repository as it is now: a scan a week old, or older than a file it reads, is redone.
+      try {
+        freshen(db, slug, now);
+      } catch (cause) {
+        logFailure('prompt rescan', cause);
+      }
+      // Its questions come with it, unless the block this session started with asked them: a session started inside the project.
+      cards.push(card(db, slug, { now, asks: slug !== (e.cwd ? projectAt(db, e.cwd) : null) }));
     }
 
     const asked = claim(db, { sessionId: e.sessionId, text: e.prompt, scopes: scopesOf(db, e.sessionId), now });
@@ -210,7 +224,7 @@ const HANDLERS = {
 
   stop(db, e, now) {
     ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
-    if (shouldRun(db, { event: 'stop', now })) spawnDetached(['scribe', 'run']);
+    if (shouldRun(db, { event: 'stop', now })) spawnDetached(['memory', 'run']);
 
     // The other gates: a turn that ends on an edit nothing checked, or by asking the user something memory may
     // already hold. Already continuing because of one → whatever the turn ends on now goes to the user.
@@ -223,7 +237,7 @@ const HANDLERS = {
   'session-end'(db, e, now) {
     ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
     endSession(db, e.sessionId, now);
-    if (shouldRun(db, { event: 'session-end', now })) spawnDetached(['scribe', 'run']);
+    if (shouldRun(db, { event: 'session-end', now })) spawnDetached(['memory', 'run']);
     return '';
   },
 };
@@ -242,8 +256,7 @@ export function handleEvent(db, event, payload, now = new Date().toISOString()) 
 /** What went wrong, in logs/hook.log. If even the log cannot be written there is nothing left to do but stay out of the way. */
 function logFailure(what, cause) {
   try {
-    mkdirSync(paths().logs, { recursive: true, mode: 0o700 });
-    appendFileSync(join(paths().logs, 'hook.log'), `${new Date().toISOString()} ${what}: ${cause.stack ?? cause}\n`);
+    appendLog('hook.log', `${new Date().toISOString()} ${what}: ${cause.stack ?? cause}\n`);
   } catch {
     // Said above.
   }

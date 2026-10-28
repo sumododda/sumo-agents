@@ -34,10 +34,10 @@ test('the chat router is shown the project and the turn, answers a route, and a 
       assert.deepEqual(await chooseChatRoute(db, { project: null, text: 'what does this repo do?' }), { model: 'sonnet', effort: 'medium', reason: 'an ordinary fix with a clear spec' });
       assert.match(JSON.parse(readFileSync(routerSaw, 'utf8')).prompt, /project: none/);
 
-      answer(routerAnswer, { kind: 'mechanical', surface: 'one spot', risky: false, model: 'haiku', effort: 'none', reason: 'a typo' });
-      assert.deepEqual(await chooseChatRoute(db, { project, text: 'typo in the readme' }), { model: 'haiku', effort: 'none', reason: 'a typo' });
+      answer(routerAnswer, { kind: 'mechanical', surface: 'one spot', risky: false, model: 'haiku', effort: 'low', reason: 'a typo' });
+      assert.deepEqual(await chooseChatRoute(db, { project, text: 'typo in the readme' }), { model: 'haiku', effort: 'low', reason: 'a typo' });
 
-      answer(routerAnswer, { model: 'haiku', effort: 'high', reason: 'off the grammar' });
+      answer(routerAnswer, { model: 'haiku', effort: 'none', reason: 'off the grammar' });
       await assert.rejects(chooseChatRoute(db, { project, text: 'x' }), /the router failed: the router answered outside its schema/);
 
       rmSync(routerAnswer, { force: true });

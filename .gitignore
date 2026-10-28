@@ -9,3 +9,4 @@ BRIEFING.md
 .claude/
 .DS_Store
 dist/
+.sandbox-test-*/

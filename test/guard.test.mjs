@@ -209,6 +209,45 @@ test('loading a secret file in one command and printing something else in the ne
   }
 });
 
+test('any command that names a secret file reads it unless it only loads, lists, writes or passes it on: a reader not on any list is refused too', () => {
+  // The audit's: readers no list of printing commands named.
+  for (const command of [
+    'sort .env',
+    'diff .env .env.example',
+    'git diff --no-index .env.example .env',
+    'comm .env other.txt',
+    'cut -d= -f1 .env',
+    'paste .env',
+    "awk '{print}' .env",
+    'sed -n p .env',
+    'xxd .env',
+    'od -c .env',
+    'strings .env',
+    'git show HEAD:.env',
+    'cp .env /tmp/leak.txt',
+    'python3 -c "print(open(\'.env\').read())"',
+    'X=1 sort .env',
+    'cat < .env',
+  ]) {
+    assert.match(guardCommand(command) ?? '', /^Refused: .*secret/i, `should refuse: ${command}`);
+  }
+  // Naming it without its contents reaching the model.
+  for (const command of [
+    'echo "API_URL=http://localhost" >> .env',
+    'cat .env.example > .env',
+    'mv .env .env.bak',
+    'chmod 600 .env',
+    'test -f .env && echo present',
+    'touch .env',
+    'rm .env.local',
+    'git add .gitignore && git status',
+    'git check-ignore .env',
+    'printf "%s\\n" .env >> .gitignore',
+  ]) {
+    assert.equal(guardCommand(command), null, `should allow: ${command}`);
+  }
+});
+
 test('a secret file is a secret in any case and through a redirect, and git\'s stored credentials are one', () => {
   for (const command of ['cat .ENV', 'grep KEY .Env.local', 'cat <.env', 'echo "$(< .env)"', 'cat ~/.git-credentials', 'head ~/.ssh/ID_RSA', 'cat certs/SERVER.PEM']) {
     assert.match(guardCommand(command) ?? '', /^Refused: .*secret/i, command);

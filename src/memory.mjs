@@ -1,13 +1,13 @@
 import { createHash } from 'node:crypto';
 import { getMeta, setMeta, tx } from './db.mjs';
 import { redact } from './redact.mjs';
-import { clip, ftsQuery, overlap, sharedStems, stem, words } from './text.mjs';
+import { cjkTerms, clip, containing, ftsQuery, overlap, sharedStems, stem, words } from './text.mjs';
 import { matchWithin } from './workflows.mjs';
 
 /** How much of a search that found nothing is kept as the record of it. */
 const MISS_KEPT = 200;
 
-export const TYPES = ['preference', 'fact', 'decision', 'gotcha', 'procedure'];
+const TYPES = ['preference', 'fact', 'decision', 'gotcha', 'procedure'];
 
 const IMPORTANCE = { preference: 0.8, procedure: 0.8, decision: 0.7, gotcha: 0.6, fact: 0.5 };
 const PROVENANCE_WEIGHT = { stated: 1, observed: 0.9, scanned: 0.7, inferred: 0.5 };
@@ -26,13 +26,23 @@ const NEVER_GATED = ['', 'ls', 'cd src', 'git status', 'cat README.md'];
 const RUNAWAY = ['a'.repeat(40), 'word '.repeat(30), ' '.repeat(60), '1'.repeat(40), 'gh pr create '.repeat(8)].map((text) => `${text}!`);
 
 /** A mistake in how `sumo` was called (exit 2), as opposed to something going wrong (exit 1). */
-export class UsageError extends Error {}
+export class UsageError extends Error {
+  exit = 2;
+}
+/** Understood, and not done: what it names is not there, not in a state for it, or not the asker's to do (exit 1). */
+export class Refusal extends UsageError {
+  exit = 1;
+}
+/** Not done for want of an Anthropic credential in this shell (exit 4, as other tools say "log in first"). */
+export class NeedsCredential extends UsageError {
+  exit = 4;
+}
 
 /**
  * A gate is a regular expression over a shell command: the commands a workflow has to come before.
  * It is written once, by whoever teaches the workflow, and shown to the user — stated, not guessed.
  */
-export function checkGate(raw) {
+function checkGate(raw) {
   const pattern = String(raw ?? '').trim();
   const example = 'a gate is a regular expression over the shell command, e.g. gh(-axi)? pr create';
   if (!pattern) throw new UsageError(example);
@@ -53,7 +63,7 @@ export function checkGate(raw) {
 
 export function setGate(db, id, raw) {
   const row = get(db, id);
-  if (row.type !== 'procedure') throw new UsageError(`m${id} is not a workflow — only a workflow can gate a command`);
+  if (row.type !== 'procedure') throw new Refusal(`m${id} is not a workflow — only a workflow can gate a command`);
   const gate = raw === null ? null : checkGate(raw);
   db.prepare('UPDATE memories SET gate = ? WHERE id = ?').run(gate, id);
   return get(db, id);
@@ -73,7 +83,7 @@ export function resolveProject(db, nameOrAlias) {
   if (!row) {
     const known = db.prepare(`SELECT slug FROM projects WHERE status = 'active' ORDER BY slug LIMIT 9`).all().map((r) => r.slug);
     const listed = known.length === 0 ? '' : ` (known: ${known.slice(0, 8).join(', ')}${known.length > 8 ? ', …' : ''})`;
-    throw new UsageError(`unknown project "${nameOrAlias}"${listed} — register it first: sumo project add <path>`);
+    throw new Refusal(`unknown project "${nameOrAlias}"${listed} — register it first: sumo project add <path>`);
   }
   return row.slug;
 }
@@ -84,13 +94,13 @@ function scopeFor(db, project) {
 
 export function get(db, id) {
   const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
-  if (!row) throw new UsageError(`no memory m${id}`);
+  if (!row) throw new Refusal(`no memory m${id}`);
   return row;
 }
 
 function requireActive(db, id, verb) {
   const row = get(db, id);
-  if (row.state !== 'active') throw new UsageError(`m${id} is ${row.state} — only an active memory can be ${verb}`);
+  if (row.state !== 'active') throw new Refusal(`m${id} is ${row.state} — only an active memory can be ${verb}`);
   return row;
 }
 
@@ -256,6 +266,30 @@ export function markHits(db, ids, now) {
 }
 
 /**
+ * What the index found, with the memories holding a Chinese, Japanese or Korean word of the search: the index keeps a
+ * run of those characters as one word, so a word inside it is looked for in the text itself, under the same `filters`.
+ * One found that way ranks by the share of those words it holds, the best the index found counting as all of them.
+ * With no such word, the index alone answers, unchanged.
+ */
+function withCjk(db, terms, found, filters, params) {
+  if (terms.length === 0) return found;
+  const fields = ['title', 'cue', 'body', 'topic', 'keys'];
+  const holds = terms.flatMap(() => fields.map((f) => `m.${f} LIKE ? ESCAPE '\\'`)).join(' OR ');
+  const rows = db
+    .prepare(`SELECT m.* FROM memories m WHERE (${holds})${filters.map((w) => ` AND ${w}`).join('')}`)
+    .all(...terms.flatMap((t) => fields.map(() => containing(t))), ...params);
+  const best = found.length > 0 ? found.reduce((min, row) => Math.min(min, row.rank), 0) : -1;
+  const byId = new Map(found.map((row) => [row.id, row]));
+  for (const row of rows) {
+    const text = fields.map((f) => row[f] ?? '').join(' ').toLowerCase();
+    const rank = (best * terms.filter((t) => text.includes(t)).length) / terms.length;
+    const known = byId.get(row.id);
+    if (!known || rank < known.rank) byId.set(row.id, { ...row, rank });
+  }
+  return [...byId.values()];
+}
+
+/**
  * Ranked search. Scope is `global` plus the named project; other projects stay
  * invisible unless `everywhere` is set — only their hit counts come back, so
  * the caller learns where to look without one project's memory leaking into
@@ -268,7 +302,8 @@ export function search(db, query, opts = {}) {
   const match = ftsQuery(query);
   if (!match) throw new UsageError('nothing to search for');
   if (opts.type && !TYPES.includes(opts.type)) {
-    throw new UsageError(`unknown type "${opts.type}" — one of: ${TYPES.join(', ')}`);
+    // Said as the user knows them: a procedure is a workflow everywhere they look.
+    throw new UsageError(`unknown type "${opts.type}" — one of: ${TYPES.map((t) => (t === 'procedure' ? 'workflow' : t)).join(', ')}`);
   }
 
   const projectScope = opts.project ? scopeFor(db, opts.project) : null;
@@ -292,12 +327,13 @@ export function search(db, query, opts = {}) {
     params.push(opts.before);
   }
 
-  const rows = db
+  const found = db
     .prepare(
       `SELECT m.*, bm25(memories_fts) AS rank FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
        WHERE ${where.join(' AND ')}`,
     )
     .all(...params);
+  const rows = withCjk(db, cjkTerms(query), found, where.slice(1), params.slice(1));
 
   const inScope = (row) => opts.everywhere || row.scope === 'global' || row.scope === projectScope;
   // OR-ed words match on any one of them. Fine for words a caller picked; a caller searching with
@@ -313,8 +349,10 @@ export function search(db, query, opts = {}) {
 
   const elsewhere = {};
   for (const row of rows) if (!inScope(row)) elsewhere[row.scope] = (elsewhere[row.scope] ?? 0) + 1;
+  // Matches past the limit, counted, so a list cut short says so.
+  const more = candidates.length - results.length;
 
-  if (opts.record === false) return { results, elsewhere };
+  if (opts.record === false) return { results, elsewhere, more };
   if (results.length > 0) {
     markHits(db, results.map((r) => r.id), now);
   } else {
@@ -328,7 +366,7 @@ export function search(db, query, opts = {}) {
     );
   }
 
-  return { results, elsewhere };
+  return { results, elsewhere, more };
 }
 
 /** Every memory connected to `id` by supersession, oldest first. */
@@ -385,16 +423,105 @@ export function forget(db, id, { purge = false, now = new Date().toISOString() }
 }
 
 /** The user said yes to a guess: from here on it carries the weight of something they stated. */
-export function confirm(db, id) {
+export function confirm(db, id, { byUser = true } = {}) {
   const row = get(db, id);
-  if (row.state !== 'unconfirmed') throw new UsageError(`m${id} is ${row.state} — only an unconfirmed memory can be confirmed`);
+  if (row.state !== 'unconfirmed') throw new Refusal(`m${id} is ${row.state} — only an unconfirmed memory can be confirmed`);
+  // Held because what it says came from a page or an MCP server the model read: the model may not vouch for it.
+  if (row.held_for === 'outside' && !byUser) throw new Refusal(`m${id} came from a conversation that read the web or an MCP server: only the user confirms it — on the memory page (/memory), or with sumo confirm in their own terminal`);
   db.prepare(`UPDATE memories SET state = 'active', provenance = 'stated' WHERE id = ?`).run(id);
   return get(db, id);
 }
 
 export function reject(db, id, now = new Date().toISOString()) {
   const row = get(db, id);
-  if (row.state !== 'unconfirmed') throw new UsageError(`m${id} is ${row.state} — only an unconfirmed memory can be rejected`);
+  if (row.state !== 'unconfirmed') throw new Refusal(`m${id} is ${row.state} — only an unconfirmed memory can be rejected`);
   db.prepare(`UPDATE memories SET state = 'rejected', invalid_at = ? WHERE id = ?`).run(now, id);
   return get(db, id);
+}
+
+/** How long a gotcha an agent filed may go unshown before it is let go. */
+export const GOTCHA_UNUSED_DAYS = 45;
+const DAY_MS = 86_400_000;
+
+/**
+ * Lets go of the traps agents filed that nobody was ever shown: observed, unpinned, no hits, older than
+ * GOTCHA_UNUSED_DAYS. Let go the way `sumo forget` does — state `invalid`, the row and its history kept. What the user
+ * said, pinned, or was shown is never touched. Returns how many went.
+ */
+export function expireUnusedGotchas(db, now = new Date().toISOString()) {
+  const before = new Date(Date.parse(now) - GOTCHA_UNUSED_DAYS * DAY_MS).toISOString();
+  const unused = db
+    .prepare(`SELECT id FROM memories WHERE type = 'gotcha' AND state = 'active' AND provenance = 'observed' AND pinned = 0 AND hits = 0 AND created_at < ?`)
+    .all(before);
+  tx(db, () => {
+    for (const { id } of unused) forget(db, id, { now });
+  });
+  return unused.length;
+}
+
+/** The writers whose memories start as a model's guess; one confirmed by the user becomes `stated` and keeps no quote. */
+const GUESSING_WRITERS = ['scribe', 'dream', 'worker'];
+/** How old a project's scan may be before memory health names it. */
+const SCAN_STALE_DAYS = 7;
+
+/**
+ * How memory is doing, as plain values for whoever says it — doctor, the memory status:
+ * - `lastTurnAt`: when the user was last heard (null: never);
+ * - `lastPass`: the last memory pass, `{ at, ok, error }` (null: never ran);
+ * - `waiting`, `oldestWaitingDays`: guesses waiting for the user, and the age of the oldest;
+ * - `guesses`: of the guesses settled, how many the user confirmed and rejected, and the share confirmed;
+ * - `scans`: active projects whose scan is more than a week old, oldest first, with its age in days.
+ */
+export function memoryHealth(db, now = new Date().toISOString()) {
+  const daysSince = (at) => Math.floor((Date.parse(now) - Date.parse(at)) / DAY_MS);
+  const lastTurnAt = db.prepare('SELECT MAX(ts) AS at FROM user_turns').get().at ?? null;
+  const pass = db.prepare(`SELECT ts, ok, note FROM model_runs WHERE kind IN ('scribe', 'dream') ORDER BY ts DESC, id DESC LIMIT 1`).get();
+  const lastPass = pass ? { at: pass.ts, ok: pass.ok === 1, error: pass.ok === 1 ? null : pass.note } : null;
+  const waitingRow = db.prepare(`SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM memories WHERE state = 'unconfirmed'`).get();
+  const writers = GUESSING_WRITERS.map(() => '?').join(', ');
+  const confirmed = db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE provenance = 'stated' AND source_quote IS NULL AND written_by IN (${writers})`).get(...GUESSING_WRITERS).n;
+  const rejected = db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE state = 'rejected'`).get().n;
+  const scans = db
+    .prepare(`SELECT slug, scanned_at FROM projects WHERE status = 'active' AND scanned_at IS NOT NULL ORDER BY scanned_at`)
+    .all()
+    .map((p) => ({ slug: p.slug, days: daysSince(p.scanned_at) }))
+    .filter((p) => p.days > SCAN_STALE_DAYS);
+  return {
+    lastTurnAt,
+    lastPass,
+    waiting: waitingRow.n,
+    oldestWaitingDays: waitingRow.oldest ? daysSince(waitingRow.oldest) : null,
+    guesses: { confirmed, rejected, rate: confirmed + rejected > 0 ? confirmed / (confirmed + rejected) : null },
+    scans,
+  };
+}
+
+/** How long ago, in the largest whole unit: `3d ago`, `5h ago`, `just now`. */
+function sinceSaid(at, now) {
+  const hours = (Date.parse(now) - Date.parse(at)) / 3_600_000;
+  if (hours >= 24) return `${Math.floor(hours / 24)}d ago`;
+  return hours >= 1 ? `${Math.floor(hours)}h ago` : 'just now';
+}
+/** A scan this old is a warning, not a note. */
+const SCAN_WARN_DAYS = 30;
+
+/**
+ * Memory health said in one line, for doctor and the memory status: `{ ok, label, fix }`. Not ok — a warning — when the
+ * last pass failed or a project's scan is a month old; `fix` says what to do about each.
+ */
+export function memoryHealthLine(health, now = new Date().toISOString()) {
+  const parts = [
+    health.lastTurnAt ? `last heard ${sinceSaid(health.lastTurnAt, now)}` : 'nothing heard yet',
+    health.lastPass ? `last pass ${sinceSaid(health.lastPass.at, now)}${health.lastPass.ok ? '' : ', failed'}` : 'no memory pass yet',
+    health.waiting > 0 ? `${health.waiting} guess${health.waiting === 1 ? '' : 'es'} waiting, the oldest ${health.oldestWaitingDays}d` : 'no guesses waiting',
+  ];
+  if (health.guesses.rate !== null) parts.push(`${Math.round(health.guesses.rate * 100)}% of guesses confirmed`);
+  if (health.scans.length > 0) {
+    const named = health.scans.slice(0, 3).map((p) => `${p.slug}, ${p.days}d`).join('; ');
+    parts.push(`${health.scans.length} project scan${health.scans.length === 1 ? '' : 's'} over ${SCAN_STALE_DAYS} days old (${named}${health.scans.length > 3 ? '; …' : ''})`);
+  }
+  const failed = health.lastPass && !health.lastPass.ok;
+  const old = health.scans.filter((p) => p.days > SCAN_WARN_DAYS);
+  const fix = [failed ? `the last pass failed: ${health.lastPass.error}` : null, old.length > 0 ? `rescan: sumo project rescan ${old[0].slug}${old.length > 1 ? ` (and ${old.length - 1} more)` : ''}` : null].filter(Boolean).join('; ');
+  return { ok: !failed && old.length === 0, label: `memory: ${parts.join(' · ')}`, fix };
 }

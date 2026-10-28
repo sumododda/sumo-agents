@@ -136,14 +136,16 @@ describe('the chat terminal rendering', () => {
     const edit = { name: 'str_replace_based_edit_tool', input };
     // What the editor says it did: where the old text began, and the text as the file had it and has it now.
     const done = { content: 'edited /p/cart.js', isError: false, edit: { line: 3, old: input.old_str, new: input.new_str } };
+    // The line that came stands under the one that went, what it added marked: here nothing went from the old line, so it has no mark.
     assert.deepEqual(toolView(edit, done), {
       title: 'Update',
       detail: '/p/cart.js:4',
       stat: { added: 1, removed: 1 },
+      rows: 12,
       lines: [
         { text: '3     for (const item of items) {', tone: 'dim' },
         { text: '4 -     sum += item.price;', tone: 'del' },
-        { text: '4 +     sum += item.price * (item.quantity ?? 1);', tone: 'add' },
+        { text: '4 +     sum += item.price * (item.quantity ?? 1);', tone: 'add', span: [25, 48] },
         { text: '5     }', tone: 'dim' },
       ],
     });
@@ -157,17 +159,19 @@ describe('the chat terminal rendering', () => {
     assert.deepEqual(toolView(edit, { content: 'edited /p/cart.js', isError: false }).lines.map((l) => l.text), ['    for (const item of items) {', '-     sum += item.price;', '+     sum += item.price * (item.quantity ?? 1);', '    }']);
     assert.deepEqual(toolView(edit, { content: 'old_str was not found in /p/cart.js', isError: true }).lines, [{ text: 'old_str was not found in /p/cart.js', tone: 'error' }], 'a refused edit shows the refusal, not the diff');
 
-    // A big change folded: what went and what came each keep their top, so what was added is never folded away whole.
+    // A big change: each line that went over the one that came, so what was added is never folded away whole — the screen
+    // folds it by the rows it takes (`rows`), the pager shows it all.
     const many = (n, word) => Array.from({ length: n }, (_, i) => `${word} ${i}`).join('\n');
     const big = toolView({ name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: '/p/a.mjs', old_str: many(20, 'old'), new_str: many(20, 'new') } }, { content: 'edited', isError: false, edit: { line: 1, old: many(20, 'old'), new: many(20, 'new') } });
     assert.deepEqual(big.stat, { added: 20, removed: 20 });
-    assert.ok(big.lines.some((l) => l.tone === 'add' && /new 0$/.test(l.text)) && big.lines.some((l) => l.tone === 'del' && /old 0$/.test(l.text)), 'both sides show');
-    assert.equal(big.lines.filter((l) => /^… \+\d+ lines$/.test(l.text)).length, 2, 'and each says how much more there is');
-    assert.ok(big.lines.length <= 14);
+    assert.deepEqual(big.lines.slice(0, 4).map((l) => l.text), [' 1 - old 0', ' 1 + new 0', ' 2 - old 1', ' 2 + new 1'], 'in pairs');
+    assert.equal(big.lines.length, 40);
+    assert.equal(big.rows, 12);
+    assert.equal(toolView({ name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: '/p/a.mjs', old_str: 'a', new_str: 'b' } }, { content: 'edited', isError: false, edit: { line: 1, old: 'a', new: 'b' } }, { full: true }).rows, null, 'in full, nothing is folded');
 
     // An insert: the lines that came, numbered from the line they landed on.
     const insert = { name: 'str_replace_based_edit_tool', input: { command: 'insert', path: '/p/a.mjs', insert_line: 2, insert_text: 'x\ny\n' } };
-    assert.deepEqual(toolView(insert, { content: 'inserted', isError: false, edit: { line: 3, old: '', new: 'x\ny' } }), { title: 'Update', detail: '/p/a.mjs:3', stat: { added: 2, removed: 0 }, lines: [{ text: '3 + x', tone: 'add' }, { text: '4 + y', tone: 'add' }] });
+    assert.deepEqual(toolView(insert, { content: 'inserted', isError: false, edit: { line: 3, old: '', new: 'x\ny' } }), { title: 'Update', detail: '/p/a.mjs:3', stat: { added: 2, removed: 0 }, rows: 12, lines: [{ text: '3 + x', tone: 'add' }, { text: '4 + y', tone: 'add' }] });
 
     const view = { name: 'str_replace_based_edit_tool', input: { command: 'view', path: '/p/a.mjs', view_range: [1, 40] } };
     assert.deepEqual(toolView(view, { content: '1\ta\n2\tb', isError: false }), { title: 'Read', detail: '/p/a.mjs:1-40', lines: [{ text: '2 lines', tone: 'dim' }] });
@@ -369,16 +373,17 @@ describe('the conversation as text for a pager', () => {
       { kind: 'footer', text: '48s · 2 calls · $0.07' },
     ];
     const text = transcript(log, styles(false), { width: 80, cwd: '/work/shop' });
-    assert.ok(text.startsWith('┃ fix the total\n┃ and say why\n\n⏺ Looking at cart.js.\n\n⏺ Bash(npm test # xxx'), text.slice(0, 120));
+    assert.ok(text.startsWith('┃ fix the total\n┃ and say why\n\n⏺ Looking at cart.js.\n\n✗ Bash(npm test # xxx'), text.slice(0, 120));
     assert.ok(text.includes('x'.repeat(300)), 'the command whole');
     assert.match(text, /⎿ {2}line 1\n {5}line 2\n[\s\S]* {5}line 30\n/);
     assert.equal(text.match(/line \d+/g).length, 30, 'every line it printed');
     assert.match(text, /\n⏺ Update\(cart\.js:4\) \+1 −1\n {2}⎿ {2}4 - a\n {5}4 \+ b\n/);
     assert.match(text, /\n┃ ! git status\n {2}⎿ {2}clean\n/);
-    assert.match(text, /\n⏺ j7 scout · sonnet\/low — look\n {2}⎿ {2}Interrupted\n\nerror: 529\n\n {2}48s · 2 calls · \$0\.07\n$/);
+    // A failure has its mark here too, as on the screen.
+    assert.match(text, /\n⏺ j7 scout · sonnet\/low — look\n {2}⎿ {2}Interrupted\n\n✗ error: 529\n\n {2}48s · 2 calls · \$0\.07\n$/);
     assert.doesNotMatch(text, /opus · high/, 'the header is the screen\'s');
     // In colour where the terminal has it.
-    assert.match(transcript(log, styles(true), { width: 80 }), /\x1b\[31m⏺\x1b\[39m \x1b\[1mBash/);
+    assert.match(transcript(log, styles(true), { width: 80 }), /\x1b\[31m✗\x1b\[39m \x1b\[1mBash/);
   });
 });
 
@@ -510,5 +515,37 @@ describe('code, links and tables, as a reader wants them', () => {
       '# Sumo — shop\n\n**You**\n\n> fix it\n> please\n\n<details><summary>Thought for 4s</summary>\n\n```\nThe loop stops short.\n```\n\n</details>\n\nOn it — **now**.\n\n<details><summary>Bash(echo ```)</summary>\n\n````\n```\nok\n````\n\n</details>\n\n**error: the API failed** — 500\n\n_4s · 1 call_\n',
       'a fence longer than any in what it holds',
     );
+  });
+});
+
+describe('plain mode, drawn for a screen reader', () => {
+  it('reads a table as records and a code block by its name — no frames for a reader to spell out', () => {
+    const plain = styles(false, { plain: true });
+    const out = [];
+    const r = createRenderer((t) => out.push(t), plain, { width: 100 });
+    r.write('| file | change |\n|---|---|\n| app.js | +3 |\n\nok\n```js\nconst a = 1;\n```\n');
+    r.end?.();
+    const text = out.join('\n');
+    assert.match(text, /- file: app\.js\n  change: \+3/);
+    assert.match(text, /^ {4}code \(js\):$/m);
+    assert.match(text, /^ {4}end of code$/m);
+    assert.doesNotMatch(text, /\+-|\+---|\|/, 'no ASCII frame, rule or bar');
+  });
+});
+
+describe('what a call came back with, on the screen', () => {
+  it('folded, it is what was written for the screen when there is such a thing; in full, every word the model was given', () => {
+    const call = { name: 'bash', input: { command: 'touch ~/x' } };
+    const result = { content: 'touch: denied\n(the sandbox blocked a write — only these can be written: /a, /b)\n(the user declined: do not run it again)', isError: true, shown: 'touch: denied\ndeclined: not run outside the sandbox' };
+    assert.deepEqual(toolView(call, result).lines.map((l) => l.text), ['touch: denied', 'declined: not run outside the sandbox']);
+    assert.match(toolView(call, result, { full: true }).lines.map((l) => l.text).join('\n'), /only these can be written/);
+  });
+  it('folded, one very long line is cut to a few rows, not left to fill the window', () => {
+    const call = { name: 'bash', input: { command: 'echo' } };
+    const long = `paths: ${'/private/var/folders/xy/T, '.repeat(200)}`;
+    const [line] = toolView(call, { content: long, isError: false }).lines;
+    assert.ok(line.text.length <= 400, `${line.text.length} characters`);
+    assert.match(line.text, / …$/);
+    assert.equal(toolView(call, { content: long, isError: false }, { full: true }).lines[0].text, long, 'in full, all of it');
   });
 });

@@ -32,7 +32,7 @@ test('a ledger from before the cache columns migrates, keeps its rows, and reads
       assert.equal(rows.length, 1);
       assert.deepEqual(
         { ...rows[0], id: undefined },
-        { id: undefined, ts: NOW, kind: 'scribe', model: 'haiku', input_tokens: 100, output_tokens: 10, cost_usd: 0.001, ok: 1, note: 'old row', cache_read_tokens: null, cache_creation_tokens: null, job_id: null, session_id: null },
+        { id: undefined, ts: NOW, kind: 'scribe', model: 'haiku', input_tokens: 100, output_tokens: 10, cost_usd: 0.001, ok: 1, note: 'old row', cache_read_tokens: null, cache_creation_tokens: null, job_id: null, session_id: null, cache_cause: null },
       );
       assert.deepEqual(modelStats(db), ['scribe: 1 run (1 ok) · 100 tokens in · 10 out · $0.0010 · cache 0 read · 0 written']);
     } finally {
@@ -54,7 +54,8 @@ test('a half-applied upgrade that already has some of the cache columns adds onl
     try {
       assert.equal(schemaVersion(db), SCHEMA_VERSION);
       const columns = db.prepare('PRAGMA table_info(model_runs)').all().map((c) => `${c.name} ${c.type}`);
-      assert.deepEqual(columns.slice(-4), ['cache_read_tokens INTEGER', 'cache_creation_tokens INTEGER', 'job_id INTEGER', 'session_id TEXT']);
+      // The cause column was there already, so the two put back come after it.
+      assert.deepEqual(columns.slice(-5), ['cache_read_tokens INTEGER', 'cache_creation_tokens INTEGER', 'cache_cause TEXT', 'job_id INTEGER', 'session_id TEXT']);
       assert.equal(db.prepare('SELECT COUNT(*) AS n FROM model_runs').get().n, 1);
     } finally {
       db.close();

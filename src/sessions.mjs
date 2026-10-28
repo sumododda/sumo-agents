@@ -2,10 +2,10 @@ import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, re
 import { join } from 'node:path';
 import { ago } from './card.mjs';
 import { heldBy } from './lock.mjs';
-import { UsageError } from './memory.mjs';
+import { Refusal, UsageError } from './memory.mjs';
 import { paths } from './paths.mjs';
 import { redact } from './redact.mjs';
-import { clip, head } from './text.mjs';
+import { cjkTerms, clip, containing, head } from './text.mjs';
 import { readBackwards } from './transcript.mjs';
 
 const TURN_MAX_CHARS = 4000;
@@ -50,6 +50,28 @@ export function recordTurn(db, { sessionId, text, now }) {
     .run(sessionId, now, kept, cleaned.count > 0 ? 1 : 0);
   db.prepare("UPDATE sessions SET last_turn_at = ?, dream_state = 'pending' WHERE id = ?").run(now, sessionId);
   return Number(lastInsertRowid);
+}
+
+/**
+ * A call that reached past the machine — a web search or fetch, an MCP server — written on its session, each tool once:
+ * what the conversation says after it may be what a page told it, so the memory pass holds what it would file from the
+ * conversation's replies for the user (arXiv 2503.03704: memory written from injected content is read later as trusted).
+ * A session not recorded yet gets nothing: a call comes after the turn that recorded it.
+ */
+export function noteSessionOutside(db, sessionId, tool) {
+  if (!sessionId) return;
+  const name = String(tool).replace(/\s+/g, ' ');
+  const row = db.prepare('SELECT outside_read FROM sessions WHERE id = ?').get(sessionId);
+  if (!row || (row.outside_read ?? '').split('\n').includes(name)) return;
+  db.prepare('UPDATE sessions SET outside_read = ? WHERE id = ?').run(row.outside_read ? `${row.outside_read}\n${name}` : name, sessionId);
+}
+
+/** The tools any of these sessions read past the machine with, each once, in the order first seen. */
+export function outsideReadsOf(db, sessionIds) {
+  const ids = [...new Set(sessionIds)].filter(Boolean);
+  if (ids.length === 0) return [];
+  const rows = db.prepare(`SELECT outside_read FROM sessions WHERE id IN (${ids.map(() => '?').join(', ')}) AND outside_read IS NOT NULL`).all(...ids);
+  return [...new Set(rows.flatMap((r) => r.outside_read.split('\n')))];
 }
 
 export function endSession(db, id, now) {
@@ -108,14 +130,27 @@ export function sessionsAwaitingDream(db, now, limit = 5, { includeOpen = false 
     .all(includeOpen ? 1 : 0, cutoff, limit);
 }
 
-/** What the user actually typed, searched word for word. */
+/**
+ * What the user actually typed, searched word for word: `match` is `ftsQuery`'s expression. A Chinese, Japanese or
+ * Korean word sits inside a run the index keeps as one word, so it is looked for in the text itself: what holds the most
+ * of those words, newest first, after what the index found.
+ */
 export function searchTurns(db, match, limit = 8) {
-  return db
+  const found = db
     .prepare(
       `SELECT t.* FROM user_turns_fts JOIN user_turns t ON t.id = user_turns_fts.rowid
        WHERE user_turns_fts MATCH ? ORDER BY bm25(user_turns_fts), t.id DESC LIMIT ?`,
     )
     .all(match, limit);
+  const terms = cjkTerms(match);
+  if (terms.length === 0 || found.length >= limit) return found;
+  const holds = terms.map(() => `(text LIKE ? ESCAPE '\\')`);
+  const patterns = terms.map(containing);
+  const seen = new Set(found.map((t) => t.id));
+  const more = db
+    .prepare(`SELECT * FROM user_turns WHERE ${holds.join(' OR ')} ORDER BY ${holds.join(' + ')} DESC, id DESC LIMIT ?`)
+    .all(...patterns, ...patterns, limit + found.length);
+  return [...found, ...more.filter((t) => !seen.has(t.id))].slice(0, limit);
 }
 
 /**
@@ -162,8 +197,8 @@ const inK = (tokens) => `${Math.round(tokens / 1000)}k`;
  */
 export function contextNudge(band, focus) {
   const hint = `hint: focus on ${focus}; keep decisions and open job ids in a note; drop tool output and file contents.`;
-  if (band === 'act') return `context: very large — start fresh now: note where you are (sumo job note; the end of the turn records "Left off"), then tell the user to type /new. ${hint}`;
-  return `context: large — quality drops from here. Finish the piece in hand, then tell the user to type /new: the memory block brings the thread back. ${hint}`;
+  if (band === 'act') return `context: very large — start fresh now: note where you are (sumo job note; the end of the turn records "Left off"), then tell the user to type /handoff, which carries your hand-off into a fresh session, or /new. ${hint}`;
+  return `context: large — quality drops from here. Finish the piece in hand, then tell the user to type /handoff: a fresh session starts from your hand-off, and the memory block brings the thread back. ${hint}`;
 }
 
 /**
@@ -218,7 +253,7 @@ function keepBlock(block) {
 }
 
 /** The conversation as it is kept on disk: no pictures, no secrets, no cache markers (they are placed again when it is sent). */
-export function keepable(messages) {
+function keepable(messages) {
   return messages.map((m) => ({ role: m.role, content: typeof m.content === 'string' ? redact(m.content).text : m.content.map(keepBlock) }));
 }
 
@@ -253,9 +288,9 @@ export function loadState(id) {
     state = JSON.parse(readFileSync(stateFile(id), 'utf8'));
   } catch (cause) {
     if (cause.code === 'ENOENT') return null;
-    throw new UsageError(`the saved session ${shortId(id)} cannot be read: ${cause.message}`);
+    throw new Refusal(`the saved session ${shortId(id)} cannot be read: ${cause.message}`);
   }
-  if (state?.version !== 1 || !Array.isArray(state.messages)) throw new UsageError(`the saved session ${shortId(id)} is not one this version can resume`);
+  if (state?.version !== 1 || !Array.isArray(state.messages)) throw new Refusal(`the saved session ${shortId(id)} is not one this version can resume`);
   return state;
 }
 
@@ -321,12 +356,12 @@ export function savedSessions(db, { now, except = null } = {}) {
 export function findSaved(db, ref, options) {
   const all = savedSessions(db, options);
   if (ref === 'last') {
-    if (all.length === 0) throw new UsageError('no saved session to resume');
+    if (all.length === 0) throw new Refusal('no saved session to resume');
     return all[0];
   }
   const hits = all.filter((s) => s.id.startsWith(ref));
   if (hits.length === 1) return hits[0];
-  if (hits.length === 0) throw new UsageError(`no saved session starts with "${ref}"${all.length > 0 ? ` — one of: ${all.map((s) => shortId(s.id)).join(', ')}` : ''}`);
+  if (hits.length === 0) throw new Refusal(`no saved session starts with "${ref}"${all.length > 0 ? ` — one of: ${all.map((s) => shortId(s.id)).join(', ')}` : ''}`);
   throw new UsageError(`"${ref}" could be ${hits.map((s) => shortId(s.id)).join(' or ')} — give more of the id`);
 }
 

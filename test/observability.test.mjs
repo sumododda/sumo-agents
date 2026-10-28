@@ -10,11 +10,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { CHAT_TOOLS, createChat } from '../src/chat.mjs';
-import { breakdown } from '../src/cost.mjs';
+import { breakdown, noteRewrite, prefixOf, rewriteCause } from '../src/cost.mjs';
 import { openDb, setMeta } from '../src/db.mjs';
 import { jobParams } from '../src/loop.mjs';
 import { closeMcp, mcpReady, writeConfig } from '../src/mcp.mjs';
-import { costOf } from '../src/model.mjs';
+import { costOf, logRun, usageOf } from '../src/model.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { contextBand } from '../src/sessions.mjs';
 import { toolView } from '../src/tty.mjs';
@@ -29,9 +29,9 @@ const OPUS = 'claude-opus-5-5';
 const FABLE = 'claude-fable-5-1';
 
 /** One ledger row, its cost worked out from its tokens the way the loop writes it; `input` is the total, as the ledger keeps it. */
-function run({ ts = NOW, kind = 'chat', model = OPUS, input = 0, read = 0, written = 0, output = 0, searches = 0, ok = 1, job = null, session = 's1' }) {
+function run({ ts = NOW, kind = 'chat', model = OPUS, input = 0, read = 0, written = 0, output = 0, searches = 0, ok = 1, job = null, session = 's1', cause = null }) {
   const usage = { input_tokens: input - read - written, cache_read_input_tokens: read, cache_creation_input_tokens: written, output_tokens: output, server_tool_use: { web_search_requests: searches } };
-  return { ts, kind, model, input_tokens: input, output_tokens: output, cost_usd: costOf(model, usage), ok, cache_read_tokens: read, cache_creation_tokens: written, job_id: job, session_id: session };
+  return { ts, kind, model, input_tokens: input, output_tokens: output, cost_usd: costOf(model, usage), ok, cache_read_tokens: read, cache_creation_tokens: written, job_id: job, session_id: session, cache_cause: cause };
 }
 
 /** A conversation's ledger: a cold start, a warm turn, a rewrite, one after the cache ran out, a job's own, the advisor's, and a local pass. */
@@ -39,15 +39,15 @@ const LEDGER = [
   run({ ts: at(0), input: 100_000, written: 100_000, output: 1000 }),
   run({ ts: at(1), input: 102_000, read: 100_000, written: 2000, output: 1000, searches: 1 }),
   // Two minutes on, almost nothing read and nearly all of it written again: the cache was dropped under it.
-  run({ ts: at(3), input: 90_000, read: 2000, written: 88_000 }),
+  run({ ts: at(3), input: 90_000, read: 2000, written: 88_000, cause: 'unknown' }),
   // The advisor answers in the same session on a model of its own: its first request is a cold start, not a rewrite.
   run({ ts: at(3.5), model: FABLE, input: 30_000, written: 30_000, output: 500 }),
   // A failed request warmed nothing: the one after it is still seventeen minutes after the last that answered.
   run({ ts: at(19), ok: 0 }),
-  run({ ts: at(20), input: 90_000, written: 90_000 }),
+  run({ ts: at(20), input: 90_000, written: 90_000, cause: 'gap' }),
   // A job is a conversation of its own, though it carries the session that made it.
   run({ ts: at(4), kind: 'worker', job: 7, input: 50_000, written: 50_000, output: 2000 }),
-  run({ ts: at(6), kind: 'worker', job: 7, input: 60_000, read: 4000, written: 56_000, output: 2000 }),
+  run({ ts: at(6), kind: 'worker', job: 7, input: 60_000, read: 4000, written: 56_000, output: 2000, cause: 'prefix' }),
   run({ ts: at(7), kind: 'scribe', model: 'local:Qwen3-4B-Q4_K_M.gguf', input: 3000, output: 100, session: null }),
 ];
 
@@ -76,7 +76,57 @@ test('the breakdown: per kind and model, what was paid for fresh input, cache re
 
   assert.equal(b.rewrites.requests, 2, 'the chat\'s at three minutes and the job\'s second request — not the cold starts, not the one after the cache ran out');
   close(b.rewrites.usd, (88_000 + 56_000) * 5 / 1e6, 'what writing them again cost');
+  assert.deepEqual(Object.entries(b.causes).map(([cause, sum]) => [cause, sum.requests, Math.round(sum.usd * 100)]), [['prefix', 1, 28], ['gap', 1, 45], ['unknown', 1, 44]], 'the causes told at the time, in their order: the one after the cache ran out is a gap, counted here though it is no rewrite above');
   assert.deepEqual(breakdown([]).groups, []);
+  assert.deepEqual(breakdown([]).causes, {});
+});
+
+test('why a request wrote its context again is told at the time — model, cleared, prefix, gap, or unknown — and written to its row; a first request and a warm one carry none', async () => {
+  const warm = { read: 80_000, written: 2000, input: 90_000 };
+  const cold = { read: 0, written: 90_000, input: 90_000 };
+  const base = { key: 's1', at: 0, model: OPUS, prefix: 'p1', cleared: false };
+  const last = { key: 's1', at: 0, model: OPUS, prefix: 'p1' };
+  assert.equal(rewriteCause(null, { ...base, ...cold }), null, 'a conversation\'s first request writes its context: expected');
+  assert.equal(rewriteCause({ ...last, key: 's0' }, { ...base, ...cold }), null, 'another conversation before it is no request before');
+  assert.equal(rewriteCause(last, { ...base, ...warm }), null, 'found its context');
+  assert.equal(rewriteCause(last, { ...base, ...cold, model: FABLE, cleared: true, prefix: 'p2', at: 60 * 60_000 }), 'model', 'the model first: its cache is another');
+  assert.equal(rewriteCause(last, { ...base, ...cold, cleared: true, prefix: 'p2', at: 60 * 60_000 }), 'cleared');
+  assert.equal(rewriteCause(last, { ...base, ...cold, prefix: 'p2', at: 60 * 60_000 }), 'prefix');
+  assert.equal(rewriteCause(last, { ...base, ...cold, at: 5 * 60_000 + 1 }), 'gap');
+  assert.equal(rewriteCause(last, { ...base, ...cold, at: 5 * 60_000 }), 'unknown', 'inside five minutes with nothing changed: the cache was dropped under it');
+  assert.equal(prefixOf({ system: 'a', tools: [{ name: 't' }] }), prefixOf({ system: 'a', tools: [{ name: 't' }], messages: [1] }), 'the messages are not the prefix');
+  assert.notEqual(prefixOf({ system: 'a', tools: [] }), prefixOf({ system: 'b', tools: [] }));
+
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    const ledger = { kind: 'chat', sessionId: 's1' };
+    const row = (usage, note) => logRun(db, { kind: 'chat', model: OPUS, result: { ok: true, usage: usageOf(OPUS, usage) }, note, now: NOW, sessionId: 's1' });
+    const at = (minutes) => Date.parse(NOW) + minutes * 60_000;
+    const params = { system: 'be brief', tools: [] };
+    row({ input_tokens: 0, cache_creation_input_tokens: 90_000, output_tokens: 10 }, 'first');
+    assert.equal(noteRewrite(db, ledger, { at: at(0), model: OPUS, prefix: prefixOf(params), usage: usageOf(OPUS, { input_tokens: 0, cache_creation_input_tokens: 90_000, output_tokens: 10 }) }), null);
+    row({ input_tokens: 0, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 1000, output_tokens: 10 }, 'warm');
+    assert.equal(noteRewrite(db, ledger, { at: at(1), model: OPUS, prefix: prefixOf(params), usage: usageOf(OPUS, { input_tokens: 0, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 1000, output_tokens: 10 }) }), null);
+    // A compaction between requests is a clear; the flag is spent on the request after it.
+    ledger.cleared = true;
+    row({ input_tokens: 0, cache_creation_input_tokens: 30_000, output_tokens: 10 }, 'after compaction');
+    assert.equal(noteRewrite(db, ledger, { at: at(2), model: OPUS, prefix: prefixOf(params), usage: usageOf(OPUS, { input_tokens: 0, cache_creation_input_tokens: 30_000, output_tokens: 10 }) }), 'cleared');
+    assert.equal(ledger.cleared, false);
+    row({ input_tokens: 0, cache_creation_input_tokens: 31_000, output_tokens: 10 }, 'tools joined');
+    assert.equal(noteRewrite(db, ledger, { at: at(3), model: OPUS, prefix: prefixOf({ ...params, tools: [{ name: 'mcp__x' }] }), usage: usageOf(OPUS, { input_tokens: 0, cache_creation_input_tokens: 31_000, output_tokens: 10 }) }), 'prefix');
+    // A new session on the same ledger starts over: its first request carries no cause.
+    ledger.sessionId = 's2';
+    row({ input_tokens: 0, cache_creation_input_tokens: 5000, output_tokens: 10 }, 'new session');
+    assert.equal(noteRewrite(db, ledger, { at: at(4), model: OPUS, prefix: prefixOf(params), usage: usageOf(OPUS, { input_tokens: 0, cache_creation_input_tokens: 5000, output_tokens: 10 }) }), null);
+    assert.deepEqual(db.prepare('SELECT note, cache_cause FROM model_runs ORDER BY id').all().map((r) => ({ ...r })), [
+      { note: 'first', cache_cause: null },
+      { note: 'warm', cache_cause: null },
+      { note: 'after compaction', cache_cause: 'cleared' },
+      { note: 'tools joined', cache_cause: 'prefix' },
+      { note: 'new session', cache_cause: null },
+    ]);
+    db.close();
+  });
 });
 
 test('sumo cost: the whole ledger or the last days, one project or all, and a line for the cache rewrites', () => {
@@ -87,13 +137,13 @@ test('sumo cost: the whole ledger or the last days, one project or all, and a li
   const old = new Date(Date.now() - 30 * 86_400_000).toISOString();
   s.sql((db) => {
     const insert = db.prepare(
-      `INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, note, cache_read_tokens, cache_creation_tokens, job_id, session_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'test', ?, ?, ?, ?)`,
+      `INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, note, cache_read_tokens, cache_creation_tokens, job_id, session_id, cache_cause)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'test', ?, ?, ?, ?, ?)`,
     );
     const shifted = (r, base) => ({ ...r, ts: new Date(Date.parse(base) + (Date.parse(r.ts) - Date.parse(NOW))).toISOString() });
-    for (const r of LEDGER.map((row) => shifted(row, recent))) insert.run(r.ts, r.kind, r.model, r.input_tokens, r.output_tokens, r.cost_usd, r.ok, r.cache_read_tokens, r.cache_creation_tokens, r.job_id, r.session_id);
+    for (const r of LEDGER.map((row) => shifted(row, recent))) insert.run(r.ts, r.kind, r.model, r.input_tokens, r.output_tokens, r.cost_usd, r.ok, r.cache_read_tokens, r.cache_creation_tokens, r.job_id, r.session_id, r.cache_cause);
     const gone = run({ ts: old, input: 1_000_000, written: 1_000_000, session: 's-old' });
-    insert.run(gone.ts, gone.kind, gone.model, gone.input_tokens, gone.output_tokens, gone.cost_usd, gone.ok, gone.cache_read_tokens, gone.cache_creation_tokens, null, gone.session_id);
+    insert.run(gone.ts, gone.kind, gone.model, gone.input_tokens, gone.output_tokens, gone.cost_usd, gone.ok, gone.cache_read_tokens, gone.cache_creation_tokens, null, gone.session_id, null);
     // j7 is simba's; session s1 had simba's card, the old one had nala's.
     db.prepare(`INSERT INTO jobs (id, project, title, agent, status, session_id, created_at, updated_at) VALUES (7, 'simba', 't', 'worker', 'done', 's1', ?, ?)`).run(recent, recent);
     for (const [id, slug] of [['s1', 'simba'], ['s-old', 'nala']]) {
@@ -108,16 +158,21 @@ test('sumo cost: the whole ledger or the last days, one project or all, and a li
   assert.match(head, /^since \d{4}-\d{2}-\d{2}: 10 requests, \$\d+\.\d\d — uncached \$\d+\.\d\d \(\d+%\) · cache read \$\d+\.\d\d \(\d+%\) · cache write \$\d+\.\d\d \(\d+%\) · output \$\d+\.\d\d \(\d+%\) · search \$0\.01$/, head);
   assert.match(rest[0], /^ {2}chat · opus: 6 requests, \$\d+\.\d\d — uncached \$0\.00 · cache read \$0\.02 · cache write \$6\.40 · output \$0\.04 · search \$0\.01$/, rest[0]);
   assert.ok(rest.some((l) => /^ {2}worker · opus: 2 requests, /.test(l)) && rest.some((l) => /^ {2}chat · fable: 1 request, /.test(l)), rest.join('\n'));
-  assert.match(rest.at(-1), /^cache rewrites: 2 requests read under 10k from the cache and wrote most of their context again, under 5 minutes after the request before — \$0\.72 of cache writes, \d+% of the total$/, rest.at(-1));
+  assert.match(rest.at(-5), /^cache rewrites: 2 requests read under 10k from the cache and wrote most of their context again, under 5 minutes after the request before — \$0\.72 of cache writes, \d+% of the total$/, rest.at(-5));
+  // The causes told at the time, whatever the gap, each explained once: what a 1-hour cache would have kept is the gap line.
+  assert.equal(rest.at(-4), '  why: prefix 1 request, $0.28 · gap 1 request, $0.45 · unknown 1 request, $0.44', rest.at(-4));
+  assert.deepEqual(rest.slice(-3), ['    prefix: the system prompt or the tools changed', '    gap: over 5 minutes since the request before, which a 1-hour cache would have kept', '    unknown: nothing seen here explains it']);
+  assert.doesNotMatch(s.sumo(['cost', '--project', 'nala']).out, /why:/, 'nothing told, nothing said');
 
   const week = s.sumo(['cost', '--days', '7']).out;
   assert.match(week, /^the last 7 days: 9 requests, /, 'the old request is past the window');
   const simba = s.sumo(['cost', '--project', 'simba']).out;
   assert.match(simba, /^since \d{4}-\d{2}-\d{2} · simba: 8 requests, /, 'its job and the session that had its card; not the session that had nala\'s');
   assert.equal(s.sumo(['cost', '--project', 'nala', '--days', '7']).out, 'nothing was spent in the last 7 days on nala\n');
-  for (const [args, message] of [[['cost', '--days', 'week'], /--days needs a positive number/], [['cost', '--project', 'pumbaa'], /pumbaa/]]) {
+  // A value that is not one is the command line's fault (2); a project that is not there is not (1).
+  for (const [args, message, code] of [[['cost', '--days', 'week'], /--days needs a positive number/, 2], [['cost', '--project', 'pumbaa'], /pumbaa/, 1]]) {
     const refused = s.sumo(args);
-    assert.equal(refused.code, 2, refused.out);
+    assert.equal(refused.code, code, refused.out);
     assert.match(refused.err, message);
   }
   assert.match(s.sumo(['help']).out, /sumo cost/);

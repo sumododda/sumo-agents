@@ -1,8 +1,10 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { closeSync, mkdirSync, openSync } from 'node:fs';
+import { closeSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { basename, join } from 'node:path';
+import { basename } from 'node:path';
 import { getMeta, setMeta, tx } from './db.mjs';
+import { alive } from './lock.mjs';
+import { openLog, trimLog } from './logs.mjs';
 import { paths } from './paths.mjs';
 
 /**
@@ -16,21 +18,12 @@ const HEALTH_TIMEOUT_MS = 60_000;
 const HEALTH_POLL_MS = 250;
 const SLEEP_IDLE_SECONDS = 600;
 /** The context the server is given: the largest scribe bundle seen was 24k tokens, dream's 90th percentile 12k. */
-export const LOCAL_CONTEXT_TOKENS = 32_768;
+const LOCAL_CONTEXT_TOKENS = 32_768;
 /** How long a pass may think. Measured on the scribe probe, the 4B model answers right within this; uncapped, a small model can think until the token limit and answer nothing. */
 export const LOCAL_REASONING_BUDGET = 1024;
 
 /** Router mode names a model after its file. */
 export const modelIdOf = (file) => basename(file, '.gguf');
-
-function alive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (cause) {
-    return cause.code === 'EPERM';
-  }
-}
 
 /** Only a process still carrying the port it was started on is ours: a pid can be reused once the server is gone. */
 function ours(server) {
@@ -85,9 +78,7 @@ async function waitForHealth(port, dead) {
 
 /** Starts the server for `file`, detached, logging to logs/llama-server.log, and records it. */
 function start(db, { llama, file, port }) {
-  const logs = paths().logs;
-  mkdirSync(logs, { recursive: true, mode: 0o700 });
-  const out = openSync(join(logs, 'llama-server.log'), 'a');
+  const out = openLog('llama-server.log');
   let dead = null;
   let child;
   try {
@@ -117,6 +108,8 @@ function start(db, { llama, file, port }) {
 export async function ensureLocalServer(db, { llama, file }) {
   const current = recorded(db);
   if (current && current.file === file && current.llama === llama && ours(current)) {
+    // The server outlives the sumo that started it, and its log with it: trimmed in place each time it is used again.
+    trimLog('llama-server.log');
     if (await healthy(current.port)) return current;
     // Started a moment ago by another sumo and still coming up: wait for it rather than replace it.
     if (Date.now() - current.startedAt < HEALTH_TIMEOUT_MS) {
@@ -154,7 +147,7 @@ export function stopLocalServer(db, expected) {
   db.prepare('DELETE FROM meta WHERE key = ?').run(META_KEY);
 }
 
-/** One line for `sumo scribe status`: where the server is and what it says about the model. */
+/** One line for `sumo memory status`: where the server is and what it says about the model. */
 export async function localServerStatus(db, { file }) {
   const current = recorded(db);
   if (!current) return 'local server: not running (starts on the first call)';

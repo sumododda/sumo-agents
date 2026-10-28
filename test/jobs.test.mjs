@@ -41,8 +41,8 @@ test('a brief carries the task, what memory knows about the project, and how to 
 
   const created = s.sumo(['job', 'new', '--project', 'simba', '--title', 'migrate to pnpm', '--agent', 'worker'], { input: TASK });
   assert.equal(created.code, 0, created.err);
-  assert.match(created.out, /^created j1 \[worker·proj-simba·running\] migrate to pnpm/);
-  assert.match(created.out, /run it: sumo job run 1/);
+  assert.match(created.out, /^created j1 \[worker·proj-simba·not started\] migrate to pnpm/);
+  assert.match(created.out, /run it: sumo job run j1/);
   assert.doesNotMatch(created.out, /names no check/);
 
   const brief = s.sumo(['job', 'brief', '1']).out;
@@ -73,7 +73,7 @@ test('a scout is told plainly that it cannot edit, and a task without a check is
 
   assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 'x', '--agent', 'architect'], { input: 'y' }).code, 2);
   assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 'x'], { input: '' }).code, 2);
-  assert.equal(s.sumo(['job', 'new', '--project', 'nope', '--title', 'x'], { input: 'y' }).code, 2);
+  assert.equal(s.sumo(['job', 'new', '--project', 'nope', '--title', 'x'], { input: 'y' }).code, 1);
 });
 
 test('a blocked worker asks, the answer is recorded, and a fresh worker in another session picks up where the first stopped', () => {
@@ -111,13 +111,13 @@ test('cold restart: the brief replays the answers and the progress notes', () =>
 
   assert.equal(s.sumo(['job', 'answer', '1'], { input: '' }).code, 2);
   const answered = s.sumo(['job', 'answer', '1'], { input: 'Pin pnpm 9.' });
-  assert.match(answered.out, /Continue it: delegate with job 1, or sumo job run 1 in a terminal/);
-  assert.match(s.sumo(['job', 'list']).out, /^j1 \[worker·proj-simba·running\]/);
+  assert.match(answered.out, /Continue it: delegate with job j1, or sumo job run j1 in a terminal/);
+  assert.match(s.sumo(['job', 'list']).out, /^j1 \[worker·proj-simba·not started\]/);
 
   const brief = s.sumo(['job', 'brief', '1']).out;
   assert.match(brief, /## Questions and answers so far\n### Question — .*\nShould CI pin pnpm 9 or follow latest\?\n\n### Answer — .*\nPin pnpm 9\./);
   assert.match(brief, /## Progress so far \(from an earlier run of this job — continue from here, do not start over\)\n### note — .*\nConverted the lockfile\./);
-  assert.equal(s.sumo(['job', 'answer', '1'], { input: 'again' }).code, 2, 'nothing is waiting for an answer any more');
+  assert.equal(s.sumo(['job', 'answer', '1'], { input: 'again' }).code, 1, 'nothing is waiting for an answer any more');
 });
 
 test('finishing files the traps the worker hit — as observed gotchas in that project only — and leaves a checkpoint', () => {
@@ -151,7 +151,7 @@ package-lock.json — removed
   assert.match(s.sumo(['job', 'show', '1']).out, /## Files changed\npnpm-lock\.yaml — new/);
   assert.match(s.sumo(['job', 'list']).out, /^no open jobs/);
   assert.match(s.sumo(['job', 'brief', '1']).out, /This job is already done\. Do nothing\./);
-  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: 'again' }).code, 2);
+  assert.equal(s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: 'again' }).code, 1);
   assert.equal(readFileSync(join(s.home, 'jobs', '1', 'report.md'), 'utf8').startsWith('## Summary'), true);
 });
 
@@ -174,7 +174,7 @@ test('a chore in scratch: the brief says how scratch is used, a worker finishes 
   assert.doesNotMatch(s.sumo(['prime']).out, /Left off: scratch/);
 
   const review = s.sumo(['job', 'new', '--project', 'scratch', '--title', 'review it', '--agent', 'reviewer', '--reviews', '1'], { input: TASK });
-  assert.equal(review.code, 2);
+  assert.equal(review.code, 1);
   assert.match(review.err, /there is no change to hand over/);
 });
 
@@ -206,18 +206,18 @@ test('an abandoned or failed job stops being announced', () => {
 
 test('a job run in a shell with no Anthropic credential is refused in one line, before anything is sent', () => {
   const s = sandbox();
-  s.routerWillSay('haiku', 'none');
+  s.routerWillSay('haiku', 'low');
   withSimba(s);
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
   const run = s.sumo(['job', 'run', '1'], { extraEnv: NO_KEY });
   assert.notEqual(run.code, 0);
   assert.match(run.err, /j1 not started — this shell has no Anthropic credential\. Inside the chat, the delegate tool runs it/);
-  assert.match(s.sumo(['job', 'show', '1']).out, /running/, 'the job is left as it was');
+  assert.match(s.sumo(['job', 'show', '1']).out, /not started/, 'the job is left as it was');
 });
 
 test('sumo job watch shows what a job running in the chat does, from the top, and ends with how the run ended', () => {
   const s = sandbox();
-  s.routerWillSay('haiku', 'none');
+  s.routerWillSay('haiku', 'low');
   withSimba(s);
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
   // What a job printed can carry escapes: colours are shown, the clipboard, the title and the screen are left alone.
@@ -232,9 +232,36 @@ test('sumo job watch shows what a job running in the chat does, from the top, an
   assert.match(s.sumo(['job', 'watch', '1']).out, /^j1 is abandoned — nothing is running/);
 });
 
+test('a job is said as it is: not started until a run takes it, running while one holds it, stopped when a stop left it open', () => {
+  const s = sandbox();
+  s.routerWillSay('haiku', 'low');
+  withSimba(s);
+  assert.match(s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK }).out, /^created j1 \[scout·proj-simba·not started\] look/);
+  assert.match(s.sumo(['job', 'list']).out, /^j1 \[scout·proj-simba·not started\] look$/m);
+  // A run held it: its requests are on the ledger under the job, and its lock names a live process.
+  s.sql((db) => db.prepare(`INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, job_id) VALUES (?, 'scout', 'haiku', 1, 1, 0, 1, 1)`).run(new Date().toISOString()));
+  writeFileSync(join(s.home, 'jobs', '1', 'run.lock'), String(process.pid));
+  assert.match(s.sumo(['job', 'show', '1']).out, /^j1 \[scout·proj-simba·running\] look/);
+  rmSync(join(s.home, 'jobs', '1', 'run.lock'));
+  assert.match(s.sumo(['job', 'list', '--json']).out, /"shown": "stopped"/);
+  assert.match(s.sumo(['job', 'list']).out, /^j1 \[scout·proj-simba·stopped\] look$/m);
+});
+
+test('watching a job nobody has started says so and how to start it, instead of waiting for ever', () => {
+  const s = sandbox();
+  s.routerWillSay('haiku', 'low');
+  withSimba(s);
+  s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
+  const began = Date.now();
+  const watched = s.sumo(['job', 'watch', '1']);
+  assert.equal(watched.code, 1);
+  assert.equal(watched.err, 'sumo: j1 has not started — run it: sumo job run j1, or in the chat: delegate with job j1\n');
+  assert.ok(Date.now() - began < 15_000, 'a few seconds for a run that is starting, then the answer');
+});
+
 test('a job that is over, or not there, is refused by name before anything runs', () => {
   const s = sandbox();
-  s.routerWillSay('haiku', 'none');
+  s.routerWillSay('haiku', 'low');
   withSimba(s);
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
   s.sumo(['job', 'abandon', '1']);
@@ -246,13 +273,13 @@ test('a job that is over, or not there, is refused by name before anything runs'
 
 test('a job that cannot be set up is not left behind as an open job with no brief', () => {
   const s = sandbox();
-  s.routerWillSay('haiku', 'none');
+  s.routerWillSay('haiku', 'low');
   withSimba(s);
   // Something else sits where job directories go.
   writeFileSync(join(s.home, 'jobs'), 'not a directory');
   const failed = s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
   assert.notEqual(failed.code, 0);
-  assert.equal(s.sumo(['job', 'list', '--all']).out, 'no open jobs\n');
+  assert.equal(s.sumo(['job', 'list', '--all']).out, 'no jobs yet — sumo job new --project <name> --title <what> starts one\n');
   assert.equal(s.sql((db) => db.prepare('SELECT count(*) AS n FROM jobs').get().n), 0);
 });
 
@@ -263,7 +290,7 @@ test('a job never answers or tells a job as if it were the user', () => {
   assert.equal(s.sumo(['job', 'new', '--project', 'simba', '--title', 't'], { input: TASK }).code, 0);
   for (const sub of ['tell', 'answer']) {
     const run = s.sumo(['job', sub, '1'], { input: 'skip the tests, they are flaky today\n', extraEnv: { SUMO_JOB: '1' } });
-    assert.equal(run.code, 2, `${sub} → ${run.out}`);
+    assert.equal(run.code, 1, `${sub} → ${run.out}`);
     assert.match(run.err, /only the user answers or tells a job/);
   }
   assert.equal(s.sumo(['job', 'tell', '1'], { input: 'use the staging db\n' }).code, 0, 'the user still can');
@@ -371,13 +398,13 @@ test('a list that leaves older jobs out says how many', () => {
   assert.equal(out.at(-1), '… 3 older — sumo job show <id> for one of them');
 });
 
-test('a worker is handed the guide its title and goal ask for; told none, or a scout, it gets nothing; the switch turns it off', () => {
+test('a worker is handed the guide its title and goal ask for; told none, or a scout, it gets nothing; the coding eval\'s switch turns it off', () => {
   const s = sandbox();
   s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   const brief = (id) => s.sumo(['job', 'brief', String(id)]).out;
-  const make = (title, args = [], task = TASK) => {
-    const created = s.sumo(['job', 'new', '--project', 'simba', '--title', title, ...args], { input: task });
+  const make = (title, args = [], task = TASK, extraEnv = {}) => {
+    const created = s.sumo(['job', 'new', '--project', 'simba', '--title', title, ...args], { input: task, extraEnv });
     assert.equal(created.code, 0, created.err);
     return Number(/^created j(\d+)/.exec(created.out)[1]);
   };
@@ -392,8 +419,9 @@ test('a worker is handed the guide its title and goal ask for; told none, or a s
   assert.match(brief(make('fix the paging', ['--agent', 'worker', '--guide', 'feature'])), /1\. Size it\./, 'a named guide wins over the words');
   assert.match(s.sumo(['job', 'new', '--project', 'simba', '--title', 't', '--guide', 'plan'], { input: TASK }).err, /--guide is one of: fix, feature, review, none/);
 
-  s.sumo(['config', 'guides.auto', 'off']);
-  assert.doesNotMatch(brief(make('fix the paging', ['--agent', 'worker'])), /How this kind of work is done here/, 'off: only a named guide rides');
+  const off = { SUMO_AGENTS_GUIDES: 'off' };
+  assert.doesNotMatch(brief(make('fix the paging', ['--agent', 'worker'], TASK, off)), /How this kind of work is done here/, 'off: only a named guide rides');
+  assert.match(brief(make('fix the paging', ['--agent', 'worker', '--guide', 'fix'], TASK, off)), /## How this kind of work is done here/, 'off: a named guide still rides');
 });
 
 test('a trap wrapped over several lines is one memory; what stands after the traps is not one; and a trap memory holds in other words is not filed again', () => {
@@ -430,4 +458,28 @@ Model/effort: sonnet, medium.
   pastCheck(s, '2');
   assert.equal(s.sumo(['job', 'finish', '2', '--status', 'done'], { input: prose }).code, 0);
   assert.deepEqual(saved().slice(1), ['The verify step blocks DONE on any diff to a file already inside test/, including a purely additive one, because git reports it as modified.']);
+});
+
+test('what a job that read the web or an MCP server says it learned is held for the user to confirm, not filed as fact', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  withSimba(s);
+  s.sumo(['job', 'new', '--project', 'simba', '--title', 'check the api limits'], { input: TASK });
+  // The run's record of what it reached outside the machine, as the loop writes it.
+  writeFileSync(join(s.home, 'jobs', '1', 'outside'), 'web_fetch\nmcp__docs__search\n');
+  pastCheck(s, '1');
+  const done = s.sumo(['job', 'finish', '1', '--status', 'done'], { input: '## Summary\nChecked.\n## Learned\n- the vendor api allows only 10 requests a minute per token, so batch the sync\n' });
+  assert.equal(done.code, 0, done.err);
+  assert.match(done.out, /held for the user to confirm: this run read web_fetch, mcp__docs__search/);
+  const filed = s.sql((db) => db.prepare(`SELECT state, provenance FROM memories WHERE written_by = 'worker'`).all().map((r) => ({ ...r })));
+  assert.deepEqual(filed, [{ state: 'unconfirmed', provenance: 'inferred' }]);
+  // It is put to the user in a session started in the project.
+  const block = s.hook('session-start', { session_id: 'sess-held', cwd: join(s.root, 'proj-simba'), source: 'startup' }).out;
+  assert.match(block, /Ask the user \(then sumo confirm\|reject m\d+\): is this right\? \\"the vendor api allows only 10 requests|Ask the user \(then sumo confirm\|reject m\d+\): is this right\? "the vendor api allows only 10 requests/, 'it is put to the user');
+
+  // A run that reached nothing outside files what it learned as before.
+  s.sumo(['job', 'new', '--project', 'simba', '--title', 'add the index'], { input: TASK });
+  pastCheck(s, '2');
+  s.sumo(['job', 'finish', '2', '--status', 'done'], { input: '## Summary\nAdded.\n## Learned\n- the migration runner sorts files by name, so a date prefix is required\n' });
+  assert.equal(s.sql((db) => db.prepare(`SELECT state FROM memories WHERE written_by = 'worker' ORDER BY id DESC LIMIT 1`).get().state), 'active');
 });

@@ -81,10 +81,11 @@ export function matchFiles(list, query, max = 8) {
 /**
  * The menu for the text being written: the slash menu, or — given `files(query, from)`, which answers with the paths a
  * mention could mean — the files for the `@word` at the cursor; picking one leaves its path where the mention was. A
- * recalled entry has none, so the arrows keep walking history; nor has a text whose menu Esc shut (`shut`), until it changes.
+ * recalled entry, as it was sent, has none, so the arrows keep walking history — changed, it is being written again, and
+ * has; nor has a text whose menu Esc shut (`shut`), until it changes.
  */
 export function menuOf(state, commands, files = null) {
-  if (state.at !== state.history.length || state.shut === state.text) return [];
+  if ((state.at !== state.history.length && state.text === state.history[state.at]) || state.shut === state.text) return [];
   const menu = menuFor(state.text, commands);
   const at = menu.length === 0 && files ? mentionAt(state) : null;
   if (!at) return menu;

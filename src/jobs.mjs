@@ -8,7 +8,7 @@ import { usableModels } from './catalog.mjs';
 import { getMeta, setMeta, tx } from './db.mjs';
 import { autoGuides, guideBody, matchGuide, WORKER_GUIDES } from './guides.mjs';
 import { heldBy } from './lock.mjs';
-import { UsageError } from './memory.mjs';
+import { Refusal, UsageError } from './memory.mjs';
 import { callModel, failure, logRun } from './model.mjs';
 import { paths } from './paths.mjs';
 import { preferences } from './prime.mjs';
@@ -40,7 +40,7 @@ export function parseJobId(raw) {
 
 export function getJob(db, id) {
   const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(id);
-  if (!job) throw new UsageError(`no job j${id}`);
+  if (!job) throw new Refusal(`no job j${id}`);
   return job;
 }
 
@@ -77,7 +77,7 @@ function setOpenStatus(db, id, status, now) {
 }
 
 function requireOpen(job, verb) {
-  if (job.status !== 'running' && job.status !== 'needs_input') throw new UsageError(`j${job.id} is ${job.status} — it cannot be ${verb}`);
+  if (job.status !== 'running' && job.status !== 'needs_input') throw new Refusal(`j${job.id} is ${job.status} — it cannot be ${verb}`);
 }
 
 const ROLE = {
@@ -208,7 +208,7 @@ function whereThingsStand(root) {
 function renderBrief({ job, project, known, rules, situation, task, guide, change, options = {} }) {
   const closing =
     job.agent === 'worker'
-      ? `\`finish\` with DONE (or FAILED). DONE is not taken on your word: the first is answered with the task beside your change, to look over once more; the next has the project's checks run and compared with the baseline, and is refused while something new fails. See the verdict first with \`verify\` (allow it ten minutes). The report:`
+      ? `\`finish\` with DONE (or FAILED). DONE is not taken on your word: the first is answered with the task as a numbered list beside your change, each number to answer once; the next has the project's checks run and compared with the baseline, and is refused while something new fails. See the verdict first with \`verify\` (allow it ten minutes). The report:`
       : `\`finish\` with DONE (or FAILED), and this report:`;
   return `# Job j${job.id} — ${job.title}
 
@@ -256,7 +256,7 @@ const writeState = (db, id, state) => {
 };
 
 /** The written way of doing one kind of work, without its title — the brief has its own heading for it. */
-export function guideFor(name) {
+function guideFor(name) {
   if (!GUIDES.includes(name)) throw new UsageError(`--guide is one of: ${[...GUIDES, 'none'].join(', ')}`);
   const text = guideBody(name);
   if (!text) throw new UsageError(`guides/${name}.md is missing or empty`);
@@ -265,11 +265,11 @@ export function guideFor(name) {
 
 /**
  * The guide a job carries when none is named: a reviewer always review; a worker the one its title and goal ask
- * for, the way the chat is handed one by the user's words — unless the switch is off. A scout changes nothing.
+ * for, the way the chat is handed one by the user's words — unless the coding eval switched guides off. A scout changes nothing.
  */
-function defaultGuide(db, { agent, title, task }) {
+function defaultGuide({ agent, title, task }) {
   if (agent === 'reviewer') return 'review';
-  if (agent !== 'worker' || !autoGuides(db)) return null;
+  if (agent !== 'worker' || !autoGuides()) return null;
   return matchGuide(`${title}\n${task.split(/\n(?=## )/)[0]}`, WORKER_GUIDES);
 }
 
@@ -285,29 +285,31 @@ function changeToJudge(db, { project, reviews }) {
   let kept = null;
   if (reviews !== undefined) {
     const target = getJob(db, reviews);
-    if (target.project !== project.slug) throw new UsageError(`j${target.id} belongs to ${target.project}, not ${project.slug}`);
+    if (target.project !== project.slug) throw new Refusal(`j${target.id} belongs to ${target.project}, not ${project.slug}`);
     const state = readState(db, target.id);
     snap = state?.snap;
     // A change still in the worktree it was made in is judged there.
     if (state?.tree && existsSync(state.tree.path)) root = state.tree.path;
-    if (!snap) throw new UsageError(`j${target.id} recorded no starting point (not a worker job, or not a git repository) — there is no change to hand over`);
+    if (!snap) throw new Refusal(`j${target.id} recorded no starting point (not a worker job, or not a git repository) — there is no change to hand over`);
     // One whose worktree is gone is judged by what it kept as it went (`changes`), not by the project against the tree's start:
     // the project holds that change and more — what git ignores, what was never added — none of it the job's.
     if (state.tree && !existsSync(state.tree.path)) kept = changes(db, target.id);
     lines.push(`What was asked: ${fileOf(target.id, 'brief.md')}   (read "## The task")`);
+    // The task as the author was asked to answer it: the reviewer gives a verdict on each number under "Asked vs built".
+    lines.push('Asked, by number — a verdict on each under "Asked vs built", with what in the change shows it:', ...checklistOf(taskFromBrief(readOr(fileOf(target.id, 'brief.md')))).map((item, i) => `  ${i + 1}. ${item}`));
     if (existsSync(fileOf(target.id, 'report.md'))) {
       lines.push(`What its author says they did: ${fileOf(target.id, 'report.md')}   — claims, not facts. A stated reason never makes a finding smaller.`);
     }
   } else {
-    if (!hasCommit(project.path)) throw new UsageError(`${project.path} is not a git repository with a commit — there is no change to hand over`);
+    if (!hasCommit(project.path)) throw new Refusal(`${project.path} is not a git repository with a commit — there is no change to hand over`);
     snap = { base: 'HEAD', mixed: false, untracked: [] };
   }
   if (kept) {
-    if (kept.files === 0) throw new UsageError('nothing has changed — there is nothing to review');
+    if (kept.files === 0) throw new Refusal('nothing has changed — there is nothing to review');
     return { snap, lines, root, kept };
   }
   const { tracked, created } = changesSince(root, snap);
-  if (tracked.length + created.length === 0) throw new UsageError('nothing has changed — there is nothing to review');
+  if (tracked.length + created.length === 0) throw new Refusal('nothing has changed — there is nothing to review');
   return { snap, lines, root };
 }
 
@@ -371,7 +373,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
   if (reviews !== undefined && agent !== 'reviewer') throw new UsageError('--reviews goes with --agent reviewer');
   const project = getProject(db, nameOrAlias);
   // Everything that can refuse the job is settled before the job exists.
-  const chosen = guideName === 'none' ? null : (guideName ?? defaultGuide(db, { agent, title, task }));
+  const chosen = guideName === 'none' ? null : (guideName ?? defaultGuide({ agent, title, task }));
   const guide = chosen ? guideFor(chosen) : null;
   const judged = agent === 'reviewer' ? changeToJudge(db, { project, reviews }) : null;
 
@@ -473,7 +475,7 @@ async function newAttempts(db, { attempts, title, ...options }) {
   if (options.agent !== 'worker') throw new UsageError('--attempts goes with a worker');
   if (!title?.trim()) throw new UsageError('a job needs a --title');
   const project = getProject(db, options.project);
-  if (!hasCommit(project.path)) throw new UsageError(`${project.path} is not a git repository with a commit — each attempt needs a worktree of its own`);
+  if (!hasCommit(project.path)) throw new Refusal(`${project.path} is not a git repository with a commit — each attempt needs a worktree of its own`);
   const made = [];
   try {
     for (let n = 1; n <= attempts; n++) {
@@ -507,12 +509,12 @@ export async function retry(db, id, { now = new Date().toISOString() } = {}) {
   const old = getJob(db, id);
   const eligible = old.status === 'failed' || (old.status === 'done' && (old.important ?? 0) >= RETRY_IMPORTANT_THRESHOLD);
   if (!eligible) {
-    throw new UsageError(
+    throw new Refusal(
       `j${id} is ${old.status}${old.status === 'done' ? ` (important: ${old.important ?? 0})` : ''} — only a failed job, or a done one reviewed with important >= ${RETRY_IMPORTANT_THRESHOLD}, can be retried`,
     );
   }
   const task = taskFromBrief(readOr(fileOf(id, 'brief.md')));
-  if (!task) throw new UsageError(`j${id}'s brief has no "## The task" section to retry from`);
+  if (!task) throw new Refusal(`j${id}'s brief has no "## The task" section to retry from`);
 
   // What the original was allowed and pointed at travels with the task: a retry of a review judges the same job,
   // and a retry of a worker keeps the permission the first attempt was given.
@@ -583,7 +585,7 @@ none: a review changes nothing — read the change, what was asked, and the code
 
 /**
  * What follows a worker's run without being asked, once the worker has closed. A first attempt that FAILED is retried
- * once, on a route one step up (`retry`; `jobs.escalate`) — a retry is never retried again this way, nor one sumo told to
+ * once, on a route one step up (`retry`) — a retry is never retried again this way, nor one sumo told to
  * close near its budget, time or turns, and one of several `attempts` is settled with its siblings instead. One that closed
  * DONE, verified by the checks — in git, so there is a change to hand over — is reviewed when the
  * router called its work risky, or always (`jobs.review`), by a reviewer at least as strong as it (`--reviews`). The job
@@ -593,7 +595,7 @@ async function followUp(db, id, { now = new Date().toISOString() } = {}) {
   const job = getJob(db, id);
   if (job.agent !== 'worker' || attemptsOf(db, id) !== null) return null;
   if (job.status === 'failed') {
-    if (job.retry_of !== null || setting(db, 'jobs.escalate') !== 'on') return null;
+    if (job.retry_of !== null) return null;
     // Told by sumo to close near one of its limits, it closed where it stood: a run one step up with that limit fresh would only buy
     // the limit off at a dearer price, and that is the user's call.
     const near = CLOSED_NEAR[getMeta(db, closingKey(id))];
@@ -687,9 +689,9 @@ function checkable(db, id, verb) {
   const job = getJob(db, id);
   requireOpen(job, verb);
   const state = readState(db, id);
-  if (job.agent !== 'worker' || !state) throw new UsageError(`j${id} is not a worker job with a recorded start — there is nothing to ${verb === 'verified' ? 'verify' : 'take a baseline of'}`);
+  if (job.agent !== 'worker' || !state) throw new Refusal(`j${id} is not a worker job with a recorded start — there is nothing to ${verb === 'verified' ? 'verify' : 'take a baseline of'}`);
   const root = workdir(state, getProject(db, job.project));
-  if (!existsSync(root)) throw new UsageError(`${root} no longer exists`);
+  if (!existsSync(root)) throw new Refusal(`${root} no longer exists`);
   return { job, state, root };
 }
 
@@ -723,7 +725,7 @@ export function verifyJob(db, id, now = new Date().toISOString()) {
 export function changes(db, id) {
   const job = getJob(db, id);
   const state = readState(db, id);
-  if (!state?.snap) throw new UsageError(`j${id} recorded no starting point (not a worker job, or not a git repository)`);
+  if (!state?.snap) throw new Refusal(`j${id} recorded no starting point (not a worker job, or not a git repository)`);
   const root = workdir(state, getProject(db, job.project));
   // A worktree that is gone wrote down its change as it went: that is kept, not overwritten from a project that has moved on.
   if (state.tree && !existsSync(root) && existsSync(fileOf(id, 'changes.diff'))) {
@@ -820,6 +822,24 @@ export function startLive(id) {
 export const appendLive = (id, text) => appendFileSync(liveFile(id), text, { mode: 0o600 });
 export const endLive = (id, lines) => writeFileSync(endFile(id), `${lines.join('\n')}\n`, { mode: 0o600 });
 
+/**
+ * The tools a job used that read the world outside the machine — a web search, a fetch, an MCP server — one name a
+ * line, each once. What such a run says it learned may be what a page told it, so it is not filed as a fact (see finish).
+ */
+const outsideFile = (id) => fileOf(id, 'outside');
+export function noteOutsideRead(id, tool) {
+  const name = String(tool).replace(/\s+/g, ' ');
+  if (outsideReads(id).includes(name)) return;
+  appendFileSync(outsideFile(id), `${name}\n`, { mode: 0o600 });
+}
+export function outsideReads(id) {
+  try {
+    return readFileSync(outsideFile(id), 'utf8').split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 /** What was told to the job since it last looked, taken off the disk so it is read once. A file that is not a message is passed over. */
 export function takeInbox(id) {
   let names;
@@ -843,7 +863,7 @@ export function takeInbox(id) {
 
 export function answer(db, id, text, now = new Date().toISOString()) {
   const job = getJob(db, id);
-  if (job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — it is not waiting for an answer`);
+  if (job.status !== 'needs_input') throw new Refusal(`j${id} is ${job.status} — it is not waiting for an answer`);
   if (!text.trim()) throw new UsageError('the answer is empty — put it on stdin');
   append(id, 'qa.md', 'Answer', text, now);
   setOpenStatus(db, id, 'running', now);
@@ -892,10 +912,48 @@ const checkedFile = (id) => fileOf(id, 'checked');
 /** How many changed files, and how many new ones, the check names before it counts the rest. */
 const CHECK_LISTED = 30;
 
+/** The most lines of one section of the task that become items of their own; past it, the rest is one item. */
+const ITEMS_PER_SECTION = 12;
+
+/** The lines under one `## heading` of a task, bullets and numbers stripped, until the next heading. */
+function sectionLines(task, heading) {
+  const lines = String(task ?? '').split('\n');
+  const at = lines.findIndex((l) => l.trim().toLowerCase() === `## ${heading}`.toLowerCase());
+  if (at === -1) return [];
+  const body = [];
+  for (const line of lines.slice(at + 1)) {
+    if (/^##\s/.test(line)) break;
+    const said = line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim();
+    if (said && !/^none\.?$/i.test(said)) body.push(said);
+  }
+  return body;
+}
+
+/**
+ * The task as a numbered list, one line each — what was asked, what must not change, what must not be attempted, and the
+ * check that proves it — for an author or a reviewer to answer by number. A checklist drawn from the task is answered;
+ * "check your work" is not: measured on long tasks, an itemized list caught what a general self-check let through. A task
+ * without those headings is one item: the whole of it.
+ */
+export function checklistOf(task) {
+  const items = [];
+  const take = (heading, say) => {
+    const lines = sectionLines(task, heading);
+    for (const line of lines.slice(0, ITEMS_PER_SECTION)) items.push(say(line));
+    if (lines.length > ITEMS_PER_SECTION) items.push(`and the ${lines.length - ITEMS_PER_SECTION} more lines under ${heading}`);
+  };
+  take('Goal', (l) => `Done: ${l}`);
+  take('Must not change', (l) => `Unchanged: ${l}`);
+  take('Non-goals', (l) => `Not attempted: ${l}`);
+  take('Check', (l) => `Ran, and it passed: ${l}`);
+  if (items.length === 0) items.push('Done: everything the task asks, as it asks it.');
+  return items;
+}
+
 /**
  * What a worker's first DONE is answered with instead of being taken: the task as it was given, what has changed since
- * the job began, and what to look for — the first thing a reviewer does, done by the author while it can still fix
- * what it finds. Nothing is run here; the checks come with the next DONE.
+ * the job began, and the task as a list to answer by number — the first thing a reviewer does, done by the author while
+ * it can still fix what it finds. Nothing is run here; the checks come with the next DONE.
  */
 function checkAgainstTask(db, job, state) {
   // Where the job works: its worktree when it was given one, the project otherwise.
@@ -913,20 +971,21 @@ function checkAgainstTask(db, job, state) {
       change = ['what changed could not be read from git — look over it yourself'];
     }
   }
+  const task = taskFromBrief(readOr(fileOf(job.id, 'brief.md')));
+  // Asked to hunt for the bug, an author judges its own work closest (arXiv 2602.06948: told to find what breaks it,
+  // not whether it works); and nothing that was in the tree before the job is the job's to undo.
+  const items = [...checklistOf(task), 'Debug output and scratch files are removed.', 'Tests were changed only if the task allows it.', 'Every claim in the report is backed by a tool result from this run.', 'The input most likely to break this change is named, and was run.', 'No change you did not make was reverted or overwritten.'];
   return [
     `j${job.id} is not closed yet — before DONE counts, check the work against the task. Nothing was run.`,
     '',
     '## The task',
-    taskFromBrief(readOr(fileOf(job.id, 'brief.md'))) || '(the brief has no "## The task" section)',
+    task || '(the brief has no "## The task" section)',
     '',
     '## What changed since the job began',
     ...change,
     '',
-    '## Check each, and fix what is not so',
-    '- Every requirement in the task is met.',
-    '- Debug output and scratch files are removed.',
-    '- Tests were changed only if the task allows it.',
-    '- Every claim in the report is backed by a tool result from this run.',
+    '## Answer each by number — what in the change or a tool result shows it — and fix what is not so',
+    ...items.map((item, i) => `${i + 1}. ${item}`),
     '',
     'Then call `finish` again with the same report, or a corrected one, to go on to verification. This is asked once.',
   ].join('\n');
@@ -948,21 +1007,21 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
   // A DONE that cannot be checked is refused, not waved through; --accept is the way to take it anyway, and it is written down.
   const graded = job.agent === 'worker' && status === 'DONE';
   const state = graded ? readState(db, id) : null;
-  const unchecked = (why) => new UsageError(`j${id} cannot be verified — ${why}. To take the work as it stands: sumo job finish ${id} --status DONE --accept "<why>"`);
+  const unchecked = (why) => new Refusal(`j${id} cannot be verified — ${why}. To take the work as it stands: sumo job finish ${id} --status DONE --accept "<why>"`);
   if (graded && accept === undefined && !state) throw unchecked(`the record of where it began (${fileOf(id, 'verify.json')}) cannot be read, or was changed since sumo wrote it`);
   // Before the checks are run, the author looks once at the task beside its change: the first DONE is answered with that, not taken.
   // Kept in the job's folder, so a run started again goes on to the checks instead of being asked again.
   if (graded && accept === undefined && !existsSync(checkedFile(id))) {
     const asked = checkAgainstTask(db, job, state);
     writeFileSync(checkedFile(id), `${now}\n`, { mode: 0o600 });
-    throw new UsageError(asked);
+    throw new Refusal(asked);
   }
   const verdict = state && accept === undefined ? verdictForDone(db, id, state, now) : null;
   // The checks can take minutes: report a job closed in the meantime before interpreting their verdict.
   requireOpen(getJob(db, id), 'finished');
   if (graded && accept === undefined && !verdict) throw unchecked(`${getProject(db, job.project).path} no longer exists, so its checks cannot be run`);
   if (verdict && !verdict.ok) {
-    throw new UsageError(
+    throw new Refusal(
       [
         `j${id} is not done — the project's checks were run, and:`,
         ...verdictLines(verdict).map((l) => `  ${l}`),
@@ -994,6 +1053,16 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
   const kept = !isScratch(getProject(db, job.project));
   const ops = kept ? learnedLines(report).map((body) => ({ op: 'gotcha', scope: `project:${job.project}`, body: clip(body, 300) })) : [];
   const learned = applyOps(db, ops, { source: 'worker', turns: new Map(), now });
+  // A run that read a page or an MCP server may be passing on what it was told: what it learned waits for the user to
+  // confirm (arXiv 2503.03704 — memory written from injected content is read later as trusted). Exactly what this
+  // finish wrote is held: another job finishing in the same project at the same moment keeps its own.
+  const outside = outsideReads(id);
+  if (outside.length > 0 && learned.written.length > 0) {
+    const held = db
+      .prepare(`UPDATE memories SET state = 'unconfirmed', provenance = 'inferred', held_for = 'outside' WHERE id IN (${learned.written.map(() => '?').join(', ')}) AND type = 'gotcha' AND state = 'active' RETURNING id`)
+      .all(...learned.written);
+    if (held.length > 0) learned.applied = learned.applied.map((said) => `${said} — held for the user to confirm: this run read ${outside.join(', ')}`);
+  }
 
   const summary = /^##\s*Summary\s*\n+([^\n]+)/im.exec(report)?.[1]?.trim();
   if (kept) {
@@ -1020,11 +1089,21 @@ export function listJobs(db, { all = false } = {}) {
   const where = all ? '' : `WHERE status IN ('running', 'needs_input')`;
   const rows = db.prepare(`SELECT * FROM jobs ${where} ORDER BY id DESC LIMIT ${LISTED}`).all();
   const total = db.prepare(`SELECT COUNT(*) AS n FROM jobs ${where}`).get().n;
-  return Object.assign(rows, { more: total - rows.length });
+  return Object.assign(rows.map((row) => ({ ...row, shown: shownStatus(db, row) })), { more: total - rows.length });
 }
 
-export function jobLine(job) {
-  return `j${job.id} [${job.agent}·${job.project}·${job.status}] ${job.title}`;
+/**
+ * A job's state as a person reads it; the stored status is unchanged. Open, it is running only while a run holds it,
+ * not started if no run ever sent a request for it, and stopped if a stop — budget, time, Esc — left it open.
+ */
+function shownStatus(db, job) {
+  if (job.status !== 'running') return job.status;
+  if (atWork(job.id)) return 'running';
+  return db.prepare('SELECT 1 FROM model_runs WHERE job_id = ? LIMIT 1').get(job.id) ? 'stopped' : 'not started';
+}
+
+export function jobLine(job, status = job.status) {
+  return `j${job.id} [${job.agent}·${job.project}·${status}] ${job.title}`;
 }
 
 /** The report a job closed with, as its sub-agent wrote it; empty while it has none. */
@@ -1033,7 +1112,7 @@ export const reportOf = (id) => readOr(fileOf(id, 'report.md')).trim();
 /** What the main agent needs to decide its next move — not the whole report. */
 export function show(db, id) {
   const job = getJob(db, id);
-  const out = [jobLine(job), `files: ${dirOf(id)}`];
+  const out = [jobLine(job, shownStatus(db, job)), `files: ${dirOf(id)}`];
   if (job.model && job.effort) out.push(`route: ${job.model}/${job.effort} — ${job.route_reason}`);
   if (job.important !== null && job.important !== undefined) out.push(`important: ${job.important}`);
   const qa = readOr(fileOf(id, 'qa.md')).trim();
@@ -1052,7 +1131,7 @@ const pickedKey = (first) => `job.${first}.picked`;
 const firstTo = (db, key, now) => tx(db, () => getMeta(db, key) === null && (setMeta(db, key, now), true));
 
 /** The jobs one `--attempts` made, in order; null for a job that is not one of them. */
-export function attemptsOf(db, id) {
+function attemptsOf(db, id) {
   const ids = getMeta(db, attemptsKey(id));
   return ids === null ? null : JSON.parse(ids);
 }

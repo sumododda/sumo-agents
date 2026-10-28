@@ -9,7 +9,7 @@ import { getMeta, openDb, setMeta } from '../src/db.mjs';
 import { ensureLocalServer, stopLocalServer } from '../src/local-server.mjs';
 import { callLocalModel } from '../src/model.mjs';
 import { paths, REPO_ROOT } from '../src/paths.mjs';
-import { CONFIG_DEFAULTS } from '../src/setup.mjs';
+import { modelFileOfUrl } from '../src/setup.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const FAKE = join(REPO_ROOT, 'test', 'fixtures', 'fake-llama-server.mjs');
@@ -26,7 +26,7 @@ const alive = (pid) => {
 const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A home with a model file and a `llama-server` that is really the fake above; returns the db and the files the fake writes. */
-function arrange(home, { file = CONFIG_DEFAULTS['model.file'] } = {}) {
+function arrange(home, { file = modelFileOfUrl() } = {}) {
   mkdirSync(paths().models, { recursive: true });
   writeFileSync(join(paths().models, file), 'gguf');
   const llama = join(home, 'llama-server');
@@ -34,7 +34,7 @@ function arrange(home, { file = CONFIG_DEFAULTS['model.file'] } = {}) {
   chmodSync(llama, 0o755);
   const db = openDb();
   setMeta(db, 'llama.path', llama);
-  if (file !== CONFIG_DEFAULTS['model.file']) setMeta(db, 'config.model.file', file);
+  if (file !== modelFileOfUrl()) setMeta(db, 'config.model.url', `https://huggingface.co/x/y/resolve/main/${file}`);
   return { db, log: join(home, 'fake.log'), capture: join(home, 'capture.json'), answer: join(home, 'answer.json') };
 }
 
@@ -55,7 +55,7 @@ test('the first call starts llama-server in router mode on the models directory 
       assert.equal(started.args[started.args.indexOf('--models-dir') + 1], paths().models);
       assert.ok(started.args.includes('--sleep-idle-seconds'), 'an idle server sleeps instead of holding the model');
       const asked = JSON.parse(readFileSync(capture, 'utf8'));
-      assert.equal(asked.model, CONFIG_DEFAULTS['model.file'].replace(/\.gguf$/, ''), 'router mode names a model after its file');
+      assert.equal(asked.model, modelFileOfUrl().replace(/\.gguf$/, ''), 'router mode names a model after its file');
       assert.equal(asked.chat_template_kwargs.enable_thinking, true);
       assert.equal(asked.max_tokens, 4096);
       assert.equal(asked.response_format.type, 'json_schema');
@@ -103,7 +103,7 @@ test('a second call reuses the running server; a changed model file replaces it;
       assert.ok(alive(first));
 
       writeFileSync(join(paths().models, 'Other-Model.gguf'), 'gguf');
-      setMeta(db, 'config.model.file', 'Other-Model.gguf');
+      setMeta(db, 'config.model.url', 'https://huggingface.co/x/y/resolve/main/Other-Model.gguf');
       const result = await callLocalModel(db, { system: 's', prompt: 'p', schema: { type: 'object' } });
       assert.equal(result.ok, true, result.error ?? '');
       const second = JSON.parse(readFileSync(log, 'utf8')).pid;
@@ -147,7 +147,7 @@ test('two callers replacing one wedged server end up on one new server: the seco
   await live(home, {}, async () => {
     const { db } = arrange(home);
     const other = openDb();
-    const file = CONFIG_DEFAULTS['model.file'];
+    const file = modelFileOfUrl();
     const llama = getMeta(db, 'llama.path');
     // Ours by its command line, but /health never answers, and long past its start-up grace.
     const port = 45000 + Math.floor(Math.random() * 1000);

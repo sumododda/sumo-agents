@@ -1,19 +1,19 @@
 // The j22 review's findings, each as a check: a stale llama-server pin, a missing Content-Length,
 // a credential in the source URL, a file name that escapes models/, and the harness skip that said nothing.
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { openDb, setMeta } from '../src/db.mjs';
 import { callLocalModel } from '../src/model.mjs';
 import { paths } from '../src/paths.mjs';
-import { CONFIG_DEFAULTS, setup } from '../src/setup.mjs';
+import { modelFileOfUrl, setup } from '../src/setup.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 function placeModelFile(bytes = 'gguf') {
   mkdirSync(paths().models, { recursive: true });
-  const file = join(paths().models, CONFIG_DEFAULTS['model.file']);
+  const file = join(paths().models, modelFileOfUrl());
   writeFileSync(file, bytes);
   return file;
 }
@@ -81,12 +81,19 @@ test('a credential in the source URL never reaches the output', async () => {
   });
 });
 
-test('a model file name with a path separator is refused before any request', async () => {
-  await withHome(freshHome(), {}, async () => {
-    const db = openDb();
-    setMeta(db, 'config.model.file', '../bin/sumo');
-    db.close();
-    const lines = await setup({ link: false, modelSource: 'http://127.0.0.1:9' });
-    assert.ok(lines.some((l) => /model\.file/.test(l) && /separator|refused/.test(l)), lines.join('\n'));
-  });
+test('a model address whose last part spells a path in escapes is fetched into models/ under that name, never beside it', async () => {
+  const origin = await serve();
+  try {
+    await withHome(freshHome(), {}, async () => {
+      const db = openDb();
+      setMeta(db, 'config.model.url', `${origin.url}/x/..%2Fbin%2Fsumo.gguf`);
+      db.close();
+      const lines = await setup({ link: false, modelSource: origin.url });
+      assert.ok(lines.some((l) => /downloaded/.test(l)), lines.join('\n'));
+      assert.equal(existsSync(join(paths().models, '..%2Fbin%2Fsumo.gguf')), true);
+      assert.ok(!readdirSync(paths().bin).includes('sumo.gguf'), 'nothing was written in bin/');
+    });
+  } finally {
+    await origin.close();
+  }
 });

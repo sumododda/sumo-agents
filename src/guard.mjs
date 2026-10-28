@@ -14,10 +14,11 @@ import { homedir } from 'node:os';
 
 /**
  * A file whose contents are a secret: reading it is refused, and a change that adds one is never DONE. A glob (`.env*`) names them too.
- * Any case: the disk a Mac ships with reads `.ENV` as `.env`. A redirect (`<.env`) is a reading too.
+ * Any case: the disk a Mac ships with reads `.ENV` as `.env`. A redirect (`<.env`) is a reading too, and so is a file at a
+ * revision (`HEAD:.env`).
  */
 const SECRET_FILE =
-  /(^|[\s/'"=<])(\.env[*?]*(\.(?!example\b|sample\b|template\b)[\w*?-]+)?|\.netrc|\.git-credentials|\.aws\/credentials|\.ssh\/(?!known_hosts\b|config\b|authorized_keys\b)[\w.-]+(?<!\.pub)|id_(rsa|dsa|ecdsa|ed25519)(?!\.pub)|[\w.-]+\.(pem|key|p12|pfx))(?=$|[\s'"|;&)])/i;
+  /(^|[\s/'"=<:])(\.env[*?]*(\.(?!example\b|sample\b|template\b)[\w*?-]+)?|\.netrc|\.git-credentials|\.aws\/credentials|\.ssh\/(?!known_hosts\b|config\b|authorized_keys\b)[\w.-]+(?<!\.pub)|id_(rsa|dsa|ecdsa|ed25519)(?!\.pub)|[\w.-]+\.(pem|key|p12|pfx))(?=$|[\s'"|;&)])/i;
 
 /** Anything that would put a file's contents in front of the model, `$(< file)` among them. `source .env` is not on it: that sets variables without showing them. */
 const PRINTS = /(^|[\s;&|($`])(cat|head|tail|less|more|bat|grep|rg|egrep|fgrep|sed|awk|cut|strings|xxd|hexdump|od|base64|nl|tac|view|vim?|nano|code|open|pbcopy|jq|yq)\s|\$\(\s*</;
@@ -25,22 +26,67 @@ const PRINTS = /(^|[\s;&|($`])(cat|head|tail|less|more|bat|grep|rg|egrep|fgrep|s
 /** Where one simple command ends and the next begins: a separator, a pipe, a new line, a subshell or a substitution. */
 const SEPARATORS = /[;&|\n()`]|\$\(/;
 
-/** A secret file bound to a name instead of read: `f=.env`, `for f in .env .env.local`. What later prints `$f` is a reading of it. */
-const BINDS = /(^|[\s;&|(`])(?:\w+=|for\s+\w+\s+in\s)/;
+/**
+ * Commands that name a secret file without putting what is in it in front of the model: loading it (`source`, `.`),
+ * listing, testing, touching or removing it, changing its mode, and `echo`/`printf`, which print the name.
+ */
+const NAMES_ONLY = new Set(['source', '.', 'ls', 'test', '[', '[[', 'touch', 'chmod', 'chown', 'rm', 'stat', 'file', 'echo', 'printf', 'mkdir']);
+/** Of git's commands, those that name a file without printing it. `git diff` and `git show` print it. */
+const GIT_NAMES_ONLY = new Set(['add', 'rm', 'mv', 'status', 'check-ignore', 'ls-files', 'update-index', 'restore']);
+/** Commands that copy a file: harmless only when the secret is where it goes, never where it comes from. */
+const COPIES = new Set(['cp', 'mv', 'install', 'ln']);
+/** Words in front of a command that leave it the same command. */
+const PREFIXES = new Set(['sudo', 'command', 'builtin', 'nohup', 'time', 'exec', 'env']);
+/** A here-document whose delimiter is quoted: its body is text, nothing in it runs or expands. */
+const QUOTED_HEREDOC = /<<-?\s*(['"])(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2[ \t]*(?=\n|$)/g;
+/** A shell started on a command string: what matters is the command inside the quotes. */
+const SHELL_C = /\b(?:ba|z)?sh\s+-l?c\s+/g;
+const isSecret = (word) => SECRET_FILE.test(` ${word} `);
 
 /**
- * Whether a command puts a secret file's contents in front of the model: a printing command with the file among its
- * words — in the same simple command, not merely somewhere in the same line, so `source .env && npm test | tail` is
- * what it looks like — or a printing command given a variable the file was bound to earlier in the line.
+ * Whether one simple command reads a secret file it names. Read narrowly the other way round from a list of printing
+ * commands, which a reader nobody listed (`sort`, `diff`, a one-line script) walks past: it reads it unless what it does
+ * with it is one of the few things that never show what is in it — loading, listing, writing into it, copying onto it,
+ * git's bookkeeping, or handing it to a container as its environment.
+ */
+function readsSecret(part) {
+  // Written into, not read: a redirect's target is not an argument.
+  const rest = part.replace(/\d*>>?\s*\S+/g, ' ');
+  if (!SECRET_FILE.test(rest)) return false;
+  // `$(< .env)` was split at its `$(`: what is left starts with the redirect.
+  if (/^\s*</.test(rest)) return true;
+  const words = rest.trim().replace(/^["']+/, '').split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < words.length && (PREFIXES.has(words[i]) || /^\w+=/.test(words[i]))) i++;
+  const [command, sub] = [words[i], words[i + 1]];
+  if (NAMES_ONLY.has(command)) return false;
+  if (command === 'git' && GIT_NAMES_ONLY.has(sub)) return false;
+  if (COPIES.has(command)) return !isSecret(words.at(-1));
+  if (command === 'docker' || command === 'podman') return SECRET_FILE.test(rest.replace(/--env-file[=\s]+\S+/g, ' '));
+  return true;
+}
+
+/**
+ * Whether a command puts a secret file's contents in front of the model: one of its simple commands reads the file —
+ * judged command by command, not across the line, so `source .env && npm test | tail` is what it looks like — or a
+ * printing command is given a variable the file was bound to earlier in the line.
  */
 function printsSecret(command) {
-  const parts = command.replace(/\\\n/g, ' ').split(SEPARATORS);
+  const parts = command.replace(/\\\n/g, ' ').replace(QUOTED_HEREDOC, '<<heredoc').replace(SHELL_C, ' ').split(SEPARATORS);
   let bound = false;
   for (const part of parts) {
     if (!SECRET_FILE.test(part)) continue;
-    // `$(< .env)` was split at its `$(`: what is left starts with the redirect.
-    if (PRINTS.test(part) || /^\s*</.test(part)) return true;
-    if (BINDS.test(part)) bound = true;
+    // Bound to a name, not read: `f=.env`, `export ENV_FILE=.env`, `for f in .env …`. What later prints `$f` is a reading.
+    const first = part.trim().split(/\s+/)[0];
+    if (/^\w+=/.test(first) && part.trim().split(/\s+/).every((w) => /^\w+=/.test(w))) {
+      bound = true;
+      continue;
+    }
+    if (first === 'export' || first === 'for') {
+      bound = true;
+      continue;
+    }
+    if (readsSecret(part)) return true;
   }
   return bound && parts.some((part) => PRINTS.test(part) && part.includes('$'));
 }

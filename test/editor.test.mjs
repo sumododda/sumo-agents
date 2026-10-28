@@ -227,6 +227,23 @@ describe('the chat input box', () => {
     assert.equal(s.text, 'draft');
   });
 
+  it('gives a recalled entry its menus back once it is changed: cleared and a slash typed, the commands; an @, the files — and the draft is still there', () => {
+    const files = () => ['src/app.js'];
+    let s = press(type(editor(), 'older'), '\r', ENTER, COMMANDS).state;
+    s = type(s, 'my draft');
+    s = key(s, { upArrow: true });
+    assert.equal(s.text, 'older');
+    assert.deepEqual(menuOf(s, COMMANDS, files), [], 'recalled as it was, it has none: the arrows walk history');
+    s = key(s, { ctrl: true }, 'u');
+    s = type(s, '/');
+    assert.deepEqual(menuOf(s, COMMANDS, files).map((c) => c.name), ['fix', 'feature', 'dream'], 'the commands');
+    s = key(s, { backspace: true });
+    s = type(s, '@ap');
+    assert.deepEqual(menuOf(s, COMMANDS, files).map((c) => c.name), ['src/app.js'], 'the files');
+    s = key(key(s, { ctrl: true }, 'u'), { downArrow: true });
+    assert.equal(s.text, 'my draft', 'Down still comes back to the draft');
+  });
+
   it('keeps a control key in a burst a control key', () => {
     assert.deepEqual(keysOf('ab\x03', {}), [['a', {}], ['b', {}], ['c', { ctrl: true }]]);
   });

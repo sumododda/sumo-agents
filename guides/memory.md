@@ -1,7 +1,8 @@
 # Memory
 
-Everything the user has told any session on this machine, behind `sumo`. You read it; a background
-writer (a cheap model, checked by code) files what the user says after each turn.
+Everything the user has told any session on this machine, behind `sumo`. You read it; one background
+memory pass (a cheap model, checked by code) files what the user says after each turn and tidies memory
+when conversations finish.
 
 **Reading**
 - `sumo search "<words>" [--project <slug>]` — ranked one-line results. Scope is global plus the named
@@ -19,5 +20,6 @@ writer (a cheap model, checked by code) files what the user says after each turn
 session-start block. Ask the user in one line, then `sumo confirm <id>` or `sumo reject <id>`.
 The user can do the same, and edit or forget, on a page: `/memory` in the chat, or `sumo memory`.
 
-**If the block warns that the writer is failing:** tell the user, run `sumo scribe status`. While
-`sumo config scribe.model` is `off`, save durable statements yourself with `sumo add` as they are made.
+**If the block warns that the memory pass is failing:** tell the user, run `sumo memory status`. While
+`sumo config memory.model` is `off`, save durable statements yourself with `sumo add` as they are made.
+Asked to tidy memory: `sumo memory run --tidy`, then say what it raised.

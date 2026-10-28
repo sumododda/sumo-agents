@@ -123,11 +123,11 @@ test('the guide rides in with the message, once per session; a taught workflow w
   assert.match(taught, /<workflow m\d+ "Fixing a bug here">/);
   assert.doesNotMatch(taught, /<guide/);
 
-  s.sumo(['config', 'guides.auto', 'off']);
+  // The coding eval's --no-guides: nothing fires unasked.
+  const off = { SUMO_AGENTS_GUIDES: 'off' };
   s.hook('session-start', { ...SESSION, source: 'new' });
-  assert.equal(prompt(s, 'the login page is broken'), '', 'off: nothing fires');
-  assert.match(prompt(s, 'the login bug', { guide: 'fix' }), /<guide fix>/, 'off: a guide named by its command still comes');
-  assert.match(s.sumo(['config', 'guides.auto', 'maybe']).err, /guides\.auto is on or off/);
+  assert.equal(s.hook('prompt', { ...SESSION, prompt: 'the login page is broken' }, off).out, '', 'off: nothing fires');
+  assert.match(s.hook('prompt', { ...SESSION, prompt: 'the login bug', guide: 'fix' }, off).out, /<guide fix>/, 'off: a guide named by its command still comes');
 });
 
 test('a guide named by its command goes in even when it was given before, and an unknown name is ignored', () => {
@@ -153,6 +153,6 @@ test('a turn that edited a file nothing checked since is held once, and told the
   assert.equal(stop({ edited: ['src/render.mjs'], checks: ['npm test'], stop_hook_active: true }).out, '', 'already continuing: the turn ends');
   assert.equal(stop({}).out, '', 'another harness says nothing of edits: silent');
 
-  s.sumo(['config', 'guides.auto', 'off']);
-  assert.equal(stop({ edited: ['src/render.mjs'], checks: ['npm test'] }).out, '', 'off: the turn ends as the model ended it');
+  const off = s.hook('stop', { ...SESSION, last_assistant_message: 'Done.', stop_hook_active: false, edited: ['src/render.mjs'], checks: ['npm test'] }, { SUMO_AGENTS_GUIDES: 'off' });
+  assert.equal(off.out, '', 'the coding eval\'s --no-guides: the turn ends as the model ended it');
 });

@@ -242,7 +242,7 @@ test('the sandboxed shell cannot write git\'s hooks or its config, nor move the 
   assert.equal(existsSync(join(root, '.git', 'hooks', 'pre-commit')), false);
   assert.doesNotMatch(readFileSync(join(root, '.git', 'config'), 'utf8'), /hooksPath/);
   const blocked = await runBash({ command: 'echo x > .git/hooks/post-commit' }, sandboxed);
-  assert.match(blocked.content, new RegExp(`except git's hooks and config: ${join(root, '.git', 'hooks')}, ${join(root, '.git', 'config')}\\)`));
+  assert.match(blocked.content, new RegExp(`except what is read later outside it — git's hooks and config, the shell's and the tools' own files: ${join(root, '.git', 'hooks')}, ${join(root, '.git', 'config')}`));
 
   const tree = join(realpathSync(tmpdir()), `sumo-agents-git-tree-${process.pid}`);
   const work = await runBash({ command: `echo a > a.txt && git add a.txt && git commit -qm second && git checkout -qb side && git checkout -q - && git worktree add -q ${tree} && git log --oneline | wc -l | tr -d ' '` }, sandboxed);
@@ -285,14 +285,55 @@ test('on the screen a run outside the sandbox is asked as itself, and only y or 
         assert.fail(`the screen never showed ${what}:\n${tty.screen()}`);
       };
       try {
-        const answered = new Promise((resolve) => events.emit('approve', { name: 'bash', server: 'bash', tool: 'outside the sandbox', input: { command: 'touch ~/outside.txt' }, unsandboxed: true, resolve }));
-        await shows(/⚠ Run this once outside the sandbox\?[\s\S]*│ {3}touch ~\/outside\.txt[\s\S]*│ y yes · n no · esc stop/, 'the question');
+        const answered = new Promise((resolve) => events.emit('approve', { name: 'bash', server: 'bash', tool: 'outside the sandbox', input: { command: 'touch ~/outside.txt' }, unsandboxed: true, blocked: 'touch: /home/me/outside.txt: Operation not permitted', resolve }));
+        // A second question behind it is counted under the first, and comes up once the first is answered.
+        const behind = new Promise((resolve) => events.emit('approve', { name: 'mcp__slack__send', server: 'slack', tool: 'send', input: { text: 'hi' }, job: 4, resolve }));
+        await shows(/⚠ Run this once outside the sandbox\?[\s\S]*│ {3}the sandbox refused: touch: \/home\/me\/outside\.txt: Operation not permitted[\s\S]*│ {3}touch ~\/outside\.txt[\s\S]*│ y yes · n no · r no, say why · esc to interrupt/, 'the question, with what the sandbox refused');
         assert.doesNotMatch(tty.screen(), /allow bash|a always/);
         await tty.type('a');
-        await shows(/y runs it once outside the sandbox · n refuses it · esc stops the turn/, 'that a is no answer');
+        await shows(/│ y runs it once outside the sandbox · n refuses it · r with why · esc interrupts the turn · 1 more waiting/, 'that a is no answer, in the panel');
         assert.match(tty.screen(), /Run this once outside the sandbox\?/, 'still asked');
         await tty.type('y');
         assert.equal(await answered, 'once');
+        await shows(/j4: Allow slack · send\?[\s\S]*│ y once · a always · n no · r no, say why · esc (to interrupt|no)\s+│/, 'the question behind it, alone');
+        await tty.type('n');
+        assert.equal(await behind, 'no');
+
+        // A change outside the project is asked as the change: the file, what goes out and what comes in; a opens the file for the session.
+        const edited = new Promise((resolve) => events.emit('approve', { name: 'str_replace_based_edit_tool', server: 'editor', tool: 'outside the project', input: { command: 'str_replace', path: '/Users/me/app/config.toml', old_str: 'a = 1', new_str: 'a = 2' }, path: '/Users/me/app/config.toml', outside: true, guarded: null, directory: '/Users/me/app', resolve }));
+        await shows(/⚠ Change this file outside the project\?[\s\S]*│ {3}change \/Users\/me\/app\/config\.toml[\s\S]*│ {3}- a = 1[\s\S]*│ {3}\+ a = 2[\s\S]*│ y once · a this file, session · d all of app\/, session · n no · r no, say why · esc to interrupt/, 'the change asked');
+        await tty.type('x');
+        await shows(/y changes it once · a this file, session · d all of app\/, session · n refuses it/, 'what the keys do');
+        await tty.type('d');
+        assert.equal(await edited, 'directory');
+        // A guarded file is this once or not: a and d answer nothing on it.
+        const guarded = new Promise((resolve) => events.emit('approve', { name: 'str_replace_based_edit_tool', server: 'editor', tool: 'a guarded file', input: { command: 'insert', path: '/Users/me/.zshrc', insert_line: 0, insert_text: 'export X=1\n' }, path: '/Users/me/.zshrc', outside: true, guarded: 'your shell reads it when it starts', resolve }));
+        await shows(/⚠ Change this guarded file\? your shell reads it when it starts[\s\S]*│ {3}insert into \/Users\/me\/\.zshrc after line 0[\s\S]*│ {3}\+ export X=1[\s\S]*│ y once · n no · r no, say why · esc to interrupt/, 'the guarded file asked');
+        await tty.type('a');
+        await shows(/y changes it once · n refuses it · r with why · esc interrupts the turn/, 'that a is no answer on a guarded file');
+        assert.match(tty.screen(), /Change this guarded file\?/, 'still asked');
+        await tty.type('y');
+        assert.equal(await guarded, 'once');
+
+        // r opens a line for why: typed words land there, not in the box; Esc goes back to the question, Enter refuses with them.
+        const reasoned = new Promise((resolve) => events.emit('approve', { name: 'bash', server: 'bash', tool: 'outside the sandbox', input: { command: 'rm -r ~/build' }, unsandboxed: true, resolve }));
+        await shows(/Run this once outside the sandbox\?[\s\S]*rm -r ~\/build/, 'the third question');
+        await tty.type('r');
+        await shows(/why not\? ▌[\s\S]*enter refuses with this · esc back to the question/, 'the line for why');
+        await tty.type('use make cleanx');
+        await tty.type('\x7f');
+        await shows(/why not\? use make clean▌/, 'what was typed, less the deleted letter');
+        await tty.type('\x1b');
+        await shows(/│ y yes · n no · r no, say why · esc to interrupt/, 'Esc goes back to the keys, and stops nothing');
+        await tty.type('r');
+        await tty.type('use make clean');
+        // A paste goes into the reason, on one line, and nothing of it is left in the box behind.
+        await tty.type('\x1b[200~ in\n./build\x1b[201~');
+        await shows(/why not\? use make clean in \.\/build▌/, 'the pasted words in the reason');
+        await tty.type('\r');
+        assert.deepEqual(await reasoned, { no: 'use make clean in ./build' });
+        assert.doesNotMatch(tty.screen(), /why not\?/);
+        assert.doesNotMatch(tty.screen(), /\.\/build/, 'nothing pasted waits in the box');
         await tty.type('\x04');
       } finally {
         ui.unmount();

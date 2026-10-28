@@ -50,7 +50,7 @@ test('no first attempt runs above high effort; a retry may', () => {
 });
 
 test('what the policy leaves alone it says nothing about', () => {
-  for (const [model, effort] of [['haiku', 'none'], ['sonnet', 'low'], ['opus', 'high']]) {
+  for (const [model, effort] of [['haiku', 'low'], ['sonnet', 'low'], ['opus', 'high']]) {
     const r = routePolicy({ agent: 'worker', routed: routed(model, effort), usable: ALL });
     assert.deepEqual(r, { model, effort, policy: null });
   }
@@ -61,8 +61,9 @@ test('a retry of a job that failed runs at least one step above it: the next mod
   assert.equal(route(up), 'opus/low');
   assert.equal(up.policy, "a retry goes above j3's sonnet/low, which failed (the router said sonnet/low)");
 
-  // Off haiku there is an effort to pick: medium.
-  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('haiku', 'none'), retryOf: job(3, 'haiku', 'none'), usable: ALL })), 'sonnet/medium');
+  // Off haiku the effort is kept too; off a job that ran at the old 'none' there is an effort to pick: medium.
+  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('haiku', 'low'), retryOf: job(3, 'haiku', 'low'), usable: ALL })), 'sonnet/low');
+  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('haiku', 'low'), retryOf: job(3, 'haiku', 'none'), usable: ALL })), 'sonnet/medium');
   // A model that is off is stepped over.
   assert.equal(route(routePolicy({ agent: 'worker', routed: routed('sonnet', 'medium'), retryOf: job(3, 'sonnet', 'medium'), usable: ['haiku', 'sonnet', 'fable'] })), 'fable/medium');
   // A retry is where fable is for: the first-attempt cap does not apply.
@@ -73,8 +74,8 @@ test('on the top model that is on, a retry goes one effort up, max at most', () 
   assert.equal(route(routePolicy({ agent: 'worker', routed: routed('opus', 'medium'), retryOf: job(3, 'fable', 'high'), usable: ALL })), 'fable/xhigh');
   assert.equal(route(routePolicy({ agent: 'worker', routed: routed('fable', 'low'), retryOf: job(3, 'fable', 'max'), usable: ALL })), 'fable/max');
   assert.equal(route(routePolicy({ agent: 'worker', routed: routed('sonnet', 'low'), retryOf: job(3, 'opus', 'high'), usable: ['haiku', 'sonnet', 'opus'] })), 'opus/xhigh');
-  // Only haiku on: there is nowhere to go.
-  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('haiku', 'none'), retryOf: job(3, 'haiku', 'none'), usable: ['haiku'] })), 'haiku/none');
+  // Only haiku on: one effort up on it.
+  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('haiku', 'low'), retryOf: job(3, 'haiku', 'low'), usable: ['haiku'] })), 'haiku/medium');
 });
 
 test('a retry is never below what the router answered, and goes up only after something went wrong', () => {
@@ -98,7 +99,7 @@ test('a reviewer of a job runs on at least that job\'s model, at medium effort o
   assert.equal(route(raised), 'opus/medium');
   assert.equal(raised.policy, "a reviewer is at least as strong as j1's opus; a reviewer runs at medium effort at least (the router said sonnet/low)");
 
-  assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('haiku', 'none'), reviews: job(1, 'sonnet', 'low', 'done'), usable: ALL })), 'sonnet/medium');
+  assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('haiku', 'low'), reviews: job(1, 'sonnet', 'low', 'done'), usable: ALL })), 'sonnet/medium');
   assert.deepEqual(routePolicy({ agent: 'reviewer', routed: routed('opus', 'high'), reviews: job(1, 'sonnet', 'low', 'done'), usable: ALL }), { model: 'opus', effort: 'high', policy: null });
   assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('fable', 'low'), reviews: job(1, 'opus', 'high', 'done'), usable: ALL })), 'fable/medium');
   // The work ran on fable: so does its review, first attempt or not.
@@ -106,8 +107,8 @@ test('a reviewer of a job runs on at least that job\'s model, at medium effort o
   // A model that is off now: the nearest one that is on, above it if there is one, else the top one.
   assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('sonnet', 'medium'), reviews: job(1, 'opus', 'high', 'done'), usable: ['haiku', 'sonnet', 'fable'] })), 'fable/medium');
   assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('sonnet', 'medium'), reviews: job(1, 'fable', 'high', 'done'), usable: ['haiku', 'sonnet', 'opus'] })), 'opus/medium');
-  // Haiku judging haiku: there is no effort to raise.
-  assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('haiku', 'none'), reviews: job(1, 'haiku', 'none', 'done'), usable: ALL })), 'haiku/none');
+  // Haiku judging haiku: medium effort at least, as on any model.
+  assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('haiku', 'low'), reviews: job(1, 'haiku', 'low', 'done'), usable: ALL })), 'haiku/medium');
   // A reviewer pointed at no job (the uncommitted change) is the router's answer.
   assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('sonnet', 'low'), usable: ALL })), 'sonnet/low');
 });
@@ -204,17 +205,17 @@ test('the chat\'s default effort is medium', () => {
 });
 
 test('jobs.floor: no job starts on a model below the one the user set, and the router is offered only the models from there up', () => {
-  // Below the floor, a job goes up to the cheapest model on at or above it, keeping its effort; haiku's none becomes medium.
-  const raised = routePolicy({ agent: 'worker', routed: routed('haiku', 'none'), usable: ALL, floor: 'opus' });
-  assert.equal(route(raised), 'opus/medium');
-  assert.equal(raised.policy, 'jobs.floor is opus (the router said haiku/none)');
+  // Below the floor, a job goes up to the cheapest model on at or above it, keeping its effort.
+  const raised = routePolicy({ agent: 'worker', routed: routed('haiku', 'low'), usable: ALL, floor: 'opus' });
+  assert.equal(route(raised), 'opus/low');
+  assert.equal(raised.policy, 'jobs.floor is opus (the router said haiku/low)');
   assert.equal(route(routePolicy({ agent: 'reviewer', routed: routed('sonnet', 'high'), usable: ALL, floor: 'opus' })), 'opus/high');
   // At or above it, the router's answer stands; so does everything when the floor is haiku, or no model at or above it is on.
   assert.equal(route(routePolicy({ agent: 'worker', routed: routed('opus', 'low'), usable: ALL, floor: 'sonnet' })), 'opus/low');
-  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('haiku', 'none'), usable: ALL, floor: 'haiku' })), 'haiku/none');
+  assert.equal(route(routePolicy({ agent: 'worker', routed: routed('haiku', 'low'), usable: ALL, floor: 'haiku' })), 'haiku/low');
   assert.equal(route(routePolicy({ agent: 'worker', routed: routed('sonnet', 'low'), usable: ['haiku', 'sonnet'], floor: 'opus' })), 'sonnet/low');
   // The scout's own rule still holds above a lower floor.
-  assert.equal(route(routePolicy({ agent: 'scout', routed: routed('haiku', 'none'), usable: ALL, floor: 'haiku' })), 'sonnet/low');
+  assert.equal(route(routePolicy({ agent: 'scout', routed: routed('haiku', 'low'), usable: ALL, floor: 'haiku' })), 'sonnet/low');
 
   withHome(freshHome(), {}, () => {
     const db = openDb();

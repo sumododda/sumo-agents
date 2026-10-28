@@ -16,8 +16,8 @@ const ROUTER_SYSTEM =
   'You assign a coding job to a model and an effort level. Answer with JSON only. First classify the job, then choose. kind: mechanical (typos, ' +
   'renames, comments, constants, tests for a pure function), routine (an ordinary feature or fix with a clear spec), hard (design, a bug whose ' +
   'cause is unknown, or reviewing risky code), novel (new algorithms, subtle concurrency, deep security review). surface: how much code the job ' +
-  'touches. risky: true when it touches security, credentials, money, migrations or concurrency. Model follows kind: haiku for mechanical (it ' +
-  'takes no effort setting), sonnet for routine, opus for hard, fable for novel. Effort follows surface: low for one spot, medium for a few ' +
+  'touches. risky: true when it touches security, credentials, money, migrations or concurrency. Model follows kind: haiku for mechanical, ' +
+  'sonnet for routine, opus for hard, fable for novel. Effort follows surface: low for one spot, medium for a few ' +
   'files, high for many interacting parts. risky raises the effort one step (low, medium, high, xhigh, max) and makes a routine job hard. ' +
   'History lists only the routes that failed or drew Important review findings on this project: for work like that, go above them.';
 
@@ -33,15 +33,15 @@ const SCOUT_ROUTER_SYSTEM =
   'exist, which dependencies are behind — however large or unfamiliar the project), hard (it must judge: an audit of security or ' +
   'correctness, a review, a hunt for the cause of a bug), novel (almost never: only reasoning nobody has written down, such as proving a ' +
   'concurrent algorithm correct). surface: how much code must be read. risky: true when what is judged is security, credentials, money, ' +
-  'migrations or concurrency. Model follows kind: haiku for mechanical (it takes no effort setting), sonnet for routine, opus for hard, ' +
+  'migrations or concurrency. Model follows kind: haiku for mechanical, sonnet for routine, opus for hard, ' +
   'fable for novel. Effort follows surface: low for one spot, medium for a few files or a whole project read for a summary, high when ' +
   'many interacting parts must be judged together. risky raises the effort one step (low, medium, high, xhigh, max). ' +
   'History lists only the routes that failed or drew Important review findings on this project: for work like that, go above them.';
 
 /**
- * One answer shape per pairing, so the grammar itself cannot give haiku an effort or another model none.
- * The classification comes first: a small model that names the route first just repeats a route it was
- * shown, and one that has described the job first chooses from the description.
+ * The answer shape: the models that are on and the efforts every one of them takes. The classification comes
+ * first: a small model that names the route first just repeats a route it was shown, and one that has described
+ * the job first chooses from the description.
  */
 const answerShape = (models, efforts) => ({
   type: 'object',
@@ -56,13 +56,8 @@ const answerShape = (models, efforts) => ({
   required: ['kind', 'surface', 'risky', 'model', 'effort', 'reason'],
   additionalProperties: false,
 });
-/** The grammar over the models that are on: the haiku branch while haiku is, the effort branch over the others. */
-const routerSchema = (usable) => ({
-  anyOf: [
-    ...(usable.includes('haiku') ? [answerShape(['haiku'], ['none'])] : []),
-    ...(usable.some((m) => m !== 'haiku') ? [answerShape(usable.filter((m) => m !== 'haiku'), EFFORTS)] : []),
-  ],
-});
+/** The grammar over the models that are on. */
+const routerSchema = (usable) => answerShape(usable, EFFORTS);
 
 const TASK_CUT = 3500;
 
@@ -170,7 +165,7 @@ const CHAT_ROUTER_SYSTEM =
   'rename, running a command and reporting), routine (an ordinary feature or fix with a clear ask, a summary, an explanation), hard (design, ' +
   'a bug whose cause is unknown, a review of risky code, planning across a codebase), novel (new algorithms, subtle concurrency, deep security ' +
   'review). surface: how much code the turn touches. risky: true when it touches security, credentials, money, migrations or concurrency. ' +
-  'Model follows kind: haiku for mechanical (it takes no effort setting), sonnet for routine, opus for hard, fable for novel. Effort follows ' +
+  'Model follows kind: haiku for mechanical, sonnet for routine, opus for hard, fable for novel. Effort follows ' +
   'surface: low for one spot, medium for a few files, high for many interacting parts. risky raises the effort one step (low, medium, high, ' +
   'xhigh, max) and makes a routine turn hard.';
 
@@ -180,7 +175,7 @@ function chatRouterPrompt(db, { project, text }) {
 }
 
 /** The smallest model a job may run on (`jobs.floor`); haiku, the cheapest, holds nothing back. */
-export const jobFloor = (db) => getMeta(db, 'config.jobs.floor') ?? CONFIG_DEFAULTS['jobs.floor'];
+const jobFloor = (db) => getMeta(db, 'config.jobs.floor') ?? CONFIG_DEFAULTS['jobs.floor'];
 
 /** The models a job may be routed to: the ones that are on, from the floor up — or all of them, when none at or above it is on. */
 export function jobModels(db) {
@@ -198,24 +193,23 @@ async function askFor(db, system, prompt, models = usableModels(db)) {
   if (!result.ok) return { ok: false, error: result.error };
   const { model, effort, reason, risky } = result.data ?? {};
   // The same pairing the schema enforces, checked again: a backend without grammar support can still answer anything.
-  const fits = usable.includes(model) && (model === 'haiku' ? effort === 'none' : EFFORTS.includes(effort));
+  const fits = usable.includes(model) && EFFORTS.includes(effort);
   if (!fits || typeof reason !== 'string' || !reason.trim()) return { ok: false, error: `the router answered outside its schema: ${JSON.stringify(result.data)}` };
   // Whether the work touches security, credentials, money, migrations or concurrency: kept, so such work is reviewed. Only a plain yes is one.
   return { ok: true, model, effort, reason: reason.replace(/\s+/g, ' ').trim(), risky: risky === true };
 }
 
 // Routes compared on one scale: by model first, cheapest to dearest as the catalog lists them, then by effort.
-// Haiku's 'none' sits below every effort.
+// The 'none' an old job ran at, from when haiku took no effort, sits below every effort.
 const modelRank = (model) => MODELS.indexOf(model);
 const effortRank = (effort) => EFFORTS.indexOf(effort);
 const compareRoutes = (a, b) => modelRank(a.model) - modelRank(b.model) || effortRank(a.effort) - effortRank(b.effort);
 
-/** One step above a route: the next model up that is on, keeping the effort (medium, off haiku); on the top one, one effort up, max at most. */
+/** One step above a route: the next model up that is on, keeping the effort (medium, off an old 'none'); on the top one, one effort up, max at most. */
 function stepAbove({ model, effort }, usable) {
   const next = usable.find((m) => modelRank(m) > modelRank(model));
   if (next) return { model: next, effort: EFFORTS.includes(effort) ? effort : 'medium' };
   const top = usable.at(-1);
-  if (top === 'haiku') return { model: top, effort: 'none' };
   return { model: top, effort: EFFORTS[Math.min(effortRank(effort) + 1, EFFORTS.length - 1)] };
 }
 
@@ -225,7 +219,7 @@ function stepAbove({ model, effort }, usable) {
  * 2 of 5 at more than twice the price of opus, which finished 5 of 6. So these hold whatever it answers:
  * - A first attempt starts lower: a worker's never runs on fable while opus is on, and no first attempt runs above high effort.
  * - A scout's first attempt does not run on haiku while sonnet is on: on the ledger, haiku scouts left 3 of 11 unfinished,
- *   sonnet and opus ones none of 9 — and haiku caches nothing below 4,096 tokens. It runs on sonnet at low effort instead.
+ *   sonnet and opus ones none of 9 (measured on Haiku 4.5; not yet on 5.5). It runs on sonnet at low effort instead.
  * - A retry of a job that failed, or that drew RETRY_IMPORTANT_THRESHOLD Important findings, runs at least one step above it.
  * - A reviewer pointed at a job runs on at least that job's model, at medium effort or more.
  * Pure: `retryOf` and `reviews` are the rows (id, model, effort, status, important) of the job retried and the job judged,
@@ -239,7 +233,7 @@ export function routePolicy({ agent, routed, retryOf: prev, reviews: target, usa
   if (floor && modelRank(route.model) < modelRank(floor)) {
     const up = usable.find((m) => modelRank(m) >= modelRank(floor));
     if (up) {
-      route = { model: up, effort: up === 'haiku' ? 'none' : EFFORTS.includes(route.effort) ? route.effort : 'medium' };
+      route = { model: up, effort: EFFORTS.includes(route.effort) ? route.effort : 'medium' };
       why.push(`jobs.floor is ${floor}`);
     }
   }
@@ -270,7 +264,7 @@ export function routePolicy({ agent, routed, retryOf: prev, reviews: target, usa
       route.model = usable.find((m) => modelRank(m) >= modelRank(target.model)) ?? usable.at(-1);
       why.push(`a reviewer is at least as strong as j${target.id}'s ${target.model}`);
     }
-    if (route.model !== 'haiku' && effortRank(route.effort) < effortRank('medium')) {
+    if (effortRank(route.effort) < effortRank('medium')) {
       route.effort = 'medium';
       why.push('a reviewer runs at medium effort at least');
     }
