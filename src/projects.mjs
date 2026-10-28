@@ -3,10 +3,11 @@ import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { getMeta, setMeta, tx } from './db.mjs';
 import * as memory from './memory.mjs';
-import { UsageError } from './memory.mjs';
+import { Refusal, UsageError } from './memory.mjs';
 import { paths } from './paths.mjs';
-import { gitRemote, scan } from './scan.mjs';
-import { CONFIG_DEFAULTS } from './setup.mjs';
+import { changedSince, gitRemote, presentOf, scan } from './scan.mjs';
+
+import { STOPWORDS } from './text.mjs';
 
 /**
  * Names too ordinary to mean "this project" when they turn up in a sentence.
@@ -22,7 +23,7 @@ const slugify = (name) => name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').repl
 
 function expand(path) {
   const full = resolve(path.replace(/^~(?=$|\/)/, homedir()));
-  if (!existsSync(full) || !statSync(full).isDirectory()) throw new UsageError(`${full} is not a directory`);
+  if (!existsSync(full) || !statSync(full).isDirectory()) throw new Refusal(`${full} is not a directory`);
   return realpathSync(full);
 }
 
@@ -35,13 +36,47 @@ export function aliasesOf(db, slug) {
   return db.prepare('SELECT alias FROM project_aliases WHERE slug = ? ORDER BY alias').all(slug).map((r) => r.alias);
 }
 
+/**
+ * A name too short or too common to stand for a project: every sentence holding it would name the project, and its
+ * card — and its folder as the chat's place to work — would come with it.
+ */
+const tooCommon = (name) => name.length < 3 || STOPWORDS.has(name);
+
+/**
+ * Folders that are never a project: the disk's top, your home and anything above it, and sumo's own home. Made the
+ * chat's project, one would be the shell's place to write — all of it.
+ */
+function refuseTooWide(path) {
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  const holds = (outer, inner) => outer === '/' || outer === inner || `${inner}/`.startsWith(`${outer}/`);
+  const home = real(homedir());
+  const sumo = real(paths().home);
+  const refuse = (what) => {
+    throw new Refusal(`${path} cannot be a project: it holds ${what} — a project is one folder of work`);
+  };
+  if (path === '/') refuse('the whole disk');
+  if (holds(path, home)) refuse('your home');
+  if (holds(path, sumo)) refuse("sumo's own home");
+  // A system folder on the PATH (/opt/homebrew/bin, /usr/local/bin): made the shell's place to write, a program put there
+  // would run whenever its name is typed. One in the home is the user's own, and judged as the home is.
+  const onPath = String(process.env.PATH ?? '').split(':').filter((d) => d.startsWith('/')).map(real).find((d) => !holds(home, d) && holds(path, d));
+  if (onPath) refuse(`${onPath}, a folder on your PATH`);
+}
+
 export function addAlias(db, slug, rawAlias) {
   const alias = slugify(rawAlias);
   if (!alias) throw new UsageError(`"${rawAlias}" is not a usable alias`);
+  if (tooCommon(alias)) throw new UsageError(`"${alias}" is too short or too common a word to name a project: every sentence with it would mean the project`);
   const takenBySlug = db.prepare('SELECT slug FROM projects WHERE slug = ?').get(alias);
   const takenByAlias = db.prepare('SELECT slug FROM project_aliases WHERE alias = ?').get(alias);
   const owner = takenBySlug?.slug ?? takenByAlias?.slug;
-  if (owner && owner !== slug) throw new UsageError(`"${alias}" already means the project ${owner}`);
+  if (owner && owner !== slug) throw new Refusal(`"${alias}" already means the project ${owner}`);
   if (!owner) db.prepare('INSERT INTO project_aliases (alias, slug) VALUES (?, ?)').run(alias, slug);
   return alias;
 }
@@ -52,6 +87,7 @@ export function addAlias(db, slug, rawAlias) {
  */
 export function addProject(db, rawPath, { slug: wantedSlug, aliases = [], now = new Date().toISOString() } = {}) {
   const path = expand(rawPath);
+  refuseTooWide(path);
   // Read off disk before the write lock is taken, as rescan does.
   const read = { scanned: scan(path), remote: gitRemote(path) };
   return tx(db, () => {
@@ -60,8 +96,9 @@ export function addProject(db, rawPath, { slug: wantedSlug, aliases = [], now = 
     if (created) {
       const slug = slugify(wantedSlug ?? basename(path));
       if (!slug) throw new UsageError('could not derive a name from that path — pass --slug');
+      if (wantedSlug !== undefined && tooCommon(slug)) throw new UsageError(`"${slug}" is too short or too common a word to name a project: every sentence with it would mean the project`);
       if (db.prepare('SELECT 1 FROM projects WHERE slug = ?').get(slug) || db.prepare('SELECT 1 FROM project_aliases WHERE alias = ?').get(slug)) {
-        throw new UsageError(`the name "${slug}" is taken by another project — pass --slug <name>`);
+        throw new Refusal(`the name "${slug}" is taken by another project — pass --slug <name>`);
       }
       db.prepare('INSERT INTO projects (slug, name, path, remote, created_at, last_touched_at) VALUES (?, ?, ?, ?, ?, ?)').run(
         slug,
@@ -89,10 +126,11 @@ export function addProject(db, rawPath, { slug: wantedSlug, aliases = [], now = 
  */
 export function rescan(db, nameOrAlias, now = new Date().toISOString(), read = null) {
   const project = getProject(db, nameOrAlias);
-  if (!existsSync(project.path)) throw new UsageError(`${project.path} no longer exists — archive the project or re-add it at its new path`);
+  if (!existsSync(project.path)) throw new Refusal(`${project.path} no longer exists — archive the project or re-add it at its new path`);
   const scope = `project:${project.slug}`;
   // Read off disk before the write lock is taken: a slow disk or a strange file must not hold every other writer.
   const { scanned, remote } = read ?? { scanned: scan(project.path), remote: gitRemote(project.path) };
+  const present = presentOf(project.path);
 
   return tx(db, () => {
     const current = new Map(
@@ -127,8 +165,34 @@ export function rescan(db, nameOrAlias, now = new Date().toISOString(), read = n
     }
 
     db.prepare('UPDATE projects SET scanned_at = ?, remote = ? WHERE slug = ?').run(now, remote, project.slug);
+    // Which of the files it reads were there: one made or deleted since is a change no file's time can show.
+    setMeta(db, presentKey(project.slug), present);
     return changes;
   });
+}
+
+/** Where a project's last scan keeps which of the files it reads were there. */
+const presentKey = (slug) => `scan.present.${slug}`;
+
+/** How old a scan may get before a card is built from a new one, whatever the disk says. */
+const SCAN_FRESH_MS = 7 * 24 * 3_600_000;
+
+/**
+ * A project's scanned facts made current before its card is shown: rescanned when the scan is a week old or anything it
+ * reads changed since — a stat of each file decides, so a card shown often costs nothing. True when it rescanned. A
+ * project whose folder is gone is left as it is: the card says where it was, and `project rescan` says what to do.
+ */
+export function freshen(db, slug, now = new Date().toISOString()) {
+  const project = db.prepare('SELECT * FROM projects WHERE slug = ?').get(slug);
+  if (!project || !existsSync(project.path)) return false;
+  const stale =
+    !project.scanned_at ||
+    Date.parse(now) - Date.parse(project.scanned_at) > SCAN_FRESH_MS ||
+    changedSince(project.path, project.scanned_at) ||
+    getMeta(db, presentKey(slug)) !== presentOf(project.path);
+  if (!stale) return false;
+  rescan(db, slug, now);
+  return true;
 }
 
 export function listProjects(db, { includeArchived = false } = {}) {
@@ -186,7 +250,7 @@ export function projectAt(db, dir) {
 }
 
 /** The project for work that belongs to none. It lives in Sumo's own home, and a chore in it is kept only while it is worked on. */
-export const SCRATCH = 'scratch';
+const SCRATCH = 'scratch';
 const DAY_MS = 24 * 3_600_000;
 
 /** Scratch's directory, made if it is not there: tools start in it, so it has to be. */
@@ -199,12 +263,12 @@ export function scratchDir() {
 export const isScratch = (project) => project.path === scratchDir();
 
 /** How many days a chore nothing is written in is kept. */
-export const scratchDays = (db) => Number(getMeta(db, 'config.scratch.days') ?? CONFIG_DEFAULTS['scratch.days']);
+export const SCRATCH_DAYS = 14;
 
 /** How scratch is used, as its card and a job's brief say it. */
-export const scratchRules = (db) => [
+export const scratchRules = () => [
   'for work that belongs to no project: one folder per chore, named <date>-<what it is>',
-  `a folder nothing is written in for ${scratchDays(db)} days is deleted — to keep one, move it out of here, then: sumo project add <path>`,
+  `a folder nothing is written in for ${SCRATCH_DAYS} days is deleted — to keep one, move it out of here, then: sumo project add <path>`,
   'nothing here is checked or remembered: say in the report what you ran to prove the work',
 ];
 
@@ -245,6 +309,6 @@ export function keepScratch(db, now) {
   ensureScratch(db, now);
   const last = getMeta(db, 'scratch.pruned');
   if (last && Date.parse(now) - Date.parse(last) < DAY_MS) return;
-  pruneScratch(now, scratchDays(db));
+  pruneScratch(now, SCRATCH_DAYS);
   setMeta(db, 'scratch.pruned', now);
 }

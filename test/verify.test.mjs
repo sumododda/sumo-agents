@@ -66,8 +66,8 @@ test('a passing check that changes the tree cannot certify the changed files', (
   assert.match(verdict.out, /^j1 would be REFUSED as DONE:/, verdict.out);
   assert.match(verdict.out, /files changed while the checks ran/);
   const done = finish(s);
-  assert.equal(done.code, 2, 'the cached verdict must not accept an untested tree');
-  assert.match(s.sumo(['job', 'list']).out, /running/);
+  assert.equal(done.code, 1, 'the cached verdict must not accept an untested tree');
+  assert.match(s.sumo(['job', 'list']).out, /j1 \[worker·proj-git·not started\]/, 'still open');
 });
 
 test("a worker's DONE rests on what the project's checks say, not on what its report says", () => {
@@ -83,11 +83,11 @@ test("a worker's DONE rests on what the project's checks say, not on what its re
   assert.match(s.sumo(['job', 'verify', '1']).out, /^j1 would be REFUSED as DONE:\n {2}`make test` FAILED/);
 
   const refused = finish(s);
-  assert.equal(refused.code, 2, 'a report that says "ok" does not make it so');
+  assert.equal(refused.code, 1, 'a report that says "ok" does not make it so');
   assert.match(refused.err, /j1 is not done — the project's checks were run, and:/);
   assert.match(refused.err, /`make test` fails, and it passed when this job began — read .*verify-test\.txt/);
   assert.match(refused.err, /sumo job finish 1 --status FAILED, or ask: sumo job ask 1/, 'there is always an honest way out');
-  assert.match(s.sumo(['job', 'list']).out, /j1 \[worker·proj-git·running\]/, 'a refused job is still open');
+  assert.match(s.sumo(['job', 'list']).out, /j1 \[worker·proj-git·not started\]/, 'a refused job is still open');
 
   p.write('status', 'ok\n');
   const done = finish(s);
@@ -112,7 +112,7 @@ test('what already failed is not blamed on the job — and without a baseline, n
 
   newWorker(s);
   const blamed = finish(s, '2');
-  assert.equal(blamed.code, 2);
+  assert.equal(blamed.code, 1);
   assert.match(blamed.err, /no baseline was taken before the work, so the failure counts as this job's/);
 });
 
@@ -123,7 +123,7 @@ test('a baseline taken after the first edit is refused, because it would call th
   newWorker(s);
   p.write('status', 'broken\n');
   assert.match(s.sumo(['job', 'baseline', '1']).out, /^no baseline taken: files have already changed since this job began/);
-  assert.equal(finish(s).code, 2);
+  assert.equal(finish(s).code, 1);
 });
 
 test('tests that were already here judge the change and are not part of it; new tests are welcome', () => {
@@ -136,7 +136,7 @@ test('tests that were already here judge the change and are not part of it; new 
 
   p.write('test/thing.test.js', '// asserts nothing\n');
   const refused = finish(s);
-  assert.equal(refused.code, 2);
+  assert.equal(refused.code, 1);
   assert.match(refused.err, /tests that were already here were changed: test\/thing\.test\.js .* If one is genuinely wrong, say why: sumo job ask/);
 
   // The main agent can say up front that this task is allowed to.
@@ -164,13 +164,13 @@ test('a key or token in the change blocks DONE; a credential-looking assignment 
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\nconst gh = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";\n');
   const refused = finish(s);
-  assert.equal(refused.code, 2, 'a token in the diff is never DONE');
+  assert.equal(refused.code, 1, 'a token in the diff is never DONE');
   assert.match(refused.err, /blocking: a key, token or private key was added: src\.js:2 — remove it and read it from the environment/);
 
   p.write('src.js', 'export const thing = 2;\n');
   p.write('.env', 'API_KEY=whatever\n');
   const envFile = finish(s);
-  assert.equal(envFile.code, 2, 'a secret file in the change is never DONE');
+  assert.equal(envFile.code, 1, 'a secret file in the change is never DONE');
   assert.match(envFile.err, /blocking: a secret file was added or changed: \.env/);
 
   s.sumo(['job', 'abandon', '1']);
@@ -234,7 +234,7 @@ test('a reviewer is handed the change as one file, what was asked, and the autho
   const s = sandbox();
   s.routerWillSay('sonnet', 'medium');
   const p = gitProject(s);
-  assert.equal(s.sumo(['job', 'new', '--project', 'gitproj', '--agent', 'reviewer', '--title', 'review'], { input: 'x' }).code, 2, 'nothing changed, nothing to review');
+  assert.equal(s.sumo(['job', 'new', '--project', 'gitproj', '--agent', 'reviewer', '--title', 'review'], { input: 'x' }).code, 1, 'nothing changed, nothing to review');
 
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
@@ -242,7 +242,7 @@ test('a reviewer is handed the change as one file, what was asked, and the autho
 
   const created = s.sumo(['job', 'new', '--project', 'gitproj', '--agent', 'reviewer', '--reviews', 'j1', '--title', 'review j1'], { input: 'The thing must return 2.' });
   assert.equal(created.code, 0, created.err);
-  assert.match(created.out, /run it: sumo job run \d+/);
+  assert.match(created.out, /run it: sumo job run j\d+/);
   assert.doesNotMatch(created.out, /names no check/);
 
   const brief = s.sumo(['job', 'brief', '2']).out;
@@ -296,7 +296,7 @@ test('jobs from before reviewers existed survive the upgrade, and no job id is e
     `);
   });
 
-  assert.match(s.sumo(['job', 'list']).out, /^j1 \[worker·proj-git·running\] return 2\n?$/, 'opening it migrates it; the job is still there');
+  assert.match(s.sumo(['job', 'list']).out, /^j1 \[worker·proj-git·not started\] return 2\n?$/, 'opening it migrates it; the job is still there');
   assert.match(newWorker(s).out, /^created j3 /, "j2's directory still exists on disk, so its id must not come back");
   assert.equal(s.sumo(['job', 'new', '--project', 'gitproj', '--agent', 'architect', '--title', 'x'], { input: 'y' }).code, 2);
 });
@@ -346,13 +346,13 @@ test('git is read the same whatever the user has configured: a test with an acce
 
   p.write('test/café.test.js', '// asserts nothing any more\n');
   const tampered = finish(s);
-  assert.equal(tampered.code, 2, tampered.out);
+  assert.equal(tampered.code, 1, tampered.out);
   assert.match(tampered.err, /tests that were already here were changed: test\/café\.test\.js/);
 
   p.git('checkout', '--', '.');
   p.write('src.js', 'export const thing = 2;\nconst gh = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";\n');
   const leaked = finish(s);
-  assert.equal(leaked.code, 2, leaked.out);
+  assert.equal(leaked.code, 1, leaked.out);
   assert.match(leaked.err, /blocking: a key, token or private key was added: src\.js:2/);
 });
 
@@ -363,7 +363,7 @@ test('a private key pasted into the change blocks DONE, though it is spread over
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\nconst pem = `-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----`;\n');
   const refused = finish(s);
-  assert.equal(refused.code, 2, refused.out);
+  assert.equal(refused.code, 1, refused.out);
   assert.match(refused.err, /blocking: a key, token or private key was added: src\.js:2/);
 });
 
@@ -374,14 +374,14 @@ test('a DONE that cannot be checked is refused, not waved through: no record of 
   newWorker(s);
   p.write('src.js', 'export const thing = 2;\n');
   p.write('status', 'broken\n');
-  assert.equal(finish(s).code, 2, 'the checks fail');
+  assert.equal(finish(s).code, 1, 'the checks fail');
 
   // The record of where the job began is gone or cut short: a full disk, or the worker's own editor, which may write there.
   writeFileSync(join(s.home, 'jobs', '1', 'verify.json'), '');
   const unreadable = finish(s);
-  assert.equal(unreadable.code, 2, unreadable.out);
+  assert.equal(unreadable.code, 1, unreadable.out);
   assert.match(unreadable.err, /j1 cannot be verified — .*verify\.json.*--accept/s);
-  assert.match(s.sumo(['job', 'list']).out, /j1 \[worker·proj-git·running\]/);
+  assert.match(s.sumo(['job', 'list']).out, /j1 \[worker·proj-git·not started\]/);
 
   // Taking it anyway stays possible, and is still said out loud.
   const taken = finish(s, '1', ['--accept', 'checked by hand']);
@@ -401,13 +401,13 @@ test('a file that was there before the job but never added to git is watched too
 
   p.write('test/new.test.js', '// asserts nothing\n');
   const tampered = finish(s);
-  assert.equal(tampered.code, 2, tampered.out);
+  assert.equal(tampered.code, 1, tampered.out);
   assert.match(tampered.err, /tests that were already here were changed: test\/new\.test\.js/);
 
   p.write('test/new.test.js', '// asserts help is 1\n');
   p.write('helper.js', 'export const help = 1;\nconst gh = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";\n');
   const leaked = finish(s);
-  assert.equal(leaked.code, 2, leaked.out);
+  assert.equal(leaked.code, 1, leaked.out);
   assert.match(leaked.err, /blocking: a key, token or private key was added: helper\.js:2/);
   s.sumo(['job', 'changes', '1']);
   assert.match(readFileSync(join(s.home, 'jobs', '1', 'changes.diff'), 'utf8'), /changed \(it was never in git\): helper\.js/);
@@ -452,12 +452,12 @@ test('the checks that judge a change are not part of it: one rewritten or no lon
   p.write('status', 'broken\n');
   p.write('Makefile', '.PHONY: test\ntest:\n\t@true\n');
   const rewritten = finish(s);
-  assert.equal(rewritten.code, 2, rewritten.out);
+  assert.equal(rewritten.code, 1, rewritten.out);
   assert.match(rewritten.err, /blocking: checks that were already here were changed: `make test` — they judge this change and are not part of it\. If one is genuinely wrong, say why: sumo job ask/);
 
   p.write('Makefile', 'all:\n\t@true\n');
   const dropped = finish(s);
-  assert.equal(dropped.code, 2, dropped.out);
+  assert.equal(dropped.code, 1, dropped.out);
   assert.match(dropped.err, /blocking: checks that were run when this job began are no longer run: `make test` — they judge this change and are not part of it/);
 
   // A task that may change tests may change how they run — but not stop them running.
@@ -506,7 +506,7 @@ test('two checks of one name are told apart: each is judged against its own base
   writeFileSync(join(dir, 'rust-status'), 'broken\n');
   pastCheck(s);
   const refused = s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT, ...withBin });
-  assert.equal(refused.code, 2, refused.out);
+  assert.equal(refused.code, 1, refused.out);
   assert.match(refused.err, /blocking: `cargo test` fails, and it passed when this job began/);
   const logs = readdirSync(join(s.home, 'jobs', '1')).filter((f) => f.endsWith('.txt')).sort();
   // A failing check is run once more — at the baseline the one already failing, at the end the one that passed then — and that run's log sits beside its first.
@@ -531,7 +531,7 @@ test('a retried worker is judged from where the first attempt began: what that a
   assert.equal(retried.code, 0, retried.err);
   assert.match(s.sumo(['job', 'baseline', '2']).out, /^`make test` passes$/m, 'the first attempt\'s baseline comes with it — not taken again over that attempt\'s edits, nor refused');
   const done = finish(s, '2');
-  assert.equal(done.code, 2, done.out);
+  assert.equal(done.code, 1, done.out);
   assert.match(done.err, /tests that were already here were changed: test\/thing\.test\.js/);
 });
 
@@ -575,7 +575,7 @@ test('a job abandoned while its checks run stays abandoned: finishing it afterwa
   assert.equal(s.sumo(['job', 'abandon', '1']).code, 0);
   p.write('go', '');
   const code = await new Promise((r) => run.on('close', r));
-  assert.equal(code, 2, err);
+  assert.equal(code, 1, err);
   assert.match(err, /j1 is abandoned — it cannot be finished/);
   assert.match(s.sumo(['job', 'list', '--all']).out, /^j1 \[worker·proj-git·abandoned\]/m);
 });
@@ -669,7 +669,7 @@ test('a record of the baseline changed outside sumo judges nothing: a job cannot
   const record = join(s.home, 'jobs', '1', 'verify.json');
   writeFileSync(record, readFileSync(record, 'utf8').replace('"ok": true', '"ok": false'));
   const forged = finish(s);
-  assert.equal(forged.code, 2, forged.out);
+  assert.equal(forged.code, 1, forged.out);
   assert.match(forged.err, /cannot be verified — the record of where it began .* cannot be read, or was changed since sumo wrote it/);
 });
 

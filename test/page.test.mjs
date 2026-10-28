@@ -1,6 +1,5 @@
 // The memory page: the store in a browser, where the user reads it, says yes or no to guesses, edits and forgets.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -9,9 +8,9 @@ import { test } from 'node:test';
 import { openDb } from '../src/db.mjs';
 import { add, get, history } from '../src/memory.mjs';
 import { servePage } from '../src/page.mjs';
-import { ENTRY } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
+import { atTerminal, HAS_PTY } from './helpers.mjs';
 
 /** Exactly the request a browser or another site would send, Host and Origin included — fetch will not set those. */
 function raw(url, { method = 'GET', headers = {}, body } = {}) {
@@ -155,13 +154,11 @@ test('the page answers only at its own address: no token, another host, or a pos
   });
 });
 
-test('sumo memory serves the page, asks for it to be opened, and stops cleanly on Ctrl-C', async () => {
+test('sumo memory serves the page, asks for it to be opened, and stops cleanly on Ctrl-C', { skip: !HAS_PTY && 'no python3 pty here' }, async () => {
   const home = freshHome();
   const spawnLog = join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log');
-  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', ENTRY, 'memory'], {
-    env: { ...process.env, SUMO_AGENTS_HOME: home, SUMO_AGENTS_SPAWN_LOG: spawnLog },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  // At a terminal, as a person runs it: with none, the page is refused rather than left waiting on nobody.
+  const child = atTerminal(['memory'], { ...process.env, SUMO_AGENTS_HOME: home, SUMO_AGENTS_SPAWN_LOG: spawnLog });
   let out = '';
   child.stdout.setEncoding('utf8');
   const url = await new Promise((resolve, reject) => {
@@ -175,6 +172,6 @@ test('sumo memory serves the page, asks for it to be opened, and stops cleanly o
   assert.equal((await raw(url)).status, 200);
   assert.equal(readFileSync(spawnLog, 'utf8'), `open ${url}\n`);
   const exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
-  child.kill('SIGINT');
+  child.stdin.write('\x03');
   assert.equal(await exited, 0);
 });

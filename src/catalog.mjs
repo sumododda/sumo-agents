@@ -1,6 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { spawnSync } from 'node:child_process';
-import { anthropicClient, resolveAnthropicCredential } from './auth.mjs';
+import { anthropicClient, loadedSdk, loadSdk, resolveAnthropicCredential } from './auth.mjs';
 import { getMeta, setMeta } from './db.mjs';
 import { UsageError } from './memory.mjs';
 
@@ -12,7 +11,7 @@ import { UsageError } from './memory.mjs';
  * job's run all read the switches as they are now.
  */
 export const MODEL_IDS = {
-  haiku: 'claude-haiku-4-5-20251001',
+  haiku: 'claude-haiku-5-5',
   sonnet: 'claude-sonnet-5-5',
   opus: 'claude-opus-5-5',
   fable: 'claude-fable-5-1',
@@ -85,6 +84,9 @@ export function modelLines(db, names = MODELS) {
 
 /** What went wrong with an API call, in one line a person can act on. */
 export function describeApiError(cause) {
+  // Only the SDK makes these errors: with it not loaded, none can be one of them.
+  const Anthropic = loadedSdk();
+  if (!Anthropic) return String(cause?.message ?? cause).slice(0, 300);
   if (cause instanceof Anthropic.AuthenticationError) return 'the Anthropic credential is missing or invalid — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that runs sumo';
   if (cause instanceof Anthropic.RateLimitError) return 'the API is rate-limiting this key — try again in a minute';
   if (cause instanceof Anthropic.APIError) return `the API answered ${cause.status ?? 'an error'}: ${String(cause.message).slice(0, 300)}`;
@@ -113,6 +115,7 @@ async function askApi() {
   if (standIn) return askStandIn(standIn);
   const credential = resolveAnthropicCredential();
   if (!credential) return { error: 'no Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this shell' };
+  const Anthropic = await loadSdk();
   const client = anthropicClient({ timeout: TIMEOUT_MS }, credential);
   const options = credential.type === 'oauth' ? { headers: { 'anthropic-beta': OAUTH_BETA } } : {};
   const entries = await Promise.all(

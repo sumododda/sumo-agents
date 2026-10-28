@@ -4,6 +4,11 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// The test runner sets FORCE_COLOR=1 for each file when it reports to a terminal, for its own diffs. sumo honours a
+// FORCE_COLOR as the user's, so every line a test reads would be coloured at a terminal and plain in CI: it is taken
+// away here, before any test runs. A test about colour sets it itself.
+delete process.env.FORCE_COLOR;
+
 /** A fresh SUMO_AGENTS_HOME nothing else has touched. */
 export function freshHome() {
   return join(mkdtempSync(join(tmpdir(), 'sumo-agents-env-sandbox-')), 'home');

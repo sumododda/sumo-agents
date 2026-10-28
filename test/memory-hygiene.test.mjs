@@ -136,7 +136,7 @@ test('search can be held to what was said or changed since a day, or before one'
   assert.equal(turns.code, 2);
   assert.match(turns.err, /--since and --before hold memories to a time, not what the user typed/);
   assert.match(s.sumo(['search', '--help']).out, /\[--since <YYYY-MM-DD\|Nd>\] \[--before <YYYY-MM-DD>\]/);
-  assert.match(s.sumo(['help']).out, /sumo search <query> .*\[--since <YYYY-MM-DD\|Nd>\] \[--before <YYYY-MM-DD>\]/);
+  assert.match(s.sumo(['help', 'search']).out, /sumo search <query> .*\[--since <YYYY-MM-DD\|Nd>\] \[--before <YYYY-MM-DD>\]/);
 });
 
 const TOOLS = ['eslint', 'prettier', 'vitest', 'webpack', 'rollup', 'docker', 'podman', 'terraform', 'pulumi', 'bazel', 'gradle', 'maven'];
@@ -218,8 +218,8 @@ test('a refused rewrite is said where the pass says what it did, and written to 
   for (const [id, prompt] of [['one', 'from now on use two spaces for indentation'], ['two', 'commit messages go in the past tense from now on'], ['three', 'thanks, that is all for today']]) {
     s.hook('prompt', { session_id: id, prompt });
     s.hook('session-end', { session_id: id, reason: 'other' });
-    s.modelWillSay([]);
-    s.sumo(['scribe', 'run']);
+    // Marked filed by hand: a memory pass run here would tidy by itself once the third is over.
+    s.sql((db) => db.prepare('UPDATE user_turns SET scribed = 1 WHERE session_id = ?').run(id));
   }
   s.modelWillSay([
     { op: 'supersede', old: 1, type: 'preference', scope: 'global', topic: 'style', body: 'use two spaces for indentation', turn: 1, quote: 'use two spaces for indentation' },
@@ -227,12 +227,103 @@ test('a refused rewrite is said where the pass says what it did, and written to 
     { op: 'gotcha', scope: 'global', body: 'the staging database is wiped every night at two' },
   ]);
 
-  const run = s.sumo(['dream', 'run']);
+  const run = s.sumo(['memory', 'run', '--tidy']);
   assert.equal(run.code, 0, run.err);
   assert.match(run.out, /^ {2}saved m5 \[gotcha·global·observed\]/m);
   assert.match(run.out, /^ {2}dropped — supersede: m1 is left as it is — this pass would retire 2 of the 4 memories in global, more than a quarter/m);
   assert.match(run.out, /^ {2}dropped — supersede: m2 is left as it is/m);
   assert.deepEqual(s.sql((db) => db.prepare(`SELECT id FROM memories WHERE state = 'active' ORDER BY id`).all().map((r) => r.id)), [1, 2, 3, 4, 5]);
   assert.match(readFileSync(join(s.home, 'logs', 'scribe.log'), 'utf8'), /dropped — supersede: m1 is left as it is — this pass would retire 2 of the 4 memories in global/);
-  assert.match(s.sql((db) => db.prepare(`SELECT note FROM model_runs WHERE kind = 'dream'`).get().note), /^applied=1 dropped=2$/);
+  // The pass's own row, after the tidy's: the conversations' answer, applied and dropped.
+  assert.match(s.sql((db) => db.prepare(`SELECT note FROM model_runs WHERE kind = 'dream' ORDER BY id DESC`).get().note), /^applied=1 dropped=2$/);
+});
+
+test('a gotcha an agent filed, never shown and never pinned, lets go after 45 days — history kept; what the user said, pinned or was shown stays', async () => {
+  const { expireUnusedGotchas } = await import('../src/memory.mjs');
+  await withDb(async (db) => {
+    const days = (n) => new Date(Date.parse(NOW) - n * 86_400_000).toISOString();
+    const file = (body, age, extra = {}) => add(db, { type: 'gotcha', body, provenance: 'observed', writtenBy: 'worker', now: days(age), ...extra }).memory.id;
+    const unused = file('the build cache must be cleared after a schema change', 46);
+    const pinned = file('the integration tests need the docker socket', 46, { pin: true });
+    const shown = file('the seed script is not idempotent', 46);
+    db.prepare('UPDATE memories SET hits = 1, last_hit_at = ? WHERE id = ?').run(days(10), shown);
+    const young = file('the linter runs with the project config only', 44);
+    const said = add(db, { type: 'preference', body: 'keep commit messages short', now: days(100) }).memory.id;
+    const stated = add(db, { type: 'gotcha', body: 'never run the migrations twice', now: days(100) }).memory.id;
+
+    assert.equal(expireUnusedGotchas(db, NOW), 1);
+    const state = (id) => db.prepare('SELECT state, invalid_at FROM memories WHERE id = ?').get(id);
+    assert.deepEqual({ ...state(unused) }, { state: 'invalid', invalid_at: NOW }, 'let go the way sumo forget does: the row and its history stay');
+    for (const id of [pinned, shown, young, said, stated]) assert.equal(state(id).state, 'active', `m${id} stays`);
+    assert.equal(expireUnusedGotchas(db, NOW), 0, 'and once is all');
+  });
+});
+
+test('memory health says when the user was last heard, how the last pass went, what waits to be asked and how often a guess was right, and which scans are old', async () => {
+  const { memoryHealth } = await import('../src/memory.mjs');
+  const { logRun } = await import('../src/model.mjs');
+  const { ensureSession, recordTurn } = await import('../src/sessions.mjs');
+  const { addProject } = await import('../src/projects.mjs');
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  await withDb(async (db) => {
+    const days = (n) => new Date(Date.parse(NOW) - n * 86_400_000).toISOString();
+    const empty = memoryHealth(db, NOW);
+    assert.deepEqual({ ...empty, scans: empty.scans.length }, { lastTurnAt: null, lastPass: null, waiting: 0, oldestWaitingDays: null, guesses: { confirmed: 0, rejected: 0, rate: null }, scans: 0 });
+
+    ensureSession(db, { id: 's1', now: days(3) });
+    recordTurn(db, { sessionId: 's1', text: 'we deploy on fridays now', now: days(3) });
+    const usage = { inputTokens: 1, outputTokens: 1, costUsd: 0 };
+    logRun(db, { kind: 'scribe', model: 'local', result: { ok: true, usage }, note: 'applied=1 dropped=0', now: days(3) });
+    logRun(db, { kind: 'dream', model: 'local', result: { ok: false, usage }, note: 'llama-server did not become healthy', now: days(1) });
+    // Two guesses the user confirmed, one rejected, two still waiting — the oldest twenty days.
+    const guess = (body, age) => add(db, { type: 'preference', body, provenance: 'inferred', writtenBy: 'scribe', now: days(age) }).memory.id;
+    for (const id of [guess('likes short answers', 30), guess('uses pnpm', 30)]) db.prepare(`UPDATE memories SET state = 'active', provenance = 'stated' WHERE id = ?`).run(id);
+    db.prepare(`UPDATE memories SET state = 'rejected' WHERE id = ?`).run(guess('prefers yaml', 30));
+    guess('works mostly at night', 20);
+    guess('wants emoji in commits', 2);
+    // Said by the user themselves: not a guess, whatever its words.
+    add(db, { type: 'preference', body: 'no trailing summaries', now: days(5) });
+    addProject(db, mkdtempSync(join(tmpdir(), 'sumo-agents-old-scan-')), { slug: 'old', now: days(40) });
+    addProject(db, mkdtempSync(join(tmpdir(), 'sumo-agents-new-scan-')), { slug: 'new', now: days(1) });
+
+    const health = memoryHealth(db, NOW);
+    assert.equal(health.lastTurnAt, days(3));
+    assert.deepEqual(health.lastPass, { at: days(1), ok: false, error: 'llama-server did not become healthy' });
+    assert.equal(health.waiting, 2);
+    assert.equal(health.oldestWaitingDays, 20);
+    assert.deepEqual(health.guesses, { confirmed: 2, rejected: 1, rate: 2 / 3 });
+    assert.deepEqual(health.scans, [{ slug: 'old', days: 40 }]);
+  });
+});
+
+test('a session starting lets the old unused gotchas go, and says how many in the hook log', () => {
+  const s = sandbox();
+  s.sumo(['config']);
+  const old = new Date(Date.now() - 50 * 86_400_000).toISOString();
+  const id = s.sql((db) => add(db, { type: 'gotcha', body: 'the e2e suite needs the staging token', provenance: 'observed', writtenBy: 'worker', now: old }).memory.id);
+  s.hook('session-start', { session_id: 'sess-expire', source: 'startup' });
+  assert.equal(s.sql((db) => db.prepare('SELECT state FROM memories WHERE id = ?').get(id).state), 'invalid');
+  assert.match(readFileSync(join(s.home, 'logs', 'hook.log'), 'utf8'), /session-start: 1 gotcha never shown in 45 days let go \(sumo history shows them\)/);
+});
+
+test('a pass says exactly which memories it wrote — not one already there, not one it dropped, not one a refused rewrite undid — so what it learned can be held by id', async () => {
+  await withDb((db) => {
+    const there = add(db, { type: 'gotcha', body: 'the build cache lives in /tmp/cache', now: NOW }).memory.id;
+    const worker = applyOps(db, [
+      { op: 'gotcha', scope: 'global', body: 'the vendor api allows ten requests a minute' },
+      { op: 'gotcha', scope: 'global', body: 'the build cache lives in /tmp/cache' },
+      { op: 'add', type: 'fact', body: 'not a worker operation' },
+    ], { source: 'worker', turns: new Map(), now: NOW });
+    const made = db.prepare(`SELECT id FROM memories WHERE body = 'the vendor api allows ten requests a minute'`).get().id;
+    assert.deepEqual(worker.written, [made], 'the new one only: the repeat and the refused operation wrote nothing');
+    assert.ok(!worker.written.includes(there));
+
+    // The slow pass's too-wide rewrite is undone and tried again without its replacements: only what it kept counts.
+    const { ops, turns } = rewriteOf(db, { filler: 40, tools: TOOLS.slice(0, 11) });
+    const gotcha = { op: 'gotcha', scope: 'global', body: 'the staging database is wiped every night at two' };
+    const dream = applyOps(db, [...ops, gotcha], { source: 'dream', turns, now: NOW });
+    assert.deepEqual(dream.written, [db.prepare(`SELECT id FROM memories WHERE body = ?`).get(gotcha.body).id]);
+    assert.deepEqual(applyOps(db, 'not a list', { source: 'worker', turns: new Map(), now: NOW }).written, []);
+  });
 });

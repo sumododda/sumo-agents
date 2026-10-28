@@ -1,8 +1,8 @@
 import { homedir } from 'node:os';
-import { ago } from './card.mjs';
+import { ago, askLines } from './card.mjs';
 import { getMeta } from './db.mjs';
 import { paths } from './paths.mjs';
-import { isScratch, listProjects, scratchDays } from './projects.mjs';
+import { isScratch, listProjects, SCRATCH_DAYS } from './projects.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { clip, estimateTokens } from './text.mjs';
 
@@ -11,6 +11,8 @@ const NAME_MAX = 60;
 const MAX_PROJECTS = 12;
 const MAX_LEFT_OFF = 3;
 const MAX_CONFIRM = 3;
+/** The block's ceiling, in tokens: what does not fit is found by search. */
+const PRIME_BUDGET = 800;
 const MAX_NOTICES = 2;
 const SCRIBE_FAILURES_TO_WARN = 3;
 /** A preference never used, and said more days ago than this, is the first to leave the block when room is short. */
@@ -25,20 +27,19 @@ const tilde = (path) => (path === homedir() || path.startsWith(`${homedir()}/`) 
  * they are the problem". Everything that does not fit is reachable by search,
  * and the block says so rather than silently pretending to be complete.
  */
-export function prime(db, { budget, now = new Date().toISOString() } = {}) {
-  const asked = budget ?? Number(getMeta(db, 'config.prime.budget') ?? CONFIG_DEFAULTS['prime.budget']);
+export function prime(db, { budget, project = null, now = new Date().toISOString() } = {}) {
   // A budget that is not a number would hold nothing back: the default stands in for it.
-  const limit = Number.isInteger(asked) && asked > 0 ? asked : Number(CONFIG_DEFAULTS['prime.budget']);
+  const limit = Number.isInteger(budget) && budget > 0 ? budget : PRIME_BUDGET;
   const machine = getMeta(db, 'machine');
   const open = `<sumo-memory${machine ? ` machine="${machine}"` : ''}>`;
   const close = '</sumo-memory>';
 
   // The small, time-sensitive sections are fixed first; preferences get whatever room is left.
   // Preserve the compact layout normally; when it cannot fit, keep time-sensitive lines first.
-  const sections = [workflows(db), projectsLine(db), leftOff(db, now), jobs(db, now), toConfirm(db), warnings(db)];
+  const sections = [workflows(db), projectsLine(db), leftOff(db, now), jobs(db, now), toConfirm(db, { project, now }), warnings(db)];
   // Where the work with no project goes is said every time, and is not something remembered.
   const remembered = sections.flat().length;
-  sections.splice(2, 0, scratchLine(db));
+  sections.splice(2, 0, scratchLine());
   const fixed = sections.flat();
   const spent = estimateTokens([open, ...fixed, close].join('\n'));
   const prefs = preferences(db, limit - spent, now);
@@ -121,8 +122,8 @@ function projectsLine(db) {
   return [`Projects: ${shown.join(' · ')}${more}`];
 }
 
-function scratchLine(db) {
-  return [`Scratch: ${tilde(paths().scratch)} — work that belongs to no project goes here, a folder per chore; one idle ${scratchDays(db)} days is deleted`];
+function scratchLine() {
+  return [`Scratch: ${tilde(paths().scratch)} — work that belongs to no project goes here, a folder per chore; one idle ${SCRATCH_DAYS} days is deleted`];
 }
 
 function leftOff(db, now) {
@@ -142,35 +143,22 @@ function jobs(db, now) {
   return rows.map((j) => `Job j${j.id} ${j.project} "${clip(j.title, 60)}" ${j.status.toUpperCase()} (${ago(j.updated_at, now)}) → sumo job show ${j.id}`);
 }
 
-function toConfirm(db) {
-  const guesses = db.prepare(`SELECT * FROM memories WHERE state = 'unconfirmed' ORDER BY id LIMIT ?`).all(MAX_CONFIRM);
-  const out = guesses.map(
-    (m) => `Ask the user (then sumo confirm|reject m${m.id}): is this right? "${clip(m.type === 'procedure' ? `workflow "${m.title}"` : m.body, LINE_MAX)}"`,
-  );
-  // A notice stands only while both memories are still true; superseding or forgetting either settles it.
-  const notices = db
-    .prepare(
-      `SELECT n.* FROM notices n
-       JOIN memories a ON a.id = n.memory_a AND a.state = 'active'
-       JOIN memories b ON b.id = n.memory_b AND b.state = 'active'
-       ORDER BY n.id LIMIT ?`,
-    )
-    .all(MAX_NOTICES);
-  for (const n of notices) {
-    const verb = n.kind === 'lookalike' ? 'look alike' : 'disagree';
-    out.push(`Ask the user: m${n.memory_a} and m${n.memory_b} ${verb} — ${clip(n.note, LINE_MAX)} (sumo show both; settle with sumo supersede or sumo forget)`);
-  }
-  return out;
+/**
+ * What to put to the user at the start: guesses and notices about everything and about this session's project, each
+ * guess for two weeks. One about another project is asked with that project's card, when it comes up.
+ */
+function toConfirm(db, { project = null, now }) {
+  return askLines(db, { scopes: ['global', ...(project ? [`project:${project}`] : [])], now, guesses: MAX_CONFIRM, notices: MAX_NOTICES });
 }
 
 function warnings(db) {
   const out = [];
   // AGENTS.md says a background writer files what the user says; with it off, nothing does unless the model is told.
-  if ((getMeta(db, 'config.scribe.model') ?? CONFIG_DEFAULTS['scribe.model']) === 'off') {
-    out.push('The memory writer is off (scribe.model): save what the user states that should last, as it is said, with sumo add.');
+  if ((getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model']) === 'off') {
+    out.push('The memory pass is off (memory.model): save what the user states that should last, as it is said, with sumo add.');
   }
   const failures = Number(getMeta(db, 'scribe.failures') ?? 0);
-  if (failures >= SCRIBE_FAILURES_TO_WARN) out.push(`Warning: the background memory writer has failed ${failures} times in a row — nothing new is being remembered. Tell the user; sumo scribe status shows why.`);
+  if (failures >= SCRIBE_FAILURES_TO_WARN) out.push(`Warning: the background memory writer has failed ${failures} times in a row — nothing new is being remembered. Tell the user; sumo memory status shows why.`);
   const backup = getMeta(db, 'backup.failed');
   if (backup) out.push(`Warning: the weekly backup could not be written (${backup}). Tell the user; sumo backup tries again.`);
   return out;

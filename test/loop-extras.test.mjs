@@ -3,6 +3,7 @@
 // the last calls go round in circles.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +11,7 @@ import { test } from 'node:test';
 import { openDb, setMeta } from '../src/db.mjs';
 import { newJob, note, verifyJob } from '../src/jobs.mjs';
 import { jobTools } from '../src/jobtools.mjs';
-import { CIRCLES, converse, jobMinutes, jobParams, paramsFor, runJob, runLines, stopReason } from '../src/loop.mjs';
+import { CIRCLES, converse, jobMinutes, jobParams, paramsFor, QUIET_RETRIES, runJob, runLines, sendToApi, stopReason } from '../src/loop.mjs';
 import { closeMcp } from '../src/mcp.mjs';
 import { paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
@@ -305,4 +306,29 @@ test('every thirty requests a job asks the local model whether its last twelve c
       db.close();
     }
   });
+});
+
+test("a request the loop sends again goes once from the client: the loop's own tries, each said on the screen, are the only ones; a lone request keeps the client's quiet retries", async () => {
+  let requests = 0;
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      requests++;
+      res.writeHead(529, { 'content-type': 'application/json', 'retry-after-ms': '1' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await withHome(freshHome(), { ANTHROPIC_API_KEY: 'sk-ant-api03-test', ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}` }, async () => {
+      const params = paramsFor({ model: 'haiku', effort: 'none', tools: [], text: 'hello', system: 'test' });
+      await assert.rejects(sendToApi(params), (cause) => cause.status === 529);
+      assert.equal(requests, 1, 'no hidden tries under the loop\'s');
+      requests = 0;
+      await assert.rejects(sendToApi(params, { retries: QUIET_RETRIES }), (cause) => cause.status === 529);
+      assert.equal(requests, QUIET_RETRIES + 1, 'a summary or a hand-off is tried again quietly, as before');
+    });
+  } finally {
+    server.close();
+  }
 });

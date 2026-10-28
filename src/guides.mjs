@@ -1,8 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { getMeta } from './db.mjs';
 import { REPO_ROOT } from './paths.mjs';
-import { CONFIG_DEFAULTS } from './setup.mjs';
 import { stem, words } from './text.mjs';
 
 /**
@@ -82,5 +80,8 @@ export function renderGuide(name) {
   return `<guide ${name}>\nThe user is asking for ${asking}. This is how that is done here — follow it in order:\n${body}\n</guide>`;
 }
 
-/** `guides.auto`: whether guides ride in unasked and the end of a turn is held for an unchecked edit. */
-export const autoGuides = (db) => (getMeta(db, 'config.guides.auto') ?? CONFIG_DEFAULTS['guides.auto']) !== 'off';
+/**
+ * Whether guides ride in unasked and the end of a turn is held for an unchecked edit: always, for the user. The coding
+ * eval's `--no-guides` switches them off for its own run (SUMO_AGENTS_GUIDES=off), to measure what a guide is worth.
+ */
+export const autoGuides = () => process.env.SUMO_AGENTS_GUIDES !== 'off';

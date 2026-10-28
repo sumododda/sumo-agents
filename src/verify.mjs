@@ -144,6 +144,16 @@ function tailOf(file) {
   }
 }
 
+/** The sandbox a job's process hands down for its checks: the wrap's words, or null — none given, or one that is not a list of words. */
+function checksWrapOf(env) {
+  try {
+    const wrap = JSON.parse(env.SUMO_CHECKS_WRAP ?? 'null');
+    return Array.isArray(wrap) && wrap.length > 0 && wrap.every((w) => typeof w === 'string') ? wrap : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Runs each command where the project lives and keeps the end of what it printed, which is where runners put the failures. */
 function runChecks(root, commands, dir, prefix) {
   const named = new Map();
@@ -160,7 +170,13 @@ function runChecks(root, commands, dir, prefix) {
     const into = openSync(file, 'w', 0o600);
     let run;
     try {
-      run = spawnSync(`${watcher}${command}`, { cwd: root, shell: true, detached: true, stdio: ['ignore', into, into], timeout: timeoutMs(), killSignal: 'SIGKILL' });
+      // A job's checks run the project's code, perhaps tests the model wrote: in the sandbox its shell is in, handed down by the
+      // job's own process (SUMO_CHECKS_WRAP), while this process — which records the verdict in sumo's memory — stays outside it.
+      const wrap = checksWrapOf(process.env);
+      const script = `${watcher}${command}`;
+      run = wrap
+        ? spawnSync(wrap[0], [...wrap.slice(1), '/bin/sh', '-c', script], { cwd: root, detached: true, stdio: ['ignore', into, into], timeout: timeoutMs(), killSignal: 'SIGKILL' })
+        : spawnSync(script, { cwd: root, shell: true, detached: true, stdio: ['ignore', into, into], timeout: timeoutMs(), killSignal: 'SIGKILL' });
     } finally {
       closeSync(into);
     }

@@ -35,7 +35,8 @@ function holderOf(file) {
   }
 }
 
-function alive(pid) {
+/** Whether a process is there: signal 0 asks without sending; one that is someone else's (EPERM) is there too. */
+export function alive(pid) {
   try {
     process.kill(pid, 0);
     return true;

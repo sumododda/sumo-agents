@@ -3,11 +3,10 @@ import { appendFileSync, closeSync, openSync, readFileSync, rmSync, statSync, wr
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
-import { ago } from './card.mjs';
 import { MODELS, offLine, usableModels } from './catalog.mjs';
 import { getMeta, openDb, setMeta, tx } from './db.mjs';
-import { localServerStatus } from './local-server.mjs';
 import { callModel, failure, logRun } from './model.mjs';
+import { appendLog } from './logs.mjs';
 import { paths, REPO_ROOT, SELF } from './paths.mjs';
 import { aliasesOf, listProjects } from './projects.mjs';
 import { line } from './render.mjs';
@@ -135,7 +134,7 @@ export async function withLock(name, fn) {
   }
 }
 
-export function projectEnum(db) {
+function projectEnum(db) {
   return listProjects(db, { includeArchived: true }).map((p) => p.slug);
 }
 
@@ -173,6 +172,7 @@ export function opsSchema(db, ops) {
       ? branch('checkpoint', { project: { type: 'string', enum: slugs }, done: { type: 'string' }, next: { type: ['string', 'null'] } })
       : null,
     contradiction: branch('contradiction', { ids: { type: 'array', items: { type: 'integer' } }, note: { type: 'string' } }),
+    same: branch('same', { ids: { type: 'array', items: { type: 'integer' } }, note: { type: 'string' } }),
     procedure: branch('procedure', { scope: field.scope, title: { type: 'string' }, cue: { type: 'string' }, body: field.body }),
   };
   return {
@@ -243,11 +243,12 @@ const fallbackModel = (db) => usableModels(db)[0] ?? null;
 
 /** Shared by the writer and the consolidation pass: ask, validate, record what it cost. */
 export async function askAndApply(db, { kind, promptFile, bundle, ops, sessionId, now }) {
-  let model = getMeta(db, `config.${kind}.model`) ?? CONFIG_DEFAULTS[`${kind}.model`];
+  // One setting for the whole memory pass, filing and tidying alike.
+  let model = getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model'];
   const system = readFileSync(join(REPO_ROOT, 'prompts', promptFile), 'utf8').trim();
   const schema = opsSchema(db, ops);
   // A writer set to a model the user has since turned off is not called: the refusal is the pass's failure, in the ledger like any other.
-  const off = MODELS.includes(model) ? offLine(db, model, `sumo config ${kind}.model local`) : null;
+  const off = MODELS.includes(model) ? offLine(db, model, 'sumo config memory.model local') : null;
   let result = off ? failure(off) : await callModel(db, { system, prompt: bundle.prompt, schema, model, kind });
   // A local answer that failed (server down, bundle past its context, answer cut off) is one failed row, then one more try —
   // when a credential is there to pay for it and a model is on to take it.
@@ -268,21 +269,21 @@ export async function askAndApply(db, { kind, promptFile, bundle, ops, sessionId
     logRun(db, { kind, model, result: { ...result, ok: false }, note: error, now });
     return { ok: false, error, applied: [], dropped: [], usage: result.usage };
   }
-  const outcome = applyOps(db, result.data.ops, { source: kind, turns: bundle.turns, sessionId, now });
+  const outcome = applyOps(db, result.data.ops, { source: kind, turns: bundle.turns, shown: bundle.shown, sessionId, now });
   logRun(db, { kind, model, result, note: `applied=${outcome.applied.length} dropped=${outcome.dropped.length}`, now });
-  for (const reason of outcome.dropped) appendFileSync(join(paths().logs, 'scribe.log'), `${now}   dropped — ${reason}\n`);
+  for (const reason of outcome.dropped) appendLog('scribe.log', `${now}   dropped — ${reason}\n`);
   return { ok: true, error: null, ...outcome, usage: result.usage };
 }
 
 /** Whether the user turned the writer off: nothing gets filed, so nothing should wait for it to be. */
-export const writerOff = (db) => (getMeta(db, 'config.scribe.model') ?? CONFIG_DEFAULTS['scribe.model']) === 'off';
+export const writerOff = (db) => (getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model']) === 'off';
 
 /**
  * Files what was said since the last run. Turns are marked done only after the
  * answer was applied, so a failed call costs nothing but a retry.
  */
 export async function runScribe(db, { now = new Date().toISOString() } = {}) {
-  if (writerOff(db)) return { skipped: 'scribe.model is off' };
+  if (writerOff(db)) return { skipped: 'memory.model is off' };
 
   return withLock('scribe', async () => {
     const bundle = buildBundle(db);
@@ -304,19 +305,6 @@ export async function runScribe(db, { now = new Date().toISOString() } = {}) {
     }
     return { ...outcome, turns: bundle.turns.size };
   });
-}
-
-export async function scribeStatus(db) {
-  const failures = Number(getMeta(db, 'scribe.failures') ?? 0);
-  const last = getMeta(db, 'scribe.last_run');
-  const model = getMeta(db, 'config.scribe.model') ?? CONFIG_DEFAULTS['scribe.model'];
-  return [
-    `model: ${model}`,
-    ...(model === 'local' ? [await localServerStatus(db, { file: getMeta(db, 'config.model.file') ?? CONFIG_DEFAULTS['model.file'] })] : []),
-    `turns waiting: ${pendingTurns(db, 1000).length}`,
-    `last run: ${last ? `${last} (${ago(last, new Date().toISOString())})` : 'never'}`,
-    failures > 0 ? `failing: ${failures} in a row — ${getMeta(db, 'scribe.last_error')}` : 'healthy',
-  ];
 }
 
 export function modelStats(db) {

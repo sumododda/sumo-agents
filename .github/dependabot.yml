@@ -1,0 +1,23 @@
+# Pinned actions and locked dependencies stay current without trusting a release the day it appears: updates are
+# proposed weekly, each only once it is a week old (a compromised release is usually caught and pulled sooner), grouped
+# so they arrive as one pull request per kind. Each runs the full CI before anything is merged.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ['*']
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      dependencies:
+        patterns: ['*']

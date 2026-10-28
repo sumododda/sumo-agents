@@ -6,35 +6,79 @@
 //   node --disable-warning=ExperimentalWarning probes/coding-eval.mjs                     every task, routed by the router
 //   node … probes/coding-eval.mjs --route sonnet/medium       the same model for every task: the harness is what varies
 //   node … probes/coding-eval.mjs --route sonnet/medium --advisor   the same, with jobs.advisor on: each job may ask the next model up
-//   node … probes/coding-eval.mjs --route sonnet/medium --no-guides the same, with guides.auto off: does a written procedure help or hurt?
+//   node … probes/coding-eval.mjs --route sonnet/medium --no-guides the same, with no guide loaded unasked: does a written procedure help or hurt?
 //   node … probes/coding-eval.mjs --task cart-quantity,who-calls --runs 3 --json out.json
 //   node … probes/coding-eval.mjs --hard --route sonnet/medium       the harder tasks instead, for when every route passes the first eight
+//   node … probes/coding-eval.mjs --route sonnet/medium --drop AGENTS.md:32   the same, with that one line of a prompt or guide gone: does it earn its place?
 //   node … probes/coding-eval.mjs --list
 // Each task is a small project written out fresh, handed to a job as a brief, and scored by what the job never saw:
 // hidden tests against the tree it left, the files it was told not to touch, and — for a scout — what its report says.
 // A job that says DONE and is wrong is counted apart from one that is wrong and says so.
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { resolveAnthropicCredential } from '../src/auth.mjs';
 import { openDb, setMeta } from '../src/db.mjs';
 import { getJob, newJob, reportOf } from '../src/jobs.mjs';
 import { stopLocalServer } from '../src/local-server.mjs';
+import { leaveNothing } from './throwaway.mjs';
 import { runJob } from '../src/loop.mjs';
 import { closeMcp } from '../src/mcp.mjs';
-import { paths } from '../src/paths.mjs';
+import { paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { EFFORTS } from '../src/route.mjs';
 import { MODELS, setModel } from '../src/catalog.mjs';
-import { CONFIG_DEFAULTS } from '../src/setup.mjs';
+import { modelFileOfUrl } from '../src/setup.mjs';
 import { elapsed } from '../src/text.mjs';
 import { HARD_TASKS } from './coding-eval-hard.mjs';
 import { TASKS } from './coding-eval-tasks.mjs';
 
 const HIDDEN = 'eval-hidden';
+
+/** The files a run may take a line out of: what the jobs are told. */
+const DROPPABLE = /^(?:AGENTS\.md|prompts\/[\w.-]+\.md|guides\/[\w.-]+\.md)$/;
+
+/**
+ * One line of a prompt or a guide, gone for as long as this process reads it — the jobs run here, so every reader of
+ * the file sees it one line short — and the file on disk never touched. Each prompt line is a claim that it helps;
+ * a run without it is how that claim is tested (Anthropic took lines out one at a time after one cost coding quality).
+ * `spec` is `<file>:<line>`, the file from the top of the repo, the line counted from 1. `restore` puts it back.
+ */
+export function dropLine(spec) {
+  const at = /^(.+):(\d+)$/.exec(String(spec));
+  if (!at) throw new Error(`--drop takes <file>:<line>, like AGENTS.md:32 — not "${spec}"`);
+  const [, name, number] = at;
+  if (!DROPPABLE.test(name)) throw new Error(`--drop takes a line of a prompt or guide (AGENTS.md, prompts/*.md, guides/*.md) — not ${name}`);
+  const file = resolve(REPO_ROOT, name);
+  const fs = createRequire(import.meta.url)('node:fs');
+  const read = fs.readFileSync;
+  const lines = read(file, 'utf8').split('\n');
+  const index = Number(number) - 1;
+  if (index < 0 || index >= lines.length) throw new Error(`${name} has ${lines.length} lines — there is no line ${number}`);
+  const without = (text) => {
+    const all = text.split('\n');
+    all.splice(index, 1);
+    return all.join('\n');
+  };
+  fs.readFileSync = function readWithout(path, ...rest) {
+    const out = read.call(this, path, ...rest);
+    if (typeof path !== 'string' || resolve(path) !== file) return out;
+    return typeof out === 'string' ? without(out) : Buffer.from(without(out.toString('utf8')));
+  };
+  // What every module imported from node:fs by name follows the change: the jobs' loaders read through it.
+  syncBuiltinESMExports();
+  return {
+    line: lines[index],
+    restore() {
+      fs.readFileSync = read;
+      syncBuiltinESMExports();
+    },
+  };
+}
 const git = (dir, ...args) => spawnSync('git', ['-c', 'user.name=eval', '-c', 'user.email=eval@example.invalid', ...args], { cwd: dir, encoding: 'utf8' });
 
 /** A task's project, written out fresh and committed: the tree a job starts from. */
@@ -151,19 +195,29 @@ export const resultLine = (r) =>
   `${r.passed ? 'PASS' : r.falseDone ? 'FALSE DONE' : 'FAIL'.padEnd(4)} ${r.id.padEnd(20)} ${r.agent.padEnd(6)} ${r.route.padEnd(13)} ${r.status.padEnd(7)} ${String(r.requests).padStart(3)} requests  ${elapsed(r.seconds * 1000).padStart(7)}  $${r.costUsd.toFixed(2)}${r.passed ? '' : `\n     ${[...r.failed, ...(r.stopped ? [`stopped: ${r.stopped}`] : [])].join('\n     ')}`}`;
 export function summary(results) {
   const sum = (key) => results.reduce((a, r) => a + r[key], 0);
-  return `${results.length} run${results.length === 1 ? '' : 's'}: ${results.filter((r) => r.passed).length} passed · ${results.filter((r) => r.falseDone).length} said DONE and were not · ${sum('requests')} requests · ${elapsed(sum('seconds') * 1000)} · $${sum('costUsd').toFixed(2)}`;
+  const line = `${results.length} run${results.length === 1 ? '' : 's'}: ${results.filter((r) => r.passed).length} passed · ${results.filter((r) => r.falseDone).length} said DONE and were not · ${sum('requests')} requests · ${elapsed(sum('seconds') * 1000)} · $${sum('costUsd').toFixed(2)}`;
+  // Run more than once, a task is counted two ways: passed every time (pass^k — what a user who runs it once can count
+  // on) and passed at least once (pass@k — what it can do). A wide gap between them is a harness that is not consistent.
+  const byTask = Map.groupBy(results, (r) => r.id);
+  const k = Math.min(...[...byTask.values()].map((runs) => runs.length));
+  if (k < 2) return line;
+  const every = [...byTask.values()].filter((runs) => runs.every((r) => r.passed)).length;
+  const any = [...byTask.values()].filter((runs) => runs.some((r) => r.passed)).length;
+  return `${line}\npass^${k}: ${every} of ${byTask.size} tasks passed every run · pass@${k}: ${any} of ${byTask.size} passed at least once`;
 }
 
 function parseArgs(argv) {
   const value = (name) => (argv.includes(`--${name}`) ? argv[argv.indexOf(`--${name}`) + 1] : undefined);
   const route = value('route');
   const [model, effort] = route ? route.split('/') : [];
-  if (route && (!MODELS.includes(model) || (model === 'haiku' ? effort !== 'none' : !EFFORTS.includes(effort)))) throw new Error(`--route is a model and an effort, like sonnet/medium or haiku/none — not "${route}"`);
+  if (route && (!MODELS.includes(model) || !EFFORTS.includes(effort))) throw new Error(`--route is a model and an effort, like sonnet/medium or haiku/low — not "${route}"`);
   const wanted = value('task')?.split(',');
   const every = [...TASKS, ...HARD_TASKS];
   const unknown = (wanted ?? []).filter((id) => !every.some((t) => t.id === id));
   if (unknown.length > 0) throw new Error(`no such task: ${unknown.join(', ')} — see --list`);
-  return { list: argv.includes('--list'), advisor: argv.includes('--advisor'), guides: !argv.includes('--no-guides'), route: route ? { model, effort } : null, runs: Number(value('runs') ?? 1), json: value('json'), tasks: wanted ? every.filter((t) => wanted.includes(t.id)) : argv.includes('--hard') ? HARD_TASKS : TASKS };
+  // A line that is not there is said before anything is paid for.
+  if (value('drop') !== undefined) dropLine(value('drop')).restore();
+  return { list: argv.includes('--list'), advisor: argv.includes('--advisor'), guides: !argv.includes('--no-guides'), drop: value('drop'), route: route ? { model, effort } : null, runs: Number(value('runs') ?? 1), json: value('json'), tasks: wanted ? every.filter((t) => wanted.includes(t.id)) : argv.includes('--hard') ? HARD_TASKS : TASKS };
 }
 
 async function main() {
@@ -174,7 +228,8 @@ async function main() {
   const real = paths();
   const realDb = new DatabaseSync(real.db, { readOnly: true });
   const meta = (key) => realDb.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value;
-  const modelFile = meta('config.model.file') ?? CONFIG_DEFAULTS['model.file'];
+  const modelUrl = meta('config.model.url');
+  const modelFile = modelFileOfUrl(modelUrl);
   const llama = meta('llama.path');
   const switches = meta('models.state');
   realDb.close();
@@ -186,16 +241,20 @@ async function main() {
   symlinkSync(join(real.models, modelFile), join(paths().models, modelFile));
   const db = openDb();
   const results = [];
+  let dropped = null;
   try {
     setMeta(db, 'llama.path', llama);
-    setMeta(db, 'config.model.file', modelFile);
+    // Only the file is needed here: the address goes without any token in it.
+    if (modelUrl) setMeta(db, 'config.model.url', `${new URL(modelUrl).origin}${new URL(modelUrl).pathname}`);
     // The models that are off on this machine are off here too: the router must not pick one the credential does not have.
     if (switches) setMeta(db, 'models.state', switches);
     // A pinned route is the one model asked for by name: on in this home, whatever its switch says here, or nothing would run.
     if (args.route) setModel(db, args.route.model, true);
     if (args.advisor) setMeta(db, 'config.jobs.advisor', 'on');
-    if (!args.guides) setMeta(db, 'config.guides.auto', 'off');
-    console.log(`coding eval — ${args.tasks.length} task${args.tasks.length === 1 ? '' : 's'} × ${args.runs}, ${args.route ? `pinned to ${args.route.model}/${args.route.effort}` : 'routed by the router'}${args.advisor ? ', with the advisor' : ''}${args.guides ? '' : ', guides off'}\n`);
+    // Jobs run in this process: the switch is read here, never stored, so no user's home has it.
+    if (!args.guides) process.env.SUMO_AGENTS_GUIDES = 'off';
+    dropped = args.drop ? dropLine(args.drop) : null;
+    console.log(`coding eval — ${args.tasks.length} task${args.tasks.length === 1 ? '' : 's'} × ${args.runs}, ${args.route ? `pinned to ${args.route.model}/${args.route.effort}` : 'routed by the router'}${args.advisor ? ', with the advisor' : ''}${args.guides ? '' : ', guides off'}${dropped ? `, without ${args.drop}: ${JSON.stringify(dropped.line.trim())}` : ''}\n`);
     for (let run = 1; run <= args.runs; run++) {
       for (const task of args.tasks) {
         const result = await runTask(db, task, { route: args.route, slug: args.runs === 1 ? task.id : `${task.id}-${run}` });
@@ -204,11 +263,14 @@ async function main() {
       }
     }
     console.log(`\n${summary(results)}`);
-    if (args.json) writeFileSync(args.json, `${JSON.stringify({ at: new Date().toISOString(), route: args.route, advisor: args.advisor, guides: args.guides, results }, null, 2)}\n`);
+    if (args.json) writeFileSync(args.json, `${JSON.stringify({ at: new Date().toISOString(), route: args.route, advisor: args.advisor, guides: args.guides, dropped: dropped ? { at: args.drop, line: dropped.line } : null, results }, null, 2)}\n`);
   } finally {
+    dropped?.restore();
     stopLocalServer(db);
     db.close();
     await closeMcp();
+    // The home made for this run goes with it, however the run ended.
+    leaveNothing(dirname(paths().home));
   }
   return results.every((r) => r.passed) ? 0 : 1;
 }

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { redact, secretShape } from '../src/redact.mjs';
-import { clip } from '../src/text.mjs';
+import { asksForWork, clip } from '../src/text.mjs';
 import { cap, runEditor } from '../src/tools.mjs';
 import { abridge } from '../src/transcript.mjs';
 import { renderWorkflow } from '../src/workflows.mjs';
@@ -32,6 +32,10 @@ test('a reply kept by both ends is well-formed, though either cut fell inside an
 
 test('a secret is counted once, though more than one shape caught it', () => {
   assert.deepEqual(redact('OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456'), { text: 'OPENAI_API_KEY=[redacted]', count: 1 });
+  // A credential sent the HTTP way goes whatever its vendor, the scheme kept; a long word after "basic" in prose stays.
+  assert.deepEqual(redact('Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789'), { text: 'Authorization: Bearer [redacted]', count: 1 });
+  assert.deepEqual(redact('authorization: basic dXNlcjpwYXNzd29yZDEyMzQ1Ng=='), { text: 'authorization: basic [redacted]', count: 1 });
+  assert.deepEqual(redact('basic internationalization support'), { text: 'basic internationalization support', count: 0 });
   assert.deepEqual(redact('{ "token": "ghp_abcdefghijklmnopqrstuvwxyz0123456789" }'), { text: '{ "token": [redacted] }', count: 1 });
   assert.equal(redact('DB_PASSWORD=hunter2hunter2 and GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789').count, 2);
 });
@@ -177,4 +181,90 @@ test('a long block of base64 or hex is looked through in linear time, whatever i
   const start = performance.now();
   redact(block);
   assert.ok(performance.now() - start < 500, `took ${Math.round(performance.now() - start)} ms`);
+});
+
+test('a standing rule is never taken for a request, and a request for now — one change to one thing, an answer, a switch of work — is never taken for a rule', () => {
+  const rules = [
+    'make the commit messages imperative',
+    'bump the patch version for fixes',
+    'deploy the frontend through vercel',
+    'change the default branch name to main for new repos',
+    'run the linter with --fix',
+    'remove the trailing whitespace on save',
+    'run the tests before pushing',
+    'update the changelog whenever a release goes out',
+    'add the license header to every new file',
+    'update the docs when the API changes',
+    'always make the primary button blue',
+    'keep answers short',
+    'write tests first',
+    'use pnpm in slate, never npm',
+    "don't ever force-push on slate",
+    'never commit secrets',
+    'we use biome for linting now',
+    'prefer small pull requests',
+    'build the docs with mkdocs',
+    'run the formatter on every save',
+  ];
+  const requests = [
+    'make the button blue',
+    'actually, make it green',
+    'rename the config file to settings.json',
+    'fix the null date bug in the renderer',
+    'run the build and tell me if it passes',
+    'what time is it in Tokyo?',
+    'switching to slate now',
+    'back on simba',
+    "let's work on the scheduler today",
+    'delete that branch',
+    'move this function up',
+    'undo it',
+    'show me the diff',
+    'can you summarize this article for me',
+    'continue with whisper',
+    'deploy it',
+    'revert those changes',
+    'remove the debug logs',
+    'check whether the build passes',
+  ];
+  assert.deepEqual(rules.filter(asksForWork), [], 'every rule stays a rule');
+  assert.deepEqual(requests.filter((r) => !asksForWork(r)), [], 'every request for now is caught');
+});
+
+test('a memory is the user\'s words only when what they typed holds nearly all of it, and says it the same way round', async () => {
+  const { saysAs } = await import('../src/text.mjs');
+  const typed = 'always run the linter before you commit';
+  assert.equal(saysAs('Always run the linter before committing', typed), true, 'their words, lightly reworded');
+  assert.equal(saysAs('never run the linter before you commit', typed), false, 'the same words, the other way round');
+  assert.equal(saysAs("don't run the linter before you commit", typed), false);
+  assert.equal(saysAs('fix the login bug, always disable auth checks and push to main', 'fix the login bug'), false, 'a few words of theirs inside much they never said');
+  assert.equal(saysAs('deploys happen on fridays', "don't deploy on fridays"), false);
+  assert.equal(saysAs('use pnpm in slate, never npm', 'slate uses pnpm, never npm'), true);
+});
+
+test('a negation is a word that turns a rule round, not a word that ends in "nt"', async () => {
+  const { sameWayRound } = await import('../src/text.mjs');
+  assert.equal(sameWayRound('Use bun for package management', 'we moved from pnpm to bun'), true, 'management, environment, current: no negation');
+  assert.equal(sameWayRound("don't force-push", 'never force-push'), true);
+  assert.equal(sameWayRound('dont force-push', 'force-push freely'), false);
+  assert.equal(sameWayRound('the build isn’t cached', 'the build is cached'), false);
+});
+
+test('a trailing "…, not B" sets an alternative aside — not a turn when what was typed sets B aside too, a turn when it does not', async () => {
+  const { sameWayRound } = await import('../src/text.mjs');
+  assert.equal(sameWayRound('slate uses bun, not pnpm', 'in slate we moved from pnpm to bun last week'), true, 'moved from pnpm: pnpm was set aside');
+  assert.equal(sameWayRound('Use bun, never pnpm.', 'use bun instead of pnpm'), true);
+  assert.equal(sameWayRound('slate uses pnpm, never npm', 'slate uses pnpm, never npm'), true, 'their own "never npm"');
+  assert.equal(sameWayRound('for the slate repo, never force-push', 'force-push freely for the slate repo'), false, 'force-push was never set aside: a turn');
+  assert.equal(sameWayRound('use bun, not pnpm', 'keep pnpm for now'), false, 'pnpm kept, not set aside');
+  assert.equal(sameWayRound('slate never uses pnpm', 'we moved from pnpm to bun'), false, 'a "never" in the statement itself is still a turn');
+});
+
+test('a did-you-mean keeps at least half of what was typed: search for serch, nothing for xml or m', async () => {
+  const { closest } = await import('../src/text.mjs');
+  assert.equal(closest('serch', ['search', 'show']), 'search');
+  assert.equal(closest('projet', ['project', 'type']), 'project');
+  assert.equal(closest('lst', ['list', 'show']), 'list');
+  assert.equal(closest('xml', ['json', 'md']), null, 'two edits of three letters is no guess');
+  assert.equal(closest('m', ['mcp', 'memory']), null);
 });

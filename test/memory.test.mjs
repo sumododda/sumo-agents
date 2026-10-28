@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { score } from '../src/memory.mjs';
 import { redact } from '../src/redact.mjs';
 import { overlap } from '../src/text.mjs';
-import { sandbox } from './helpers.mjs';
+import { HAS_PTY, sandbox } from './helpers.mjs';
 
 test('a memory is found by a differently-worded question', () => {
   const s = sandbox();
@@ -102,7 +102,7 @@ test('a project can be named by its alias, and an unknown project is refused', (
   assert.match(s.sumo(['add', 'decision', 'ship behind a feature flag', '--project', 'simba']).out, /\[dec·proj-simba·stated\]/);
 
   const unknown = s.sumo(['add', 'fact', 'anything', '--project', 'nope']);
-  assert.equal(unknown.code, 2);
+  assert.equal(unknown.code, 1);
   assert.match(unknown.err, /unknown project "nope"/);
 });
 
@@ -147,7 +147,13 @@ test('a guess stays out of search until the user says yes, and is gone for good 
 
   assert.match(s.sumo(['reject', 'm2']).out, /^rejected m2/);
   assert.match(s.sumo(['search', 'tabs spaces']).out, /^nothing in memory/);
-  assert.equal(s.sumo(['confirm', 'm2']).code, 2);
+  assert.equal(s.sumo(['confirm', 'm2']).code, 1);
+});
+
+test('a forgotten memory is said as forgotten, not by the name it is stored under', () => {
+  const s = sandbox();
+  s.sumo(['add', 'fact', 'a fact to let go']);
+  assert.match(s.sumo(['forget', 'm1']).out, /^forgot m1 \[fact·global·stated·forgotten\] a fact to let go$/m);
 });
 
 test('forget hides a memory but keeps the record; purge erases it, and its id is never reused', () => {
@@ -155,12 +161,12 @@ test('forget hides a memory but keeps the record; purge erases it, and its id is
   s.sumo(['add', 'fact', 'the staging database lives on host alpha']);
   s.sumo(['add', 'fact', 'the office wifi password hint is the cat']);
 
-  assert.match(s.sumo(['forget', 'm1']).out, /^forgot m1 .*invalid/);
+  assert.match(s.sumo(['forget', 'm1']).out, /^forgot m1 .*forgotten/);
   assert.match(s.sumo(['search', 'staging database']).out, /^nothing in memory/);
   assert.match(s.sumo(['show', 'm1']).out, /host alpha/);
 
-  assert.match(s.sumo(['forget', 'm2', '--purge']).out, /^purged m2/);
-  assert.equal(s.sumo(['show', 'm2']).code, 2);
+  assert.match(s.sumo(['forget', 'm2', '--purge', '--yes']).out, /^purged m2/);
+  assert.equal(s.sumo(['show', 'm2']).code, 1);
   assert.match(s.sumo(['search', 'wifi password', '--all']).out, /^nothing in memory/);
 
   assert.match(s.sumo(['add', 'fact', 'something new']).out, /^saved m3 /);
@@ -171,10 +177,10 @@ test('purge leaves nothing of what it erased in the database files: not the memo
   const secret = 'zq7hunter2vault'; // a shape the scrubber does not know, which is when purge is needed
   s.hook('prompt', { session_id: 'sess-p', prompt: `the staging login is admin / ${secret}, remember that` });
   s.modelWillSay([{ op: 'add', type: 'fact', scope: 'global', topic: 'deploy', body: `the staging login is admin / ${secret}`, turn: 1, quote: `the staging login is admin / ${secret}` }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m1 /);
+  assert.match(s.sumo(['memory', 'run']).out, /saved m1 /);
   assert.equal(s.sql((db) => db.prepare('SELECT source_turn FROM memories WHERE id = 1').get().source_turn), 1);
 
-  assert.match(s.sumo(['forget', 'm1', '--purge']).out, /^purged m1/);
+  assert.match(s.sumo(['forget', 'm1', '--purge', '--yes']).out, /^purged m1/);
   for (const file of ['memory.db', 'memory.db-wal']) {
     const path = join(s.home, file);
     if (existsSync(path)) assert.equal(readFileSync(path).includes(secret), false, `${file} still holds the purged words`);
@@ -287,11 +293,54 @@ test('purge reaches every backup: none of them holds the erased words afterwards
   const secret = 'zanzibarquux'; // one word: the full-text index keeps it whole
   assert.match(s.sumo(['add', 'preference', `Always use ${secret} for deploys`]).out, /saved m1 /);
   s.sumo(['backup']);
-  const purged = s.sumo(['forget', 'm1', '--purge']);
+  const purged = s.sumo(['forget', 'm1', '--purge', '--yes']);
   assert.match(purged.out, /^purged m1 — erased, not recoverable, and from 1 backup;/m);
   for (const file of readdirSync(join(s.home, 'backups'))) {
     assert.equal(readFileSync(join(s.home, 'backups', file)).includes(secret), false, `${file} still holds the purged words`);
   }
+});
+
+test('purge reaches the copies a restore or an upgrade set aside, too: none of them holds the erased words afterwards', () => {
+  const s = sandbox();
+  const secret = 'quokkavelvet';
+  s.sumo(['add', 'preference', `Always use ${secret} for deploys`]);
+  s.sumo(['backup']);
+  const [copy] = readdirSync(join(s.home, 'backups'));
+  const aside = ['memory.db.pre-v13.bak', 'memory.db.damaged-2026-10-28T05-07-26-518Z', 'memory.db.replaced-2026-10-28T05-08-00-000Z'];
+  for (const name of aside) copyFileSync(join(s.home, 'backups', copy), join(s.home, name));
+  const purged = s.sumo(['forget', 'm1', '--purge', '--yes']);
+  assert.match(purged.out, /^purged m1 — erased, not recoverable, and from 4 backups;/m);
+  for (const name of aside) assert.equal(readFileSync(join(s.home, name)).includes(secret), false, `${name} still holds the purged words`);
+});
+
+test('a memory typed at a terminal is written by the user; one added from a shell with no terminal — another harness\'s model — is not', { skip: !HAS_PTY && 'no python3 pty here' }, () => {
+  const s = sandbox();
+  assert.equal(s.typed(['add', 'fact', 'typed by hand'], '', 'never asked').code, 0);
+  s.sumo(['add', 'fact', 'added by a tool']);
+  assert.match(s.sumo(['show', 'm1']).out, /^written by: user$/m);
+  assert.match(s.sumo(['show', 'm2']).out, /^written by: chat-model$/m);
+});
+
+test('erasing for good asks first: with no terminal and no --yes nothing is erased, and the way to go on is said', () => {
+  const s = sandbox();
+  s.sumo(['add', 'fact', 'a fact worth keeping']);
+  const refused = s.sumo(['forget', 'm1', '--purge']);
+  assert.equal(refused.code, 2);
+  assert.equal(refused.err, 'sumo: erasing m1 for good cannot be undone, so it asks first — run it in a terminal, or add --yes\n');
+  assert.match(s.sumo(['show', 'm1']).out, /a fact worth keeping/);
+});
+
+test('at a terminal, erasing for good shows the memory and goes ahead only when its id is typed back', { skip: !HAS_PTY && 'no python3 pty here' }, () => {
+  const s = sandbox();
+  s.sumo(['add', 'fact', 'a fact worth keeping']);
+  const declined = s.typed(['forget', 'm1', '--purge'], 'yes', ':');
+  assert.match(declined.out, /m1 \[fact·global·stated\] a fact worth keeping\nErase m1 for good, from every backup too\? Type m1 to confirm:/);
+  assert.match(declined.out, /sumo: nothing was erased — the answer was not m1/);
+  assert.equal(declined.code, 1);
+  assert.match(s.sumo(['show', 'm1']).out, /a fact worth keeping/);
+  const done = s.typed(['forget', 'm1', '--purge'], 'm1', ':');
+  assert.equal(done.code, 0, done.out);
+  assert.match(done.out, /purged m1 — erased, not recoverable/);
 });
 
 test('a backup that cannot be cleaned whole is left as it was and named, never half-purged', async () => {
@@ -299,13 +348,13 @@ test('a backup that cannot be cleaned whole is left as it was and named, never h
   const s = sandbox();
   s.hook('prompt', { session_id: 'sess-o', prompt: 'the old vault word is quokkaglimmer, remember that' });
   s.modelWillSay([{ op: 'add', type: 'fact', scope: 'global', body: 'the old vault word is quokkaglimmer', turn: 1, quote: 'the old vault word is quokkaglimmer' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m1 /);
+  assert.match(s.sumo(['memory', 'run']).out, /saved m1 /);
   s.sumo(['backup']);
   const [file] = readdirSync(join(s.home, 'backups'));
   const old = new DatabaseSync(join(s.home, 'backups', file));
   old.exec('DROP TABLE user_turns_fts');
   old.close();
-  const purged = s.sumo(['forget', 'm1', '--purge']);
+  const purged = s.sumo(['forget', 'm1', '--purge', '--yes']);
   assert.match(purged.out, /still in 1 backup that could not be cleaned — delete it by hand/);
   const after = new DatabaseSync(join(s.home, 'backups', file));
   assert.equal(after.prepare('SELECT COUNT(*) AS n FROM memories WHERE id = 1').get().n, 1, 'the memory is still there, not half-removed');

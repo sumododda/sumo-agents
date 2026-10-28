@@ -1,6 +1,6 @@
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { paths } from './paths.mjs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { homeProblem, paths } from './paths.mjs';
 import { DatabaseSync } from './sqlite.mjs';
 
 /**
@@ -269,6 +269,51 @@ const MIGRATIONS = [
   // 9 — whether the router called a job's work risky (security, credentials, money, migrations, concurrency): 1 or 0, so such
   // work is reviewed once it is done. Nullable: a job routed before this migration was never asked.
   (db) => addColumnsIfMissing(db, 'jobs', ['risky INTEGER']),
+  // 10 — why a request wrote its context to the cache again when the cache should have held it: gap, prefix, cleared, model
+  // or unknown (cost.mjs). Nullable: a request that found its context, a conversation's first, or a row from before this.
+  (db) => addColumnsIfMissing(db, 'model_runs', ['cache_cause TEXT']),
+  // 11 — two memories the tidy pass has had judged (dream.mjs): same, replaces, conflict or unrelated, so a pair is put to
+  // the model once. Either memory going takes the pair with it.
+  `
+  CREATE TABLE IF NOT EXISTS memory_pairs (
+    a         INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    b         INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    label     TEXT NOT NULL,
+    judged_at TEXT NOT NULL,
+    PRIMARY KEY (a, b)
+  ) STRICT;
+  `,
+  // 12 — the writer and the tidier are one memory pass with one setting, memory.model. The writer's choice is kept: it is
+  // the one that runs after every turn (the user who turned it off still has it off). The tidier's alone is not taken —
+  // it would move every turn's filing onto the model chosen for a weekly tidy, a paid one perhaps. The old keys go.
+  `
+  INSERT OR IGNORE INTO meta (key, value) SELECT 'config.memory.model', value FROM meta WHERE key = 'config.scribe.model';
+  DELETE FROM meta WHERE key IN ('config.scribe.model', 'config.dream.model');
+  `,
+  // 13 — what a conversation read past the machine (a web search or fetch, an MCP server), one tool name a line, each
+  // once: what the memory pass files from its replies is held for the user (sessions.mjs, apply.mjs). On the session's
+  // own row, not in meta: the pass runs in a process of its own and reads it with the session's turns. Nullable: a
+  // conversation that read nothing, or one from before this.
+  (db) => addColumnsIfMissing(db, 'sessions', ['outside_read TEXT']),
+  // 14 — why a memory is held for the user beyond being a guess: 'outside' when what it says came from a conversation that
+  // read the web or an MCP server. Only the user confirms such a one: the model that read the page may not vouch for it.
+  (db) => addColumnsIfMissing(db, 'memories', ['held_for TEXT']),
+  // 15 — fewer settings. chat.plain and chat.motion are one, chat.screen: plain wins, then a motion turned off is still.
+  // model.source, model.repo and model.file are one, model.url, the address they made (the defaults of the time fill in a
+  // part not set) — the same file is fetched. prime.budget, scratch.days, jobs.escalate and guides.auto are fixed now.
+  `
+  INSERT OR IGNORE INTO meta (key, value)
+    SELECT 'config.chat.screen', CASE WHEN EXISTS (SELECT 1 FROM meta WHERE key = 'config.chat.plain' AND value = 'on') THEN 'plain' ELSE 'still' END
+    WHERE EXISTS (SELECT 1 FROM meta WHERE (key = 'config.chat.plain' AND value = 'on') OR (key = 'config.chat.motion' AND value = 'off'));
+  INSERT OR IGNORE INTO meta (key, value)
+    SELECT 'config.model.url',
+      COALESCE((SELECT value FROM meta WHERE key = 'config.model.source'), 'https://huggingface.co') || '/' ||
+      COALESCE((SELECT value FROM meta WHERE key = 'config.model.repo'), 'Qwen/Qwen3-4B-GGUF') || '/resolve/main/' ||
+      COALESCE((SELECT value FROM meta WHERE key = 'config.model.file'), 'Qwen3-4B-Q4_K_M.gguf')
+    WHERE EXISTS (SELECT 1 FROM meta WHERE key IN ('config.model.source', 'config.model.repo', 'config.model.file'));
+  DELETE FROM meta WHERE key IN ('config.chat.plain', 'config.chat.motion', 'config.model.source', 'config.model.repo', 'config.model.file',
+    'config.prime.budget', 'config.scratch.days', 'config.jobs.escalate', 'config.guides.auto');
+  `,
 ];
 
 /**
@@ -295,6 +340,17 @@ const BUSY_MS = 3000;
  * secure_delete zeroes what is deleted, so an erased memory does not linger in the file's free space.
  */
 export function openDb(file = paths().db) {
+  try {
+    return opened(file);
+  } catch (cause) {
+    // A home that is a file, or one sumo may not write, is said as that, with what to do — not as Node's or SQLite's words.
+    const said = homeProblem(cause, dirname(file));
+    if (said === null) throw cause;
+    throw new Error(said, { cause });
+  }
+}
+
+function opened(file) {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   // SQLite gives the -wal and -shm files the database's own mode: the file is made private before SQLite first opens
   // it, or they are born readable by everyone (umask 022) and keep the latest writes there.
@@ -309,8 +365,55 @@ export function openDb(file = paths().db) {
   const db = new DatabaseSync(file);
   db.exec(`PRAGMA busy_timeout = ${BUSY_MS}; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;`);
   useWal(db);
+  const found = schemaVersion(db);
+  // A newer sumo's tables are not this one's to write: its migrations would be taken for undone, or its rows misread.
+  if (found > MIGRATIONS.length) {
+    db.close();
+    throw new Error(`the database is from a newer sumo (schema ${found}; this one knows ${MIGRATIONS.length}) — upgrade: npm update -g sumo-agents`);
+  }
+  if (found > 0 && found < MIGRATIONS.length) copyAside(db, file, found);
   migrate(db);
   return db;
+}
+
+/** How many copies made before a migration are kept: the newest. */
+const PRE_MIGRATION_KEPT = 3;
+/** How long an empty copy may be another process's copy still being made, before it is taken for one that died half-way. */
+const HALF_MADE_MS = 60_000;
+
+/**
+ * The database as it is, copied beside it before it is migrated — `<db>.pre-v<N>.bak`, N the version it was at — so an
+ * upgrade that goes wrong can be undone by hand. VACUUM INTO writes a consistent copy while others read; it writes into
+ * a file made empty and private first, so the copy is never readable by others for a moment. A copy already there was
+ * made by a process that got here first. One that cannot be made is let go: the migrations only add.
+ */
+function copyAside(db, file, version) {
+  const copy = `${file}.pre-v${version}.bak`;
+  // An empty copy left a while ago is one a process died making: it is made again. A fresh empty one is another
+  // process's at work.
+  try {
+    const left = statSync(copy);
+    if (left.size === 0 && Date.now() - left.mtimeMs > HALF_MADE_MS) rmSync(copy, { force: true });
+  } catch {
+    // Not there: the usual case.
+  }
+  try {
+    closeSync(openSync(copy, 'wx', 0o600));
+  } catch {
+    return;
+  }
+  try {
+    db.exec(`VACUUM INTO '${copy.replaceAll("'", "''")}'`);
+  } catch {
+    rmSync(copy, { force: true });
+    return;
+  }
+  const mine = `${basename(file)}.pre-v`;
+  const copies = readdirSync(dirname(file))
+    .filter((name) => name.startsWith(mine) && name.endsWith('.bak'))
+    .map((name) => join(dirname(file), name))
+    .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  for (const old of copies.slice(PRE_MIGRATION_KEPT)) rmSync(old, { force: true });
 }
 
 /**

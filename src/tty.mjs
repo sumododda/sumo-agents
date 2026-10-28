@@ -13,10 +13,23 @@ import { isWebTool, WEB_SEARCH_TOOL } from './web.mjs';
  * dim and colour as it streams, wrapped to a readable width; the memory block
  * in spaced sections with its labels standing out; tool lines and errors told
  * apart from the model's own words. Colour is off when stdout is not a
- * terminal or NO_COLOR is set, so a pipe gets plain text.
+ * terminal or NO_COLOR is set, so a pipe gets plain text — unless FORCE_COLOR asks for it.
  */
 
-const CODES = { bold: ['1', '22'], dim: ['2', '22'], italic: ['3', '23'], underline: ['4', '24'], strike: ['9', '29'], cyan: ['36', '39'], yellow: ['33', '39'], red: ['31', '39'], green: ['32', '39'], magenta: ['35', '39'], blue: ['34', '39'] };
+const CODES = { bold: ['1', '22'], dim: ['2', '22'], italic: ['3', '23'], underline: ['4', '24'], inverse: ['7', '27'], strike: ['9', '29'], cyan: ['36', '39'], yellow: ['33', '39'], red: ['31', '39'], green: ['32', '39'], magenta: ['35', '39'], blue: ['34', '39'] };
+
+/**
+ * The marks the screen draws with. Plain, for a screen reader or a terminal that draws only ASCII, each is a character a
+ * reader says as itself: no box drawing, no symbol spelled out by its Unicode name.
+ */
+const GLYPHS = {
+  tool: '⏺', fail: '✗', pick: '❯', under: '⎿', bar: '┃', quote: '│', rule: '─', fenceOpen: '┌─', fenceClose: '└─', todo: '☐', done: '☑', bullet: '•', warn: '⚠', thought: '✻',
+  box: { h: '─', v: '│', tl: '┌', tm: '┬', tr: '┐', ml: '├', mm: '┼', mr: '┤', bl: '└', bm: '┴', br: '┘' },
+};
+const PLAIN_GLYPHS = {
+  tool: '*', fail: 'x', pick: '>', under: '|', bar: '>', quote: '|', rule: '-', fenceOpen: '+-', fenceClose: '+-', todo: '[ ]', done: '[x]', bullet: '-', warn: '!', thought: '*',
+  box: { h: '-', v: '|', tl: '+', tm: '+', tr: '+', ml: '+', mm: '+', mr: '+', bl: '+', bm: '+', br: '+' },
+};
 const MAX_WIDTH = 100;
 const MIN_WIDTH = 40;
 
@@ -27,15 +40,27 @@ const LINK_CLOSE = '\x1b]8;;\x07';
 /**
  * The style functions, each a no-op when colour is off. `links` makes `link` an address the terminal opens on a click; a
  * terminal that does not know them draws the text alone, but a pager does not, so the screen asks for them and nothing else.
+ * `plain` draws with ASCII marks (`g`): see GLYPHS.
  */
-export function styles(enabled, { links = false } = {}) {
+export function styles(enabled, { links = false, plain = false } = {}) {
   const s = {};
   for (const [name, [on, off]] of Object.entries(CODES)) s[name] = enabled ? (t) => `\x1b[${on}m${t}\x1b[${off}m` : (t) => t;
   s.link = enabled && links ? (url, text = url) => `${LINK_OPEN(url)}${text}${LINK_CLOSE}` : (_url, text = _url) => text;
+  s.plain = plain;
+  s.g = plain ? PLAIN_GLYPHS : GLYPHS;
   return s;
 }
 
-export const colourEnabled = (stream = process.stdout, env = process.env) => Boolean(stream.isTTY) && !('NO_COLOR' in env) && env.TERM !== 'dumb';
+/** The marks for a screen, plain or not. */
+export const glyphs = (plain = false) => (plain ? PLAIN_GLYPHS : GLYPHS);
+
+/**
+ * Colour on a terminal unless NO_COLOR holds something (an empty one is not set: no-color.org) or the terminal is dumb.
+ * A FORCE_COLOR the user set wins, as it does for chalk on the chat screen: 0 or false is none, anything else is colour,
+ * piped too — a CI log can ask for it. Empty is not set, as for NO_COLOR.
+ */
+export const colourEnabled = (stream = process.stdout, env = process.env) =>
+  env.FORCE_COLOR ? env.FORCE_COLOR !== '0' && env.FORCE_COLOR !== 'false' : Boolean(stream.isTTY) && !env.NO_COLOR && env.TERM !== 'dumb';
 
 /** Lines no wider than this read comfortably whatever the window is. */
 export const widthOf = (stream = process.stdout, env = process.env) => Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, (stream.columns || Number(env.COLUMNS) || 80) - 1));
@@ -124,7 +149,7 @@ const LIST_ITEM = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
  * The indent a line that goes on with a list item is drawn at: under the item's text, not its marker. Null for a
  * line that is no list item.
  */
-export function hangOf(line) {
+function hangOf(line) {
   const item = LIST_ITEM.exec(line);
   if (!item) return null;
   return `${item[1]}${' '.repeat(/\d/.test(item[2]) ? item[2].length + 3 : 4)}`;
@@ -206,12 +231,12 @@ export function renderLine(line, s, { fence = false, width = MAX_WIDTH, hang = n
   const item = LIST_ITEM.exec(line);
   if (item && !/\d/.test(item[2])) {
     const task = /^\[([ xX])\]\s+(.*)$/.exec(item[3]);
-    const mark = task ? (task[1] === ' ' ? s.dim('☐') : s.green('☑')) : s.dim('•');
+    const mark = task ? (task[1] === ' ' ? s.dim(s.g.todo) : s.green(s.g.done)) : s.dim(s.g.bullet);
     return wrap(`${item[1]}  ${mark} ${inline(task ? task[2] : item[3], s)}`, width, `${item[1]}    `);
   }
   if (item) return wrap(`${item[1]}  ${s.dim(`${item[2].slice(0, -1)}.`)} ${inline(item[3], s)}`, width, hangOf(line));
-  if (/^\s*>\s?/.test(line)) return wrap(`  ${s.dim('│')} ${s.italic(inline(line.replace(/^\s*>\s?/, ''), s))}`, width, `  ${s.dim('│')} `);
-  if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) return s.dim('─'.repeat(Math.min(40, width)));
+  if (/^\s*>\s?/.test(line)) return wrap(`  ${s.dim(s.g.quote)} ${s.italic(inline(line.replace(/^\s*>\s?/, ''), s))}`, width, `  ${s.dim(s.g.quote)} `);
+  if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) return s.dim(s.g.rule.repeat(Math.min(40, width)));
   if (hang !== null && /^\s+\S/.test(line)) return wrap(`${hang}${inline(line.trim(), s)}`, width, hang);
   return wrap(inline(line, s), width);
 }
@@ -289,6 +314,10 @@ export function renderTable(rows, s, width) {
   const columns = head.length;
   const aligns = Array.from({ length: columns }, (_, i) => (/^:-+:$/.test(rule[i] ?? '') ? 'center' : /-:$/.test(rule[i] ?? '') ? 'right' : 'left'));
   const table = [head, ...body].map((row) => Array.from({ length: columns }, (_, i) => row[i] ?? ''));
+  // Each row as a record — the column's name, then the cell — one under the other.
+  const records = () => body.map((row) => head.map((name, i) => wrap(`${i === 0 ? s.dim(s.g.bullet) : ' '} ${s.bold(inline(name, s))}: ${inline(row[i] ?? '', s)}`, width, '    ')).join('\n')).join('\n\n');
+  // Plain mode is drawn for a screen reader, which would spell a frame out character by character: always records.
+  if (s.plain && body.length > 0) return records();
   const widths = Array.from({ length: columns }, (_, i) => Math.max(1, ...table.map((row) => visible(inline(row[i], s)))));
   const room = width - (3 * columns + 1);
   const sum = (list) => list.reduce((a, b) => a + b, 0);
@@ -299,9 +328,7 @@ export function renderTable(rows, s, width) {
     const spare = room - sum(least);
     // Three columns or more that cannot keep their words whole would fold into a ladder of word ends: each row is shown as
     // a record instead — the column's name, then the cell — one under the other.
-    if (spare < 0 && columns >= 3 && body.length > 0) {
-      return body.map((row) => head.map((name, i) => wrap(`${i === 0 ? s.dim('•') : ' '} ${s.bold(inline(name, s))}: ${inline(row[i] ?? '', s)}`, width, '    ')).join('\n')).join('\n\n');
-    }
+    if (spare < 0 && columns >= 3 && body.length > 0) return records();
     if (spare >= 0) {
       const wants = widths.map((most, i) => most - least[i]);
       const given = least.map((w, i) => w + Math.floor((spare * wants[i]) / Math.max(1, sum(wants))));
@@ -312,14 +339,15 @@ export function renderTable(rows, s, width) {
     while (sum(widths) > room && Math.max(...widths) > MIN_COLUMN) widths[widths.indexOf(Math.max(...widths))]--;
   }
 
-  const edge = (left, mid, right) => s.dim(`${left}${widths.map((w) => '─'.repeat(w + 2)).join(mid)}${right}`);
-  const bar = s.dim('│');
+  const box = s.g.box;
+  const edge = (left, mid, right) => s.dim(`${left}${widths.map((w) => box.h.repeat(w + 2)).join(mid)}${right}`);
+  const bar = s.dim(box.v);
   const draw = (row, style) => {
     const cells = row.map((cell, i) => (visible(inline(cell, s)) <= widths[i] ? [inline(cell, s)] : fold(inline(cell, NO_STYLE), widths[i])));
     const height = Math.max(...cells.map((c) => c.length));
     return Array.from({ length: height }, (_, n) => `${bar} ${cells.map((c, i) => style(pad(c[n] ?? '', widths[i], aligns[i]))).join(` ${bar} `)} ${bar}`);
   };
-  return [edge('┌', '┬', '┐'), ...draw(table[0], s.bold), edge('├', '┼', '┤'), ...table.slice(1).flatMap((row) => draw(row, (t) => t)), edge('└', '┴', '┘')].join('\n');
+  return [edge(box.tl, box.tm, box.tr), ...draw(table[0], s.bold), edge(box.ml, box.mm, box.mr), ...table.slice(1).flatMap((row) => draw(row, (t) => t)), edge(box.bl, box.bm, box.br)].join('\n');
 }
 
 /**
@@ -332,6 +360,26 @@ export function renderTable(rows, s, width) {
  * eight, so a box's border or a wrapped line would land wherever the tab pushed it.
  */
 export const untab = (text) => text.replaceAll('\t', '    ');
+
+/**
+ * The line still arriving, a mark it has opened and not yet closed made whole for now — a code span shut, a link whose
+ * address is still coming shown by its words, bold ended — so the live line never shows a mark the finished one will not.
+ * A mark with nothing after it yet is held back. Only the live line is drawn from this; the finished one, from what came.
+ */
+function closedForNow(line) {
+  const ticks = [...line.matchAll(/(?<!\\)`/g)];
+  if (ticks.length % 2 === 1) {
+    const at = ticks.at(-1).index;
+    return line.slice(at + 1).trim() ? `${line}\`` : line.slice(0, at);
+  }
+  const shown = line.replace(/\[([^\]\n]+)\]\([^)\s]*$/, '$1');
+  // Bold counted outside the code spans, where a `**` is only itself.
+  const bold = [...shown.replace(/`[^`]*`/g, (span) => ' '.repeat(span.length)).matchAll(/\*\*/g)];
+  if (bold.length % 2 === 0) return shown;
+  const at = bold.at(-1).index;
+  const words = shown.trimEnd();
+  return shown.slice(at + 2).trim() ? `${words}**${shown.slice(words.length)}` : shown.slice(0, at);
+}
 
 export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
   let tail = '';
@@ -349,7 +397,9 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
       hang = null;
       lang = fence ? marks[1].toLowerCase() : '';
       code = { comment: false };
-      return s.dim(fence ? `    ┌─${marks[1] ? ` ${marks[1]}` : ''}` : '    └─');
+      // Plain mode names the block in words, for a reader: no frame corner to spell out.
+      if (s.plain) return s.dim(fence ? `    code${marks[1] ? ` (${marks[1]})` : ''}:` : '    end of code');
+      return s.dim(fence ? `    ${s.g.fenceOpen}${marks[1] ? ` ${marks[1]}` : ''}` : `    ${s.g.fenceClose}`);
     }
     if (!fence) hang = hangOf(raw) ?? (/^\s+\S/.test(raw) || raw.trim() === '' ? hang : null);
     return renderLine(raw, s, { fence, width, hang: hangOf(raw) === null ? hang : null, lang, code });
@@ -389,7 +439,7 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
     /** What has not been written yet, rendered as far as it has got: the rows of a table, and the line still arriving. */
     get tail() {
       const going = /^\s+\S/.test(tail) && hangOf(tail) === null ? hang : null;
-      return [rows.length > 0 ? held() : '', tail && !/^\s*```/.test(tail) ? renderLine(tail, s, { fence, width, hang: going, lang, code: { ...code } }) : ''].filter(Boolean).join('\n');
+      return [rows.length > 0 ? held() : '', tail && !/^\s*```/.test(tail) ? renderLine(fence ? tail : closedForNow(tail), s, { fence, width, hang: going, lang, code: { ...code } }) : ''].filter(Boolean).join('\n');
     },
   };
 }
@@ -404,7 +454,7 @@ export const VERSION = (() => {
 })();
 
 /** The words shown while the model works: yours, one a line, in spinner.txt at the top of the repo. */
-export const SPINNER_FILE = join(REPO_ROOT, 'spinner.txt');
+const SPINNER_FILE = join(REPO_ROOT, 'spinner.txt');
 const SPINNER_FALLBACK = ['Working'];
 
 /** The working messages: every line of the file that is not blank and not a `#` comment. */
@@ -445,7 +495,7 @@ export function flow(i, frame) {
 }
 
 /** What the chat draws faint in the empty room above the box you type in: yours, in logo.txt at the top of the repo. */
-export const LOGO_FILE = join(REPO_ROOT, 'logo.txt');
+const LOGO_FILE = join(REPO_ROOT, 'logo.txt');
 
 /** The logo's rows, as drawn: `#` comments and the blank rows around it dropped, the blank rows inside it kept. No file draws nothing. */
 export function logoLines(file = LOGO_FILE) {
@@ -464,7 +514,8 @@ export function logoLines(file = LOGO_FILE) {
 const SHOWN_REPORT_LINES = 3;
 const SHOWN_HEAD_LINES = 2;
 const SHOWN_TAIL_LINES = 3;
-const SHOWN_DIFF_LINES = 12;
+/** The rows of the screen an edit's diff takes before the rest is folded away. */
+const SHOWN_DIFF_ROWS = 12;
 const SHOWN_COMMAND_LINES = 3;
 const SHOWN_COMMAND_CHARS = 240;
 const SHOWN_WRITE_LINES = 4;
@@ -485,8 +536,26 @@ function ends(lines, full) {
 /** A path as a person reads it: under the home directory, from `~`. */
 export const tilde = (path, home = homedir()) => (path === home ? '~' : String(path).startsWith(`${home}${sep}`) ? `~${String(path).slice(home.length)}` : String(path));
 
+/**
+ * A path without the link macOS keeps its own /var, /tmp and /etc behind (`/private/var` is `/var`): one file, one
+ * spelling on the screen, however the model or a resolved path named it. Elsewhere `/private` is a folder like any other.
+ */
+const unlinked = (path) => (process.platform === 'darwin' ? String(path).replace(/^\/private(?=\/(?:var|tmp|etc)(?:\/|$))/, '') : String(path));
+
 /** A path as the work reads it: a file in the project from the project, anything else from the home directory. */
-export const pathFrom = (path, cwd) => (cwd && path === cwd ? '.' : cwd && String(path).startsWith(`${cwd}${sep}`) ? String(path).slice(cwd.length + 1) : tilde(path));
+export const pathFrom = (path, cwd) => {
+  const at = unlinked(path);
+  const from = cwd ? unlinked(cwd) : null;
+  return from && at === from ? '.' : from && at.startsWith(`${from}${sep}`) ? at.slice(from.length + 1) : tilde(at);
+};
+
+/** What the work said back, the files in the project in it named from there, as its title names them: the editor's own words. */
+const fromProject = (text, cwd) => {
+  if (!cwd) return text;
+  const at = unlinked(cwd);
+  const places = process.platform === 'darwin' && /^\/(?:var|tmp|etc)(?:\/|$)/.test(at) ? [`/private${at}`, at] : [at];
+  return places.reduce((said, place) => said.replaceAll(`${place}${sep}`, ''), String(text));
+};
 
 /** How a delegated job ended, for the line that sums it up: its mark, the word for it, and its colour. */
 const JOB_ENDS = { done: ['✓', 'done', 'add'], failed: ['✗', 'failed', 'error'], needs_input: ['?', 'needs your answer', 'ask'], open: ['○', 'never closed', 'dim'], stopped: ['■', 'stopped by you', 'dim'] };
@@ -501,9 +570,27 @@ const toned = (text, tone) => withoutColourCodes(text).split('\n').map((t) => ({
 const count = (text) => [{ text: `${text === '' ? 0 : text.replace(/\n$/, '').split('\n').length} lines`, tone: 'dim' }];
 
 /**
+ * Where two lines differ: what lies between the start they share and the end they share, in each — null when they share
+ * neither, since then the whole line is the change and marking it says nothing.
+ */
+function changedSpan(a, b) {
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let end = 0;
+  while (end < a.length - start && end < b.length - start && a.at(-1 - end) === b.at(-1 - end)) end++;
+  if (start + end === 0) return null;
+  return [
+    [start, a.length - end],
+    [start, b.length - end],
+  ];
+}
+
+/**
  * An edit as a diff: the lines old and new share at their ends are what stayed, and what lies between is what went and
  * what came — each numbered as the file numbers it when `line` says where the old text began, with one line of what
- * stayed on either side. Folded, a big change keeps the top of each side, so what came is never folded away whole.
+ * stayed on either side. A line that went stands over the line that came in its place, the part of each that changed
+ * marked (`span`); what is left over on either side follows. Folding is the screen's: by the rows the lines take
+ * there (`rows`), so a narrow window does not show a long edit whole.
  */
 function diffView(old, now, line, full) {
   const was = old === '' ? [] : old.replace(/\r\n/g, '\n').split('\n');
@@ -515,19 +602,27 @@ function diffView(old, now, line, full) {
   const went = was.slice(head, was.length - tail);
   const came = is.slice(head, is.length - tail);
   const wide = line === null ? 0 : String(line + Math.max(was.length, is.length)).length;
-  const row = (n, sign, text, tone) => ({ text: line === null ? `${sign} ${text}` : `${String(line + n).padStart(wide)} ${sign} ${text}`, tone });
-  const fold = (rows) => (full || went.length + came.length <= SHOWN_DIFF_LINES ? rows : top(rows, SHOWN_DIFF_LINES / 2));
+  const row = (n, sign, text, tone, span = null) => {
+    const lead = line === null ? `${sign} ` : `${String(line + n).padStart(wide)} ${sign} `;
+    return { text: `${lead}${text}`, tone, ...(span && span[1] > span[0] ? { span: [lead.length + span[0], lead.length + span[1]] } : {}) };
+  };
+  // Pairs go only as far as both sides do: past that, what is left of the longer side, in its own order.
+  const lines = [];
+  for (let i = 0; i < Math.max(went.length, came.length); i++) {
+    const both = i < went.length && i < came.length ? changedSpan(went[i], came[i]) : null;
+    if (i < went.length) lines.push(row(head + i, '-', went[i], 'del', both?.[0]));
+    if (i < came.length) lines.push(row(head + i, '+', came[i], 'add', both?.[1]));
+  }
   return {
     at: line === null ? null : line + head,
     stat: { added: came.length, removed: went.length },
-    lines: [
-      ...(head > 0 ? [row(head - 1, ' ', was[head - 1], 'dim')] : []),
-      ...fold(went.map((text, i) => row(head + i, '-', text, 'del'))),
-      ...fold(came.map((text, i) => row(head + i, '+', text, 'add'))),
-      ...(tail > 0 ? [row(is.length - tail, ' ', is[is.length - tail], 'dim')] : []),
-    ],
+    rows: full ? null : SHOWN_DIFF_ROWS,
+    lines: [...(head > 0 ? [row(head - 1, ' ', was[head - 1], 'dim')] : []), ...lines, ...(tail > 0 ? [row(is.length - tail, ' ', is[is.length - tail], 'dim')] : [])],
   };
 }
+
+/** A line with the part of it that changed in reverse video, which shows with colour off too where reverse video does. */
+export const withSpan = (line, s) => (line.span ? `${untab(line.text.slice(0, line.span[0]))}${s.inverse(untab(line.text.slice(...line.span)))}${untab(line.text.slice(line.span[1]))}` : untab(line.text));
 
 /**
  * A report as it reads, a line each: no table rules, a table's row its cells, no marks, a file in the project named from
@@ -563,7 +658,12 @@ function readable(text, cwd = null, { headings = 'drop' } = {}) {
  * every line, the command whole, and the file itself for a read or a write.
  * `cwd` is the project the work is in: a file in it is named from there.
  */
+/** The most of one line a folded result shows: about five rows of a window 80 wide. */
+const LONG_LINE = 400;
+
 export function toolView(call, result = null, { full = false, cwd = null } = {}) {
+  // Folded, a result written for the screen as well as for the model says what it means in a line; in full, every word.
+  if (!full && typeof result?.shown === 'string') result = { ...result, content: result.shown };
   const input = call.input ?? {};
   // Folded, the empty lines of what came back are not shown: three of five lines spent on nothing say nothing.
   const output = (content = result.content) => {
@@ -571,6 +671,8 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     // What reads as a diff — `git diff`, a patch — is drawn as one: what went red, what came green.
     if (!result.isError && /^(?:diff --git |@@ -\d)/m.test(content)) for (const line of lines) line.tone = /^\+(?!\+\+ )/.test(line.text) ? 'add' : /^-(?!-- )/.test(line.text) ? 'del' : line.tone;
     if (full) return lines;
+    // One very long line — a list of paths, a minified file — is cut to a few rows, not left to fill the window.
+    for (const line of lines) if (line.text.length > LONG_LINE) line.text = `${line.text.slice(0, LONG_LINE - 2)} …`;
     const said = lines.filter((line) => line.text.trim() !== '');
     return said.length === 0 ? [{ text: '(no output)', tone: 'dim' }] : ends(said, false);
   };
@@ -640,7 +742,8 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
   const title = input.command === 'view' ? 'Read' : input.command === 'create' ? 'Write' : input.command === 'str_replace' || input.command === 'insert' ? 'Update' : call.name;
   const detail = `${pathFrom(input.path ?? '', cwd)}${range}`;
   if (!result) return { title, detail, lines: [] };
-  if (result.isError) return { title, detail, lines: output() };
+  // Folded, a failure names the file as the title does; in full, it is every word as the model read it.
+  if (result.isError) return { title, detail, lines: output(full ? result.content : fromProject(result.content, cwd)) };
   const added = (text) => toned(text, 'add').map((l) => ({ ...l, text: `+ ${l.text}` }));
   if (input.command === 'view') return { title, detail, lines: full ? toned(result.content, 'plain') : count(result.content) };
   // A new file is shown by its top, as what came: what was written is what is checked first.
@@ -653,7 +756,7 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
   const came = input.command === 'insert' ? (input.insert_text ?? input.new_str ?? '').replace(/\n$/, '') : (input.new_str ?? '');
   const edit = result.edit ?? { line: null, old: input.command === 'str_replace' ? (input.old_str ?? '') : '', new: came };
   const diff = diffView(edit.old, edit.new, edit.line ?? null, full);
-  return { title, detail: diff.at === null ? detail : `${detail}:${diff.at}`, stat: diff.stat, lines: diff.lines };
+  return { title, detail: diff.at === null ? detail : `${detail}:${diff.at}`, stat: diff.stat, lines: diff.lines, rows: diff.rows };
 }
 
 /** The failures a request meets most, in the words a person acts on: what happened, and what to do about it. */
@@ -661,8 +764,12 @@ const FAILURES = [
   [/overloaded|\b529\b/i, "Anthropic's API is overloaded just now — nothing was lost; send it again in a minute"],
   [/rate.?limit|\b429\b/i, 'rate limited by the API — wait a minute and send it again, or /model to another model'],
   [/credit balance|billing|payment/i, 'the API account has no credit left — top it up, then send it again'],
+  [/prompt is too long|context.{0,20}(window|length|limit)|too many tokens/i, 'the conversation no longer fits the model — /handoff starts a fresh session with a hand-off; /new starts bare; the memory brings the thread back'],
+  // Any other request the API turned down — an image too big, a model it does not know — says why in its own words, kept
+  // under this. It and the context's go before the credential's: a 400 that says "invalid_request_error … tokens" is no
+  // credential refused.
+  [/^4(?!01|08|09|29)\d\d\b|\b(?:invalid_request|permission|not_found|request_too_large)_error\b/i, 'the API refused the request — its reason is below; change what it names, or /new to start clean'],
   [/\b401\b|authentication|x-api-key|invalid.*token|oauth/i, 'the API refused the credential — check ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, then sumo doctor'],
-  [/prompt is too long|context.{0,20}(window|length|limit)|too many tokens/i, 'the conversation no longer fits the model — /new starts fresh; the memory brings the thread back'],
   [/ENOTFOUND|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|fetch failed|socket hang up|network|connection error/i, 'no connection to the API — check the network, then send it again'],
   [/\b5\d\d\b|internal server error|api_error/i, 'the API failed on its side — send it again'],
 ];
@@ -674,32 +781,41 @@ export function explained(message) {
   return known ? { text: `error: ${known[1]}`, detail: said.length > 200 ? `${said.slice(0, 199)}…` : said } : { text: `error: ${said}` };
 }
 
+/** /help's rows as text: the command or key, then what it does, in a column of its own; a blank row stays blank. */
+const helpLines = (rows, s) => {
+  const wide = Math.max(...rows.filter(Boolean).map((row) => row.key.length)) + 2;
+  return rows.map((row) => (row ? `  ${row.key.padEnd(wide)}${s.dim(row.does)}` : ''));
+};
+
 /**
  * The conversation as text for a pager: every entry of the chat's log in full — the whole command, all a tool gave back,
  * a reply as it is drawn — in the terminal's colours. What the screen folds, this does not; a pager scrolls and searches it.
  */
 export function transcript(log, s, { width = MAX_WIDTH, cwd = null } = {}) {
   const tones = { plain: (t) => t, dim: s.dim, error: s.red, add: s.green, del: s.red, ask: s.yellow };
-  const under = (lines) => lines.map((line, i) => `${i === 0 ? '  ⎿  ' : '     '}${(tones[line.tone] ?? tones.plain)(untab(line.text))}`);
+  const { g } = s;
+  const under = (lines) => lines.map((line, i) => `${i === 0 ? `  ${g.under}  ` : '     '}${(tones[line.tone] ?? tones.plain)(withSpan(line, s))}`);
   const out = [];
   for (const entry of log) {
-    if (entry.kind === 'user') out.push('', ...untab(entry.text).split('\n').map((line) => `${s.yellow('┃')} ${line}`));
+    if (entry.kind === 'user') out.push('', ...untab(entry.text).split('\n').map((line) => `${s.yellow(g.bar)} ${line}`));
     else if (entry.kind === 'reply') {
       const drawn = [];
       const reply = createRenderer((text) => drawn.push(text), s, { width: Math.max(MIN_WIDTH, width - 3) });
       reply.write(entry.raw);
       reply.flush();
-      out.push('', ...drawn.join('').replace(/\n$/, '').split('\n').map((line, i) => `${i === 0 ? '⏺ ' : '  '}${line}`));
+      out.push('', ...drawn.join('').replace(/\n$/, '').split('\n').map((line, i) => `${i === 0 ? `${g.tool} ` : '  '}${line}`));
     } else if (entry.kind === 'tool') {
       const view = toolView(entry.call, entry.result, { full: true, cwd });
       const stat = view.stat ? ` ${s.green(`+${view.stat.added}`)} ${s.red(`−${view.stat.removed}`)}` : '';
-      out.push('', `${entry.result.isError ? s.red('⏺') : s.green('⏺')} ${s.bold(view.title)}(${untab(view.detail).split('\n').join('\n  ')})${stat}`, ...under(view.lines));
+      // A failure has a mark of its own: colour alone does not tell it to someone who cannot see the colour.
+      out.push('', `${entry.result.isError ? s.red(g.fail) : s.green(g.tool)} ${s.bold(view.title)}(${untab(view.detail).split('\n').join('\n  ')})${stat}`, ...under(view.lines));
     } else if (entry.kind === 'shell') out.push(...under(toolView({ name: BASH_TOOL.name }, entry.result, { full: true }).lines));
-    else if (entry.kind === 'job') out.push('', `⏺ ${s.bold(`j${entry.id}`)} ${entry.agent} · ${entry.route} — ${entry.title}`);
-    else if (entry.kind === 'error') out.push('', s.red(entry.text), ...(entry.detail ? [s.dim(`  ${entry.detail}`)] : []));
-    else if (entry.kind === 'thought') out.push('', s.dim(`✻ Thought for ${elapsed(entry.ms)}`), ...String(entry.text ?? '').trim().split('\n').filter(Boolean).map((line) => s.dim(s.italic(`  ${line}`))));
+    else if (entry.kind === 'job') out.push('', `${g.tool} ${s.bold(`j${entry.id}`)} ${entry.agent} · ${entry.route} — ${entry.title}`);
+    else if (entry.kind === 'error') out.push('', s.red(`${g.fail} ${entry.text}`), ...(entry.detail ? [s.dim(`  ${entry.detail}`)] : []));
+    else if (entry.kind === 'thought') out.push('', s.dim(`${g.thought} Thought for ${elapsed(entry.ms)}`), ...String(entry.text ?? '').trim().split('\n').filter(Boolean).map((line) => s.dim(s.italic(`  ${line}`))));
     else if (entry.kind === 'footer') out.push('', s.dim(`  ${entry.text}`));
-    else if (entry.kind === 'note') out.push(s.dim(`  ⎿  ${entry.text.split('\n').join('\n     ')}`));
+    else if (entry.kind === 'help') out.push('', ...helpLines(entry.rows, s));
+    else if (entry.kind === 'note') out.push(s.dim(`  ${g.under}  ${entry.text.split('\n').join('\n     ')}`));
   }
   return `${out.join('\n').replace(/^\n/, '')}\n`;
 }

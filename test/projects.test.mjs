@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, lutimesSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { card } from '../src/card.mjs';
-import { openDb, setMeta } from '../src/db.mjs';
+import { openDb } from '../src/db.mjs';
 import { addProject, detect, ensureScratch, getProject, keepScratch, listProjects, pruneScratch } from '../src/projects.mjs';
 import { estimateTokens } from '../src/text.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
@@ -89,6 +89,62 @@ test('a rescan replaces exactly the facts that changed and retires the ones that
   assert.equal(stacks[1].state, 'active');
 });
 
+test('a card is built from a fresh scan: rescanned when a file the scan reads changed, or the scan is a week old — and a fact about a file that went away goes with it', () => {
+  const s = sandbox();
+  const dir = fixtureRepo(s);
+  s.sumo(['project', 'add', dir, '--alias', 'simba']);
+  const scannedAt = () => s.sql((db) => db.prepare(`SELECT scanned_at FROM projects WHERE slug = 'proj-simba'`).get().scanned_at);
+  const back = (days) => new Date(Date.now() - days * 24 * 3_600_000);
+  const setScanned = (days) => s.sql((db) => db.prepare(`UPDATE projects SET scanned_at = ? WHERE slug = 'proj-simba'`).run(back(days).toISOString()));
+  // Every file and folder the scan reads, set to before the scan, so only what a step changes is newer.
+  const age = (days) => {
+    for (const name of ['.', '.github/workflows', 'package.json', 'pnpm-lock.yaml', 'tsconfig.json', 'CLAUDE.md', 'README.md']) {
+      if (existsSync(join(dir, name))) utimesSync(join(dir, name), back(days), back(days));
+    }
+  };
+  const cardFor = (session) => s.hook('prompt', { session_id: session, prompt: 'work on simba' }).out;
+
+  // Nothing changed, scanned a day ago: the card is the stored one, and the scan stays as it was.
+  age(3);
+  setScanned(1);
+  const before = scannedAt();
+  assert.match(cardFor('fresh-1'), /stack: TypeScript, React, pnpm/);
+  assert.equal(scannedAt(), before, 'no rescan when nothing it reads changed');
+
+  // package.json changed after the scan: the card shows what it says now.
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'proj-simba', scripts: { test: 'vitest' }, devDependencies: { typescript: '^5', vue: '^3' } }));
+  assert.match(cardFor('fresh-2'), /stack: TypeScript, Vue, pnpm/);
+  assert.notEqual(scannedAt(), before);
+
+  // A change the stat cannot see — the file kept its old time — is still picked up once the scan is a week old.
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'proj-simba', scripts: { test: 'vitest' }, devDependencies: { typescript: '^5', svelte: '^5' } }));
+  age(20);
+  setScanned(6);
+  assert.match(cardFor('fresh-3'), /stack: TypeScript, Vue, pnpm/, 'six days old, nothing newer on disk: not rescanned');
+  setScanned(8);
+  assert.match(cardFor('fresh-4'), /stack: TypeScript, Svelte, pnpm/);
+
+  // What an editor or the system leaves in the folder — a swap file, .DS_Store, a file saved by rename — is not a file
+  // the scan reads: the folder's own time moves, and nothing is rescanned for it.
+  age(20);
+  setScanned(1);
+  const quiet = scannedAt();
+  writeFileSync(join(dir, '.notes.md.swp'), 'x');
+  writeFileSync(join(dir, '.DS_Store'), 'x');
+  writeFileSync(join(dir, 'notes.md.tmp'), 'draft');
+  renameSync(join(dir, 'notes.md.tmp'), join(dir, 'notes.md'));
+  cardFor('fresh-quiet');
+  assert.equal(scannedAt(), quiet, 'no rescan for files the scan does not read');
+
+  // The instructions file the card points at is deleted: the pointer goes, and the gap is named.
+  age(20);
+  setScanned(1);
+  rmSync(join(dir, 'CLAUDE.md'));
+  const after = cardFor('fresh-5');
+  assert.doesNotMatch(after, /read CLAUDE\.md/);
+  assert.match(after, /not set up here: .*AGENTS\.md/);
+});
+
 test('what the user stated is never replaced by what was read off disk, and outranks it', () => {
   const s = sandbox();
   const dir = fixtureRepo(s);
@@ -143,7 +199,7 @@ test('names cannot collide, and unknown directories are refused', () => {
   assert.equal(s.sumo(['project', 'list']).out.trim().split('\n').length, 1, 'a failed add must leave nothing behind');
 
   const missing = s.sumo(['project', 'add', join(s.root, 'nope')]);
-  assert.equal(missing.code, 2);
+  assert.equal(missing.code, 1);
   assert.match(missing.err, /is not a directory/);
 });
 
@@ -227,7 +283,7 @@ test('a project is found by the name it was registered from as well as its slug,
   assert.equal(added.code, 0, added.err);
   assert.match(added.out, /proj:my-proj|my-proj/);
   const unknown = s.sumo(['search', 'deploys', '--project', 'nope']);
-  assert.equal(unknown.code, 2);
+  assert.equal(unknown.code, 1);
   assert.match(unknown.err, /unknown project "nope" \(known: my-proj\)/);
 });
 
@@ -238,7 +294,7 @@ test('purging a forgotten scanned fact leaves no copy of its words, and the fact
   const about = () => s.sql((db) => db.prepare(`SELECT id, body FROM memories WHERE scan_key = 'about' AND state = 'active'`).get());
   const { id, body } = about();
   s.sumo(['forget', String(id)]);
-  s.sumo(['forget', String(id), '--purge']);
+  s.sumo(['forget', String(id), '--purge', '--yes']);
   const kept = s.sql((db) => db.prepare(`SELECT value FROM meta WHERE key LIKE 'scan.retired.%'`).all()).map((r) => r.value);
   assert.ok(kept.every((v) => !v.includes(body) && !body.includes(v)), 'only a digest is kept');
   s.sumo(['project', 'rescan', 'simba']);
@@ -267,7 +323,7 @@ test('purging an active scanned fact keeps it let go on the next rescan', () => 
   const dir = fixtureRepo(s);
   s.sumo(['project', 'add', dir, '--alias', 'simba']);
   const about = () => s.sql((db) => db.prepare(`SELECT id FROM memories WHERE scan_key = 'about' AND state = 'active'`).get());
-  s.sumo(['forget', String(about().id), '--purge']);
+  s.sumo(['forget', String(about().id), '--purge', '--yes']);
   assert.match(s.sumo(['project', 'rescan', 'simba']).out, /^rescanned: 0 new/);
   assert.equal(about(), undefined);
 });
@@ -300,11 +356,10 @@ test('scratch is a project in the home, registered once: its card is how it is u
 
     assert.deepEqual(detect(db, 'rebuild the parser from scratch'), [], 'a turn of phrase must not move the work');
 
-    setMeta(db, 'config.scratch.days', '9');
     const shown = card(db, 'scratch');
     assert.match(shown, new RegExp(`^<project scratch> ${path}\\n`));
     assert.match(shown, /one folder per chore/);
-    assert.match(shown, /9 days/);
+    assert.match(shown, /14 days/);
     assert.match(shown, /sumo project add/);
   });
 });
@@ -372,4 +427,55 @@ test('scratch is tidied at a session start once a day: not again within the day,
     keepScratch(db, at(25));
     assert.equal(existsSync(second), false);
   });
+});
+
+test('a folder too wide to work in is never a project — the top of the disk, the home or above it, sumo\'s own home — and a name too common to mean one project is refused', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const { homedir } = await import('node:os');
+      const { dirname } = await import('node:path');
+      const { addAlias } = await import('../src/projects.mjs');
+      for (const wide of ['/', homedir(), dirname(homedir()), process.env.SUMO_AGENTS_HOME]) {
+        assert.throws(() => addProject(db, wide, { slug: 'wide' }), /cannot be a project: it holds (the whole disk|your home|sumo's own home)|is not a directory/, wide);
+      }
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM projects').get().n, 0);
+      assert.throws(() => addProject(db, '/', { slug: 'disk' }), /cannot be a project: it holds the whole disk/);
+      // A system folder that holds one on the PATH: the shell would write where programs run from.
+      const system = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-system-')));
+      mkdirSync(join(system, 'bin'));
+      const path = process.env.PATH;
+      process.env.PATH = `${join(system, 'bin')}:${path}`;
+      try {
+        assert.throws(() => addProject(db, system, { slug: 'system' }), /it holds .*\/bin, a folder on your PATH/);
+      } finally {
+        process.env.PATH = path;
+      }
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-named-')));
+      assert.throws(() => addProject(db, dir, { slug: 'the' }), /too short or too common a word to name a project/);
+      const { project } = addProject(db, dir, { slug: 'fine-name' });
+      for (const alias of ['the', 'it', 'please'.slice(0, 2)]) assert.throws(() => addAlias(db, project.slug, alias), /too short or too common/, alias);
+      assert.equal(addAlias(db, project.slug, 'webapp'), 'webapp');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('with every project archived, the list says how many and how to see them, not that there are none', () => {
+  const s = sandbox();
+  const dir = mkdtempSync(join(tmpdir(), 'sumo-agents-archived-'));
+  s.sumo(['project', 'add', dir, '--slug', 'demo-app']);
+  s.sumo(['project', 'archive', 'demo-app']);
+  assert.equal(s.sumo(['project', 'list']).out, 'no active projects — 1 archived: sumo project list --all\n');
+  assert.match(s.sumo(['project', 'list', '--all']).out, /demo-app/);
+});
+
+test('adding a registered project again with another --slug says the name is kept, and how to add one', () => {
+  const s = sandbox();
+  const dir = mkdtempSync(join(tmpdir(), 'sumo-agents-slug-'));
+  s.sumo(['project', 'add', dir, '--slug', 'demo-app']);
+  const again = s.sumo(['project', 'add', dir, '--slug', 'other-name']);
+  assert.equal(again.code, 0, again.err);
+  assert.match(again.out, /^--slug is for a new project: this one keeps the name demo-app \(an alias adds a name: --alias other-name\)$/m);
 });

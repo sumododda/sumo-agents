@@ -99,7 +99,7 @@ function recipe(makefile, target) {
  * project itself says what a command runs — a script, a recipe — that is its
  * `definition`, so a job that rewrites it can be told apart from one that does not.
  */
-export function projectCommands(root, pkg = readJson(root, 'package.json')) {
+function projectCommands(root, pkg = readJson(root, 'package.json')) {
   const found = [];
   if (pkg?.scripts) {
     const pm = nodePackageManager(root);
@@ -186,6 +186,40 @@ function ci(root) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Everything a scan reads, by its place in the repository: a file here changed, appeared or went away, and a fact may
+ * have too. The directories are in it for what is made or deleted in them — a README added, a CLAUDE.md removed.
+ */
+/**
+ * The files and folders a scan reads. Not the project folder itself: its time moves with every swap file, .DS_Store and
+ * save-by-rename. A scanned file made or deleted is told by `presentOf` instead.
+ */
+const READS = [
+  '.claude', join('.github', 'workflows'),
+  'package.json', 'tsconfig.json', 'bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'yarn.lock', 'pnpm-workspace.yaml',
+  'pyproject.toml', 'requirements.txt', 'uv.lock', 'poetry.lock', 'go.mod', 'Cargo.toml', 'Gemfile', 'pom.xml',
+  'build.gradle', 'build.gradle.kts', 'Package.swift', 'Makefile', 'README.md', 'readme.md', 'README', 'README.rst',
+  'AGENTS.md', 'CLAUDE.md', join('.claude', 'CLAUDE.md'),
+];
+
+/** Which of the files and folders a scan reads are there, as one string to keep beside the scan and compare with later. */
+export function presentOf(root) {
+  return READS.filter((name) => existsSync(join(root, name))).join('\n');
+}
+
+/** Whether anything a scan reads changed after `since` (an ISO time): a stat of each, never a read. */
+export function changedSince(root, since) {
+  const at = Date.parse(since);
+  if (!Number.isFinite(at)) return true;
+  return READS.some((name) => {
+    try {
+      return statSync(join(root, name)).mtimeMs > at;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Facts in the order the project card should show them. A key with nothing to say is simply absent. */

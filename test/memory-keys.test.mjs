@@ -17,7 +17,7 @@ const stop = (s, reply) => s.hook('stop', { ...SESSION, last_assistant_message: 
 function filed(s, keys) {
   say(s, SAID);
   s.modelWillSay([{ op: 'add', type: 'preference', scope: 'global', topic: 'tooling', body: BODY, turn: 1, quote: SAID, keys }]);
-  const run = s.sumo(['scribe', 'run']);
+  const run = s.sumo(['memory', 'run']);
   assert.equal(run.code, 0, run.err);
   assert.match(run.out, /saved m\d+ /);
 }
@@ -99,7 +99,7 @@ test('a gotcha from the writer is found by its search terms too', () => {
   const s = sandbox();
   say(s, 'ok thanks');
   s.modelWillSay([{ op: 'gotcha', scope: 'global', body: 'The test runner hangs when a port is still bound', keys: ['flaky', 'timeout'] }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m1 \[gotcha/);
+  assert.match(s.sumo(['memory', 'run']).out, /saved m1 \[gotcha/);
   assert.match(s.sumo(['search', 'flaky']).out, /^m1 \[gotcha·global·observed\] The test runner hangs/);
 });
 
@@ -130,6 +130,6 @@ test('a memory from before search terms upgrades in place: the index is made aga
   assert.equal(s.sql((db) => db.prepare('PRAGMA user_version').get().user_version), SCHEMA_VERSION);
   filed(s, ['lint']);
   assert.match(s.sumo(['search', 'lint']).out, /^m2 .*eslint --fix/);
-  s.sumo(['forget', 'm2', '--purge']);
+  s.sumo(['forget', 'm2', '--purge', '--yes']);
   assert.match(s.sumo(['search', 'lint']).out, /^nothing in memory for: lint/, 'and a purge takes its search terms out of the index with it');
 });

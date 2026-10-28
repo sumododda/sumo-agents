@@ -21,7 +21,7 @@ const BASELINE = tool('baseline', "Before your first edit: run the project's che
 const VERIFY = tool('verify', "Run the project's checks now and see the verdict DONE will be given. Takes minutes.");
 const FINISH = tool(
   'finish',
-  "Close the job — the last thing you do, or nobody knows it ended. A worker's first DONE is answered with the task beside its change, to look over once; the next runs the project's checks and is refused while something new fails.",
+  "Close the job — the last thing you do, or nobody knows it ended. A worker's first DONE is answered with the task as a numbered list beside its change, each number to answer once; the next runs the project's checks and is refused while something new fails.",
   // No way to take the work unverified: that is for the user or the main agent to grant, never the author.
   { status: { type: 'string', enum: ['DONE', 'FAILED'] }, report: text('the report, in the shape the brief gives') },
 );
@@ -70,9 +70,11 @@ export async function runJobTool(call, { job, ctx, signal = null }) {
   try {
     const args = file ? [...command.args, '--from-file', file] : command.args;
     // The checks give each command its own limit; anything else is quick. They run the project's code — tests the model may have
-    // written among it — so they run in the sandbox its shell is in, writing only where it may: Sumo's home is one of those places,
-    // so the records are still written. A check that fails only for the sandbox fails so at the baseline and at the end alike.
-    const run = await runCommand(sumo(args), { cwd: ctx.cwd, env: ctx.env, signal, timeoutMs: command.checks ? null : 60_000, wrap: command.checks ? checksWrap(ctx) : null });
+    // written among it — so each check runs in the sandbox the job's shell is in, handed down to sumo, which itself runs outside
+    // it: sumo's memory is read-only to the sandbox, and the verdict is recorded there. A check that fails only for the sandbox
+    // fails so at the baseline and at the end alike.
+    const env = command.checks ? { ...ctx.env, SUMO_CHECKS_WRAP: JSON.stringify(checksWrap(ctx)) } : ctx.env;
+    const run = await runCommand(sumo(args), { cwd: ctx.cwd, env, signal, timeoutMs: command.checks ? null : 60_000 });
     if (run.error) return { content: run.error, isError: true };
     const output = capRedacted(run.output.trim(), undefined, run.omitted);
     return { content: output || '(done)', isError: run.stopped !== null || run.status !== 0 };

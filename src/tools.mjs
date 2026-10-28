@@ -1,11 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { delimiter, dirname, extname, join, resolve, sep } from 'node:path';
+import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { delimiter, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { CREDENTIAL_NAMES } from './auth.mjs';
 import { guardCommand, guardPath } from './guard.mjs';
+import { SELF } from './paths.mjs';
 import { redact } from './redact.mjs';
-import { blockedWrite, readOnlyPlaces, sandboxWrap, unsandboxable, writablePlaces } from './sandbox.mjs';
+import { blockedWrite, guardedPlaces, guardedWhy, readOnlyPlaces, sandboxWrap, unsandboxable, writablePlaces } from './sandbox.mjs';
 
 /**
  * The two tools a job gets, and the policy every call passes through before it
@@ -140,6 +141,9 @@ export function trackGroup(pid) {
   // A terminal closed, or a kill: leave as the signal would, after the commands — exit runs the line above.
   process.on('SIGHUP', () => process.exit(129));
   process.on('SIGTERM', () => process.exit(143));
+  // Ctrl-C too, which a group of its own never hears — unless this process already answers Ctrl-C itself (a job run
+  // stops the job and says how it ended). The chat's screen is unchanged: in raw mode Ctrl-C is a key, not a signal.
+  if (process.listenerCount('SIGINT') === 0) process.on('SIGINT', () => process.exit(130));
 }
 
 /** What a command's output ends with when the user stopped it. */
@@ -306,7 +310,7 @@ function realAncestor(path, hops = 0) {
     if (up === probe) return probe;
     probe = up;
   }
-  return realpathSync(probe);
+  return realpathSync.native(probe);
 }
 
 const isLink = (path) => {
@@ -323,7 +327,7 @@ export function jailed(path, { cwd, roots }) {
   // resolve() also tidies an absolute path: a .. after a directory that does not exist yet must not climb past the check.
   const absolute = resolve(cwd, path);
   const real = realAncestor(absolute);
-  const allowed = roots.map((r) => realpathSync(r)).some((r) => real === r || real.startsWith(`${r}/`));
+  const allowed = roots.map((r) => realpathSync.native(r)).some((r) => real === r || real.startsWith(`${r}/`));
   if (!allowed) throw new Error(`${path} is outside the project (${roots[0]}) — work only inside it`);
   return absolute;
 }
@@ -431,8 +435,8 @@ function jailOf(ctx) {
     toldUnsandboxed = true;
     return { wrap: null, writable: [], readOnly: [], note };
   }
-  const writable = writablePlaces(ctx.roots);
-  const readOnly = readOnlyPlaces(ctx.roots);
+  const writable = writablePlaces(ctx.roots, { opened: ctx.opened ?? [] });
+  const readOnly = [...new Set([...readOnlyPlaces(ctx.roots), ...guardedPlaces(ctx.roots)])];
   const offline = ctx.network === false;
   return { wrap: sandboxWrap(writable, { readOnly, network: !offline }), writable, readOnly, offline, note: '' };
 }
@@ -539,6 +543,64 @@ async function runInBackground(command, ctx, { env, jail }) {
   return result(`started in the background (pid ${pid}); its output goes to ${log} — read it with \`tail -n 50 ${log}\`. It is stopped when the job or the chat that started it ends.${jail.note}`);
 }
 
+/**
+ * The sumo commands the model's shell runs as sumo itself, outside the sandbox — the sandbox keeps sumo's memory,
+ * settings and MCP servers read-only, so from inside it they could not be read or written at all. The CLI refuses there
+ * what only the user does (settings, MCP servers, models), and a job's shell what only the chat does. Never routed:
+ * what installs or starts things — setup, a job's run, a hook, the chat.
+ */
+const SUMO_ROUTED = new Set(['search', 'add', 'learn', 'show', 'history', 'gate', 'supersede', 'forget', 'confirm', 'reject', 'prime', 'memory', 'project', 'cost', 'config', 'mcp', 'models', 'export', 'doctor', 'job', 'help', 'version', '--version', '-v', '--help', '-h']);
+/** Of a job's commands, only those that read: verify and finish run the project's checks, which belong in the sandbox. */
+const ROUTED_JOB = new Set(['show', 'list', 'stats']);
+
+/**
+ * A command's words when it is plain words alone — quoted or not — with nothing the shell would expand, redirect, pipe,
+ * glob or run besides; null for anything else. Only such a command is what it looks like before the shell reads it.
+ */
+function shellWords(text) {
+  const words = [];
+  let word = null;
+  let quote = null;
+  for (const c of String(text).trim()) {
+    if (quote === "'") {
+      if (c === "'") quote = null;
+      else word += c;
+    } else if (quote === '"') {
+      if (c === '"') quote = null;
+      else if ('$`\\'.includes(c)) return null;
+      else word += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      word ??= '';
+    } else if (c === ' ' || c === '\t') {
+      if (word !== null) words.push(word);
+      word = null;
+    } else if (/[;&|<>$`(){}*?[\]~!#\\\n\r]/.test(c)) {
+      return null;
+    } else word = (word ?? '') + c;
+  }
+  if (quote) return null;
+  if (word !== null) words.push(word);
+  return words;
+}
+
+const quoted = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `'${w.replaceAll("'", "'\\''")}'`);
+
+/** A plain `sumo …` command, spelled to run this very sumo by its path; null for any other command. */
+function sumoCall(command) {
+  // `sumo learn` reads its steps on stdin, written as a here-document: taken as it is when its delimiter is quoted (nothing
+  // in it expands) and no line inside it ends it early — bash would run what came after that line, outside the sandbox.
+  const heredoc = /^([^\n]*?)\s*<<-?\s*(['"])([A-Za-z_]\w*)\2[ \t]*\n([\s\S]*)\n\3[ \t]*$/.exec(String(command).trim());
+  const words = shellWords(heredoc ? heredoc[1] : command);
+  if (!words || words[0] !== 'sumo' || !SUMO_ROUTED.has(words[1] ?? 'help')) return null;
+  if (words[1] === 'job' && !ROUTED_JOB.has(words[2])) return null;
+  const call = [...SELF, ...words.slice(1)].map(quoted).join(' ');
+  if (!heredoc) return call;
+  const [, , , end, body] = heredoc;
+  if (words[1] !== 'learn' || body.split('\n').some((line) => line.replace(/^\t+/, '').replace(/\r$/, '') === end)) return null;
+  return `${call} <<'${end}'\n${body}\n${end}`;
+}
+
 /** A limit as it is said: in minutes when it is whole minutes, else in seconds. */
 const span = (ms) => (ms >= 60_000 && ms % 60_000 === 0 ? `${ms / 60_000} minute${ms === 60_000 ? '' : 's'}` : `${ms / 1000} second${ms === 1000 ? '' : 's'}`);
 
@@ -554,7 +616,14 @@ export async function runBash({ command, restart }, ctx, { signal = null, timeou
   const refused = guardCommand(command, { cwd: ctx.cwd });
   if (refused) return result(refused, true);
   const env = unprompted(ctx.env ?? childEnv(), ctx.cwd);
-  const jail = jailOf(ctx);
+  let jail = jailOf(ctx);
+  // sumo's own files are read-only to the sandbox: a plain sumo command runs as sumo itself, outside it, where the CLI's own
+  // rules decide what the model may change — never the settings, the MCP servers or the models.
+  const asSumo = jail.wrap ? sumoCall(command) : null;
+  if (asSumo) {
+    command = asSumo;
+    jail = { ...jail, wrap: null, note: '' };
+  }
   const behind = backgrounded(command);
   if (behind !== null) return runInBackground(behind, ctx, { env, jail });
   // The commands that run the project's checks give each check its own limit; one limit over all of them would cut a verdict off half-way.
@@ -580,7 +649,36 @@ export async function runBash({ command, restart }, ctx, { signal = null, timeou
   const kept = ctx.spill && (tidied.capped || tidied.cut > 0) ? spill(ctx.spill, output, run.omitted) : null;
   const shown = tidied.show(kept) + tail;
   if (jail.wrap && run.stopped === null && run.status !== 0 && blockedWrite(output)) return blocked(command, shown, ctx, jail, { signal, timeoutMs, idleMs, onOutput });
-  return result(shown + jail.note, failed);
+  return result(shown + changedBy(ctx) + jail.note, failed);
+}
+
+/** The most files a command is said to have changed by name. */
+const CHANGED_NAMED = 20;
+
+/**
+ * The files the model has viewed that this command changed or removed — a formatter, codegen, a checkout — said after
+ * it, so the model views those again and not the rest. What it saw of them stays as it was: an edit made without a
+ * fresh view is still said to be against what it remembers.
+ */
+function changedBy(ctx) {
+  const changed = [];
+  for (const [path, was] of ctx.seen ?? []) {
+    try {
+      const now = stampOf(path);
+      // Said once for each change: what it was told of is kept beside what it saw, which stays.
+      if ((now.mtimeMs !== was.mtimeMs || now.size !== was.size) && (now.mtimeMs !== was.told?.mtimeMs || now.size !== was.told?.size)) {
+        was.told = now;
+        changed.push(path);
+      }
+    } catch {
+      ctx.seen.delete(path);
+      changed.push(`${path} (gone)`);
+    }
+  }
+  if (changed.length === 0) return '';
+  const named = changed.slice(0, CHANGED_NAMED);
+  const more = changed.length - named.length;
+  return `\n(this command changed files you had viewed: ${named.join(', ')}${more > 0 ? ` and ${more} more` : ''} — view one again before editing it)`;
 }
 
 /**
@@ -589,16 +687,21 @@ export async function runBash({ command, restart }, ctx, { signal = null, timeou
  * the guard has passed it already. With nobody there, the model is told to report it.
  */
 async function blocked(command, shown, ctx, jail, options) {
-  const except = jail.readOnly.length > 0 ? `, except git's hooks and config: ${jail.readOnly.join(', ')}` : '';
+  const except = jail.readOnly.length > 0 ? `, except what is read later outside it — git's hooks and config, the shell's and the tools' own files: ${jail.readOnly.join(', ')}` : '';
   const offline = jail.offline ? ' — and nothing past this machine can be reached: the user turned the network off (shell.network)' : '';
   const said = `${shown}\n(the sandbox blocked a write outside the project — only these can be written: ${jail.writable.join(', ')}${except}${offline})`;
   if (!ctx.approve) return result(`${said}\n(nobody is here to allow it outside the sandbox: report it, with the command, so the user can run it themselves)`, true);
   const { signal } = options;
   const stopped = new Promise((resolve) => signal?.addEventListener('abort', () => resolve('no'), { once: true }));
   // Asked as what it is — this one run outside the sandbox, yes or no — never as an MCP call that could be allowed always.
-  const answer = signal?.aborted ? 'no' : await Promise.race([ctx.approve({ name: BASH_TOOL.name, server: 'bash', tool: 'outside the sandbox', input: { command }, unsandboxed: true, signal }), stopped]);
+  // With what the sandbox refused, so the question says why it is asked: the first line that names a refused write.
+  const refusal = String(shown).split('\n').find((line) => /operation not permitted|read-only file system|permission denied/i.test(line));
+  const blockedLine = refusal ? redact(refusal.trim()).text.slice(0, 300) : null;
+  const answer = signal?.aborted ? 'no' : await Promise.race([ctx.approve({ name: BASH_TOOL.name, server: 'bash', tool: 'outside the sandbox', input: { command }, unsandboxed: true, blocked: blockedLine, signal }), stopped]);
   // Always is once here: what is allowed is this one run, never the sandbox off.
-  if (answer !== 'once' && answer !== 'always') return result(`${said}\n(the user declined running it outside the sandbox: do not run it again; carry on another way, or ask the user)`, true);
+  if (answer !== 'once' && answer !== 'always') {
+    return { ...result(`${said}\n(the user declined running it outside the sandbox: do not run it again; carry on another way, or ask the user)${saidWhy(answer)}`, true), shown: redact(`${shown}\n${declinedShown('the sandbox kept it from writing outside the project, and it was not run outside it', answer)}`).text };
+  }
   const again = await runBash({ command }, { ...ctx, sandbox: false }, options);
   return { ...again, content: `(the sandbox blocked a write outside the project; the user let it run again outside the sandbox)\n${again.content}` };
 }
@@ -891,18 +994,125 @@ function placeholderIn(path, field, text, had = '') {
   return gap === undefined ? null : `not written: ${field} has a line that stands for code instead of holding it — ${JSON.stringify(gap.trim())} — and the file would hold that line, not the code. Write the code out in full; to leave code as it is, leave it out of the edit.`;
 }
 
+/** The longest reason a refusal carries: a sentence or two, not a document. */
+const REASON_MAX_CHARS = 500;
+
+/**
+ * What the user said when they refused a call — an answer of `{ no: 'their words' }` — as the line the model reads
+ * after the refusal; empty for a plain no. Their words are their direction for what to do instead.
+ */
+export function saidWhy(answer) {
+  const words = wordsOf(answer);
+  return words ? `\n(the user declined it and said: "${words}" — do what they said instead)` : '';
+}
+/** The user's words with a no, redacted, on one line; empty for a plain no. */
+const wordsOf = (answer) => (answer && typeof answer === 'object' && typeof answer.no === 'string' ? redact(answer.no).text.replace(/\s+/g, ' ').trim().slice(0, REASON_MAX_CHARS) : '');
+/**
+ * A refusal as the screen says it: what was declined, in a line, and the user's own words — not the paths and the
+ * instructions the model is given. The model's text stays whole in `content`; the full view shows it.
+ */
+export const declinedShown = (what, answer) => {
+  const words = wordsOf(answer);
+  return `declined: ${what}${words ? ` · you said: "${words}"` : ''}`;
+};
+
+/** The most lines an ambiguous old_str is said to start on. */
+const HITS_NAMED = 10;
+
+/** Where an old_str found more than once starts, as ` (lines 4, 18, 40)`, so one view of those lines makes it unique; empty when it matched only loosely. */
+function linesOf(text, old) {
+  const lines = [];
+  for (let at = text.indexOf(old); at !== -1 && lines.length <= HITS_NAMED; at = text.indexOf(old, at + 1)) lines.push(text.slice(0, at).split('\n').length);
+  if (lines.length < 2) return '';
+  const more = lines.length > HITS_NAMED ? ', …' : '';
+  return ` (lines ${lines.slice(0, HITS_NAMED).join(', ')}${more})`;
+}
+
+/** Why a file with another name is asked about each time. */
+const HARD_LINK = 'it has another name elsewhere (a hard link), and a change here changes that file too';
+
+/**
+ * A file the editor writes, written where its checks found it lands: through no link swapped in since — the last name
+ * is opened without following one — and only when the file opened is the one that was checked. Nothing is truncated
+ * before that. (A folder above it swapped for a link between the check and the open is not caught: Node has no openat.)
+ */
+function writeTo(path, data, { create = false } = {}) {
+  const target = landsAt(path) ?? path;
+  const before = create ? null : statSync(target);
+  const fd = openSync(target, constants.O_WRONLY | constants.O_NOFOLLOW | (create ? constants.O_CREAT | constants.O_EXCL : 0), 0o666);
+  try {
+    const opened = fstatSync(fd);
+    if (before && (opened.ino !== before.ino || opened.dev !== before.dev)) throw new Error(`${path} was replaced while it was being changed; nothing was written — view it again`);
+    ftruncateSync(fd, 0);
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** The text editor's four commands, each inside the jail; secret files are neither shown nor written. */
+/** Whether the user opened a place for the session that holds this path (`ctx.opened`, kept by real path: a file, or a directory with everything under it). */
+function openedIn(ctx, path) {
+  for (const place of ctx.opened ?? []) if (path === place || path.startsWith(`${place}${sep}`)) return true;
+  return false;
+}
+
+/**
+ * Where a write to a path lands, by real path: through every link on the way, to a file not there yet below the deepest
+ * directory that is. Null for a link that points at nothing yet — a write there goes where the link says, which no
+ * question has shown.
+ */
+function landsAt(path) {
+  if (existsSync(path)) return realpathSync.native(path);
+  let probe = path;
+  while (!existsSync(probe)) {
+    if (isLink(probe)) return null;
+    const up = dirname(probe);
+    if (up === probe) return null;
+    probe = up;
+  }
+  return join(realpathSync.native(probe), relative(probe, path));
+}
+
+/** The directory a file's question may open for the session: never the home, what is above it, or the top of the disk — the shell would write there too. */
+function directoryFor(path) {
+  const dir = dirname(path);
+  const home = landsAt(homedir()) ?? homedir();
+  return dir === home || `${home}${sep}`.startsWith(`${dir}${sep}`) || dirname(dir) === dir ? null : dir;
+}
+
+/** A refusal the model reads, with the question for the user on it: where the write lands, whether that is outside the project, why it is guarded, and what directory may be opened. */
+function askFirst(message, path, { outside, guarded }) {
+  return { ...result(message, true), ask: { path, outside, guarded, directory: outside && !guarded ? directoryFor(path) : null } };
+}
+
 export function runEditor(input, ctx) {
   let path;
+  /** Whether the user let this file, outside the project, be changed: for the session, or this once. */
+  let opened = false;
   try {
     path = jailed(input.path, ctx);
   } catch (cause) {
-    return result(cause.message, true);
+    // Outside the project: read as the shell reads, anywhere; written only where the user has said so — else refused
+    // with the path on it, for whoever runs the tool to put to the user. A guarded file is never opened for the session.
+    // Judged by where the write lands, so a link in an opened directory cannot carry it somewhere else.
+    const absolute = typeof input.path === 'string' && input.path ? resolve(ctx.cwd, input.path) : null;
+    if (absolute === null) return result(cause.message, true);
+    const lands = landsAt(absolute);
+    if (input.command !== 'view') {
+      if (lands === null) return result(`${absolute} is a link to something not there yet, outside the project — not written: say in your report what it needs`, true);
+      const guarded = guardedWhy(absolute, { roots: ctx.roots }) ?? guardedWhy(lands, { roots: ctx.roots });
+      opened = ctx.granted === lands || (!guarded && openedIn(ctx, lands));
+      // macOS's own /var, /tmp and /etc are links into /private: no link worth naming.
+      const shown = lands === absolute || lands === `/private${absolute}` ? absolute : `${absolute} (a link to ${lands})`;
+      if (!opened) return guarded ? askFirst(`${shown} is changed only when the user says so: ${guarded}`, lands, { outside: true, guarded }) : askFirst(`${shown} is outside the project (${ctx.roots[0]})`, lands, { outside: true, guarded: null });
+    }
+    path = lands ?? absolute;
   }
   try {
     const secret = guardPath(path) ?? guardPath(realAncestor(path));
     // Every root can be read; only the project (the first) can be written. A job's own folder holds what judges it.
-    if (input.command !== 'view' && ctx.roots.length > 1) {
+    if (input.command !== 'view' && !opened && ctx.roots.length > 1) {
       try {
         jailed(input.path, { cwd: ctx.cwd, roots: ctx.roots.slice(0, 1) });
       } catch {
@@ -914,6 +1124,11 @@ export function runEditor(input, ctx) {
       const at = realAncestor(path);
       const kept = readOnlyPlaces(ctx.roots).find((place) => path === place || path.startsWith(`${place}${sep}`) || at === place || at.startsWith(`${place}${sep}`));
       if (kept) return result(`${path} is git's own hooks or configuration: not changed here — what git runs by itself would run outside the sandbox. Say in your report what it needs.`, true);
+      // What something else reads later — the shell at its start, a tool before it runs, an editor — is changed only when the user says so, this once.
+      const guarded = guardedWhy(path, { roots: ctx.roots }) ?? guardedWhy(at, { roots: ctx.roots });
+      if (guarded && ctx.granted !== path) return askFirst(`${path} is changed only when the user says so: ${guarded}`, path, { outside: false, guarded });
+      // A hard link is the same file under another name, perhaps one outside the project or guarded: no path check sees it.
+      if (existsSync(path) && lstatSync(path).isFile() && lstatSync(path).nlink > 1 && ctx.granted !== path) return askFirst(`${path} is changed only when the user says so: ${HARD_LINK}`, path, { outside: false, guarded: HARD_LINK });
     }
     switch (input.command) {
       case 'view': {
@@ -934,7 +1149,7 @@ export function runEditor(input, ctx) {
           return result(`${path} already exists (${lines} line${lines === 1 ? '' : 's'}): change the lines that change with str_replace or insert — a file is never rewritten whole`, true);
         }
         mkdirSync(dirname(path), { recursive: true });
-        const said = change(path, ctx, () => writeFileSync(path, String(input.file_text ?? ''), { flag: 'wx' }), { created: true });
+        const said = change(path, ctx, () => writeTo(path, String(input.file_text ?? ''), { create: true }), { created: true });
         return result(said(`created ${path}`));
       }
       case 'str_replace': {
@@ -946,13 +1161,13 @@ export function runEditor(input, ctx) {
         if (gap) return result(gap, true);
         const where = locate(text, input.old_str);
         if (!where) return result(`old_str was not found in ${path}`, true);
-        if (where.hits !== 1) return result(`old_str appears ${where.hits} times in ${path} — include more context so it is unique`, true);
+        if (where.hits !== 1) return result(`old_str appears ${where.hits} times in ${path}${linesOf(text, input.old_str)} — include more context so it is unique`, true);
         let replacement = String(input.new_str ?? '');
         if (where.how) {
           if (text.includes('\r\n')) replacement = replacement.replace(/\r?\n/g, '\r\n');
           if (where.reindent) replacement = where.reindent(replacement);
         }
-        const said = change(path, ctx, () => writeFileSync(path, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`));
+        const said = change(path, ctx, () => writeTo(path, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`));
         return { ...result(said(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`)), edit: changeOf(text, where, replacement) };
       }
       case 'insert': {
@@ -968,7 +1183,7 @@ export function runEditor(input, ctx) {
         // A file ending in a newline splits to a last empty piece, which is not a line to insert after.
         const at = Math.max(0, Math.min(lines.at(-1) === '' ? lines.length - 1 : lines.length, line));
         lines.splice(at, 0, text.replace(/\n$/, ''));
-        const said = change(path, ctx, () => writeFileSync(path, lines.join('\n')));
+        const said = change(path, ctx, () => writeTo(path, lines.join('\n')));
         return { ...result(said(`inserted into ${path} after line ${at}`)), edit: { line: at + 1, old: '', new: redact(text.replace(/\n$/, '')).text } };
       }
       default:
@@ -979,9 +1194,31 @@ export function runEditor(input, ctx) {
   }
 }
 
+/**
+ * A change the editor refused — a file outside the project, or a guarded one — put to whoever is there (`ctx.approve`,
+ * the question a blocked command is put with): the file and the change, to make once; or, outside the project and not
+ * guarded, this file or its directory for the rest of the session (`ctx.opened`), which the shell then writes too.
+ * With nobody there, the model is told to report it.
+ */
+async function askUser(input, refused, ctx, signal) {
+  const { ask } = refused;
+  if (!ctx.approve) return result(`${refused.content}\n(nobody is here to allow it: report it, with the path and the change, so the user can make it themselves)`, true);
+  const stopped = new Promise((resolve) => signal?.addEventListener('abort', () => resolve('no'), { once: true }));
+  const answer = signal?.aborted ? 'no' : await Promise.race([ctx.approve({ name: EDITOR_TOOL.name, server: 'editor', tool: ask.guarded ? 'a guarded file' : 'outside the project', input, ...ask, signal }), stopped]);
+  const session = !ask.guarded && (answer === 'always' || answer === 'directory');
+  if (answer !== 'once' && !session) return { ...result(`${refused.content}\n(the user declined changing it: do not try again; carry on another way, or ask the user)${saidWhy(answer)}`, true), shown: declinedShown('not changed', answer) };
+  if (session) ctx.opened?.add(answer === 'directory' && ask.directory ? ask.directory : ask.path);
+  const again = runEditor(input, { ...ctx, granted: ask.path });
+  const why = ask.guarded ? 'is a guarded file' : 'is outside the project';
+  return { ...again, content: `(${ask.path} ${why}; the user allowed this change)\n${again.content}` };
+}
+
 /** One tool call, whichever tool it names; a name nothing answers to is an error the model can read. */
-export function runTool(block, ctx, { signal = null, onOutput = null } = {}) {
+export async function runTool(block, ctx, { signal = null, onOutput = null } = {}) {
   if (block.name === BASH_TOOL.name) return runBash(block.input ?? {}, ctx, { signal, onOutput });
-  if (block.name === EDITOR_TOOL.name) return runEditor(block.input ?? {}, ctx);
+  if (block.name === EDITOR_TOOL.name) {
+    const out = runEditor(block.input ?? {}, ctx);
+    return out.ask ? askUser(block.input ?? {}, out, ctx, signal) : out;
+  }
   return result(`no tool called ${block.name}`, true);
 }

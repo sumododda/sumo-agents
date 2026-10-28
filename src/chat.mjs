@@ -1,17 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { isAdvisorTool } from './advisor.mjs';
 import { ago } from './card.mjs';
 import { getMeta } from './db.mjs';
-import { runDream } from './dream.mjs';
 import { openWatchTab, runHerdr } from './herdr.mjs';
 import { appendLive, attemptsSettled, endLive, getJob, newJob, parseJobId, reportOf, runFollowed, startLive, tell as tellJob, treeOf } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
-import { contextFor, converse, networkOn, paramsFor, runJob, runLines, sandboxOn, sendToApi, stopReason, TAMPER_REFUSED, tampersMarker, textOf, thinkingFor, withMcp, withServers } from './loop.mjs';
+import { COMPACT_INSTRUCTIONS, compactionParams, contextFor, converse, describeFailure, networkOn, paramsFor, QUIET_RETRIES, runJob, runLines, sandboxOn, sendToApi, stopReason, TAMPER_REFUSED, tampersMarker, textOf, thinkingFor, withFallback, withMcp, withServers } from './loop.mjs';
+import { logRun, usageOf } from './model.mjs';
 import { closeMcp, compactInput, gateMcp, isMcpTool, mcpLines, mcpReady, splitMcpName } from './mcp.mjs';
+import { EFFORT_MESSAGE_BETA, effortOnly } from './auth.mjs';
 import { assertOn, MODEL_IDS, MODELS, modelId, usableModels } from './catalog.mjs';
 import { takeLock } from './lock.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
@@ -21,14 +22,14 @@ import { getProject, projectAt, scratchDir } from './projects.mjs';
 import { redact } from './redact.mjs';
 import { chooseChatRoute, EFFORTS } from './route.mjs';
 import { verifyCommands } from './scan.mjs';
-import { outcomeLines, runScribe } from './scribe.mjs';
-import { currentProject, describeSaved, findSaved, loadState, lockFile, recordTurn, saveState, savedSessions, sessionLine, shortId, withoutThinking } from './sessions.mjs';
+import { passLines, runMemoryPass } from './keeper.mjs';
+import { currentProject, describeSaved, findSaved, loadState, lockFile, noteSessionOutside, recordTurn, saveState, savedSessions, sessionLine, shortId, withoutThinking } from './sessions.mjs';
 import { ASK_TOOL, BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, nextUndoTurn, runCommand, undoLast } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
-import { estimateTokens, head } from './text.mjs';
-import { colourEnabled, createRenderer, header, pathFrom, prompt, renderBlock, safeForTerminal, styles, tilde, toolView, widthOf } from './tty.mjs';
+import { closest, estimateTokens, head } from './text.mjs';
+import { colourEnabled, createRenderer, explained, header, pathFrom, prompt, renderBlock, safeForTerminal, styles, tilde, toolView, widthOf } from './tty.mjs';
 import { hasCommit } from './verify.mjs';
-import { sourcesOf, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_TOOLS } from './web.mjs';
+import { isWebTool, sourcesOf, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_TOOLS } from './web.mjs';
 
 /**
  * The conversation the user has with Sumo: the same loop a job runs in, with
@@ -43,7 +44,9 @@ import { sourcesOf, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_TOOLS } from './web.mjs
  */
 
 /** Models that take operator instructions as `role: "system"` messages mid-conversation; the others get them as text in the user turn. */
-const SYSTEM_MESSAGES = new Set([MODEL_IDS.opus, MODEL_IDS.sonnet, MODEL_IDS.fable]);
+const SYSTEM_MESSAGES = new Set([MODEL_IDS.haiku, MODEL_IDS.opus, MODEL_IDS.sonnet, MODEL_IDS.fable]);
+/** Models whose effort can be changed by a message in the conversation, leaving the cache whole: the same four, with thinking on as it always is here. */
+const EFFORT_MESSAGES = SYSTEM_MESSAGES;
 
 // The guide comes with the command, by name, through the prompt hook — the same way it comes when the user's words ask for
 // it: from inside a project the tools cannot reach guides/ by a relative path, and the editor is jailed away from it.
@@ -51,47 +54,62 @@ const COMMANDS = {
   fix: (args) => ({ text: `Fix this: ${args}`, guide: 'fix' }),
   feature: (args) => ({ text: `Build this: ${args}`, guide: 'feature' }),
   review: (args) => ({ text: `Review this: ${args}`, guide: 'review' }),
-  dream: () => ({ text: 'Run `sumo dream run` and tell me, in a few lines, what it changed and what it wants me to confirm.' }),
 };
 
+/** What each model is for, as `/model`'s menu says it: the kinds of work the router gives it. */
+const MODEL_HINTS = {
+  auto: 'the router picks a model and an effort each turn',
+  haiku: 'quickest and cheapest: small, mechanical changes',
+  sonnet: 'everyday features and fixes',
+  opus: 'hard problems: design, a bug with no clear cause',
+  fable: 'novel work: new algorithms, deep reviews',
+};
+/** And each effort: how much the model thinks before it acts. */
+const EFFORT_HINTS = { low: 'quickest: one spot', medium: 'a few files', high: 'many parts that work together', xhigh: 'more thought still, slower', max: 'the most thought, the slowest' };
+
 /**
- * What the command menu shows, in the order it shows it; the models `/model` offers are the ones that are on as it is typed.
- * The effort a model would keep comes first (`effortNow`), so Enter on the open menu keeps it rather than dropping to the lowest.
+ * What the command menu shows, in the order it shows it, each with what it does for the user — and, for /help, what it
+ * takes (`args`). The models `/model` offers are the ones that are on as it is typed, each with what it is for and the one
+ * in use marked (`inUse`). The effort a model would keep comes first (`effortNow`), so Enter on the open menu keeps it
+ * rather than dropping to the lowest.
  */
-export function commandList(db, { effortNow = () => null, saved = () => [], running = () => [] } = {}) {
+function commandList(db, { effortNow = () => null, inUse = () => ({}), saved = () => [], running = () => [] } = {}) {
   const efforts = () => {
-    const now = effortNow();
-    return EFFORTS.includes(now) ? [now, ...EFFORTS.filter((e) => e !== now)] : EFFORTS;
+    const kept = effortNow();
+    return EFFORTS.includes(kept) ? [kept, ...EFFORTS.filter((e) => e !== kept)] : EFFORTS;
   };
+  const marked = (name, hint, current) => ({ name, hint: `${hint}${name === current ? ' (current)' : ''}` });
   const modelChoices = (given) => {
     const usable = usableModels(db);
-    return given.length === 0 ? ['auto', ...usable] : given.length === 1 && usable.includes(given[0]) && given[0] !== 'haiku' ? efforts() : [];
+    const { model, effort } = inUse();
+    if (given.length === 0) return ['auto', ...usable].map((name) => marked(name, MODEL_HINTS[name] ?? '', model));
+    return given.length === 1 && usable.includes(given[0]) ? efforts().map((name) => marked(name, EFFORT_HINTS[name] ?? '', model === 'auto' ? null : effort)) : [];
   };
   return [
-    { name: 'fix', hint: 'fix a bug, by guides/fix.md' },
-    { name: 'feature', hint: 'build something, by guides/feature.md' },
-    { name: 'review', hint: 'have a reviewer job judge something' },
-    { name: 'dream', hint: 'tidy the memory and say what changed' },
-    { name: 'model', hint: 'the route, or set it: auto, or a model and an effort', choices: modelChoices },
-    { name: 'memory', hint: 'see the memory in the browser: say yes or no, edit, forget' },
-    { name: 'mcp', hint: 'the MCP servers: connected or not, their tools, what may run unasked' },
-    { name: 'resume', hint: 'pick a saved session up where it stopped', choices: (given) => (given.length === 0 ? saved().map((s) => ({ name: shortId(s.id), hint: s.hint })) : []) },
-    { name: 'copy', hint: 'the last reply to the clipboard, as it was written; `code` for its last code block; a number for one further back', choices: (given) => (given.length === 0 ? ['code'] : []) },
-    { name: 'undo', hint: "put back the files the editor changed in the last turn that changed any; again for the turn before — bash's changes are not tracked" },
-    { name: 'stop', hint: 'stop a job at work in the background', choices: (given) => (given.length === 0 ? running().map((id) => `j${id}`) : []) },
-    { name: 'context', hint: 'what this session has used: how full the context is, the tokens and the cost, by model' },
-    { name: 'export', hint: 'the conversation as a Markdown file: to a path, or into the home\'s exports folder' },
-    { name: 'thinking', hint: 'the model\'s thinking under the working line: on or off', choices: (given) => (given.length === 0 ? ['on', 'off'] : []) },
+    { name: 'fix', args: '<bug>', hint: 'fix a bug: find the cause, change it, check it' },
+    { name: 'feature', args: '<what>', hint: 'build something new, with its tests' },
+    { name: 'review', args: '<what>', hint: 'have a reviewer look over a change' },
+    { name: 'model', args: '[model] [effort]', hint: 'the model and effort: see them, or change them', choices: modelChoices },
+    { name: 'memory', hint: 'your memory in the browser: confirm, edit, forget' },
+    { name: 'mcp', hint: 'the MCP servers: which are connected, and their tools' },
+    { name: 'resume', args: '[id]', hint: 'pick up a saved session where it stopped', choices: (given) => (given.length === 0 ? saved().map((s) => ({ name: shortId(s.id), hint: s.hint })) : []) },
+    { name: 'copy', args: '[code] [n]', hint: 'copy the last reply, or its code, to the clipboard', choices: (given) => (given.length === 0 ? ['code'] : []) },
+    { name: 'undo', hint: 'put back the files the last turn edited' },
+    { name: 'stop', args: '[job]', hint: 'stop a job working in the background', choices: (given) => (given.length === 0 ? running().map((id) => `j${id}`) : []) },
+    { name: 'context', hint: 'how full the context is, and what it has cost' },
+    { name: 'export', args: '[path]', hint: 'save the conversation as a Markdown file' },
+    { name: 'thinking', args: 'on|off', hint: "show or hide the model's thinking as it works", choices: (given) => (given.length === 0 ? ['on', 'off'] : []) },
     { name: 'help', hint: 'the commands and the keys' },
+    { name: 'handoff', hint: 'start fresh from a hand-off the model writes' },
     { name: 'new', hint: 'start a fresh session (/clear does too)' },
-    { name: 'exit', hint: 'leave' },
+    { name: 'exit', hint: 'leave (/quit does too)' },
   ];
 }
 
 /** A job is run with `delegate`, never from the shell: there it would be an agent in a shell of its own, holding no credential. */
 const JOB_RUN = /(?:^|[\n;&|(`]|\$\()\s*(?:\w+=\S*\s+|nohup\s+|exec\s+)*sumo\s+job\s+(run|new)\b/;
-/** A cheap-model pass the model asks for: run here too, since the shell it would start in holds no credential. */
-const PASS_RUN = /^\s*sumo\s+(scribe|dream)\s+run\s*$/;
+/** The memory pass the model asks for: run here too, since the shell it would start in holds no credential. */
+const PASS_RUN = /^\s*sumo\s+memory\s+run(\s+--tidy)?\s*$/;
 
 /**
  * Operator text for the model, placed so the cached prefix is untouched: a
@@ -150,7 +168,7 @@ export function describeCall(call) {
  * The branch a directory's repository is on, read from its HEAD — no process is started for it. A worktree's `.git` is a
  * file that names where its HEAD is. A detached head is the start of its commit; a directory in no repository has none.
  */
-export function branchOf(dir) {
+function branchOf(dir) {
   for (let at = resolve(dir); ; at = dirname(at)) {
     const git = join(at, '.git');
     try {
@@ -175,9 +193,9 @@ export const routeOf = ({ model, effort }) => (effort && effort !== 'none' ? `${
 
 /**
  * What `/model` was given: a model that is on, a model and an effort, or `auto`. The model alone keeps
- * the effort in hand; haiku takes none. Anything else is said back, and nothing changes.
+ * the effort in hand. Anything else is said back, and nothing changes.
  */
-export function parseRoute(args, current, db) {
+function parseRoute(args, current, db) {
   const [model, effort, ...rest] = args.split(/\s+/).filter(Boolean);
   if (model === 'auto') {
     if (effort) throw new UsageError('auto takes no effort — the router picks it each turn');
@@ -186,10 +204,6 @@ export function parseRoute(args, current, db) {
   if (!MODELS.includes(model)) throw new UsageError(`no such model "${model}" — one of: auto, ${usableModels(db).join(', ')}`);
   assertOn(db, model);
   if (rest.length > 0) throw new UsageError(`/model takes a model and an effort, not "${args}"`);
-  if (model === 'haiku') {
-    if (effort) throw new UsageError('haiku takes no effort setting');
-    return { model, effort: 'none' };
-  }
   if (effort !== undefined && !EFFORTS.includes(effort)) throw new UsageError(`no such effort "${effort}" — one of: ${EFFORTS.join(', ')}`);
   const kept = current.effort && current.effort !== 'none' ? current.effort : CONFIG_DEFAULTS['chat.effort'];
   return { model, effort: effort ?? kept };
@@ -245,7 +259,7 @@ const kilo = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` :
 export function contextReport({ contextTokens = 0, rows = [], turns = 0, calls = 0 }) {
   const full = Math.min(1, contextTokens / CONTEXT_FULL);
   const bar = `${'█'.repeat(Math.round(full * 20))}${'░'.repeat(20 - Math.round(full * 20))}`;
-  const band = contextTokens >= CONTEXT_FULL ? 'very large — /new now; the memory brings the thread back' : contextTokens >= CONTEXT_LARGE ? 'large — quality drops from here; finish the piece in hand, then /new' : 'room to spare';
+  const band = contextTokens >= CONTEXT_FULL ? 'very large — /handoff now, or /new; the memory brings the thread back' : contextTokens >= CONTEXT_LARGE ? 'large — quality drops from here; finish the piece in hand, then /handoff' : 'room to spare';
   const cost = rows.reduce((sum, row) => sum + row.cost, 0);
   const lines = [`**Context** ${kilo(contextTokens)} tokens · \`${bar}\` ${Math.round(full * 100)}% of ${kilo(CONTEXT_FULL)} · ${band}`, '', `**This session** ${turns} turn${turns === 1 ? '' : 's'} · ${calls} tool call${calls === 1 ? '' : 's'} · $${cost.toFixed(2)}`];
   if (rows.length === 0) return [...lines, '', 'No request has been made yet.'].join('\n');
@@ -253,9 +267,9 @@ export function contextReport({ contextTokens = 0, rows = [], turns = 0, calls =
 }
 
 /** A session past its budget, in one line: what it has cost, how to start afresh, and how to move the line. */
-export const budgetLine = (cost) => `this session has cost $${cost.toFixed(2)} — /new starts a fresh one; sumo config chat.budget changes when this is said`;
+const budgetLine = (cost) => `this session has cost $${cost.toFixed(2)} — /new starts a fresh one; sumo config chat.budget changes when this is said`;
 
-/** Where the context is large enough that quality drops, and where it is time for /new: the bands the session is told about. */
+/** Where the context is large enough that quality drops, and where it is time for /handoff: the bands the session is told about. */
 const CONTEXT_LARGE = 60_000;
 const CONTEXT_FULL = 150_000;
 
@@ -307,8 +321,6 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   const named = MODELS.find((name) => MODEL_IDS[name] === model) ?? model;
   if (named !== 'auto' && MODELS.includes(named)) assertOn(db, named, 'sumo config chat.model <name>');
   effort ??= model === 'auto' ? null : configured(db, 'chat.effort');
-  // Haiku takes no effort setting, however the chat came to be on it: by flag, by configuration, or by /model.
-  if (modelId(model) === MODEL_IDS.haiku) effort = 'none';
   /** On auto, the route the last turn ran on; null otherwise. */
   let routed = null;
   const system = chatSystem();
@@ -336,6 +348,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   let note = null;
   /** The files the model has viewed or written in this session, as they stood then: an edit to one changed on disk since says so. */
   let seen = new Map();
+  /** The files outside the project the user let the editor change for the rest of this session. */
+  let opened = new Set();
   /** Whether the screen has said what this session cost: once a session, when it first passes `chat.budget`. */
   let costSaid = false;
   /** The jobs running here, each with what the user has said to it that it has not read yet. */
@@ -365,13 +379,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       const kept = effort ?? configured(db, 'chat.effort');
       return kept && kept !== 'none' ? kept : CONFIG_DEFAULTS['chat.effort'];
     },
+    inUse: () => ({ model, effort }),
     saved: () => others().map((s) => ({ id: s.id, hint: describeSaved(s, now()) })),
     running: () => [...stops.keys()],
   });
 
   const emit = (text) => out(text);
   /** The conversation as the model in hand can take it: one that takes no operator messages is sent them as text. The history itself is left alone, so a model that does take them still reads it from its cache. */
-  const sendAs = (p, options) => send(SYSTEM_MESSAGES.has(p.model) ? p : { ...p, messages: p.messages.map((m) => (m.role === 'system' ? asText(m.content) : m)) }, options);
+  const sendAs = (p, options) => send(SYSTEM_MESSAGES.has(p.model) ? p : { ...p, messages: p.messages.filter((m) => !effortOnly(m)).map((m) => (m.role === 'system' ? asText(m.content) : m)) }, options);
 
   const busy = (id) => (holder) => `session ${shortId(id)} is open in another terminal (process ${holder})`;
 
@@ -390,6 +405,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     costSaid = false;
     project = null;
     seen = new Map();
+    opened = new Set();
     spoken = Boolean(saved);
     transcript = join(paths().logs, 'sessions', `${sessionId}.jsonl`);
     const block = handleEvent(db, 'session-start', { session_id: sessionId, cwd, transcript_path: transcript, source }, now());
@@ -397,7 +413,6 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       model = saved.model;
       routed = saved.routed ?? null;
       if (!given.effort) effort = saved.effort;
-      if (modelId(model) === MODEL_IDS.haiku) effort = 'none';
     }
     params = paramsFor({ model: model === 'auto' ? (routed?.model ?? CONFIG_DEFAULTS['chat.model']) : model, effort: model === 'auto' ? routed?.effort : effort, tools: toolsNow(), system: systemNow(), text: saved ? undefined : block });
     // What jobs reported that this session had not read comes back with it; a fresh session has read nothing, and is owed nothing.
@@ -445,14 +460,36 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     }
   }
 
-  /** The request from here on goes to this model at this effort, thinking as that model does; the conversation so far stays. */
+  /**
+   * The request from here on goes to this model at this effort, thinking as that model does; the conversation so far stays.
+   * On the same model, a new effort is said in the conversation — a system message with no content, carrying the effort — so
+   * the cached history is not written again, as changing the request's own effort would have it. A model switch writes it
+   * again whichever way, so there the request's own effort changes; one said earlier in the conversation would outrank it,
+   * so when one was, the new effort is said again too.
+   */
   function apply({ model: m, effort: e }) {
-    params.model = modelId(m);
-    if (e && e !== 'none') params.output_config = { effort: e };
-    else delete params.output_config;
-    const thinking = thinkingFor(m);
-    if (thinking) params.thinking = thinking;
-    else delete params.thinking;
+    const id = modelId(m);
+    const wanted = e && e !== 'none' ? e : null;
+    const switched = params.model !== id;
+    const spoken = params.messages.some(effortOnly);
+    const inForce = params.messages.findLast(effortOnly)?.output_config.effort ?? params.output_config?.effort ?? null;
+    if (switched) {
+      params.model = id;
+      if (wanted) params.output_config = { effort: wanted };
+      else delete params.output_config;
+      const thinking = thinkingFor(m);
+      if (thinking) params.thinking = thinking;
+      else delete params.thinking;
+      withFallback(params, m);
+    }
+    if (wanted === inForce && !(switched && spoken)) return;
+    if (wanted && EFFORT_MESSAGES.has(id) && params.messages.length > 0 && (!switched || spoken)) {
+      params.messages.push({ role: 'system', content: [], output_config: { effort: wanted } });
+      if (!params.betas.includes(EFFORT_MESSAGE_BETA)) params.betas = [...params.betas, EFFORT_MESSAGE_BETA];
+    } else if (!switched) {
+      if (wanted) params.output_config = { effort: wanted };
+      else delete params.output_config;
+    }
   }
 
   /**
@@ -526,8 +563,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     if (gate) return { content: JSON.parse(gate).deny, isError: true };
     const pass = PASS_RUN.exec(command);
     if (pass) {
-      activity(`running the ${pass[1]} pass…`);
-      return { content: outcomeLines(pass[1] === 'dream' ? await runDream(db, { force: true }) : await runScribe(db)).join('\n') };
+      activity(pass[1] ? 'tidying memory…' : 'running the memory pass…');
+      return { content: passLines(await runMemoryPass(db, { tidy: Boolean(pass[1]) }), { asked: Boolean(pass[1]) }).join('\n') };
     }
     const job = JOB_RUN.exec(command);
     if (job) return { content: `jobs are not ${job[1] === 'new' ? 'made' : 'run'} from the shell: use the delegate tool${job[1] === 'run' ? ' (only `job` for one already made)' : ''}`, isError: true };
@@ -766,10 +803,10 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return id;
   }
 
-  /** A turn that ended before the model answered left its operator message at the tail; the API takes one only where the model answers next, so before anything follows it, it becomes text. */
+  /** A turn that ended before the model answered left its operator message at the tail; the API takes one only where the model answers next, so before anything follows it, it becomes text. An effort said there may stand anywhere, and stays. */
   function settleTail() {
     const tail = params.messages.at(-1);
-    if (tail?.role === 'system') params.messages[params.messages.length - 1] = asText(tail.content);
+    if (tail?.role === 'system' && !effortOnly(tail)) params.messages[params.messages.length - 1] = asText(tail.content);
   }
 
   /**
@@ -822,16 +859,23 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
 
   async function turn(text, said, images, automated = false, guide = null) {
     stopper = new AbortController();
-    // Edits nothing has checked: an editor call that writes adds its file; one of the project's declared checks running
-    // clears them — any command does when the project declares none. The gate at the end of the turn is told what is
-    // left. The shell can edit too (`sed -i`, a redirect); that is not seen.
+    // Edits nothing has checked: an editor call that wrote adds its file — one refused, or whose old_str was not found,
+    // changed nothing and adds none; one of the project's declared checks running clears them — any command does when
+    // the project declares none. The gate at the end of the turn is told what is left. The shell can edit too (`sed -i`,
+    // a redirect); that is not seen.
     const unchecked = new Set();
     const declared = () => verifyCommands(workspace().cwd).map((c) => c.command);
     const noteCall = (call) => {
-      if (call.name === EDITOR_TOOL.name && call.input?.command !== 'view' && call.input?.path) unchecked.add(resolve(workspace().cwd, String(call.input.path)));
       if (call.name !== BASH_TOOL.name) return;
       const checks = declared();
       if (checks.length === 0 || checks.some((c) => String(call.input?.command ?? '').includes(c))) unchecked.clear();
+    };
+    // Only the project's own files are the project's check to judge: a file outside it the user let change is theirs.
+    const noteResult = (call, result) => {
+      if (call.name !== EDITOR_TOOL.name || call.input?.command === 'view' || !call.input?.path || result?.isError) return;
+      const { cwd: root } = workspace();
+      const path = resolve(root, String(call.input.path));
+      if (path.startsWith(`${root}${sep}`)) unchecked.add(path);
     };
     // The servers connect while the first turn is typed; the first request waits for them, and Esc does not. Their tools
     // join the request then — even when something else, /mcp, already waited for them to connect.
@@ -886,8 +930,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     for (;;) {
       const outcome = await converse(db, params, {
         send: sendAs,
-        // A command the sandbox kept from writing is put to the user as an MCP call off the allow list is, for one run outside it.
-        ctx: { ...workspace(), seen, undo: undoFolder, approve },
+        // A command the sandbox kept from writing is put to the user as an MCP call off the allow list is, for one run outside it;
+        // so is a change to a file outside the project, once or for the session.
+        ctx: { ...workspace(), seen, opened, undo: undoFolder, approve },
         ledger,
         beforeTool,
         concurrent: (call) => call.name === DELEGATE_TOOL.name,
@@ -904,8 +949,13 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           activity(describeCall(call));
           watch({ type: 'tool', call });
           noteCall(call);
+          // A page or an MCP server read here: what this conversation says from now on may be what it was told.
+          if (isWebTool(call) || isMcpTool(call.name)) noteSessionOutside(db, sessionId, call.name);
         },
-        onResult: (call, result) => watch({ type: 'result', call, result }),
+        onResult: (call, result) => {
+          noteResult(call, result);
+          watch({ type: 'result', call, result });
+        },
         onTurn: (response, totals) => {
           lastContext = totals.contextTokens;
           logLine(transcript, { type: 'assistant', message: { role: 'assistant', model: response.model ?? params.model, usage: response.usage, content: response.content } });
@@ -958,6 +1008,38 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return `undid the last turn that changed files: ${what} — changes made through bash are not tracked, so they stay`;
   }
 
+  /**
+   * `/handoff`: the model writes a hand-off of this session — the task, what is done, what was tried, the files and
+   * the next step, by the instructions a job's compaction summarizes under — and a fresh session starts with it as its
+   * first note, so a piece in hand survives the start. The request is this session's last; the session is then kept,
+   * as /new keeps it, and the new one begins. A hand-off that cannot be had leaves this session as it is.
+   */
+  async function handoff() {
+    if (!spoken) throw new UsageError('nothing to hand off: nothing has been said in this session — /new starts fresh');
+    stopper = new AbortController();
+    settleTail();
+    const row = (model, result, said) => logRun(db, { kind: 'chat', model, result, note: said, now: now(), sessionId });
+    let summary;
+    try {
+      summary = await sendAs(compactionParams(params, COMPACT_INSTRUCTIONS), { signal: stopper.signal, retries: QUIET_RETRIES });
+    } catch (cause) {
+      const why = describeFailure(cause).slice(0, 200);
+      row(params.model, { ok: false, usage: usageOf(params.model, null) }, `hand-off: ${why}`);
+      if (stopper.signal.aborted) throw new UsageError('the hand-off was stopped: this session goes on');
+      throw new UsageError(`no hand-off could be written: ${why} — /new starts fresh; the memory brings the thread back`);
+    }
+    const block = summary.content.find((b) => b.type === 'compaction' && b.content);
+    const by = summary.model ?? params.model;
+    row(by, { ok: Boolean(block), usage: usageOf(by, summary.usage) }, block ? 'hand-off' : 'hand-off: no summary came back');
+    if (!block) throw new UsageError('no hand-off came back from the model — /new starts fresh; the memory brings the thread back');
+    const text = redact(String(block.content)).text.trim();
+    const from = shortId(sessionId);
+    end();
+    const opening = start('handoff');
+    note = `hand-off: the session before this one (${from}) ended with this hand-off, written by the model that worked it. Carry on from where it leaves off: what it says is done is done.\n\n${text}`;
+    return { block: opening, text, from };
+  }
+
   /** `! <command>`: the user runs it themselves, where the model would be refused; the model sees what it printed. */
   async function shell(command) {
     stopper = new AbortController();
@@ -980,10 +1062,13 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     const [, name, args = ''] = m;
     if (name === 'exit' || name === 'quit') return { control: 'quit' };
     if (name === 'new' || name === 'clear') return { control: 'new' };
-    if (name === 'memory' || name === 'undo' || name === 'context') return { control: name };
+    if (name === 'memory' || name === 'undo' || name === 'context' || name === 'handoff') return { control: name };
     if (name === 'model' || name === 'resume' || name === 'mcp' || name === 'copy' || name === 'help' || name === 'stop' || name === 'export' || name === 'thinking') return { control: name, args: args.trim() };
     const make = Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
-    return make ? { ...make(args.trim()), said: args.trim() } : { error: `no such command /${name} — one of: ${commands.map((c) => `/${c.name}`).join(' ')}` };
+    if (make) return { ...make(args.trim()), said: args.trim() };
+    // A command mistyped is answered with the one it is closest to, two keys off at most; one close to none, with them all.
+    const close = closest(name, commands.map((c) => c.name));
+    return { error: close ? `no command /${name} — did you mean /${close}?` : `no command /${name} — one of: ${commands.map((c) => `/${c.name}`).join(' ')}` };
   }
 
   /** `/mcp`: the servers as `sumo mcp` lists them. They connect once, while the first turn is typed, so an early look waits for them. */
@@ -1049,6 +1134,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   return {
     start,
     say,
+    handoff,
     interrupt: () => stopper?.abort(),
     /** Said to the chat while it works: read with the model's next request of this turn. */
     steer: (text) => void steers.push(text),
@@ -1117,12 +1203,13 @@ async function screen(db, { model, effort, resume }) {
     ask: (question) => new Promise((resolve) => events.emit('ask', { ...question, resolve })),
   });
   try {
-    await runUi({ session, events, resume, notify: configured(db, 'chat.notify') !== 'off', motion: configured(db, 'chat.motion') !== 'off' }).waitUntilExit();
+    await runUi({ session, events, resume, notify: configured(db, 'chat.notify') !== 'off', motion: configured(db, 'chat.screen') === 'full', plain: configured(db, 'chat.screen') === 'plain' }).waitUntilExit();
     // The way back in, said as the screen closes: the command that picks this session up again, and what it cost.
     if (session.spoken) {
       const s = styles(colourEnabled());
       const cost = session.spent();
-      process.stdout.write(`\n${s.dim(`  sumo chat --resume ${shortId(session.sessionId)} picks this session up again${cost >= 0.005 ? ` · it cost $${cost.toFixed(2)}` : ''}`)}\n\n`);
+      // Two short lines, each with its margin, so a narrow window never wraps one past it.
+      process.stdout.write(`\n${s.dim(`  sumo chat --resume ${shortId(session.sessionId)}`)}\n${s.dim(`  picks this session up again${cost >= 0.005 ? ` · it cost $${cost.toFixed(2)}` : ''}`)}\n\n`);
     }
   } finally {
     // Jobs still at work in the background are stopped with the chat, and let go of what they hold before it closes.
@@ -1138,7 +1225,7 @@ async function screen(db, { model, effort, resume }) {
  * it is plain lines: a header, the prompt with the model in it, the reply
  * rendered as it streams, tool lines dim, errors red, a rule between turns.
  */
-export async function chat(db, { model, effort, resume = null, send, input = process.stdin, output = process.stdout } = {}) {
+export async function chat(db, { model, effort, resume = null, send, input = process.stdin, output = process.stdout, errors = process.stderr } = {}) {
   if (input.isTTY && output.isTTY) return screen(db, { model, effort, resume });
   const rl = createInterface({ input, output });
   // Every line is a turn. Lines that arrive while one is being answered wait here for theirs; a question would hear only the next.
@@ -1148,6 +1235,15 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
   // Piped in is not piped out: what the model or a command prints may reach a terminal, and only colour gets through to it.
   // A carriage return redraws a progress bar in place; as plain lines each redraw is a line of its own, not run into the next.
   const write = (t) => output.write(safeForTerminal(String(t).replace(/\r(?!\n)/g, '\n')));
+  /** Whether a turn failed: the chat then exits 1, so a script that piped into it can tell. */
+  let failed = false;
+  /** A turn that failed, said where failures go — stderr — in the screen's own words, with what to do and what came back under it. */
+  const failure = (message) => {
+    const { text, detail } = explained(message);
+    const e = styles(colourEnabled(errors));
+    errors.write(`${e.red(safeForTerminal(text))}\n${detail ? `${e.dim(`  ${safeForTerminal(detail)}`)}\n` : ''}`);
+    failed = true;
+  };
   const reply = createRenderer(write, s, { width });
   const session = createChat(db, {
     model,
@@ -1205,6 +1301,12 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
           show(session.start('new'));
           continue;
         }
+        if (control === 'handoff') {
+          const handed = await session.handoff();
+          write(`${s.dim(handed.text)}\n\n`);
+          show(handed.block, `handed off from ${handed.from}: the hand-off rides in with your next message`);
+          continue;
+        }
         if (control === 'resume') {
           if (!args) {
             const saved = session.saved();
@@ -1234,8 +1336,8 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
         write('\n');
         const outcome = await session.say(text, said, [], { guide });
         reply.flush();
-        if (outcome.stop === 'error') write(`\n${s.red(`error: ${outcome.error}`)}\n`);
-        if (stopReason(outcome.stop)) write(`\n${s.dim(stopReason(outcome.stop))}\n`);
+        if (outcome.stop === 'error') failure(outcome.error);
+        if (stopReason(outcome.stop)) write(`\n${s.dim(stopReason(outcome.stop, outcome.stopDetail))}\n`);
         rule();
       } catch (cause) {
         reply.flush();
@@ -1247,5 +1349,5 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
     rl.close();
     await closeMcp();
   }
-  return 0;
+  return failed ? 1 : 0;
 }

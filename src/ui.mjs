@@ -1,21 +1,22 @@
 import { Box, render, renderToString, Static, Text, useAnimation, useApp, useBoxMetrics, useInput, usePaste, useStdout, useWindowSize } from 'ink';
 import { execFile, spawn } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { createElement as h, useEffect, useReducer, useRef } from 'react';
-import { compactLine, contextReport, retryLine, routeLine, routeOf } from './chat.mjs';
+import { createContext, createElement as h, useContext, useEffect, useReducer, useRef } from 'react';
+import { compactLine, contextReport, routeLine, routeOf } from './chat.mjs';
 import { contextBand } from './sessions.mjs';
 import { liveFile } from './jobs.mjs';
 import { stopReason } from './loop.mjs';
-import { compactInput, INPUT_SHOWN } from './mcp.mjs';
+import { INPUT_SHOWN } from './mcp.mjs';
 import { paths } from './paths.mjs';
+import { scratchDir } from './projects.mjs';
 import { redact } from './redact.mjs';
 import { elapsed } from './text.mjs';
 import { cleanPaste, editor, keysOf, matchFiles, menuOf, paste, press, under } from './editor.mjs';
 import { clipboardImage, copyText, droppedImages } from './images.mjs';
-import { BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
-import { colourEnabled, createRenderer, explained, flow, fold, linked, logoLines, markdownOf, messageAt, pathFrom, pickMessage, renderBlock, safeForTerminal, spinnerMessages, styles, sunset, tilde, toolView, transcript, untab, VERSION, withoutColourCodes, wrap } from './tty.mjs';
+import { ASK_TOOL, BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
+import { colourEnabled, createRenderer, explained, flow, fold, glyphs, inline, linked, logoLines, markdownOf, messageAt, pathFrom, pickMessage, renderBlock, safeForTerminal, spinnerMessages, styles, sunset, tilde, toolView, transcript, untab, VERSION, withoutColourCodes, withSpan, wrap } from './tty.mjs';
 
 /**
  * The chat on a real terminal. What is finished scrolls away above — what
@@ -42,6 +43,9 @@ import { colourEnabled, createRenderer, explained, flow, fold, linked, logoLines
  */
 
 const ACCENT = '#d77757';
+/** The marks the screen draws with: plain ones (`chat.screen plain`) for a screen reader. Every component reads them here. */
+const Marks = createContext(glyphs(false));
+const useMarks = () => useContext(Marks);
 /** The name at the top of the chat, two rows of blocks. */
 const WORDMARK = ['█▀▀ █ █ █▀▄▀█ █▀█', '▄▄█ █▄█ █ ▀ █ █▄█'];
 const FLOW_STEP_MS = 100;
@@ -73,7 +77,7 @@ const SCREEN_BACK = '\x1b[?1049l';
  */
 const PROGRESS_BUSY = '\x1b]9;4;3;0\x07';
 const PROGRESS_DONE = '\x1b]9;4;0;0\x07';
-export function showsProgress(env = process.env) {
+function showsProgress(env = process.env) {
   if (env.TMUX || env.STY) return false;
   if (env.WT_SESSION || env.ConEmuANSI === 'ON' || env.TERM_PROGRAM === 'ghostty') return true;
   if (env.TERM_PROGRAM === 'iTerm.app') {
@@ -176,7 +180,7 @@ export function replayOf(messages, turns = REPLAY_TURNS) {
  * Where `/export` writes: the path given — from the project, or from home with `~` — and into a folder given, a file of its
  * own; with none, the home's exports folder, named by the day and the session.
  */
-export function exportPath(given, cwd, sessionId = null) {
+function exportPath(given, cwd, sessionId = null) {
   const named = `${new Date().toISOString().slice(0, 10)}-${String(sessionId ?? 'session').slice(0, 8)}.md`;
   if (!given) return join(paths().home, 'exports', named);
   const path = given.replace(/^~(?=$|\/)/, homedir());
@@ -206,6 +210,8 @@ function keepHistory(line) {
   try {
     mkdirSync(paths().home, { recursive: true, mode: 0o700 });
     writeFileSync(historyFile(), `${lines.slice(-HISTORY_KEPT).join('\n')}\n`, { mode: 0o600 });
+    // The mode is given only to a file being made: one made before it was set is made private here.
+    chmodSync(historyFile(), 0o600);
   } catch {
     // Nowhere to keep it: the line is still sent.
   }
@@ -214,19 +220,49 @@ function keepHistory(line) {
 const thousands = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
 
 /**
+ * A request being sent again, for the scroll: why, in the words a known failure is said in — not what to do about it,
+ * since it is being done — and which try this is. One it does not know is said as it came.
+ */
+const retryWhy = (reason) => {
+  const said = explained(reason);
+  return said.detail ? said.text.replace(/^error: /, '').split(' — ')[0] : String(reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 160);
+};
+const retryNote = ({ attempt, limit, reason }) => `${retryWhy(reason)} · retrying (${attempt} of ${limit})`;
+
+/**
+ * Reverse video, whatever the colour: NO_COLOR asks for no colour, and chalk, told so, drops every style with it — the
+ * cursor in the box, and the part of an edit that changed, would be gone. These are not colour, and are kept.
+ */
+const reverse = (text) => `\x1b[7m${text}\x1b[27m`;
+
+/**
  * The lines under a call: what came back, the first of them with the mark. Folded to `columns` here, by the same count the
  * replies are folded by, so a line too long for the window goes on under itself — not under the mark, and not past the edge.
+ * With `max`, at most that many rows: the last says how many lines were folded away — a line partly shown is shown.
  */
-const linesUnder = (lines, columns, s = styles(false)) =>
-  lines
-    .flatMap((line) => {
-      // An address in what came back opens on a click, whole, however the line is folded.
-      const text = linked(untab(line.text), s);
-      // A numbered line — a diff's, a file's — and an item of a list go on under their own text, not under the number or the bullet.
-      const hang = /^\s*(?:\d+(?: [-+ ] | {2,})\s*|[•*-] |\d+[.)] )/.exec(text)?.[0].length ?? 0;
-      return fold(text, Math.max(20, columns - 6), ' '.repeat(Math.min(hang, Math.floor((columns - 6) / 2)))).map((row) => ({ ...line, text: row }));
-    })
-    .map((line, i) => h(Text, { key: i, ...TONES[line.tone], wrap: 'truncate' }, `${i === 0 ? '  ⎿  ' : '     '}${line.text}`));
+const linesUnder = (lines, columns, s = styles(false), max = null) => {
+  const rows = [];
+  let reached = 0;
+  // Folded only as far as the budget needs: a long edit is not laid out whole to show its top.
+  while (reached < lines.length && (max === null || rows.length <= max)) {
+    const line = lines[reached];
+    // An address in what came back opens on a click, whole, however the line is folded. The part of a diff's line that changed is in reverse video.
+    const text = line.span ? withSpan(line, { ...s, inverse: reverse }) : linked(untab(line.text), s);
+    // A numbered line — a diff's, a file's — and an item of a list go on under their own text, not under the number or the bullet.
+    const hang = /^\s*(?:\d+(?: [-+ ] | {2,})\s*|[•*-] |\d+[.)] )/.exec(text)?.[0].length ?? 0;
+    rows.push(...fold(text, Math.max(20, columns - 6), ' '.repeat(Math.min(hang, Math.floor((columns - 6) / 2)))).map((row) => ({ ...line, text: row, from: reached })));
+    reached++;
+  }
+  let kept = rows;
+  if (max !== null && (rows.length > max || reached < lines.length)) {
+    kept = rows.slice(0, max - 1);
+    // A line cut short is counted with the ones never reached: the fold says what is not there to read.
+    const whole = (kept.at(-1)?.from ?? -1) + (rows[kept.length]?.from === kept.at(-1)?.from ? 0 : 1);
+    const folded = lines.length - whole;
+    kept.push({ text: `… +${folded} line${folded === 1 ? '' : 's'}`, tone: 'dim' });
+  }
+  return kept.map((line, i) => h(Text, { key: i, ...TONES[line.tone], wrap: 'truncate' }, `${i === 0 ? `  ${s.g.under}  ` : '     '}${line.text}`));
+};
 
 /**
  * The last lines a running command has printed, as the screen may show them: without secrets or control characters, a
@@ -240,12 +276,15 @@ function lastLines({ out, cut }) {
 /** A command that is running: for how long, and the last of what it has printed so far. */
 function Running({ live, label = 'Running…' }) {
   // Drawn again more often than the clock it shows turns over, so a second is not skipped by a tick that came just short of it.
-  useAnimation({ interval: 250 });
-  const ran = live ? Date.now() - live.since : 0;
+  // Plain, for a screen reader, it has no clock: it is drawn again for what the command prints, not for the time.
+  const g = useMarks();
+  const plain = g === glyphs(true);
+  useAnimation({ interval: 250, isActive: !plain });
+  const ran = live && !plain ? Date.now() - live.since : 0;
   return h(
     Box,
     { flexDirection: 'column' },
-    h(Text, { dimColor: true }, `  ⎿  ${label}${ran >= 1000 ? ` ${elapsed(ran)}` : ''}`),
+    h(Text, { dimColor: true }, `  ${g.under}  ${label}${ran >= 1000 ? ` ${elapsed(ran)}` : ''}`),
     ...(live ? lastLines(live) : []).map((line, i) => h(Text, { key: i, dimColor: true, wrap: 'truncate' }, `     ${line}`)),
   );
 }
@@ -258,30 +297,34 @@ function Running({ live, label = 'Running…' }) {
 function titleRows(view, took, s, width) {
   const stat = view.stat ? ` ${s.green(`+${view.stat.added}`)} ${s.red(`−${view.stat.removed}`)}` : '';
   const time = took >= TOOK_SHOWN_MS ? s.dim(` · ${elapsed(took)}`) : '';
-  return untab(`${s.bold(view.title)}(${view.detail})${stat}${time}`)
+  // Several calls drawn as one say what they were in words, not as a call: `Read 3 files (a.js, b.js, +1)`.
+  const what = view.group ? `${s.bold(view.title)} (${view.detail})` : `${s.bold(view.title)}(${view.detail})`;
+  return untab(`${what}${stat}${time}`)
     .split('\n')
     .flatMap((line) => wrap(line, width).split('\n'));
 }
 
 function Tool({ view, failed = false, running = false, waiting = false, jobs = [], live = null, took = 0, columns, s = styles(false) }) {
+  const g = useMarks();
   return h(
     Box,
     { flexDirection: 'column', marginTop: 1 },
     // The mark stands apart from the words, so a command that wraps, or has lines of its own, goes on under them, not under it.
+    // A failure has a mark of its own: its colour alone says nothing to someone who cannot see it.
     h(
       Box,
       null,
-      h(Box, { flexShrink: 0 }, h(Text, { color: running ? undefined : failed ? 'red' : 'green', dimColor: running }, '⏺ ')),
+      h(Box, { flexShrink: 0 }, h(Text, { color: running ? undefined : failed ? 'red' : 'green', dimColor: running }, `${failed && !running ? g.fail : g.tool} `)),
       // How long it ran, once that is long enough to have been waited on.
       // A width of its own: a box in a row is never made narrower than its longest word, and a command can be one long word.
       h(Box, { flexShrink: 1, flexDirection: 'column', width: Math.max(10, columns - 2) }, ...titleRows(view, took, s, Math.max(10, columns - 2)).map((row, i) => h(Text, { key: i }, row))),
     ),
     // A question put to the user is not running anything: it waits on them, and says so.
+    // A call held for the user's word runs nothing either: the panel under the work says it waits, and nothing here says it again.
     // A delegation has no job yet while the router picks the model and effort it runs on.
-    // So is a call held for the user's word.
-    running && (view.title === 'Question' || waiting) ? h(Text, { dimColor: true }, '  ⎿  waiting for your answer') : running && jobs.length === 0 ? h(Running, { live, label: view.title === 'Delegate' ? 'picking the model and effort…' : 'Running…' }) : null,
+    running && view.title === 'Question' && !waiting ? h(Text, { dimColor: true }, `  ${g.under}  waiting for your answer`) : running && !waiting && jobs.length === 0 ? h(Running, { live, label: view.title === 'Delegate' ? 'picking the model and effort…' : 'Running…' }) : null,
     ...jobs.map(([id, job]) => h(JobAtWork, { key: id, id, job })),
-    ...linesUnder(view.lines, columns, s),
+    ...linesUnder(view.lines, columns, s, view.rows ?? null),
   );
 }
 
@@ -319,12 +362,15 @@ const TITLE_CHARS = 32;
  * whose record is open.
  */
 function JobAtWork({ id, job, alone = false, picked = false, open = false }) {
-  useAnimation({ interval: 1000 });
+  // Plain, the row says what the job has done, not for how long: a clock would have it read out every second.
+  const g = useMarks();
+  const plain = g === glyphs(true);
+  useAnimation({ interval: 1000, isActive: !plain });
   const calls = `${job.calls} tool call${job.calls === 1 ? '' : 's'}`;
-  const mark = alone ? (picked ? '  ❯ ' : '  ⏺ ') : '  ⎿  ';
+  const mark = alone ? (picked ? `  ${g.pick} ` : `  ${g.tool} `) : `  ${g.under}  `;
   // Under the call that started it the title is the call's own: the row says who works on it, on what, and where to follow it.
   const who = alone ? ` ${job.agent} — ${job.title.length > TITLE_CHARS ? `${job.title.slice(0, TITLE_CHARS - 1)}…` : job.title}` : ` ${job.agent} · ${job.route}`;
-  const lead = `j${id}${who} · ${elapsed(Date.now() - job.since)} · ${calls} · `;
+  const lead = `j${id}${who} · ${plain ? '' : `${elapsed(Date.now() - job.since)} · `}${calls} · `;
   return h(
     Text,
     { wrap: 'truncate' },
@@ -340,8 +386,12 @@ const MAIN = 'main';
 
 /** The chat's own row, over the jobs it delegated: marked when it is the one stepped on (`picked`), or the one on the screen (`shown`). */
 function MainAtWork({ working, picked = false, shown = false }) {
-  return h(Text, { wrap: 'truncate' }, h(Text, picked || shown ? { color: ACCENT } : { dimColor: true }, picked ? '  ❯ ' : '  ⏺ '), h(Text, { dimColor: !picked }, 'main · '), h(Text, { dimColor: true }, working ? 'working' : 'idle'));
+  const g = useMarks();
+  return h(Text, { wrap: 'truncate' }, h(Text, picked || shown ? { color: ACCENT } : { dimColor: true }, picked ? `  ${g.pick} ` : `  ${g.tool} `), h(Text, { dimColor: !picked }, 'main · '), h(Text, { dimColor: true }, working ? 'working' : 'idle'));
 }
+
+/** A line written with the screen's own marks — a job's record — in the marks this screen draws with. */
+const inMarks = (line, g) => (g.tool === '⏺' ? line : line.replaceAll('⏺', g.tool).replaceAll('⎿', g.under).replaceAll('✗', g.fail).replaceAll('✻', g.thought));
 
 /** What a job at work has written down so far, as the screen may show it: its lines, under the one that says who it is. None where there is no record yet. */
 function recordLines(id) {
@@ -361,55 +411,144 @@ const openRows = (rows) => Math.max(3, Math.min(rows - 24, Math.floor(rows / 2))
  */
 function JobOpen({ id, job, rows }) {
   useAnimation({ interval: 1000 });
+  const g = useMarks();
   const all = recordLines(id);
   const seen = all.slice(-openRows(rows));
   const above = all.length - seen.length;
   return h(
     Box,
     { flexDirection: 'column', marginTop: 1 },
-    h(Text, { wrap: 'truncate' }, h(Text, { color: jobColour(id) }, '⏺ '), h(Text, { bold: true }, `j${id}`), ` ${job.agent} · ${job.route} — ${job.title}`),
+    h(Text, { wrap: 'truncate' }, h(Text, { color: jobColour(id) }, `${g.tool} `), h(Text, { bold: true }, `j${id}`), ` ${job.agent} · ${job.route} — ${job.title}`),
     above > 0 ? h(Text, { dimColor: true }, `  … +${above} line${above === 1 ? '' : 's'}`) : null,
     all.length === 0 ? h(Text, { dimColor: true }, '  nothing done yet') : null,
-    ...seen.map((line, i) => h(Text, { key: i, dimColor: /^\s*⎿/.test(line), wrap: 'truncate' }, untab(line) || ' ')),
+    ...seen.map((line, i) => h(Text, { key: i, dimColor: /^\s*⎿/.test(line), wrap: 'truncate' }, inMarks(untab(line), g) || ' ')),
   );
 }
 
 /** The most of a call's input the question shows in full; past it, the cut is said. A recipient or a body hidden past the cut is one the user never approved. */
 const ASK_INPUT_MAX = 4_000;
 
+/**
+ * What a question shows, as plain text: no escape of any kind, colours included — a conceal code (`ESC[8m`) would hide
+ * the very part of a command or a path the user is asked to judge. What draws the work keeps its colours; this does not.
+ */
+const asText = (text) => safeForTerminal(String(text ?? '').replace(/\x1b/g, '␛').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, (c) => (c === '\x7f' ? '^?' : `^${String.fromCharCode(c.charCodeAt(0) + 64)}`)));
+
+/**
+ * A change to a file outside the project, as the question shows it: the file and the command, then what is taken out (-)
+ * and put in (+). The file is where the write lands, named as the call above it names it: from the project when it is in
+ * it (a guarded one can be), else whole — one file, one spelling.
+ */
+function editLines(ask, cwd = null) {
+  const input = ask.input ?? {};
+  const lines = (text, mark) => asText(text).replace(/\n$/, '').split('\n').map((l) => `${mark} ${l}`);
+  // The head is the model's words and a path it chose: drawn as text, never as what the terminal would do with an escape.
+  // What it does is said in words, not by the editor's own command.
+  const verb = { str_replace: 'change', create: 'create', insert: 'insert into' }[input.command] ?? input.command;
+  const head = asText(`${verb} ${pathFrom(ask.path, cwd)}${input.command === 'insert' ? ` after line ${input.insert_line ?? 0}` : ''}`);
+  if (input.command === 'create') return [head, ...lines(input.file_text, '+')];
+  if (input.command === 'insert') return [head, ...lines(input.insert_text ?? input.new_str, '+')];
+  return [head, ...lines(input.old_str, '-'), ...lines(input.new_str, '+')];
+}
+
+/**
+ * The keys that answer a call waiting on the user, and what each answers. A run outside the sandbox is this one run or
+ * none; a guarded file is changed this once or not; a file outside the project can be opened for the session, alone or
+ * with its directory; an MCP call can be allowed for good.
+ */
+function answersTo(ask) {
+  // Every kind can be refused with the user's words: r opens a line for them, and the model reads them as what to do instead.
+  if (ask.unsandboxed) return 'y yes · n no · r no, say why';
+  if (ask.guarded) return 'y once · n no · r no, say why';
+  // The folder by its name: the path just above it in the question is the file's, in that folder.
+  if (ask.path) return `y once · a this file, session${ask.directory ? ` · d all of ${asText(basename(ask.directory))}/, session` : ''} · n no · r no, say why`;
+  return 'y once · a always · n no · r no, say why';
+}
+const KEY_ANSWERS = { y: 'once', a: 'always', d: 'directory', n: 'no', r: 'why' };
+/** The answer a key gives to a waiting call, or undefined when the key answers nothing on it. */
+const answerOf = (ask, key) => (answersTo(ask).split(' · ').some((said) => said.startsWith(`${key} `)) ? KEY_ANSWERS[key] : undefined);
+/** What the panel says when a key answers nothing: each key and what it does, Esc's too. */
+const explainKeys = (ask, aside = false) =>
+  `${answersTo(ask)
+    .split(' · ')
+    .map((said) => ({ 'y yes': 'y runs it once outside the sandbox', 'y once': ask.path ? 'y changes it once' : 'y allows it once', 'a always': 'a always', 'a this file, session': 'a this file, session', d: `d all of ${asText(basename(ask.directory ?? ''))}/, session`, 'n no': 'n refuses it', 'r no, say why': 'r with why' })[said.startsWith('d ') ? 'd' : said] ?? said)
+    .join(' · ')} · esc ${aside ? 'refuses it' : 'interrupts the turn'}`;
+
+/** How long a run of spaces may be before the question counts it instead of drawing it: blank rows hide what follows them. */
+const SPACES_COUNTED = 16;
+/** A long run of spaces or tabs in what would run, as a count the eye cannot miss: `echo ok ⟨200 spaces⟩ ; curl …`. */
+const spacesCounted = (line) => line.replace(new RegExp(`[ \\t]{${SPACES_COUNTED},}`, 'g'), (run) => ` ⟨${run.length} spaces⟩ `);
+
 /** A call waiting on the user's word: who asks, what would run with what — the whole input, not its first line — and the keys that answer. */
-function Ask({ ask, aside = false, columns }) {
+function Ask({ ask, aside = false, waiting = 1, why = null, explain = false, columns, cwd = null }) {
   const who = ask.job ? `j${ask.job}: ` : '';
   // A command the sandbox blocked is asked as itself: the command, to run once outside the sandbox — yes or no, never always.
-  const command = ask.unsandboxed ? safeForTerminal(String(ask.input?.command ?? '')) : null;
-  const whole = command ?? JSON.stringify(ask.input ?? {});
+  const command = ask.unsandboxed ? asText(ask.input?.command) : null;
+  // A change outside the project, or to a guarded file, is asked as the change: once; outside and not guarded, this file or its directory for the session.
+  const edit = ask.path ? editLines(ask, cwd) : null;
+  const whole = command ?? edit?.join('\n') ?? JSON.stringify(ask.input ?? {});
   // Short enough for a line, it is the one line; longer, it is laid out, every field whole, up to the cut.
   const short = whole.length <= INPUT_SHOWN && !whole.includes('\n');
-  const laid = short ? [whole] : command !== null ? command.split('\n') : JSON.stringify(ask.input ?? {}, null, 2).split('\n');
+  const laid = short ? [whole] : command !== null ? command.split('\n') : edit ?? JSON.stringify(ask.input ?? {}, null, 2).split('\n');
+  // Up to the cap, every character: a line longer than what is left is shown as far as it goes, and what the cap left out
+  // is counted in characters — a single line can hold what matters past any count of lines.
   const kept = [];
   let size = 0;
+  let unshown = 0;
   for (const line of laid) {
-    if (size + line.length > ASK_INPUT_MAX) break;
-    kept.push(line);
-    size += line.length + 1;
+    const room = ASK_INPUT_MAX - size;
+    if (room <= 0) unshown += line.length + 1;
+    else if (line.length > room) {
+      kept.push(line.slice(0, room));
+      unshown += line.length - room;
+      size = ASK_INPUT_MAX;
+    } else {
+      kept.push(line);
+      size += line.length + 1;
+    }
   }
-  const cut = laid.length - kept.length;
-  const title = command !== null ? `${who}Run this once outside the sandbox?` : `${who}Allow ${ask.server} · ${ask.tool}?`;
+  // A server names its own tools: the title draws them as text, as it draws the input.
+  const title = asText(command !== null ? `${who}Run this once outside the sandbox?` : ask.guarded ? `${who}Change this guarded file? ${ask.guarded}` : edit ? `${who}Change this file outside the project?` : `${who}Allow ${ask.server} · ${ask.tool}?`);
   // Esc stops the turn the call is part of; for a job at work in the background there is no such turn, and Esc refuses the call.
-  const keys = `${command !== null ? 'y yes · n no' : 'y once · a always · n no'} · esc ${aside ? 'no' : 'stop'}`;
-  // A panel of its own, set apart from the work: what would run, whole, and the keys that answer.
+  // Several jobs can ask at once: the ones behind this are counted, so none waits unseen.
+  // Saying why, the keys are the line's: Enter refuses with the words, Esc goes back to the question.
+  // A key that answers nothing has every key explained here, in the panel's own colour, where nothing is cut to fit.
+  // Esc is named as the working line names it, wherever it stops the turn.
+  const keys = why !== null ? `enter refuses with this · esc back to the question${waiting > 1 ? ` · ${waiting - 1} more waiting` : ''}` : explain ? `${explainKeys(ask, aside)}${waiting > 1 ? ` · ${waiting - 1} more waiting` : ''}` : `${answersTo(ask)} · esc ${aside ? 'no' : 'to interrupt'}${waiting > 1 ? ` · ${waiting - 1} more waiting` : ''}`;
+  // A panel of its own, set apart from the work: what would run, whole, and the keys that answer. Plain, it has no frame.
+  const g = useMarks();
   return h(
     Box,
-    { marginTop: 1, flexDirection: 'column', borderStyle: 'round', borderColor: 'yellow', paddingX: 1, width: Math.max(20, columns) },
-    h(Text, { color: 'yellow', bold: true }, `⚠ ${title}`),
+    { marginTop: 1, flexDirection: 'column', ...(g.tool === '⏺' ? { borderStyle: 'round', borderColor: 'yellow', paddingX: 1 } : {}), width: Math.max(20, columns) },
+    h(Text, { color: 'yellow', bold: true }, `${g.warn} ${title}`),
     h(
       Box,
       { flexDirection: 'column', marginY: 1, paddingLeft: 2 },
-      ...(whole === '{}' ? [h(Text, { key: 'none', dimColor: true }, '(no input)')] : kept.map((line, i) => h(Text, { key: i, wrap: 'truncate-end' }, untab(line) || ' '))),
-      cut > 0 ? h(Text, { dimColor: true }, `… ${cut} more line${cut === 1 ? '' : 's'} of input not shown — n, and ask the model for less`) : null,
+      // Why a run outside is asked: what the sandbox refused, faint, above the command.
+      ask.unsandboxed && ask.blocked ? h(Text, { key: 'refused', dimColor: true, wrap: 'wrap' }, asText(`the sandbox refused: ${ask.blocked}`)) : null,
+      // Wrapped, never cut at the edge: what would run past the window's width is what the question is for.
+      ...(whole === '{}' ? [h(Text, { key: 'none', dimColor: true }, '(no input)')] : kept.map((line, i) => h(Text, { key: i, wrap: 'wrap' }, spacesCounted(untab(line)) || ' '))),
+      unshown > 0 ? h(Text, { dimColor: true }, `… ${unshown.toLocaleString('en-US')} more character${unshown === 1 ? '' : 's'} of input not shown — n, and ask the model for less`) : null,
     ),
-    h(Text, { dimColor: true }, keys),
+    why !== null ? h(Box, { marginBottom: 1 }, h(Text, { color: 'yellow' }, 'why not? '), h(Text, { wrap: 'wrap' }, `${asText(why)}▌`)) : null,
+    // Inside the frame and its padding, the keys go to as many rows as they need, broken only between keys — at full weight:
+    // they are what the panel asks the user to read and press.
+    ...keyRows(keys, Math.max(20, columns) - (g.tool === '⏺' ? 4 : 0)).map((row, i) => h(Text, { key: `keys-${i}`, ...(explain && why === null ? { color: 'yellow' } : {}), wrap: 'wrap' }, row)),
   );
+}
+
+/**
+ * The keys a question takes, `y once · n no · …`, in rows that break only between them: a key never stands at the end of one
+ * row with what it does on the next. A key longer than a row has it to itself.
+ */
+export function keyRows(said, width) {
+  const rows = [];
+  for (const unit of String(said).split(' · ')) {
+    const last = rows.at(-1);
+    if (last !== undefined && last.length + 3 + unit.length <= width) rows[rows.length - 1] = `${last} · ${unit}`;
+    else rows.push(unit);
+  }
+  return rows;
 }
 
 /** A mark, and words that go on under themselves, never under the mark: the rows of a question and its options. */
@@ -419,24 +558,50 @@ function Hung({ mark, width, color, children }) {
 
 /** A question of the model's: its options, the one the arrows are on, and the keys that answer — a pick, or words typed in the box. */
 function Question({ ask, columns }) {
+  const g = useMarks();
   return h(
     Box,
     { marginTop: 1, flexDirection: 'column' },
     h(Hung, { mark: '? ', width: columns, color: 'yellow' }, ask.question),
-    ...ask.options.map((option, i) => h(Hung, { key: i, mark: `  ${i === ask.at ? '❯' : ' '} ${i + 1}. `, width: columns, color: i === ask.at ? ACCENT : undefined }, option.label, option.detail ? h(Text, { dimColor: true }, ` — ${option.detail}`) : null)),
-    h(Box, { paddingLeft: 2 }, h(Text, { dimColor: true }, `↑↓ choose · enter picks · 1–${ask.options.length} picks that one · or type your own answer · esc stop`)),
+    ...ask.options.map((option, i) => h(Hung, { key: i, mark: `  ${i === ask.at ? g.pick : ' '} ${i + 1}. `, width: columns, color: i === ask.at ? ACCENT : undefined }, option.label, option.detail ? h(Text, { dimColor: true }, ` — ${option.detail}`) : null)),
+    // Broken only between keys, as a panel's are: never `esc` at the end of a row and `to interrupt` on the next.
+    ...keyRows(`↑↓ choose · enter picks · 1–${ask.options.length} picks that one · or type your own answer · esc to interrupt`, Math.max(20, columns - 2)).map((row, i) => h(Box, { key: `keys-${i}`, paddingLeft: 2 }, h(Text, { dimColor: true }, row))),
   );
 }
 
 /** One line of a reply; the first of a block carries the mark. */
 function Reply({ text, first }) {
+  const g = useMarks();
   // The mark keeps its two columns: a line with a word wider than the window must not squeeze it, or every row after it shifts left.
-  return h(Box, { marginTop: first ? 1 : 0 }, h(Box, { flexShrink: 0 }, h(Text, null, first ? '⏺ ' : '  ')), h(Text, null, text || ' '));
+  return h(Box, { marginTop: first ? 1 : 0 }, h(Box, { flexShrink: 0 }, h(Text, null, first ? `${g.tool} ` : '  ')), h(Text, null, text || ' '));
 }
+
+/** A folder by where it really is — `/var` is `/private/var` on macOS — or as given, when it is not there to ask. */
+const realOrSame = (folder) => {
+  try {
+    return realpathSync(folder);
+  } catch {
+    return resolve(folder);
+  }
+};
+
+/** Why the tools are not working in the folder the chat was opened in, and what makes them. */
+const awayLine = (folder) => `${folder} is not a project: the tools work in scratch — sumo project add . there makes it one`;
 
 /** Something finished, drawn once and left to scroll. */
 /** `columns` is the window's width, handed down: every item asking the terminal for it would be a listener each, on a stream that takes ten. */
 function Item({ item, columns, s }) {
+  // Plain, the name is said, not drawn in blocks: a reader would spell out every one of them.
+  if (item.kind === 'header' && s.plain) {
+    return h(
+      Box,
+      { flexDirection: 'column', marginTop: 1 },
+      h(Text, { wrap: 'truncate-end' }, item.route, VERSION ? h(Text, { dimColor: true }, `  sumo ${VERSION}`) : null),
+      h(Text, { dimColor: true, wrap: 'truncate-middle' }, item.cwd),
+      item.away ? h(Text, { dimColor: true }, wrap(awayLine(item.away), Math.max(10, columns - 1))) : null,
+      item.block ? h(Box, { marginTop: 1 }, h(Text, null, item.block)) : null,
+    );
+  }
   if (item.kind === 'header') {
     return h(
       Box,
@@ -449,56 +614,121 @@ function Item({ item, columns, s }) {
         // Beside the name, as wide as the window leaves: a long path loses its middle, never runs past the edge.
         h(Box, { flexDirection: 'column', width: Math.max(10, columns - WORDMARK[0].length - 3) }, h(Text, { wrap: 'truncate-end' }, item.route, VERSION ? h(Text, { dimColor: true }, `  sumo ${VERSION}`) : null), h(Text, { dimColor: true, wrap: 'truncate-middle' }, item.cwd)),
       ),
+      item.away ? h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, wrap(awayLine(item.away), Math.max(10, columns - 1)))) : null,
       item.block ? h(Box, { marginTop: 1 }, h(Text, null, item.block)) : null,
     );
   }
-  // What the user said is what a scroll back looks for: full weight, a bar of the chat's colour down its side.
+  // What the user said is what a scroll back looks for: full weight, a bar of the chat's colour down its side — plain, a `>` before each line.
   if (item.kind === 'user') {
-    return h(
-      Box,
-      { marginTop: 1, flexDirection: 'column', borderStyle: 'bold', borderColor: ACCENT, borderTop: false, borderRight: false, borderBottom: false, paddingLeft: 1 },
-      h(Text, null, untab(item.text)),
-      item.more ? h(Text, { dimColor: true }, `… +${item.more} line${item.more === 1 ? '' : 's'}`) : null,
-    );
+    const more = item.more ? h(Text, { dimColor: true }, `… +${item.more} line${item.more === 1 ? '' : 's'}`) : null;
+    if (s.plain) return h(Box, { marginTop: 1, flexDirection: 'column' }, h(Text, null, untab(item.text).split('\n').map((line) => `${s.g.bar} ${line}`).join('\n')), more);
+    return h(Box, { marginTop: 1, flexDirection: 'column', borderStyle: 'bold', borderColor: ACCENT, borderTop: false, borderRight: false, borderBottom: false, paddingLeft: 1 }, h(Text, null, untab(item.text)), more);
   }
   if (item.kind === 'text') return h(Reply, item);
   if (item.kind === 'tool') return h(Tool, { ...item, columns, s });
   if (item.kind === 'output') return h(Box, { flexDirection: 'column' }, ...linesUnder(item.lines, columns, s));
-  if (item.kind === 'footer') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, `  ${item.text}`));
+  // Its margin holds on every row it wraps to: the turn summed up stands apart from the work above it.
+  if (item.kind === 'footer') return h(Box, { marginTop: 1, paddingLeft: 2 }, h(Text, { dimColor: true }, item.text));
   // The mark stands apart from the words, so a line that wraps in a narrow window goes on under them, not under it.
-  if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Box, { flexShrink: 0 }, h(Text, { color: jobColour(item.id) }, '⏺ ')), h(Box, { width: Math.max(10, columns - 2) }, h(Text, null, h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, h(Text, { dimColor: true }, ` · ${item.where}`))));
-  if (item.kind === 'error') return h(Box, { marginTop: 1, flexDirection: 'column' }, h(Text, { color: 'red' }, item.text), item.detail ? h(Box, { paddingLeft: 2 }, h(Text, { dimColor: true }, item.detail)) : null);
+  if (item.kind === 'job') return h(Box, { marginTop: 1 }, h(Box, { flexShrink: 0 }, h(Text, { color: jobColour(item.id) }, `${s.g.tool} `)), h(Box, { width: Math.max(10, columns - 2) }, h(Text, null, h(Text, { bold: true }, `j${item.id}`), ` ${item.agent} · ${item.route} — ${item.title}`, h(Text, { dimColor: true }, ` · ${item.where}`))));
+  // A failure has a mark of its own, as a failed call has, and goes on under its own words, not at the window's edge:
+  // folded here, at the spaces. What came back stands faint beneath, at the same margin.
+  if (item.kind === 'error') {
+    const width = Math.max(10, columns - 2);
+    return h(
+      Box,
+      { marginTop: 1, flexDirection: 'column' },
+      h(Box, null, h(Box, { flexShrink: 0 }, h(Text, { color: 'red' }, `${s.g.fail} `)), h(Box, { width }, h(Text, { color: 'red' }, wrap(item.text, width)))),
+      item.detail ? h(Box, { paddingLeft: 2 }, h(Text, { dimColor: true }, item.detail)) : null,
+    );
+  }
+  // /help: the command or key in the chat's colour, what it does faint beside it, going on under itself in a narrow window.
+  if (item.kind === 'help') {
+    const wide = Math.max(...item.rows.filter(Boolean).map((row) => row.key.length)) + 2;
+    const room = Math.max(10, columns - 2 - wide);
+    return h(Box, { marginTop: 1, flexDirection: 'column', paddingLeft: 2 }, ...item.rows.map((row, i) => (row ? h(Box, { key: i }, h(Box, { width: wide, flexShrink: 0 }, h(Text, { color: ACCENT }, row.key)), h(Box, { width: room }, h(Text, { dimColor: true }, wrap(row.does, room)))) : h(Text, { key: i }, ' '))));
+  }
   // What the model thought before it answered: how long, here; the thought itself is in the pager.
-  if (item.kind === 'thought') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, `✻ Thought for ${elapsed(item.ms)}`));
+  if (item.kind === 'thought') return h(Box, { marginTop: 1 }, h(Text, { dimColor: true }, `${s.g.thought} Thought for ${elapsed(item.ms)}`));
   return h(Box, { flexDirection: 'column' }, ...linesUnder(item.text.split('\n').map((text) => ({ text, tone: 'dim' })), columns, s));
 }
+
+/** The fewest characters of its words the working line keeps before what follows them gives way as well. */
+const WORDS_KEPT = 12;
 
 /**
  * The line that says it is working: your words, the next of them every few seconds, a sunset flowing through them; how
  * long, how much, and how to stop it. Under it, while the model thinks, the last rows of what it has thought so far.
  */
-function Working({ messages, first, tokens, thought = '', heard = 0, quietAfterMs = QUIET_AFTER_MS, motion = true }) {
-  // With motion off the words stand in one colour and the line is drawn once a second, for its clock.
-  const { frame, time } = useAnimation({ interval: motion ? FLOW_STEP_MS : 1000 });
+function Working({ messages, first, tokens, thought = '', heard = 0, quietAfterMs = QUIET_AFTER_MS, motion = true, retry = null, plan = null, waiting = false }) {
+  // With motion off the words stand in one colour and the line is drawn once a second, for its clock. While a question
+  // waits on the user, nothing works: the line steps aside — the question's own rows say it waits, and how Esc stops the
+  // turn — and nothing is drawn for it, so the screen holds still while the question is read. It stays in place, its
+  // clock running, to come back when the question is answered. Plain, for a screen reader, there is no clock at all: a
+  // row written again every second is a row read out again every second.
+  const g = useMarks();
+  const plain = g === glyphs(true);
+  const flowing = motion && !waiting;
+  const { frame } = useAnimation({ interval: flowing ? FLOW_STEP_MS : 1000, isActive: !plain && !waiting });
+  // Timed from when the line appeared, not by the animation, whose clock starts again whenever its pace changes.
+  const began = useRef(Date.now());
+  const time = Date.now() - began.current;
   const { columns } = useWindowSize();
-  const words = `${messageAt(messages, first, time)}…`;
-  const spent = tokens > 0 ? ` · ↓ ${thousands(tokens)} tokens` : '';
+  if (waiting) return null;
+  const said = `${messageAt(messages, first, time)}…`;
   const thinking = thoughtRows(thought, Math.max(20, columns - 6));
   // `heard` is when the model last said or did anything, while nothing of its own is running: a long silence is said, so a stream that died is told from one that thinks.
   const silent = heard > 0 ? Date.now() - heard : 0;
-  const quiet = silent >= quietAfterMs ? ` · quiet ${elapsed(silent)}` : '';
+  // A request sent again is waited on in the open: how long until it goes, and which try it is.
+  const left = retry ? retry.until - Date.now() : 0;
+  const parts = {
+    clock: plain ? '' : elapsed(time),
+    spent: tokens > 0 ? `↓ ${thousands(tokens)} tokens` : '',
+    again: retry && plain ? `retrying · attempt ${retry.attempt}/${retry.limit}` : left > 0 ? `retrying in ${Math.ceil(left / 1000)}s · attempt ${retry.attempt}/${retry.limit}` : '',
+    quiet: !plain && silent >= quietAfterMs ? `quiet ${elapsed(silent)}` : '',
+  };
+  const status = () => `(${[parts.clock, parts.spent, parts.again, parts.quiet, 'esc to interrupt'].filter(Boolean).join(' · ')})`;
+  // In a narrow window what is least needed gives way first — the tokens, the silence — then the words, to a few of their
+  // own, then the clock and the try. How to stop the turn is never what is cut.
+  const room = () => columns - status().length - 1;
+  for (const part of ['spent', 'quiet']) if (room() < said.length) parts[part] = '';
+  for (const part of ['clock', 'again']) if (room() < WORDS_KEPT) parts[part] = '';
+  // Cut between words where there is one to cut at: what is left still reads.
+  const fits = Math.max(WORDS_KEPT, room());
+  const cut = said.slice(0, fits - 1);
+  const words = said.length <= fits ? said : `${(cut.lastIndexOf(' ') >= WORDS_KEPT / 2 ? cut.slice(0, cut.lastIndexOf(' ')) : cut).trimEnd()}…`;
   return h(
     Box,
     { marginTop: 1, flexDirection: 'column' },
-    // One row: the words whole, and what follows them cut at the edge rather than set in a column of its own beside them.
+    // One row: the words, and what follows them cut at the edge rather than set in a column of its own beside them.
     h(
       Box,
       null,
-      h(Box, { flexShrink: 0 }, motion ? h(Text, null, ...[...words].map((ch, i) => h(Text, { key: i, color: flow(i, frame) }, ch)), ' ') : h(Text, { color: ACCENT }, `${words} `)),
-      h(Box, { flexShrink: 1 }, h(Text, { dimColor: true, wrap: 'truncate-end' }, `(${elapsed(time)}${spent}${quiet} · esc to interrupt)`)),
+      h(Box, { flexShrink: 0 }, flowing ? h(Text, null, ...[...words].map((ch, i) => h(Text, { key: i, color: flow(i, frame) }, ch)), ' ') : h(Text, { color: ACCENT }, `${words} `)),
+      h(Box, { flexShrink: 1 }, h(Text, { dimColor: true, wrap: 'truncate-end' }, status())),
     ),
-    ...thinking.map((row, i) => h(Text, { key: i, dimColor: true, wrap: 'truncate' }, `${i === 0 ? '  ⎿  ' : '     '}${row}`)),
+    // The plan the model keeps in its reply: how far it has got, and what it says comes next.
+    plan ? h(Text, { dimColor: true, wrap: 'truncate-end' }, `  plan ${plan.done}/${plan.total}${plan.next ? ` · next: ${plan.next}` : ' · all done'}`) : null,
+    ...thinking.map((row, i) => h(Text, { key: i, dimColor: true, wrap: 'truncate' }, `${i === 0 ? `  ${g.under}  ` : '     '}${row}`)),
   );
+}
+
+const CHECKLIST_ITEM = /^\s*[-*+]\s+\[([ xX])\]\s+(.+?)\s*$/;
+
+/**
+ * A checklist in what the model wrote — `- [ ]` and `- [x]` items — as a plan: how many are done, and the first that is
+ * not. The latest one is the plan: a checklist written after another replaces it. Null without one.
+ */
+export function planOf(text) {
+  const lines = String(text ?? '').split('\n');
+  let end = lines.length - 1;
+  while (end >= 0 && !CHECKLIST_ITEM.test(lines[end])) end--;
+  if (end < 0) return null;
+  let start = end;
+  while (start > 0 && CHECKLIST_ITEM.test(lines[start - 1])) start--;
+  const items = lines.slice(start, end + 1).map((line) => CHECKLIST_ITEM.exec(line)).map(([, mark, said]) => ({ done: mark !== ' ', said }));
+  const next = items.find((item) => !item.done);
+  return { done: items.filter((item) => item.done).length, total: items.length, next: next ? inline(next.said, styles(false)) : null };
 }
 
 /**
@@ -529,12 +759,14 @@ function Input({ state, width, rows, placeholder = '' }) {
   const shown = on === '' || on === '\n' ? ' ' : on;
   const after = on === '\n' ? text.slice(cursor) : text.slice(cursor + on.length);
   const hidden = (n) => (n > 0 ? h(Text, { dimColor: true }, `… +${n} line${n === 1 ? '' : 's'}`) : null);
+  // Plain, the box is its prompt alone: a frame is read out as a row of lines.
+  const framed = useMarks().tool === '⏺';
   return h(
     Box,
-    { borderStyle: 'round', borderColor: 'gray', paddingX: 1, width },
+    { ...(framed ? { borderStyle: 'round', borderColor: 'gray', paddingX: 1 } : {}), width },
     h(Box, { flexShrink: 0 }, h(Text, null, '> ')),
     // An empty box says what it is for, faint behind the cursor, until something has been said.
-    h(Box, { flexGrow: 1, flexShrink: 1, flexDirection: 'column' }, hidden(seen.above), h(Text, { wrap: !text && placeholder ? 'truncate-end' : 'wrap' }, untab(text.slice(0, cursor)), h(Text, { inverse: true }, untab(shown)), untab(after), !text && placeholder ? h(Text, { dimColor: true }, placeholder) : null), hidden(seen.below)),
+    h(Box, { flexGrow: 1, flexShrink: 1, flexDirection: 'column' }, hidden(seen.above), h(Text, { wrap: !text && placeholder ? 'truncate-end' : 'wrap' }, untab(text.slice(0, cursor)), reverse(untab(shown)), untab(after), !text && placeholder ? h(Text, { dimColor: true }, placeholder) : null), hidden(seen.below)),
   );
 }
 
@@ -542,8 +774,27 @@ function Input({ state, width, rows, placeholder = '' }) {
 const MENU_ROWS = 8;
 
 /** The commands, or the files, a half-typed word could mean: one row each, the one picked marked; past the rows there is room for, a window that follows the pick. */
-function Menu({ menu, pick }) {
+/**
+ * A description cut to its room where a clause ends — at `;`, `:` or ` — ` — so what is left still says something
+ * whole: "the MCP servers", not "the MCP servers: connected or not, their tools, what may run u…". With no such place
+ * in reach it is cut between words.
+ */
+function clauseFit(text, room) {
+  if (text.length <= room) return text;
+  let cut = -1;
+  for (const mark of ['; ', ': ', ' — ']) {
+    for (let at = text.indexOf(mark); at !== -1 && at <= room; at = text.indexOf(mark, at + 1)) cut = Math.max(cut, at);
+  }
+  if (cut > 0) return text.slice(0, cut);
+  const space = text.lastIndexOf(' ', room - 2);
+  return space > 0 ? `${text.slice(0, space)} …` : text.slice(0, Math.max(0, room - 1));
+}
+
+function Menu({ menu, pick, columns = 80 }) {
+  const g = useMarks();
   const wide = Math.max(...menu.map((c) => c.label.length)) + 2;
+  // The row's room for the description: the window less its margins, the mark and the name.
+  const room = Math.max(10, columns - 4 - 2 - wide);
   const first = Math.min(Math.max(0, pick - MENU_ROWS + 1), Math.max(0, menu.length - MENU_ROWS));
   const shown = menu.slice(first, first + MENU_ROWS);
   const below = menu.length - first - shown.length;
@@ -552,7 +803,7 @@ function Menu({ menu, pick }) {
     { flexDirection: 'column', paddingX: 2 },
     first > 0 ? h(Text, { dimColor: true }, `  ↑ ${first} more`) : null,
     // A hint is one row: wrapped, its second line would stand under the names, where a name is looked for.
-    ...shown.map((c, i) => h(Text, { key: c.name, color: first + i === pick ? ACCENT : undefined, dimColor: first + i !== pick, wrap: 'truncate-end' }, `${first + i === pick ? '❯ ' : '  '}${c.label.padEnd(wide)}`, c.hint)),
+    ...shown.map((c, i) => h(Text, { key: c.name, color: first + i === pick ? ACCENT : undefined, dimColor: first + i !== pick, wrap: 'truncate-end' }, `${first + i === pick ? `${g.pick} ` : '  '}${c.label.padEnd(wide)}`, c.hint ? clauseFit(c.hint, room) : c.hint)),
     below > 0 ? h(Text, { dimColor: true }, `  ↓ ${below} more`) : null,
   );
 }
@@ -564,7 +815,7 @@ const dollars = (cost) => (cost >= 0.005 ? `$${cost.toFixed(2)}` : '');
 const KEYS = [
   ['enter', 'send'],
   ['\\ enter', 'a new line'],
-  ['esc', 'stop the turn'],
+  ['esc', 'interrupt the turn'],
   ['↑ ↓', 'what you sent before'],
   ['ctrl-r', 'search what you sent'],
   ['ctrl-c', 'clear · twice to leave'],
@@ -591,7 +842,8 @@ function Keys({ columns }) {
     Box,
     { flexDirection: 'column', paddingX: 2 },
     ...rows.map((row, r) => h(Box, { key: r }, ...row.map(([key, does], i) => h(Box, { key: i, width }, h(Text, { wrap: 'truncate-end' }, h(Text, { color: ACCENT }, key.padEnd(KEY_WIDTH)), h(Text, { dimColor: true }, does)))))),
-    h(Text, { dimColor: true }, '/help has every command and key · any key closes this'),
+    // Broken only between its parts, as a question's keys are.
+    ...keyRows('/help has the commands too · any key closes this', columns - 4).map((row, i) => h(Text, { key: `more-${i}`, dimColor: true }, row)),
   );
 }
 
@@ -609,19 +861,33 @@ function Search({ search }) {
   );
 }
 
-/** The size of the context, coloured by how far it has grown: faint while it is small, yellow once quality starts to drop, red when it is time for /new. */
+/** The size of the context, coloured by how far it has grown: faint while it is small, yellow once quality starts to drop, red when it is time for /handoff. */
 export function contextTone(tokens) {
   const band = contextBand(tokens);
   return band === 'act' ? { color: 'red' } : band === 'watch' ? { color: 'yellow' } : { dimColor: true };
 }
 
+/**
+ * Hints that fit the room they have, whole: the ones at the end give way first, so a row never ends in a key broken
+ * off ("ctrl-o fu…"). One that is too long alone is cut between words, never inside one.
+ */
+function fitHint(hint, room) {
+  if (hint.length <= room) return hint;
+  const parts = hint.split(' · ');
+  while (parts.length > 1 && parts.join(' · ').length > room) parts.pop();
+  const left = parts.join(' · ');
+  if (left.length <= room) return left;
+  const space = left.lastIndexOf(' ', room - 2);
+  return space > 0 ? `${left.slice(0, space)} …` : '';
+}
+
 function Status({ session, leaving, notice, jobs, aside = [], pick = null, open = null, where, spent, overBudget = false, waiting, columns }) {
   const tokens = session.contextTokens;
-  const size = tokens >= 1000 ? ` · ${Math.round(tokens / 1000)}k context${contextBand(tokens) === 'act' ? ' · /new' : ''}` : '';
+  const size = tokens >= 1000 ? ` · ${Math.round(tokens / 1000)}k context${contextBand(tokens) === 'act' ? ' · /handoff' : ''}` : '';
   const cost = dollars(spent) && ` · ${dollars(spent)}`;
   // Where the tools run: the project and the branch it is on. The header that says it scrolls away; this does not.
   const place = where ? `${where.name}${where.branch ? ` (${where.branch})` : ''}` : '';
-  const hint = leaving ? `Ctrl-C again to leave${aside.length > 0 ? ` — it stops ${aside.map((id) => `j${id}`).join(', ')}, to be picked up again later` : ''}` : notice ? notice : pick === MAIN ? 'enter shows main · ↑ back to the box' : pick !== null ? `enter opens j${pick} · ↑ back to the box` : open !== null ? `esc closes j${open} · ctrl-o all of its record · @ message talks to it` : jobs.length > 0 ? `${jobs.length === 1 ? `@ message talks to j${jobs[0]}` : '@j<id> message talks to that job'} · ${aside.length > 0 ? `↓ enter opens ${aside.length === 1 ? 'it' : 'one'} · /stop stops it` : 'ctrl-o full output'}` : waiting ? '↑ takes back what is waiting' : '/ commands · ? keys · ctrl-o full output';
+  const hint = leaving ? `ctrl-c again to leave${aside.length > 0 ? ` — it stops ${aside.map((id) => `j${id}`).join(', ')}, to be picked up again later` : ''}` : notice ? notice : pick === MAIN ? 'enter shows main · ↑ back to the box' : pick !== null ? `enter opens j${pick} · ↑ back to the box` : open !== null ? `esc closes j${open} · ctrl-o all of its record · @ message talks to it` : jobs.length > 0 ? `${jobs.length === 1 ? `@ message talks to j${jobs[0]}` : '@j<id> message talks to that job'} · ${aside.length > 0 ? `↓ enter opens ${aside.length === 1 ? 'it' : 'one'} · /stop stops it` : 'ctrl-o full output'}` : waiting ? '↑ takes it back' : '/ commands · ? keys · ctrl-o full output';
   // In a narrow window the hints give way, then the place — unless the line has something to say just now, which the place
   // gives way to; the model, the size of the context and the cost never fold.
   const route = `${routeLine(session)}${size}${cost}`;
@@ -630,7 +896,7 @@ function Status({ session, leaving, notice, jobs, aside = [], pick = null, open 
   const room = columns - 4 - route.length - 2;
   const said = leaving || notice;
   const placed = place && place.length + 3 <= room - (said ? hint.length + 2 : 0) ? place : '';
-  const hinted = room - (placed ? placed.length + 3 : 0) >= 12 ? hint : '';
+  const hinted = room - (placed ? placed.length + 3 : 0) >= 12 ? fitHint(hint, room - (placed ? placed.length + 3 : 0)) : '';
   // With jobs at work the keys are what is needed, and they are long: they follow the jobs, from the left, and give way in a
   // narrow window; the route stands at the right with the place beside it, while the keys keep room for their first words.
   if (jobs.length > 0) {
@@ -639,7 +905,7 @@ function Status({ session, leaving, notice, jobs, aside = [], pick = null, open 
     return h(
       Box,
       { paddingX: 2, justifyContent: 'space-between', gap: 2 },
-      h(Box, { flexShrink: 1 }, h(Text, { dimColor: true, wrap: 'truncate' }, hint)),
+      h(Box, { flexShrink: 1 }, h(Text, { dimColor: true, wrap: 'truncate' }, fitHint(hint, columns - 4 - route.length - 2 - (beside ? place.length + 3 : 0)))),
       h(Box, { flexShrink: 0, gap: 3 }, routed, beside ? h(Text, { dimColor: true }, place) : null),
     );
   }
@@ -652,83 +918,76 @@ function Status({ session, leaving, notice, jobs, aside = [], pick = null, open 
   );
 }
 
-/** `/help`: every command with what it does, and the keys — written as a reply is, so it is drawn as one. */
-function helpText(commands) {
-  const keys = [
-    ['Enter', 'send — while the model works, it reads the message with its next step'],
-    ['\\\\ then Enter · Shift-Enter · Option-Enter · Ctrl-J', 'a new line'],
-    ['Up · Down', 'between the lines of the text, then through what you sent before; on an empty box, Up takes back a message that is waiting'],
-    ['Esc', 'stop the turn (first closes the command menu); what was waiting comes back to the box'],
-    ['Ctrl-C', 'clear the box; on an empty one, stop the turn, or twice to leave — Ctrl-D leaves too'],
-    ['Ctrl-O', 'the whole conversation in your pager ($PAGER, or less): every command and all its output, to scroll and search'],
-    ['Ctrl-G', 'write the message in your editor ($VISUAL or $EDITOR); what you save comes back to the box'],
-    ['@ and a few letters', 'name a file of the project: the menu offers the ones they could mean, and Enter or Tab puts the path in'],
-    ['Ctrl-V', 'paste an image from the clipboard; an image file dropped on the box is the image'],
-    ['Ctrl-R', 'search what you sent before: type to narrow, Ctrl-R again to go further back, Enter keeps it, Esc puts your draft back'],
-    ['?', 'on an empty box: the keys most reached for'],
-    ['Ctrl-A · Ctrl-E', 'the start and the end of the line'],
-    ['Ctrl-B · Ctrl-F', 'a character back, or on'],
-    ['Ctrl-U · Ctrl-K', 'cut to the start, or to the end, of the line'],
-    ['Ctrl-W · Option-Backspace · Option-D', 'cut the word before the cursor, or after it'],
-    ['Ctrl-Y', 'put back what was cut last — Ctrl-C\'s clearing included'],
-    ['Ctrl-_', 'undo the last change to the box'],
-    ['Option-Left · Option-Right', 'a word at a time'],
-    ['1 – 9', 'on a question with an empty box: pick that option'],
-    ['Ctrl-L', 'draw the screen again'],
-    ['Ctrl-Z', 'suspend the chat to the shell, when nothing is at work; fg brings it back'],
-    ['! command', 'run a command yourself, where the agent would be refused; the model sees what it printed'],
-    ['@ message · @j<id> message', 'say it to the job that is running — the one open, when one is — or to a named one'],
-    ['Down, then Enter', 'from the box onto the jobs at work under it, and open the one stepped on: the end of its record, as it grows; Esc closes it, Ctrl-O shows all of it'],
-  ];
-  return [
-    '**Commands**',
-    '',
-    '| Command | What it does |',
-    '|---|---|',
-    ...commands.map((c) => `| \`/${c.name}\` | ${c.hint.replaceAll('|', '\\|')} |`),
-    '',
-    '**Keys**',
-    '',
-    '| Key | What it does |',
-    '|---|---|',
-    ...keys.map(([key, does]) => `| ${key} | ${does} |`),
-    '',
-  ].join('\n');
-}
+/** The keys /help lists under the commands, a row each: the ones most reached for. `?` on an empty box shows them at a glance. */
+const HELP_KEYS = [
+  ['enter', 'send; while the model works, it reads it next'],
+  ['\\ enter', 'a new line (shift-enter and ctrl-j too)'],
+  ['esc', 'interrupt the turn, or close a menu'],
+  ['↑ ↓', 'what you sent before'],
+  ['ctrl-r', 'search what you sent'],
+  ['ctrl-c', 'clear the box; twice on an empty one to leave'],
+  ['ctrl-o', 'the whole conversation in your pager'],
+  ['ctrl-g', 'write the message in your editor'],
+  ['ctrl-v', 'paste an image'],
+  ['ctrl-z', 'suspend to the shell; fg brings it back'],
+  ['@ file', 'name a file of the project'],
+  ['! command', 'run a command yourself'],
+  ['@j<id> message', 'talk to a job at work'],
+];
+
+/** `/help`: every command with what it takes and what it does, then the keys — a row each, to be taken in at a glance. A blank row between. */
+const helpRows = (commands) => [...commands.map((c) => ({ key: `/${c.name}${c.args ? ` ${c.args}` : ''}`, does: c.hint })), null, ...HELP_KEYS.map(([key, does]) => ({ key, does }))];
+
+/** What an empty chat suggests under its header, faint: something to try, and where the rest is. */
+const STARTER = 'try "explain this project" or "add a test for @file" · /help for more';
+/** The rows the suggestion takes at the top of the room, with a blank row on either side of it. */
+const STARTER_ROWS = 3;
 
 /**
- * The room between the conversation and the box, with the logo behind it: faint, in the middle of the window, where it stays while
- * the conversation grows over it — what reaches it covers it. `from` is the row of the window the live part of the screen starts on.
+ * The room between the conversation and the box: in an empty chat, a line of what to try at its top, and the logo behind it
+ * — faint, in the middle of the window. Whatever takes rows from the room — a menu under the box, what was said — moves the
+ * logo up while it still fits whole, and then leaves it out: it is never cut. `from` is the row of the window the live part
+ * of the screen starts on.
  */
-function Room({ logo, rows, from }) {
+function Room({ logo, rows, from, starter = false }) {
   const ref = useRef(null);
   const { width, height, top, hasMeasured } = useBoxMetrics(ref);
   const wide = Math.max(0, ...logo.map((row) => row.length));
-  const at = Math.floor((rows - logo.length) / 2) - from - top;
-  const seen = logo.length > 0 && hasMeasured && width >= wide && at < height && at + logo.length > 0;
+  const clear = starter ? STARTER_ROWS : 0;
+  const at = Math.max(clear, Math.min(Math.floor((rows - logo.length) / 2) - from - top, height - logo.length));
+  const seen = logo.length > 0 && hasMeasured && width >= wide && at + logo.length <= height;
   return h(
     Box,
     { ref, flexGrow: 1, flexDirection: 'column', overflow: 'hidden' },
+    starter ? h(Box, { marginTop: 1 }, h(Text, { dimColor: true, wrap: 'truncate-end' }, STARTER)) : null,
     seen ? h(Box, { position: 'absolute', top: at, left: Math.floor((width - wide) / 2), flexDirection: 'column' }, ...logo.map((row, i) => h(Text, { key: i, color: 'gray', dimColor: true }, row || ' '))) : null,
   );
 }
 
-function App({ session, events, messages, cwd, block, opening, logo, clipboard, copy, notify: alerts, notifyAfterMs, quietAfterMs, run, listFiles, motion, progress }) {
+function App({ session, events, messages, cwd, block, opening, logo, clipboard, copy, notify: alerts, notifyAfterMs, quietAfterMs, run, listFiles, motion, progress, plain = false }) {
   const { exit, suspendTerminal, waitUntilRenderFlush } = useApp();
   const { stdout, write } = useStdout();
   const { columns, rows } = useWindowSize();
   const [, redraw] = useReducer((n) => n + 1, 0);
   // Addresses in a reply open on a click; the pager gets none of that, since a pager may draw its codes as text.
-  const s = styles(colourEnabled(stdout), { links: true });
-  const paged = styles(colourEnabled(stdout));
-  const header = (text) => ({ kind: 'header', route: routeLine(session), cwd: tilde(cwd), block: text });
+  const s = styles(colourEnabled(stdout), { links: true, plain });
+  const paged = styles(colourEnabled(stdout), { plain });
+  /**
+   * The top of a session: who answers, and where the tools work — the project, which is not always the folder the chat was
+   * opened in. Opened in a folder that is not a project, the work goes to scratch: the header says so, and how to change it.
+   */
+  const header = (text) => {
+    const at = session.where().cwd;
+    const away = at === scratchDir() && realOrSame(cwd) !== at ? tilde(cwd) : null;
+    return { kind: 'header', route: routeLine(session), cwd: tilde(at), away, block: text };
+  };
   // What the screen holds between draws. Keys and the session's events both write here, in the order they happen, and then ask for a draw.
   // `log` is what happened, as it was said; `items` is the log drawn for this window, and is drawn again when the window or the view changes.
   const st = useRef(null);
   // `live` is what each running command has printed so far and since when; `heard`, when the model last said or did anything;
   // `turn`, what the turn in hand has done; `talking`, that the model — not a `!` command — is what the screen is working on;
   // `pick`, the job under the box that Down has stepped onto; `open`, the one whose record is shown.
-  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, raw: '', ed: editor(readHistory()), images: [], pastes: [], keys: false, notice: null, queue: [], started: new Map(), known: new Map(), working: null, talking: false, tokens: 0, thought: '', thinking: null, showThinking: true, heard: 0, running: new Map(), live: new Map(), drawSoon: null, jobs: new Map(), pick: null, open: null, asks: [], reply: null, fresh: true, leaving: null, gone: false, focused: true, title: null, turn: null, where: session.where(), spent: session.spent(), files: { cwd: null, at: 0, list: [] }, away: false };
+  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, raw: '', ed: editor(readHistory()), images: [], pastes: [], keys: false, notice: null, queue: [], started: new Map(), known: new Map(), working: null, talking: false, tokens: 0, thought: '', thinking: null, showThinking: true, heard: 0, running: new Map(), live: new Map(), drawSoon: null, jobs: new Map(), pick: null, open: null, asks: [], why: null, reply: null, fresh: true, leaving: null, gone: false, focused: true, title: null, turn: null, where: session.where(), spent: session.spent(), files: { cwd: null, at: 0, list: [] }, away: false };
   const state = st.current;
   state.columns = columns;
   state.rows = rows;
@@ -741,15 +1000,48 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   /**
    * The rows what is finished takes on the screen since it was last cleared, counted until it fills the window: the room under it is
    * the box's to stand at the foot of. Measured before the next draw, never during one — a frame too tall would scroll the top away.
+   * An item is drawn apart to be counted, and that sets off a draw of the screen that is waiting, if one is: so an item leaves
+   * `unmeasured` only once it is counted, and a draw it sets off keeps the room shut rather than one row too tall.
    */
+  const rowsOf = (item) => renderToString(h(Marks.Provider, { value: s.g }, h(Item, { item, columns: state.columns, s })), { columns: state.columns }).split('\n').length;
   const measure = () => {
-    for (const item of state.unmeasured.splice(0)) {
-      if (state.used < state.rows) state.used += renderToString(h(Item, { item, columns: state.columns, s }), { columns: state.columns }).split('\n').length;
+    while (state.unmeasured.length > 0) {
+      if (state.used < state.rows) state.used += rowsOf(state.unmeasured[0]);
+      state.unmeasured.shift();
     }
   };
+  /**
+   * Reads one after another are drawn as one row: they wait here, under the work, until something else comes — and
+   * anything that goes on the screen first puts them there, as the row they make. The log keeps every one of them.
+   */
+  state.reads ??= [];
+  const isRead = (entry) => entry.kind === 'tool' && entry.call.name === EDITOR_TOOL.name && entry.call.input?.command === 'view' && !entry.result.isError && !entry.started?.length;
+  const readsDrawn = (reads) => {
+    if (reads.length === 1) return drawn(reads[0]);
+    // By the files' names: the row is a glance, and the paths, whole, are in Ctrl-O. Two of one name are told apart by their paths.
+    const paths = [...new Set(reads.map((entry) => String(entry.call.input?.path ?? '')))];
+    const names = paths.map((p) => basename(p));
+    const seen = paths.map((p, i) => (names.indexOf(names[i]) === names.lastIndexOf(names[i]) ? names[i] : pathFrom(p, state.where.cwd)));
+    const named = seen.length > 2 ? [...seen.slice(0, 2), `+${seen.length - 2}`] : seen;
+    const lines = reads.reduce((sum, entry) => sum + (entry.result.content === '' ? 0 : entry.result.content.replace(/\n$/, '').split('\n').length), 0);
+    const files = new Set(reads.map((entry) => entry.call.input?.path)).size;
+    return [{ kind: 'tool', view: { title: `Read ${files} file${files === 1 ? '' : 's'}`, detail: named.join(', '), group: true, lines: [{ text: `${lines} lines`, tone: 'dim' }] }, failed: false, took: reads.reduce((sum, entry) => sum + (entry.took ?? 0), 0) }];
+  };
+  const placeReads = () => {
+    if (state.reads.length > 0) place(readsDrawn(state.reads.splice(0)));
+  };
+  /**
+   * Items for the screen, each counted before it is placed: a draw that counting one sets off sees the screen as it was —
+   * never an item placed and not yet counted, which is a frame a row too tall for the window: the top scrolls away for good
+   * and the box is left standing above the foot. What was placed and not counted yet is counted first.
+   */
   const show = (items) => {
-    place(items);
     measure();
+    for (const item of [...(state.reads.length > 0 ? readsDrawn(state.reads.splice(0)) : []), ...items]) {
+      const placed = { id: state.next++, ...item };
+      if (state.used < state.rows) state.used += rowsOf(placed);
+      state.items = [...state.items, placed];
+    }
     redraw();
   };
   /** A renderer for a reply: each line it finishes goes on the screen, the first of a block with the mark. */
@@ -786,6 +1078,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
           { text: `their report comes here when all ${started.length} are done`, tone: 'dim' },
         ];
       }
+      // A question's answer is the user's: said as theirs, without what rode with it for the model.
+      const answered = entry.call.name === ASK_TOOL.name && !entry.result.isError ? /^The user (chose|answered): ([^\n]*)/.exec(entry.result.content) : null;
+      if (answered) view.lines = [{ text: answered[1] === 'chose' ? `you chose ${answered[2]}` : `you answered: ${answered[2]}`, tone: 'plain' }];
       return [{ kind: 'tool', view, failed: entry.result.isError, took: entry.took ?? 0 }];
     }
     // What the user's own command printed: drawn as a tool's output is, under the line they typed.
@@ -805,13 +1100,27 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   }
   const record = (entry) => {
     state.log.push(entry);
-    show(drawn(entry));
+    if (!isRead(entry)) return show(drawn(entry));
+    state.reads.push(entry);
+    redraw();
+  };
+  /** The whole log placed again, reads one after another as the row they make; the last of them still waits while the turn goes on (`open`). */
+  const placeLog = (open = false) => {
+    state.reads = [];
+    for (const entry of state.log) {
+      if (isRead(entry)) state.reads.push(entry);
+      else {
+        placeReads();
+        place(drawn(entry));
+      }
+    }
+    if (!open) placeReads();
   };
   if (state.log.length === 0) {
     state.log.push(header(block));
     // A chat opened on a saved session shows where it stopped and says which, under the header, where a fresh one shows the block's warnings.
     if (opening) state.log.push(...replayOf(session.params.messages), { kind: 'note', text: opening });
-    for (const entry of state.log) place(drawn(entry));
+    placeLog();
   }
 
   /** The jobs at work with no call standing over them, by id: the ones under the box. */
@@ -844,6 +1153,19 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   };
 
   /**
+   * The reply in hand thrown away, as the loop throws it away: the try it came from failed and is being sent again, or
+   * the model declined it. What has not been drawn is not drawn; none of it joins the log, so the pager, /copy and
+   * /export never have it, and the next text starts a block of its own.
+   */
+  const dropReply = () => {
+    state.raw = '';
+    state.fresh = true;
+    state.thought = '';
+    state.thinking = null;
+    if (state.reply) state.reply = replyTo((item) => show([item]));
+  };
+
+  /**
    * Everything again, from the log, after the window changed size — the window and its scrollback wiped, since what they
    * hold is drawn again. A session that starts over has nothing to draw again:
    * `clear` then only scrolls the old one away, where it can still be read.
@@ -852,7 +1174,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     state.items = [];
     state.unmeasured = [];
     state.used = 0;
-    for (const entry of state.log) place(drawn(entry));
+    placeLog(Boolean(state.working));
     measure();
     state.fresh = true;
     if (state.working) {
@@ -880,8 +1202,12 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     state.spent = session.spent();
     state.where = session.where();
     const { calls, edited } = state.turn;
-    const files = [...edited];
-    const parts = [elapsed(took), calls > 0 ? `${calls} call${calls === 1 ? '' : 's'}` : '', files.length > 0 ? `edited ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` +${files.length - 3} more` : ''}` : '', state.tokens > 0 ? `↓ ${thousands(state.tokens)} tokens` : '', dollars(state.spent - before)];
+    // The files by their names, as the rows above them were: each edit's row has its path.
+    const files = [...new Set([...edited].map((path) => basename(path)))];
+    // A turn quicker than a second has no time worth saying: `0s` reads as nothing happened.
+    const parts = [took >= 1000 ? elapsed(took) : '', calls > 0 ? `${calls} call${calls === 1 ? '' : 's'}` : '', files.length > 0 ? `edited ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` +${files.length - 3} more` : ''}` : '', state.tokens > 0 ? `↓ ${thousands(state.tokens)} tokens` : '', dollars(state.spent - before)];
+    // The turn is over: reads still waiting for what comes after them go on the screen now.
+    if (state.reads.length > 0) show([]);
     if (calls > 0 || took >= notifyAfterMs) record({ kind: 'footer', text: parts.filter(Boolean).join(' · ') });
     if (took >= notifyAfterMs) alert(`${state.where.name}: ${ended}`);
   };
@@ -896,6 +1222,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
 
   /** The screen let go: the box and the margin under it are cleared first, so what stays in the terminal is the conversation. */
   const close = () => {
+    placeReads();
     state.closed = true;
     redraw();
     // The cleared frame is drawn before the screen lets go, however slow the machine: exit waits for it.
@@ -906,7 +1233,25 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   const settle = (ask, answer) => {
     if (!state.asks.includes(ask)) return;
     state.asks = state.asks.filter((a) => a !== ask);
+    if (state.why?.ask === ask) state.why = null;
+    if (state.explain?.ask === ask) {
+      clearTimeout(state.explain.timer);
+      state.explain = null;
+    }
     ask.resolve(answer);
+    redraw();
+  };
+
+  /** A key that answers nothing on a waiting call: for a moment the panel says what each key does, in place of its keys. */
+  const explainKeysOf = (ask) => {
+    clearTimeout(state.explain?.timer);
+    state.explain = {
+      ask,
+      timer: setTimeout(() => {
+        state.explain = null;
+        redraw();
+      }, NOTICE_MS),
+    };
     redraw();
   };
 
@@ -951,46 +1296,65 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         return record({ kind: 'shell', result: { content: await session.shell(line.slice(1).trim()), isError: false } });
       }
       const { text, said, guide, control, args, error } = session.expand(line);
-      if (error) return record({ kind: 'error', text: error });
+      // A command mistyped is no failure: what was typed, and the command it was nearest to.
+      if (error) {
+        record({ kind: 'user', text: line });
+        return record({ kind: 'note', text: error });
+      }
       if (control === 'quit') return leave();
-      if (control === 'new') {
-        session.end();
-        state.log = [];
+      if (control === 'new' || control === 'handoff') {
+        // A hand-off is written first, by the model, while the working line says so; one that cannot be had leaves this session as it is.
+        let handed = null;
+        if (control === 'handoff') {
+          record({ kind: 'user', text: line });
+          state.working = 'writing the hand-off';
+          state.talking = true;
+          redraw();
+          try {
+            handed = await session.handoff();
+          } finally {
+            state.working = null;
+            state.talking = false;
+          }
+        } else {
+          session.end();
+        }
         // The old session's pictures go with it; their numbers stay taken, so a marker recalled from before names nothing.
         state.images = state.images.map(() => null);
         state.pastes = state.pastes.map(() => null);
         state.overBudget = false;
-        const block = session.start('new');
+        const block = handed ? handed.block : session.start('new');
         state.where = session.where();
         state.spent = session.spent();
-        refresh(scrolledClear(state.rows));
-        return record(header(block));
+        // The new session is in the log before the window is drawn again: one frame, measured under its header. A frame drawn
+        // first for an empty window would be written after the header, still that tall, and scroll the header away.
+        state.log = [header(block), ...(handed ? [{ kind: 'note', text: `handed off from ${handed.from}: the hand-off rides in with your next message\n${handed.text}` }] : [])];
+        return refresh(scrolledClear(state.rows));
       }
       if (control === 'resume') {
         record({ kind: 'user', text: line });
         if (!args) {
           const saved = session.saved();
-          return record({ kind: 'note', text: saved.length > 0 ? saved.join('\n') : 'no saved sessions' });
+          return record({ kind: 'note', text: saved.length > 0 ? `${saved.join('\n')}\nopen one with /resume <id>` : 'no saved sessions' });
         }
         // Refused — no such session, or one open elsewhere — nothing changes, and the refusal is shown below like any other error.
         const said = session.resume(args);
-        state.log = [];
         state.images = state.images.map(() => null);
         state.pastes = state.pastes.map(() => null);
         state.overBudget = false;
         state.where = session.where();
         state.spent = session.spent();
-        refresh(scrolledClear(state.rows));
-        record(header(''));
         // Where it stopped, drawn again: the last few turns, so what is picked up is in front of the user and not only the model.
-        for (const entry of replayOf(session.params.messages)) record(entry);
-        return record({ kind: 'note', text: said });
+        // In the log before the window is drawn again, as for /new.
+        state.log = [header(''), ...replayOf(session.params.messages), { kind: 'note', text: said }];
+        return refresh(scrolledClear(state.rows));
       }
       if (control === 'copy') {
         record({ kind: 'user', text: line });
         // A number goes further back: /copy 2 is the reply before the last, /copy code 2 the code block before the last.
         const asked = /^(code)?\s*(\d+)?$/.exec(args);
-        if (!asked || asked[2] === '0') return record({ kind: 'error', text: `/copy takes nothing, "code", a number, or both — /copy 2 is the reply before the last — not "${args}"` });
+        // What /copy cannot take, or has nothing to take, is no failure: it is said as a note.
+        if (!asked || asked[2] === '0') return record({ kind: 'note', text: `/copy takes nothing, "code", a number, or both — /copy 2 is the reply before the last — not "${args}"` });
         const [, code, n] = asked;
         const back = Number(n ?? 1);
         // The reply as the model wrote it, not as the screen drew it: no indent, no line broken to fit the window.
@@ -998,7 +1362,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         const blocks = replies.flatMap((entry) => [...entry.raw.matchAll(/^[ \t]*```[^\n]*\n([\s\S]*?)^[ \t]*```[ \t]*$/gm)].map((m) => m[1]));
         const text = (code ? blocks.at(-back) : replies.at(-back)?.raw)?.replace(/\n+$/, '');
         const which = code ? (back === 1 ? 'the last code block' : `code block ${back} from the end`) : back === 1 ? 'the last reply' : `reply ${back} from the end`;
-        if (!text) return record({ kind: 'error', text: back > 1 ? `no ${which} — there ${(code ? blocks : replies).length === 1 ? 'is' : 'are'} ${(code ? blocks : replies).length}` : code ? 'no code block in the conversation yet' : 'no reply to copy yet' });
+        if (!text) return record({ kind: 'note', text: back > 1 ? `no ${which} — there ${(code ? blocks : replies).length === 1 ? 'is' : 'are'} ${(code ? blocks : replies).length}` : code ? 'no code block in the conversation yet' : 'no reply to copy yet' });
         // Where no clipboard command takes it, the terminal is asked to (OSC 52).
         const taken = await copy(text);
         if (!taken) tell(`\x1b]52;c;${Buffer.from(text).toString('base64')}\x07`);
@@ -1022,15 +1386,23 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         const file = exportPath(args, state.where.cwd, session.sessionId);
         mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
         writeFileSync(file, markdownOf(state.log, { cwd: state.where.cwd, title: `Sumo — ${state.where.name}` }), { mode: 0o600 });
-        return record({ kind: 'note', text: `the conversation is in ${tilde(file)}` });
+        // Named as the calls name files: from the project when it went there.
+        return record({ kind: 'note', text: `the conversation is in ${pathFrom(file, state.where.cwd)}` });
       }
+      // The chat's own words, not the model's: not drawn as a reply, and not what /copy takes.
       if (control === 'help') {
         record({ kind: 'user', text: line });
-        return record({ kind: 'reply', raw: helpText(session.commands), own: true });
+        return record({ kind: 'help', rows: helpRows(session.commands) });
       }
-      if (control === 'model' || control === 'memory' || control === 'mcp' || control === 'undo') {
+      // The route said as the status row says it, and how to change it.
+      if (control === 'model') {
         record({ kind: 'user', text: line });
-        const text = control === 'model' ? session.route(args) : control === 'undo' ? session.undo() : control === 'mcp' ? (await session.mcp()).join('\n') : await session.memoryPage();
+        session.route(args);
+        return record({ kind: 'note', text: args ? `${routeLine(session)} from the next message` : `${routeLine(session)} · /model <model> <effort> changes it` });
+      }
+      if (control === 'memory' || control === 'mcp' || control === 'undo') {
+        record({ kind: 'user', text: line });
+        const text = control === 'undo' ? session.undo() : control === 'mcp' ? (await session.mcp()).join('\n') : await session.memoryPage();
         return record({ kind: 'note', text });
       }
       record({ kind: 'user', text: line });
@@ -1063,12 +1435,15 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       record({ kind: 'error', ...explained(cause.message) });
       return closeTurn(began, before, 'stopped on an error');
     }
+    // A declined reply is not kept by the loop, and what streamed of it is not an answer: it leaves the screen as well.
+    if (outcome?.stop === 'refusal') dropReply();
     closeReply();
     // Nothing was waiting after all: no turn was run.
     if (!outcome) return undefined;
     if (outcome.stop === 'interrupted') record({ kind: 'note', text: 'Interrupted · say what it should do instead' });
     if (outcome.stop === 'error') record({ kind: 'error', ...explained(outcome.error) });
-    if (stopReason(outcome.stop)) record({ kind: 'note', text: stopReason(outcome.stop) });
+    if (outcome.stop === 'refusal') record({ kind: 'error', text: `error: the model declined to answer${outcome.stopDetail ? ` (${outcome.stopDetail})` : ''} — rephrase the request, or /model to try another model` });
+    else if (stopReason(outcome.stop, outcome.stopDetail)) record({ kind: 'note', text: stopReason(outcome.stop, outcome.stopDetail) });
     return closeTurn(began, before, outcome.stop === 'error' ? 'stopped on an error' : outcome.stop === 'interrupted' ? 'interrupted' : 'done');
   }
 
@@ -1085,6 +1460,10 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     state.working = null;
     state.talking = false;
     state.thought = '';
+    // The plan and a countdown were the turn's: the next one starts without them.
+    state.plan = null;
+    state.retry = null;
+    state.retried = null;
     redraw();
     if (state.gone) close();
   }
@@ -1117,9 +1496,10 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   function stopJob(line, given) {
     record({ kind: 'user', text: line });
     const ids = session.running();
-    if (ids.length === 0) return record({ kind: 'error', text: 'no job is at work in the background' });
+    // No job to stop, or which one, is a note: nothing went wrong.
+    if (ids.length === 0) return record({ kind: 'note', text: 'no job is at work in the background' });
     const id = given ? Number(/^j?(\d+)$/.exec(given)?.[1]) : ids.length === 1 ? ids[0] : NaN;
-    if (!ids.includes(id)) return record({ kind: 'error', text: `which one — ${ids.map((j) => `/stop j${j}`).join(' or ')}` });
+    if (!ids.includes(id)) return record({ kind: 'note', text: `which one — ${ids.map((j) => `/stop j${j}`).join(' or ')}` });
     session.stop(id);
     return record({ kind: 'note', text: `stopping j${id} — it can be picked up again: ask for it by its id` });
   }
@@ -1252,8 +1632,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
    */
   const suspend = async () => {
     if (state.away) return;
-    if (process.platform === 'win32') return notify('Ctrl-Z does not suspend on Windows');
-    if (state.working || session.running().length > 0) return notify('Ctrl-Z waits until nothing is at work — esc stops the turn');
+    if (process.platform === 'win32') return notify('ctrl-z does not suspend on Windows');
+    if (state.working || session.running().length > 0) return notify('ctrl-z waits until nothing is at work — esc interrupts the turn');
     state.away = true;
     let stopped = true;
     try {
@@ -1285,7 +1665,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       state.away = false;
       refresh();
     }
-    if (!stopped) notify('Ctrl-Z: there is no shell here to suspend the chat into');
+    if (!stopped) notify('ctrl-z: there is no shell here to suspend the chat into');
   };
 
   /** What is waiting — to be read at the next step, or sent after the turn — back in the box, ahead of what is typed there; the model reads none of it. */
@@ -1304,6 +1684,10 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       state.thought = '';
       state.raw += chunk;
       state.reply?.write(chunk);
+      // A checklist in the reply is the plan the turn works to: the latest one, under the working line.
+      state.plan = planOf(state.raw) ?? state.plan;
+      // Text came: a request sent again has gone through.
+      state.retry = null;
       redraw();
     };
     // What the model is thinking, so far: shown under the working line until it acts. A job's thought is its own: it is not drawn here.
@@ -1315,7 +1699,20 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       redraw();
     };
     // A request being sent again, or a job's conversation summarized to make room: said where the work shows, with the job's id.
-    const onRetry = (r) => record({ kind: 'note', text: `${r.job ? `j${r.job}: ` : ''}${retryLine(r)}` });
+    // A request of the chat's own being sent again counts down on the working line; the scroll says why, in words — once
+    // for a run of tries that fail the same way, again when the reason changes. A reply that broke off half-way is thrown
+    // away, as the loop throws it away, and the scroll says so.
+    const onRetry = (r) => {
+      if (r.job) return record({ kind: 'note', text: `j${r.job}: ${retryNote(r)}` });
+      state.retry = { until: Date.now() + r.delayMs, attempt: r.attempt, limit: r.limit };
+      const broke = Boolean(state.raw);
+      if (broke) dropReply();
+      const why = retryWhy(r.reason);
+      const said = broke ? `the reply broke off: ${why} · asking again` : retryNote(r);
+      if (state.retried === `${broke}${why}`) return redraw();
+      state.retried = `${broke}${why}`;
+      record({ kind: 'note', text: said });
+    };
     const onCompact = (c) => record({ kind: 'note', text: `${c.job ? `j${c.job}: ` : ''}${compactLine(c)}` });
     // The session has passed what it may cost before it is said: said once, where the retries are.
     const onBudget = ({ text }) => {
@@ -1368,9 +1765,12 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       closeReply();
       record({ kind: 'note', text: `sources:\n${sources.map((page) => safeForTerminal(`${page.title} — ${page.url}`).replace(/\s+/g, ' ')).join('\n')}` });
     };
+    // The turn goes on once: what it edited, what has not checked it, and what the model is asked to do about that.
     const onCheck = ({ edited, checks }) => {
       closeReply();
-      record({ kind: 'note', text: `held: ${edited.length} file${edited.length === 1 ? '' : 's'} edited, ${checks.length > 0 ? `${checks.join(' and ')} not run` : 'no check declared'}` });
+      const what = edited.length === 1 ? basename(edited[0]) : `${edited.length} files`;
+      const them = edited.length === 1 ? 'it' : 'them';
+      record({ kind: 'note', text: checks.length > 0 ? `${what} edited, ${checks.join(' and ')} not run since · the model is asked to run ${checks.length === 1 ? 'it' : 'them'}` : `${what} edited and not checked yet · the model is asked to check ${them}` });
     };
     // A job's work is not the chat's: it shows one line while it works, its report when it ends, and the rest where it is watched.
     const onResult = ({ call, result, job }) => {
@@ -1414,6 +1814,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       redraw();
     };
     const onUsage = ({ totals }) => {
+      // A reply came back: a request that fails after it is a new run of tries, and its reason is said again.
+      state.retried = null;
       state.tokens = totals.outputTokens;
       state.heard = Date.now();
       state.spent = session.spent();
@@ -1423,7 +1825,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     const onApprove = (ask) => {
       state.asks.push(ask);
       ask.signal?.addEventListener('abort', () => settle(ask, 'no'), { once: true });
-      alert(`${state.where.name}: ${ask.unsandboxed ? 'a command waits to run outside the sandbox' : `${ask.server} · ${ask.tool} waits for your answer`}`);
+      alert(`${state.where.name}: ${ask.unsandboxed ? 'a command waits to run outside the sandbox' : ask.path ? 'a change to a file waits for your answer' : `${ask.server} · ${ask.tool} waits for your answer`}`);
       redraw();
     };
     // A question of the model's: shown with its options, the first one picked, until a pick or a typed answer settles it.
@@ -1444,6 +1846,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       events.off('text', onText).off('thinking', onThinking).off('retry', onRetry).off('compact', onCompact).off('budget', onBudget).off('tool', onTool).off('output', onOutput).off('heard', onHeard).off('guide', onGuide).off('sources', onSources).off('check', onCheck).off('result', onResult).off('usage', onUsage).off('job', onJob).off('tab-failed', onTabFailed).off('job-end', onJobEnd).off('job-report', onJobReport).off('approve', onApprove).off('ask', onAsk).off('mcp', onMcp);
       clearTimeout(state.leaving);
       clearTimeout(state.notice?.timer);
+      clearTimeout(state.explain?.timer);
       clearTimeout(state.drawSoon);
       // The terminal as it was found: no more word of its focus, and its own title back.
       tell(`${FOCUS_OFF}${TITLE_BACK}`);
@@ -1527,13 +1930,24 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         else asked.at = Math.max(0, Math.min(asked.options.length - 1, asked.at + (oneKey.downArrow ? 1 : -1)));
         continue;
       }
+      // Saying why a call is refused: the keys write the line, Enter refuses with it, Esc goes back to the question. Ctrl-C still stops.
+      if (state.why && state.why.ask === state.asks[0] && !(oneKey.ctrl && (one === 'c' || one === 'd'))) {
+        if (oneKey.escape) state.why = null;
+        else if (oneKey.return) settle(state.why.ask, state.why.text.trim() ? { no: state.why.text.trim() } : 'no');
+        else if (oneKey.backspace || oneKey.delete) state.why.text = state.why.text.slice(0, -1);
+        else if (!oneKey.ctrl && !oneKey.meta && one) state.why.text += one.replace(/[\r\n]+/g, ' ');
+        redraw();
+        continue;
+      }
       // A call standing takes the key: an answer, or Esc and Ctrl-C, which go on to stop the turn; nothing lands in the box.
       if (!asked && state.asks.length > 0 && !oneKey.escape && !(oneKey.ctrl && (one === 'c' || one === 'd'))) {
-        // A run outside the sandbox is this one run or none: there is no always for it.
-        const unsandboxed = state.asks[0].unsandboxed;
-        const answer = (unsandboxed ? { y: 'once', n: 'no' } : { y: 'once', a: 'always', n: 'no' })[one];
-        if (answer) settle(state.asks[0], answer);
-        else notify(unsandboxed ? 'y runs it once outside the sandbox · n refuses it · esc stops the turn' : 'y allows it once · a always · n refuses it · esc stops the turn');
+        // Each kind of call takes its own keys: a run outside the sandbox is this one run or none, a guarded file this once or not.
+        const answer = answerOf(state.asks[0], one);
+        if (answer === 'why') {
+          state.why = { ask: state.asks[0], text: '' };
+          redraw();
+        } else if (answer) settle(state.asks[0], answer);
+        else explainKeysOf(state.asks[0]);
         continue;
       }
       // A question from a job in the background: Esc refuses that one call, and stops nothing.
@@ -1625,6 +2039,12 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   });
   // A file dropped on the terminal arrives pasted as its path: an image's path becomes the image.
   usePaste((text) => {
+    // Saying why a call is refused, a paste is part of the reason — on one line — and never lands in the box behind it.
+    if (state.why && state.why.ask === state.asks[0]) {
+      state.why.text += cleanPaste(text).text.replace(/\s+/g, ' ');
+      redraw();
+      return;
+    }
     let images;
     try {
       images = droppedImages(text);
@@ -1660,22 +2080,25 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     Box,
     { flexDirection: 'column', minHeight: room },
     h(Static, { key: state.epoch, items: state.items }, (item) => h(Item, { key: item.id, item, columns, s })),
+    // Reads that wait for what comes after them, drawn as the row they will make.
+    ...(state.reads.length > 0 ? readsDrawn(state.reads).map((item, i) => h(Item, { key: `reads-${i}`, item, columns, s })) : []),
     tail ? h(Reply, { text: tail, first: state.fresh }) : null,
     // What runs now, and under a delegate call the jobs it started. In one box of their own, so the lines coming and going
     // never move what follows — the working line keeps its clock.
     h(
       Box,
       { flexDirection: 'column' },
-      ...[...state.running.values()].map((call) => h(Tool, { key: call.id, columns, s, view: toolView(call, null, { cwd: state.where.cwd }), running: true, waiting: state.asks.some((a) => !a.options && !a.job && (!a.name || a.name === call.name)), live: state.live.get(call.id), jobs: [...state.jobs].filter(([, job]) => job.parent === call.id) })),
+      // A question of the model's is said once, in its own rows under the work: the call that asks it is not drawn over it.
+      ...[...state.running.values()].filter((call) => !(call.name === ASK_TOOL.name && state.asks[0]?.options)).map((call) => h(Tool, { key: call.id, columns, s, view: toolView(call, null, { cwd: state.where.cwd }), running: true, waiting: state.asks.some((a) => !a.options && !a.job && (!a.name || a.name === call.name)), live: state.live.get(call.id), jobs: [...state.jobs].filter(([, job]) => job.parent === call.id) })),
       // A job no call here started — none should be — still shows that it works.
     ),
     // The silence that is said is the model's: while a command, a job or a question is in hand, the wait is not on it.
-    state.working ? h(Working, { messages, first: state.working, tokens: state.tokens, thought: state.showThinking ? state.thought : '', quietAfterMs, motion, heard: state.talking && state.running.size === 0 && state.jobs.size === 0 && state.asks.length === 0 ? state.heard : 0 }) : null,
-    state.asks.length > 0 ? (state.asks[0].options ? h(Question, { ask: state.asks[0], columns }) : h(Ask, { ask: state.asks[0], aside: session.running().includes(state.asks[0].job), columns })) : null,
+    state.working ? h(Working, { messages, first: state.working, tokens: state.tokens, thought: state.showThinking ? state.thought : '', quietAfterMs, motion, retry: state.retry, plan: state.plan, heard: state.talking && state.running.size === 0 && state.jobs.size === 0 && state.asks.length === 0 ? state.heard : 0, waiting: state.asks.length > 0 }) : null,
+    state.asks.length > 0 ? (state.asks[0].options ? h(Question, { ask: state.asks[0], columns }) : h(Ask, { ask: state.asks[0], aside: session.running().includes(state.asks[0].job), waiting: state.asks.length, why: state.why?.ask === state.asks[0] ? state.why.text : null, explain: state.explain?.ask === state.asks[0], columns, cwd: state.where.cwd })) : null,
     // The record of the job that is open, under everything the turn is doing: its end, as it grows.
     state.open !== null ? h(JobOpen, { id: state.open, job: state.jobs.get(state.open), rows }) : null,
-    // The logo is the empty room's: once something has been said, the room is the conversation's.
-    h(Room, { logo: said ? [] : logo, rows, from: state.used }),
+    // The logo and what to try are the empty room's: once something has been said, the room is the conversation's.
+    h(Room, { logo: said ? [] : logo, rows, from: state.used, starter: !said }),
     h(
       Box,
       { flexDirection: 'column', marginTop: 1 },
@@ -1685,13 +2108,27 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       state.asks.length > 0 && !state.asks[0].options ? null : h(Input, { state: state.ed, width: columns, rows, placeholder: said ? '' : 'Ask anything · / commands · @ files · ? keys' }),
       // The jobs at work in the background, under the box, and the chat over them: they go on whether or not there is a turn.
       ...rowsUnderBox().map((id) => (id === MAIN ? h(MainAtWork, { key: MAIN, working: Boolean(state.working), picked: state.pick === MAIN, shown: state.open === null }) : h(JobAtWork, { key: `j${id}`, id, job: state.jobs.get(id), alone: true, picked: id === state.pick, open: id === state.open }))),
-      menu.length > 0 ? h(Menu, { menu, pick: state.ed.pick }) : state.ed.search ? h(Search, { search: state.ed.search }) : state.keys ? h(Keys, { columns }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, jobs: [...state.jobs.keys()], aside: session.running(), pick: state.pick, open: state.open, where: state.where, spent: state.spent, overBudget: state.overBudget, waiting: state.queue.length > 0, columns }),
+      menu.length > 0 ? h(Menu, { menu, pick: state.ed.pick, columns }) : state.ed.search ? h(Search, { search: state.ed.search }) : state.keys ? h(Keys, { columns }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, jobs: [...state.jobs.keys()], aside: session.running(), pick: state.pick, open: state.open, where: state.where, spent: state.spent, overBudget: state.overBudget, waiting: state.queue.length > 0, columns }),
     ),
   );
 }
 
 /** Starts the session and draws it. The returned instance's `waitUntilExit()` settles when the user leaves. */
-export function runUi({ session, events, resume = null, stdin = process.stdin, stdout = process.stdout, messages = spinnerMessages(), cwd = process.cwd(), logo = logoLines(), clipboard = clipboardImage, copy = copyText, notify = true, notifyAfterMs = NOTIFY_AFTER_MS, quietAfterMs = QUIET_AFTER_MS, run = inTerminal, listFiles = gitFiles, motion = true, progress = showsProgress(), debug = false }) {
+/**
+ * Ink writes a changed line as: to its first column, the line, erase to the end. After a line exactly as wide as the
+ * window the cursor waits on its last column, and an xterm-like terminal erases that column with it — the right edge
+ * of every box, gone. The erase goes first instead: the same line drawn, nothing after it erased.
+ */
+const ERASE_AFTER_LINE = /\x1b\[1G((?:(?!\x1b\[1G)[^\n])*?)\x1b\[K/g;
+export const eraseFirst = (chunk) => (typeof chunk === 'string' ? chunk.replace(ERASE_AFTER_LINE, (_whole, line) => `\x1b[1G\x1b[K${line}`) : chunk);
+/**
+ * Ink steps over a line that has not changed with "next line" (`ESC[E`), which at the foot of the window goes nowhere: a
+ * frame that grows past the last row is then drawn a row short, and the next one a row too high — over the frame before
+ * it, which stays. A line feed is the same step everywhere else, and at the foot it scrolls, as a frame that grows needs.
+ */
+export const nextLineScrolls = (chunk) => (typeof chunk === 'string' ? chunk.replaceAll('\x1b[E', '\r\n') : chunk);
+
+export function runUi({ session, events, resume = null, stdin = process.stdin, stdout = process.stdout, messages = spinnerMessages(), cwd = process.cwd(), logo = logoLines(), clipboard = clipboardImage, copy = copyText, notify = true, notifyAfterMs = NOTIFY_AFTER_MS, quietAfterMs = QUIET_AFTER_MS, run = inTerminal, listFiles = gitFiles, motion = true, progress = showsProgress(), debug = false, plain = false }) {
   // Opened on a saved session (`sumo chat --resume`), the chat picks it up before the screen is drawn; a fresh one starts and is shown its block.
   const opening = resume === null ? null : session.resume(resume);
   const block = opening ? '' : session.start('startup');
@@ -1712,5 +2149,13 @@ export function runUi({ session, events, resume = null, stdin = process.stdin, s
       stdin.unshift = putBack;
     }, KITTY_WAIT_MS).unref();
   }
-  return render(h(App, { session, events, messages, cwd, block, opening, logo, clipboard, copy, notify, notifyAfterMs, quietAfterMs, run, listFiles, motion, progress }), { stdin, stdout, debug, exitOnCtrlC: false, kittyKeyboard: { mode: 'auto' } });
+  // Plain (`chat.screen plain`), for a screen reader: ASCII marks, no frames, no pictures, and nothing moving.
+  const app = h(App, { session, events, messages, cwd, block, opening, logo: plain ? [] : logo, clipboard, copy, notify, notifyAfterMs, quietAfterMs, run, listFiles, motion: motion && !plain, progress, plain });
+  // Only the lines that changed are written again: a keystroke in the box rewrites the box's line, not the logo above it,
+  // and a clock that ticks rewrites its own row. Measured in a real terminal at 80×24, a keystroke went from ~2.6 KB to
+  // 200 bytes; on a slow or remote terminal the whole frame drawn again on every key is what flickers. Each line is
+  // erased before it is written, not after (eraseFirst), and a line stepped over steps down even at the foot (nextLineScrolls).
+  const write = stdout.write.bind(stdout);
+  stdout.write = (chunk, ...rest) => write(nextLineScrolls(eraseFirst(chunk)), ...rest);
+  return render(h(Marks.Provider, { value: glyphs(plain) }, app), { stdin, stdout, debug, exitOnCtrlC: false, kittyKeyboard: { mode: 'auto' }, incrementalRendering: true });
 }

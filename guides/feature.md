@@ -11,4 +11,5 @@ when: add, build, implement, feature, extend, design, rewrite, approach, archite
 6. Build until they pass, without touching them. No code for cases that cannot happen; nothing the outcome did not name unless you can say what breaks without it.
 7. Name one wrong implementation that would still pass. If there is one, add the test that kills it.
 8. The project's own checks. Lint failure → the tool's safe autofix first, then the code — never an ignore.
-9. Delete what the change orphaned. Update only the docs whose truth changed; search for the old value.
+9. Output a person reads — a screen, a message, a CLI's text → run it as they would and quote what it printed.
+10. Delete what the change orphaned. Update only the docs whose truth changed; search for the old value.

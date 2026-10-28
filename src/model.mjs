@@ -1,13 +1,13 @@
-import { jsonSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/json-schema';
 import { spawnSync } from 'node:child_process';
-import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
+import { accessSync, constants, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { anthropicClient, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
+import { anthropicClient, authenticatedRequest, loadSdk, resolveAnthropicCredential } from './auth.mjs';
 import { describeApiError, modelId } from './catalog.mjs';
 import { getMeta } from './db.mjs';
 import { ensureLocalServer, LOCAL_REASONING_BUDGET, modelIdOf } from './local-server.mjs';
+import { appendLog } from './logs.mjs';
 import { paths } from './paths.mjs';
-import { CONFIG_DEFAULTS } from './setup.mjs';
+import { modelFileOf } from './setup.mjs';
 import { SEARCH_USD } from './web.mjs';
 
 const TIMEOUT_MS = 180_000;
@@ -18,26 +18,38 @@ const MAX_RETRIES = 1;
 const MAX_ANSWER_TOKENS = 400;
 // A memory pass on the local model thinks first, up to the server's reasoning budget, then lists its operations.
 const MAX_LOCAL_PASS_TOKENS = LOCAL_REASONING_BUDGET + 3072;
-// A scribe pass answers with a list of operations. Every model but haiku thinks first, and the thinking counts toward this
+// A scribe pass answers with a list of operations. Every model thinks first, and the thinking counts toward this
 // limit too: 8k holds both, ends well inside the call's three minutes, and is far below the 21,333 the SDK sends without
 // streaming. An answer longer than this is the model rambling, not remembering.
 const MAX_API_ANSWER_TOKENS = 8192;
-/** What the SDK's beta parse() sent with a schema'd request, kept for the OAuth path that goes through the beta API. */
-const STRUCTURED_OUTPUTS_BETA = 'structured-outputs-2025-12-15';
 
-/** US dollars per million tokens: input, output, and what a cache read costs relative to input. */
-export const PRICES = {
-  'claude-haiku-4-5-20251001': { input: 1, output: 5, cacheRead: 0.1 },
-  'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.1 },
+/**
+ * US dollars per million tokens: input, output, and what a cache read costs relative to input. Haiku has two rate cards,
+ * by the size of the prompt — everything read, from the cache or not — `over` is the dearer one past that many tokens.
+ */
+const PRICES = {
+  'claude-haiku-5-5': { input: 0.1, output: 0.5, cacheRead: 0.1, over: { tokens: 100_000, input: 0.5, output: 2.5, cacheRead: 0.1 } },
+  'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.05 },
   'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.05 },
   'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.025 },
+  // Where a declined reply is run again (`fallbacks`): the API names the model by the category; the ledger must price what it answered on.
+  'claude-opus-4-8': { input: 5, output: 25, cacheRead: 0.1 },
+  'claude-sonnet-5': { input: 2, output: 10, cacheRead: 0.1 },
 };
 /** What writing to the cache costs relative to input: the five-minute cache every request here writes. */
 export const CACHE_WRITE = 1.25;
 
+/** The rate card a response is priced on: the model's, or its dearer one when the prompt was over that size; null for a model the list does not know. */
+export function priceOf(model, usage = {}) {
+  const price = PRICES[modelId(model)];
+  if (!price) return null;
+  const prompt = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+  return price.over && prompt > price.over.tokens ? price.over : price;
+}
+
 /** What one response cost, from its usage and the price list; 0 for a model the list does not know. */
 export function costOf(model, usage) {
-  const price = PRICES[modelId(model)];
+  const price = priceOf(model, usage);
   if (!price) return 0;
   const plain = usage.input_tokens ?? 0;
   const read = usage.cache_read_input_tokens ?? 0;
@@ -48,6 +60,16 @@ export function costOf(model, usage) {
   return (plain * price.input + read * price.input * price.cacheRead + written * price.input * CACHE_WRITE + out * price.output) / 1_000_000 + searches;
 }
 
+/**
+ * The answer's shape as the API takes it: what the SDK's jsonSchemaOutputFormat gives with its transform off, less the
+ * parse() that only the SDK's own parse() calls — written here, so a pass that never calls the API never loads the SDK.
+ * Sent as written: the helper's own rewrite moves every enum into a description, and the API then holds the answer to none of them.
+ */
+function outputFormat(schema) {
+  if (schema.type !== 'object') throw new Error(`JSON schema must be an object, but got ${schema.type}`);
+  return { type: 'json_schema', schema: { ...schema } };
+}
+
 /** The request one cheap-model call sends: a frozen system prompt, the bundle as the one user turn, the answer shape enforced by the API. */
 export function requestFor({ system, prompt, schema, model }) {
   return {
@@ -55,8 +77,7 @@ export function requestFor({ system, prompt, schema, model }) {
     max_tokens: MAX_API_ANSWER_TOKENS,
     system,
     messages: [{ role: 'user', content: prompt }],
-    // Sent as written. The helper's own rewrite moves every enum into a description, and the API then holds the answer to none of them.
-    output_config: { format: jsonSchemaOutputFormat(schema, { transform: false }) },
+    output_config: { format: outputFormat(schema) },
   };
 }
 
@@ -127,13 +148,13 @@ export async function callModel(db, { system, prompt, schema, model, kind }) {
   try {
     const credential = resolveAnthropicCredential();
     if (!credential) return failure('no Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the shell that runs sumo');
+    await loadSdk();
     const client = anthropicClient({ timeout: TIMEOUT_MS, maxRetries: MAX_RETRIES }, credential);
     const request = authenticatedRequest(requestFor({ system, prompt, schema, model }), credential);
     // Not the SDK's parse(): it throws on an answer that is not JSON before the stop reason or the usage can be read,
     // so a cut-off or refused answer would be misnamed and what it spent never logged. The answer is parsed below instead.
-    const response = credential?.type === 'oauth'
-      ? await client.beta.messages.create({ ...request, betas: [...request.betas, STRUCTURED_OUTPUTS_BETA] })
-      : await client.messages.create(request);
+    // A Claude Code login goes through the beta API, which carries its betas; structured output itself needs none.
+    const response = credential?.type === 'oauth' ? await client.beta.messages.create(request) : await client.messages.create(request);
     const usage = usageOf(model, response.usage);
     if (response.stop_reason === 'refusal') return { ...failure(`the model declined to answer (${response.stop_details?.category ?? 'no category'})`), usage };
     if (response.stop_reason === 'max_tokens') return { ...failure(`the answer was cut off at ${MAX_API_ANSWER_TOKENS} tokens`), usage };
@@ -168,7 +189,7 @@ function describeLocal(status, body) {
  */
 export async function callLocalModel(db, { system, prompt, schema, kind = 'local', think = false, maxTokens = MAX_ANSWER_TOKENS, log = true, timeoutMs = TIMEOUT_MS }) {
   const now = new Date().toISOString();
-  const modelFile = getMeta(db, 'config.model.file') ?? CONFIG_DEFAULTS['model.file'];
+  const modelFile = modelFileOf(db);
   const modelLabel = `local:${modelFile}`;
   const record = (result) => {
     if (log) logRun(db, { kind: 'local', model: modelLabel, result, note: result.ok ? 'ok' : result.error, now });
@@ -262,9 +283,8 @@ export function logRun(db, { kind, model, result, note, now, jobId = null, sessi
     now, kind, model, result.usage.inputTokens, result.usage.outputTokens, result.usage.costUsd, result.ok ? 1 : 0, note,
     result.usage.cacheReadTokens ?? null, result.usage.cacheCreationTokens ?? null, jobId, sessionId,
   );
-  mkdirSync(paths().logs, { recursive: true, mode: 0o700 });
-  appendFileSync(
-    join(paths().logs, 'scribe.log'),
+  appendLog(
+    'scribe.log',
     `${now} ${kind} ${model} ${result.ok ? 'ok' : 'FAILED'} in=${result.usage.inputTokens} out=${result.usage.outputTokens} $${result.usage.costUsd.toFixed(4)} ${note}\n`,
   );
 }

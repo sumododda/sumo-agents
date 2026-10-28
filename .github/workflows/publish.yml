@@ -1,17 +1,65 @@
 # Every commit on main is a release candidate: the suite runs, and when package.json names a
-# version npm does not have yet, that version is published. No token is stored anywhere — npm
-# trusts this workflow by its identity (OIDC trusted publishing), and signs the provenance itself.
+# version npm does not have yet, that version is published — after a person approves it in the
+# `release` environment. No token is stored anywhere: npm trusts this workflow by its identity
+# (OIDC trusted publishing) and signs the provenance itself. A pull request, or a run started by
+# hand, tests the same way and never publishes.
+#
+# Hardening (GitHub's security-hardening guide, OpenSSF Scorecard): every action pinned to a commit;
+# no permissions by default, each job only what it uses; the checkout keeps no credentials; no
+# dependency runs an install script; the registry's signatures are checked; every job has a time
+# limit; one publish at a time; no expression from the event is ever put into a script.
 name: publish
 on:
   push:
     branches: [main]
+  pull_request:
+  workflow_dispatch:
 permissions: {}
+# A newer push to a pull request replaces the run in progress; main's runs, which may publish, never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  # The suite on every Node the package promises (engines), and on macOS, the one place the shell's sandbox — and every
+  # test of what it keeps out — runs; on Linux those tests skip. Nothing is published unless all of them pass.
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     permissions:
-      contents: read
-      id-token: write
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+      # Exactly the lockfile, and no package's install script runs: a compromised dependency gets no code run here.
+      - run: npm ci --ignore-scripts
+      # Every installed package as the registry signed it, and its provenance where it has one.
+      - run: npm audit signatures
+      - run: npm test
+  publish:
+    name: publish to npm
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A person approves each publish here: the environment's required reviewers are set in the repository's settings,
+    # and npm's trusted publisher is bound to this environment, so no other job can publish.
+    environment: release
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    permissions:
+      contents: read # to check out the code
+      id-token: write # to prove this workflow's identity to npm (trusted publishing) and sign the provenance
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -20,8 +68,8 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - run: npm ci
-      - run: npm test
+      - run: npm ci --ignore-scripts
+      - run: npm audit signatures
       - name: Publish when this version is new
         run: |
           name=$(node -p "require('./package.json').name")
@@ -30,4 +78,4 @@ jobs:
             echo "$name@$version is already on npm; nothing to publish"
             exit 0
           fi
-          npm publish --access public
+          npm publish --access public --provenance --ignore-scripts

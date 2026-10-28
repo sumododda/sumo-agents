@@ -91,7 +91,7 @@ test('a cheap-model answer cut off or refused is said as such, and what it spent
     req.on('end', () => {
       seen = { url: req.url, beta: req.headers['anthropic-beta'] ?? '', body: JSON.parse(body) };
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_details: null, ...answer }));
+      res.end(JSON.stringify({ id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-haiku-5-5', stop_details: null, ...answer }));
     });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -128,12 +128,12 @@ test('a cheap-model answer cut off or refused is said as such, and what it spent
         assert.deepEqual(fine.data, { ops: [] });
         assert.equal(seen.body.output_config.format.type, 'json_schema');
 
-        // A Claude Code token goes through the beta API, with the structured-outputs beta parse() used to send.
+        // A Claude Code token goes through the beta API: the same path, with the betas as a header.
         process.env.ANTHROPIC_API_KEY = 'sk-ant-oat-test';
         answer = { stop_reason: 'max_tokens', content: [{ type: 'text', text: '{"ops": [' }], usage: { input_tokens: 10, output_tokens: 8192 } };
         assert.match((await ask()).error, /cut off/);
-        assert.match(seen.url, /beta=true/);
-        assert.match(seen.beta, /structured-outputs-2025-12-15/);
+        assert.equal(seen.url, '/v1/messages');
+        assert.doesNotMatch(seen.beta, /structured-outputs/, 'structured output is GA: no beta for it on any path');
         assert.match(seen.beta, /oauth-2025-04-20/);
       } finally {
         db.close();

@@ -23,12 +23,10 @@ function modelServer(body) {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
 }
 
-test('config lists the router model settings, with their defaults', () => {
+test('config lists the router model\'s address, with its default', () => {
   const s = sandbox();
   const out = s.sumo(['config']).out;
-  assert.match(out, /model\.source = https:\/\/huggingface\.co/);
-  assert.match(out, /model\.repo = Qwen\/Qwen3-4B-GGUF/);
-  assert.match(out, /model\.file = Qwen3-4B-Q4_K_M\.gguf/);
+  assert.match(out, /^model\.url = https:\/\/huggingface\.co\/Qwen\/Qwen3-4B-GGUF\/resolve\/main\/Qwen3-4B-Q4_K_M\.gguf$/m);
 });
 
 test('setup downloads the router model, skips it once present, and survives a download that fails', async () => {

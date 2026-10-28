@@ -14,7 +14,7 @@ test('before anything is checked every model is on, and says it was not checked'
   assert.equal(run.code, 0, run.err);
   const lines = run.out.trim().split('\n');
   assert.equal(lines.length, 4, 'one line per model Sumo knows');
-  assert.match(lines[0], /^haiku\s+on\s+claude-haiku-4-5-20251001\s+not checked$/);
+  assert.match(lines[0], /^haiku\s+on\s+claude-haiku-5-5\s+not checked$/);
   assert.match(lines[2], /^opus\s+on\s+claude-opus-5-5\s+not checked$/);
   assert.match(lines[3], /^fable\s+on\s+claude-fable-5-1\s+not checked$/);
 });
@@ -41,7 +41,7 @@ test('setup asks the API which models it has, once: a model it does not have is 
   const discovered = s.sumo(['models', 'discover']);
   assert.equal(discovered.code, 0, discovered.err);
   assert.match(discovered.out, /^opus\s+off\s+claude-opus-5-5\s+not found /m, discovered.out);
-  assert.match(discovered.out, /^haiku\s+on\s+claude-haiku-4-5-20251001\s+found /m, discovered.out);
+  assert.match(discovered.out, /^haiku\s+on\s+claude-haiku-5-5\s+found /m, discovered.out);
 });
 
 test('a check that fails changes nothing: no answer, no credential, a model whose own check errored, or an API with none of them', () => {
@@ -54,7 +54,7 @@ test('a check that fails changes nothing: no answer, no credential, a model whos
 
   // Without the stand-in and without a credential there is nothing to ask with.
   const noKey = s.sumo(['models', 'discover'], { extraEnv: { SUMO_AGENTS_MODEL_CMD: '' } });
-  assert.equal(noKey.code, 1);
+  assert.equal(noKey.code, 4);
   assert.match(noKey.err, /no Anthropic credential/);
 
   // One model's check erroring leaves that model as it was; the others are recorded.
@@ -105,12 +105,12 @@ test('config refuses a model that is off or that Sumo does not know, for the cha
   assert.match(s.sumo(['config', 'chat.model', 'auto']).out, /chat\.model = auto/);
   assert.match(s.sumo(['config', 'chat.model', 'sonnet']).out, /chat\.model = sonnet/);
 
-  const pass = s.sumo(['config', 'scribe.model', 'fable']);
+  const pass = s.sumo(['config', 'memory.model', 'fable']);
   assert.equal(pass.code, 2);
   assert.match(pass.err, /fable is off — sumo models enable fable/);
-  assert.match(s.sumo(['config', 'dream.model', 'gpt']).err, /no such model "gpt" — one of: local, off, haiku, sonnet, opus, fable/);
-  assert.match(s.sumo(['config', 'scribe.model', 'off']).out, /scribe\.model = off/);
-  assert.match(s.sumo(['config', 'dream.model', 'local']).out, /dream\.model = local/);
+  assert.match(s.sumo(['config', 'memory.model', 'gpt']).err, /no such model "gpt" — one of: local, off, haiku, sonnet, opus, fable/);
+  assert.match(s.sumo(['config', 'memory.model', 'off']).out, /memory\.model = off/);
+  assert.match(s.sumo(['config', 'memory.model', 'local']).out, /memory\.model = local/);
 });
 
 test('doctor says which models are on, fails when none is or when a configured one is off, and warns while nothing was checked', () => {
@@ -150,18 +150,18 @@ test('the passes: a writer set to a model that is off fails without calling it; 
   const ops = [{ op: 'add', type: 'preference', scope: 'global', topic: 'git', body: 'Always squash merge', turn: 1, quote: 'always squash merge' }];
   const keyed = { ANTHROPIC_API_KEY: 'sk-ant-test', STUB_LOCAL_FAILS: '1' };
 
-  s.sumo(['config', 'scribe.model', 'opus']);
+  s.sumo(['config', 'memory.model', 'opus']);
   s.sumo(['models', 'disable', 'opus']);
   s.hook('prompt', { session_id: 'one', prompt: 'from now on always squash merge' });
   s.modelWillSay(ops);
-  const off = s.sumo(['scribe', 'run'], { extraEnv: keyed });
-  assert.match(off.out, /^failed — opus is off — sumo models enable opus, or sumo config scribe\.model local/, off.out + off.err);
+  const off = s.sumo(['memory', 'run'], { extraEnv: keyed });
+  assert.match(off.out, /^failed — opus is off — sumo models enable opus, or sumo config memory\.model local/, off.out + off.err);
   assert.deepEqual(s.sql((db) => db.prepare('SELECT model, ok FROM model_runs').all().map((r) => [r.model, r.ok])), [['opus', 0]], 'the refusal is in the ledger, no call was made');
 
   // Back on the local model, with haiku off: the retry goes to sonnet, the cheapest model that is on.
-  s.sumo(['config', 'scribe.model', 'local']);
+  s.sumo(['config', 'memory.model', 'local']);
   s.sumo(['models', 'disable', 'haiku']);
-  const retried = s.sumo(['scribe', 'run'], { extraEnv: keyed });
+  const retried = s.sumo(['memory', 'run'], { extraEnv: keyed });
   assert.match(retried.out, /^read 1 turns/, retried.out + retried.err);
   const rows = s.sql((db) => db.prepare('SELECT model, ok, note FROM model_runs ORDER BY id').all());
   assert.deepEqual(rows.slice(1).map((r) => [r.model, r.ok]), [['local', 0], ['sonnet', 1]]);
@@ -172,7 +172,7 @@ test('the passes: a writer set to a model that is off fails without calling it; 
   s.sumo(['models', 'disable', 'sonnet']);
   s.sumo(['models', 'disable', 'fable']);
   s.hook('prompt', { session_id: 'two', prompt: 'and always rebase first' });
-  const alone = s.sumo(['scribe', 'run'], { extraEnv: keyed });
+  const alone = s.sumo(['memory', 'run'], { extraEnv: keyed });
   assert.match(alone.out, /^failed — /, alone.out + alone.err);
   const last = s.sql((db) => db.prepare('SELECT model, ok, note FROM model_runs ORDER BY id DESC LIMIT 1').get());
   assert.equal(last.model, 'local');
@@ -213,9 +213,9 @@ test('discovery never turns back on a model the user turned off by hand: it only
   s.sumo(['models', 'disable', 'haiku']);
   const discovered = s.sumo(['models', 'discover']);
   assert.equal(discovered.code, 0, discovered.err);
-  assert.match(discovered.out, /^haiku\s+off\s+claude-haiku-4-5-20251001\s+turned off \d{4}-\d{2}-\d{2}$/m, discovered.out);
+  assert.match(discovered.out, /^haiku\s+off\s+claude-haiku-5-5\s+turned off \d{4}-\d{2}-\d{2}$/m, discovered.out);
   assert.match(discovered.out, /^sonnet\s+on\s/m, discovered.out);
   // Turned on again by hand, it is the API's to judge once more.
   s.sumo(['models', 'enable', 'haiku']);
-  assert.match(s.sumo(['models', 'discover']).out, /^haiku\s+on\s+claude-haiku-4-5-20251001\s+found /m);
+  assert.match(s.sumo(['models', 'discover']).out, /^haiku\s+on\s+claude-haiku-5-5\s+found /m);
 });

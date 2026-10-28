@@ -15,7 +15,7 @@ test('a case-sensitive branch correction is not dropped as a duplicate', () => {
   s.sumo(['add', 'fact', 'The deployment branch is Release']);
   say(s, 'always use release as the deployment branch');
   s.modelWillSay([{ op: 'add', type: 'fact', scope: 'global', body: 'The deployment branch is release', turn: 1, quote: 'always use release as the deployment branch' }]);
-  const run = s.sumo(['scribe', 'run']);
+  const run = s.sumo(['memory', 'run']);
   assert.equal(run.code, 0, run.err);
   assert.match(run.out, /saved m2/);
   const rows = s.sql((db) => db.prepare("SELECT body FROM memories WHERE state = 'active' ORDER BY id").all());
@@ -30,7 +30,7 @@ test('one user turn may state the same rule for two different projects', () => {
   s.modelWillSay(['alpha', 'beta'].map((project) => ({
     op: 'add', type: 'preference', scope: `project:${project}`, body: 'Always use pnpm', turn: 1, quote: 'always use pnpm for both alpha and beta',
   })));
-  const run = s.sumo(['scribe', 'run']);
+  const run = s.sumo(['memory', 'run']);
   assert.equal(run.code, 0, run.err);
   const rows = s.sql((db) => db.prepare("SELECT scope FROM memories WHERE body = 'Always use pnpm' ORDER BY scope").all());
   assert.deepEqual(rows.map((r) => r.scope), ['project:alpha', 'project:beta']);
@@ -44,7 +44,7 @@ test('same-turn statements preserve identifier differences even when they quote 
     s.modelWillSay([old, next].map((branch) => ({
       op: 'add', type: 'fact', scope: 'global', body: `The deployment branch is ${branch}`, turn: 1, quote,
     })));
-    const run = s.sumo(['scribe', 'run']);
+    const run = s.sumo(['memory', 'run']);
     assert.equal(run.code, 0, run.err);
     const rows = s.sql((db) => db.prepare("SELECT body FROM memories WHERE state = 'active' ORDER BY id").all());
     assert.deepEqual(rows.map((r) => r.body), [old, next].map((branch) => `The deployment branch is ${branch}`));
@@ -126,7 +126,7 @@ test('the writer is woken at once by a standing instruction, and otherwise only 
 
   say(s, 'what does this function do?');
   s.hook('stop', SESSION);
-  assert.deepEqual(s.spawned(), ['scribe run'], 'the very first run has no batch to wait for');
+  assert.deepEqual(s.spawned(), ['memory run'], 'the very first run has no batch to wait for');
 
   s.sql((db) => db.prepare(`INSERT INTO meta (key, value) VALUES ('scribe.last_run', ?)`).run(new Date().toISOString()));
   s.hook('stop', SESSION);
@@ -170,7 +170,7 @@ test('the writer files what the user really said, holds back what it cannot prov
     { op: 'checkpoint', project: 'proj-simba', done: 'Fixed the null date in the briefing generator; PR #42 open', next: 'address review on PR #42' },
   ]);
 
-  const run = s.sumo(['scribe', 'run']);
+  const run = s.sumo(['memory', 'run']);
   assert.equal(run.code, 0, run.err);
   assert.match(run.out, /^read 2 turns \(3,400 tokens in, 120 out, \$0\.0040\)/);
   assert.match(run.out, /saved m\d+ \[dec·proj-simba·stated\] Never push to main/);
@@ -189,8 +189,8 @@ test('the writer files what the user really said, holds back what it cannot prov
   assert.match(next, /Left off: proj-simba — Fixed the null date in the briefing generator; PR #42 open → next: address review on PR #42/);
 
   // Filed turns are not read again.
-  assert.match(s.sumo(['scribe', 'run']).out, /nothing to do — nothing new was said/);
-  assert.match(s.sumo(['scribe', 'stats']).out, /^scribe: 1 run \(1 ok\) · 3,400 tokens in · 120 out · \$0\.0040/);
+  assert.match(s.sumo(['memory', 'run']).out, /nothing to do — nothing new was said/);
+  assert.match(s.sumo(['memory', 'status']).out, /^spent {6}filing: 1 run \(1 ok\) · 3,400 tokens in · 120 out · \$0\.0040/m);
 });
 
 test('the writer is shown the user and the assistant — never tool output, thinking, or sub-agent chatter', () => {
@@ -199,7 +199,7 @@ test('the writer is shown the user and the assistant — never tool output, thin
   const session = { ...SESSION, transcript_path: transcript(s) };
   say(s, 'fix the null date bug in simba', session);
   s.modelWillSay([]);
-  s.sumo(['scribe', 'run']);
+  s.sumo(['memory', 'run']);
 
   const { prompt, system, schema } = s.modelWasShown();
   assert.match(prompt, /\[t1\] user: fix the null date bug in simba/);
@@ -221,7 +221,7 @@ test('a replacement only takes effect when the user demonstrably said it', () =>
 
   // A quote the user never typed: the claim is held as a guess and the true memory stays in force.
   s.modelWillSay([{ op: 'supersede', old, body: 'simba deploys from the main branch', turn: 1, quote: 'a quote the user never typed at all' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /held for confirmation m\d+ .*main branch/);
+  assert.match(s.sumo(['memory', 'run']).out, /held for confirmation m\d+ .*main branch/);
   assert.match(search(), /release branch/, 'a guess must never hide something true');
   assert.doesNotMatch(search(), /main branch/);
 
@@ -229,14 +229,14 @@ test('a replacement only takes effect when the user demonstrably said it', () =>
   const stack = s.sql((db) => db.prepare(`SELECT id FROM memories WHERE scan_key = 'stack'`).get().id);
   say(s, 'to be clear: we moved simba deploys to the main branch');
   s.modelWillSay([{ op: 'supersede', old: stack, body: 'simba deploys from the main branch', turn: 2, quote: 'we moved simba deploys to the main branch' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m\d+ \[fact·proj-simba·stated\] simba deploys from the main branch/, 'no scope given: it belongs to the project being discussed');
+  assert.match(s.sumo(['memory', 'run']).out, /saved m\d+ \[fact·proj-simba·stated\] simba deploys from the main branch/, 'no scope given: it belongs to the project being discussed');
   assert.equal(s.sql((db) => db.prepare(`SELECT state FROM memories WHERE scan_key = 'stack'`).get().state), 'active', 'the unrelated memory is untouched');
   assert.match(search(), /release branch/, 'and the old fact is still in force, because nothing has replaced it yet');
 
   // The same words with the right target: the statement already on file now replaces the old fact.
   say(s, 'once more, we moved simba deploys to the main branch');
   s.modelWillSay([{ op: 'supersede', old, body: 'simba deploys from the main branch', turn: 3, quote: 'we moved simba deploys to the main branch' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, new RegExp(`m\\d+ now replaces m${old}`));
+  assert.match(s.sumo(['memory', 'run']).out, new RegExp(`m\\d+ now replaces m${old}`));
 
   assert.match(search(), /main branch/);
   assert.doesNotMatch(search(), /release branch/);
@@ -254,7 +254,7 @@ test('the words being the user\'s own is what counts, not which turn the model s
     { op: 'add', type: 'preference', scope: 'global', body: 'The user loves long meetings', turn: 3, quote: 'three lines max' },
     { op: 'add', type: 'preference', scope: 'global', body: 'Use tabs', turn: 1, quote: 'ok' },
   ]);
-  const run = s.sumo(['scribe', 'run']).out;
+  const run = s.sumo(['memory', 'run']).out;
   assert.match(run, /saved m1 \[pref·global·stated\] Keep PR descriptions to three lines max/);
   assert.match(run, /dropped — add: a guess about nothing the user typed, not kept — the quote is real but the memory is about something else/);
   assert.match(run, /dropped — add: a guess about nothing the user typed, not kept — the quote is too short to prove anything/);
@@ -270,7 +270,7 @@ test('a correction is never mistaken for a repeat', () => {
 
   // The model names what it replaces: the near-identical wording must not read as "already known".
   s.modelWillSay([{ op: 'supersede', old, scope: 'project:proj-simba', type: 'preference', body: 'Use bun for package management in simba', turn: 1, quote: 'we moved from pnpm to bun' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m\d+ \[pref·proj-simba·stated\] Use bun for package management in simba/);
+  assert.match(s.sumo(['memory', 'run']).out, /saved m\d+ \[pref·proj-simba·stated\] Use bun for package management in simba/);
   const found = s.sumo(['search', 'package management', '--project', 'simba']).out;
   assert.match(found, /Use bun/);
   assert.doesNotMatch(found, /Use pnpm/);
@@ -279,8 +279,10 @@ test('a correction is never mistaken for a repeat', () => {
   say(s, 'and for linting in simba we use biome now, not eslint');
   s.sumo(['add', 'preference', 'Use eslint for linting in simba', '--project', 'simba']);
   s.modelWillSay([{ op: 'add', type: 'preference', scope: 'project:proj-simba', body: 'Use biome for linting in simba', turn: 2, quote: 'for linting in simba we use biome now' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m\d+ .*Use biome for linting/);
-  assert.match(s.sumo(['prime']).out, /Ask the user: m\d+ and m\d+ look alike — .* \(sumo show both; settle with sumo supersede or sumo forget\)/);
+  assert.match(s.sumo(['memory', 'run']).out, /saved m\d+ .*Use biome for linting/);
+  // Asked in a session about simba, where the two rules apply.
+  const block = s.hook('session-start', { session_id: 'sess-simba', cwd: join(s.root, 'proj-simba'), source: 'startup' }).out;
+  assert.match(block, /Ask the user: m\d+ and m\d+ look alike — .* \(sumo show both; settle with sumo supersede or sumo forget\)/);
 });
 
 test('nothing is saved twice, a rejected guess is not proposed again, and one bad operation does not sink the rest', () => {
@@ -291,7 +293,7 @@ test('nothing is saved twice, a rejected guess is not proposed again, and one ba
   const guess = { op: 'add', type: 'preference', scope: 'global', body: 'The user dislikes long pull request descriptions', turn: 2 };
 
   s.modelWillSay([stated, guess, { op: 'add', type: 'opinion', body: 'x' }, { op: 'add', type: 'fact', scope: 'project:nowhere', body: 'y' }, { op: 'contradiction', ids: [1, 2] }, { op: 'drop_table' }]);
-  const first = s.sumo(['scribe', 'run']).out;
+  const first = s.sumo(['memory', 'run']).out;
   assert.match(first, /saved m1 /);
   assert.match(first, /held for confirmation m2 /);
   assert.match(first, /dropped — add: type "opinion" cannot come from a model/);
@@ -323,7 +325,7 @@ test('a request is not a statement: quoting it proves nothing, and a guess drawn
     // No quote at all: the model answering the question itself.
     { op: 'add', type: 'fact', scope: 'global', body: 'The router selects a model by task type and priority', turn: 1 },
   ]);
-  const out = s.sumo(['scribe', 'run']).out;
+  const out = s.sumo(['memory', 'run']).out;
   assert.match(out, /dropped — add: the quote is from a sentence that asks for work or an answer/);
   assert.equal(out.match(/the quote is from a sentence that asks/g).length, 2, 'a quote cut short of the request in its sentence proves no more than the sentence');
   assert.match(out, /dropped — add: a guess from a request, not kept/);
@@ -339,7 +341,7 @@ test('a request is not a statement: quoting it proves nothing, and a guess drawn
     { op: 'add', type: 'fact', scope: 'global', body: 'please tell the scout how the deploy works ok', turn: 2, quote: pasted.trim() },
   ]);
   const started = Date.now();
-  assert.match(s.sumo(['scribe', 'run']).out, /dropped — add: the quote is from a sentence that asks for work/);
+  assert.match(s.sumo(['memory', 'run']).out, /dropped — add: the quote is from a sentence that asks for work/);
   assert.ok(Date.now() - started < 1_500, `a long turn does not stall the writer (${Date.now() - started} ms)`);
 
   // A rule given inside a request is still a rule.
@@ -348,7 +350,7 @@ test('a request is not a statement: quoting it proves nothing, and a guess drawn
     { op: 'add', type: 'preference', scope: 'global', body: 'Always run the linter first', turn: 3, quote: 'from now on always run the linter first' },
     { op: 'add', type: 'fact', scope: 'global', body: 'Staging is deployed on Fly', turn: 3, quote: 'We deploy staging on Fly' },
   ]);
-  const kept = s.sumo(['scribe', 'run']).out;
+  const kept = s.sumo(['memory', 'run']).out;
   assert.match(kept, /saved m\d+ \[pref·global·stated\] Always run the linter first/);
   assert.match(kept, /saved m\d+ \[fact·global·stated\] Staging is deployed on Fly/, 'a statement beside a request, in a sentence of its own, is still a statement');
 });
@@ -358,15 +360,15 @@ test('when the writer fails, nothing is lost and the user is told after the thir
   say(s, 'always run the linter before committing');
   s.modelWillSay([], { isError: true });
 
-  for (let i = 0; i < 3; i++) assert.match(s.sumo(['scribe', 'run']).out, /^failed — model call failed: rate limited/);
+  for (let i = 0; i < 3; i++) assert.match(s.sumo(['memory', 'run']).out, /^failed — model call failed: rate limited/);
   assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM user_turns WHERE scribed = 0').get().n), 1, 'the turn is still waiting');
   assert.match(s.sumo(['prime']).out, /Warning: the background memory writer has failed 3 times in a row/);
-  assert.match(s.sumo(['scribe', 'status']).out, /failing: 3 in a row — model call failed/);
+  assert.match(s.sumo(['memory', 'status']).out, /^failing {4}filing failed 3 times in a row — model call failed/m);
 
   s.modelWillSay([{ op: 'add', type: 'preference', scope: 'global', body: 'Run the linter before committing', turn: 1, quote: 'always run the linter before committing' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m1 /);
+  assert.match(s.sumo(['memory', 'run']).out, /saved m1 /);
   assert.doesNotMatch(s.sumo(['prime']).out, /Warning/);
-  assert.match(s.sumo(['scribe', 'stats']).out, /scribe: 4 runs \(1 ok\)/);
+  assert.match(s.sumo(['memory', 'status']).out, /filing: 4 runs \(1 ok\)/);
 });
 
 test('the core block holds its budget at ten times a realistic memory, and says what it is not showing', () => {
@@ -393,9 +395,9 @@ test('erasing a memory erases the sentence it came from', () => {
   const s = sandbox();
   say(s, 'remember that my home address is 12 example street');
   s.modelWillSay([{ op: 'add', type: 'fact', scope: 'global', body: 'Home address is 12 example street', turn: 1, quote: 'my home address is 12 example street' }]);
-  s.sumo(['scribe', 'run']);
+  s.sumo(['memory', 'run']);
 
-  s.sumo(['forget', 'm1', '--purge']);
+  s.sumo(['forget', 'm1', '--purge', '--yes']);
   assert.match(s.sumo(['search', 'home address', '--turns']).out, /^the user never said anything like/);
   assert.equal(existsSync(join(s.home, 'memory.db')), true);
 });
@@ -466,7 +468,7 @@ test('a session that has grown big says so once per band, with the compact hint 
   grownTo(file, 90_000);
   assert.equal(
     say(s, 'keep going', session).out,
-    `context: large — quality drops from here. Finish the piece in hand, then tell the user to type /new: the memory block brings the thread back. ${hint}`,
+    `context: large — quality drops from here. Finish the piece in hand, then tell the user to type /handoff: a fresh session starts from your hand-off, and the memory block brings the thread back. ${hint}`,
   );
 
   grownTo(file, 100_000);
@@ -477,7 +479,7 @@ test('a session that has grown big says so once per band, with the compact hint 
   grownTo(file, 155_000);
   assert.equal(
     say(s, 'one more thing', session).out,
-    'context: very large — start fresh now: note where you are (sumo job note; the end of the turn records "Left off"), then tell the user to type /new. ' +
+    'context: very large — start fresh now: note where you are (sumo job note; the end of the turn records "Left off"), then tell the user to type /handoff, which carries your hand-off into a fresh session, or /new. ' +
       'hint: focus on migrate to pnpm; keep decisions and open job ids in a note; drop tool output and file contents.',
   );
 });
@@ -551,7 +553,7 @@ test('a secret the assistant repeated is scrubbed before the writer is shown the
   writeFileSync(file, JSON.stringify({ type: 'assistant', timestamp: at, message: { role: 'assistant', content: [{ type: 'text', text }] } }));
   say(s, 'fix the null date bug in simba', { ...SESSION, transcript_path: file });
   s.modelWillSay([]);
-  s.sumo(['scribe', 'run']);
+  s.sumo(['memory', 'run']);
 
   const { prompt } = s.modelWasShown();
   assert.match(prompt, /\[assistant\]: a a a /);
@@ -591,7 +593,7 @@ test('a background run that cannot be started is the background run\'s loss, nev
   const script = `
     process.execPath = '/nowhere/node';
     const { spawnDetached } = await import(${JSON.stringify(new URL('../src/scribe.mjs', import.meta.url).href)});
-    spawnDetached(['scribe', 'run']);
+    spawnDetached(['memory', 'run']);
     await new Promise((r) => setTimeout(r, 300));
     console.log('still here');`;
   const run = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--input-type=module', '-e', script], { encoding: 'utf8', env: { ...process.env, SUMO_AGENTS_HOME: join(sandbox().root, 'home'), SUMO_AGENTS_SPAWN_LOG: '' } });
@@ -607,13 +609,13 @@ test('the writer cannot retire a taught workflow, or a memory of another reach, 
 
   say(s, 'when creating a PR also run the linter locally first');
   s.modelWillSay([{ op: 'supersede', old: flow, type: 'preference', body: 'when creating a PR also run the linter locally first', turn: 1, quote: 'when creating a PR also run the linter locally first' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m\d+ \[pref/);
+  assert.match(s.sumo(['memory', 'run']).out, /saved m\d+ \[pref/);
   assert.equal(s.sql((db) => db.prepare('SELECT state FROM memories WHERE id = ?').get(flow).state), 'active', 'the workflow and its gate are still in force');
 
   // A statement about one project does not replace a rule that holds everywhere.
   say(s, 'in simba, when creating a PR write the description as plain prose');
   s.modelWillSay([{ op: 'supersede', old: rule, scope: 'project:proj-simba', body: 'when creating a PR write the description as plain prose', turn: 2, quote: 'when creating a PR write the description as plain prose' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /saved m\d+ \[pref·proj-simba/);
+  assert.match(s.sumo(['memory', 'run']).out, /saved m\d+ \[pref·proj-simba/);
   assert.equal(s.sql((db) => db.prepare('SELECT state FROM memories WHERE id = ?').get(rule).state), 'active', 'the global rule still holds elsewhere');
 });
 
@@ -623,7 +625,7 @@ test('a correction that differs by one word is a correction, not a repeat; and t
   s.sumo(['add', 'fact', 'The staging environment for the billing service is deployed from the release branch every Friday afternoon']);
   say(s, 'The staging environment for the billing service is deployed from the main branch every Friday afternoon');
   s.modelWillSay([{ op: 'add', type: 'fact', scope: 'global', body: 'The staging environment for the billing service is deployed from the main branch every Friday afternoon', turn: 1, quote: 'The staging environment for the billing service is deployed from the main branch every Friday afternoon' }]);
-  const corrected = s.sumo(['scribe', 'run']).out;
+  const corrected = s.sumo(['memory', 'run']).out;
   assert.doesNotMatch(corrected, /already known/);
   assert.match(corrected, /saved m\d+ \[fact·global·stated\] The staging environment .* main branch/);
   assert.match(s.sumo(['prime']).out, /look alike/, 'and the user is asked which of the two holds');
@@ -631,7 +633,7 @@ test('a correction that differs by one word is a correction, not a repeat; and t
   // The same stored statement, proposed again from a differently capitalized user turn, is not saved twice.
   say(s, 'the staging environment for the billing service is deployed from the main branch every friday afternoon!');
   s.modelWillSay([{ op: 'add', type: 'fact', scope: 'global', body: 'The staging environment for the billing service is deployed from the main branch every Friday afternoon', turn: 2, quote: 'the staging environment for the billing service is deployed from the main branch every friday afternoon' }]);
-  assert.match(s.sumo(['scribe', 'run']).out, /already known/);
+  assert.match(s.sumo(['memory', 'run']).out, /already known/);
 
   // One sentence, two rules, each with its own words quoted: the second is not a repeat of the first.
   const slate = join(s.root, 'proj-slate');
@@ -643,7 +645,7 @@ test('a correction that differs by one word is a correction, not a repeat; and t
     { op: 'add', type: 'fact', scope: 'project:proj-simba', body: 'simba uses pnpm as its package manager', turn: 3, quote: 'simba uses pnpm as its package manager' },
     { op: 'add', type: 'fact', scope: 'project:proj-slate', body: 'slate uses bun as its package manager', turn: 3, quote: 'slate uses bun as its package manager' },
   ]);
-  const both = s.sumo(['scribe', 'run']).out;
+  const both = s.sumo(['memory', 'run']).out;
   assert.match(both, /saved m\d+ \[fact·proj-simba·stated\] simba uses pnpm/);
   assert.match(both, /saved m\d+ \[fact·proj-slate·stated\] slate uses bun/);
 });
@@ -652,12 +654,12 @@ test('a purge says what it erased: the sentence a memory came from goes with it,
   const s = sandbox();
   say(s, 'remember that the door code at the office is zebra-quartz-1987');
   s.modelWillSay([{ op: 'add', type: 'fact', scope: 'global', body: 'the door code at the office is zebra-quartz-1987', turn: 1, quote: 'the door code at the office is zebra-quartz-1987' }]);
-  const filed = /saved m(\d+) /.exec(s.sumo(['scribe', 'run']).out)[1];
-  assert.match(s.sumo(['forget', `m${filed}`, '--purge']).out, new RegExp(`^purged m${filed} — erased, not recoverable, with the sentence it came from`));
+  const filed = /saved m(\d+) /.exec(s.sumo(['memory', 'run']).out)[1];
+  assert.match(s.sumo(['forget', `m${filed}`, '--purge', '--yes']).out, new RegExp(`^purged m${filed} — erased, not recoverable, with the sentence it came from`));
   assert.match(s.sumo(['search', 'door code office', '--turns']).out, /^the user never said anything like/);
 
   const loose = /saved m(\d+) /.exec(s.sumo(['add', 'fact', 'the build needs node twenty-four']).out)[1];
-  assert.match(s.sumo(['forget', `m${loose}`, '--purge']).out, /no sentence of the user's was tied to it — sumo search --turns finds one if it is there/);
+  assert.match(s.sumo(['forget', `m${loose}`, '--purge', '--yes']).out, /no sentence of the user's was tied to it — sumo search --turns finds one if it is there/);
 });
 
 test('an operation file may name a memory as m12, the way every command does', () => {
@@ -734,12 +736,16 @@ test('an order for now is not a rule: what the user tells the assistant to do ne
     'set them in the other box and eploy and lmk',
     'dont deploy yet',
     'soo i want to improve my privacy routing',
+    // A change to one thing, now: the change lives in the code, not in memory.
+    'make the button blue',
+    'actually, make it green',
+    'rename the config file to settings.json',
   ];
-  const rules = ['use Telegram alerts for Simba; do not build a web push UI', 'run the tests before pushing', 'i want every report to say which model ran', 'dont add anything from screenshots to the code, and keep it out of the commit history aswell'];
+  const rules = ['use Telegram alerts for Simba; do not build a web push UI', 'run the tests before pushing', 'i want every report to say which model ran', 'dont add anything from screenshots to the code, and keep it out of the commit history aswell', 'update the changelog whenever a release goes out', 'always make the primary button blue'];
   const all = [...orders, ...rules];
   for (const text of all) say(s, text);
   s.modelWillSay(all.map((text, i) => ({ op: 'add', type: 'decision', scope: 'global', body: text, turn: i + 1, quote: text })));
-  const out = s.sumo(['scribe', 'run']).out;
+  const out = s.sumo(['memory', 'run']).out;
   assert.equal(out.match(/asks for work or an answer/g)?.length, orders.length, out);
   assert.deepEqual(s.sql((db) => db.prepare(`SELECT body FROM memories ORDER BY id`).all().map((r) => r.body)), rules);
 });
@@ -754,7 +760,7 @@ test('a guess is put to the user only when it is about something they typed: wha
     { op: 'add', type: 'fact', scope: 'global', body: 'Books storage defaults to the share directory' },
     guess,
   ]);
-  const first = s.sumo(['scribe', 'run']).out;
+  const first = s.sumo(['memory', 'run']).out;
   assert.match(first, /held for confirmation m1 .*Previews moved to fly/, 'the words were not exact, but it is about what the user typed');
   assert.equal(first.match(/dropped — add: a guess about nothing the user typed, not kept/g)?.length, 2, first);
 
@@ -769,4 +775,49 @@ test('a guess is put to the user only when it is about something they typed: wha
   // The slow pass reads conversations side by side: a pattern nobody said out loud is its to put to the user, with no turn to point at.
   writeFileSync(ops, JSON.stringify({ ops: [{ op: 'add', type: 'preference', scope: 'global', body: 'Likes changes shipped in small steps', turn: null, quote: null }] }));
   assert.match(s.sumo(['apply', ops, '--source', 'dream']).out, /held for confirmation m2 /);
+});
+
+test('a rule turned round is not the user\'s word: a "never" filed from an "always" — or from a quote cut short of its "never" — is held, while a "not" about the old tool is not a turn', () => {
+  const s = sandbox();
+  say(s, 'always run the linter before you commit');
+  say(s, 'never push to main here');
+  say(s, 'for linting we use biome now, not eslint');
+  s.modelWillSay([
+    { op: 'add', type: 'preference', scope: 'global', body: 'Never run the linter before you commit', turn: 1, quote: 'run the linter before you commit' },
+    { op: 'add', type: 'preference', scope: 'global', body: 'Push to main here', turn: 2, quote: 'push to main here' },
+    { op: 'add', type: 'preference', scope: 'global', body: 'Use biome for linting', turn: 3, quote: 'for linting we use biome now' },
+  ]);
+  const out = s.sumo(['memory', 'run']).out;
+  assert.match(out, /held for confirmation m\d+ \[pref·global·inferred·unconfirmed\] Never run the linter before you commit — the quote is real but the memory says it the other way round/);
+  assert.match(out, /held for confirmation m\d+ \[pref·global·inferred·unconfirmed\] Push to main here — the quote is real but the memory says it the other way round/);
+  assert.match(out, /saved m\d+ \[pref·global·stated\] Use biome for linting/);
+});
+
+test('a correction written as "bun, not pnpm" from "we moved from pnpm to bun" is the user\'s word; a "never" about what they never set aside is held', () => {
+  const s = sandbox();
+  say(s, 'in slate we moved from pnpm to bun last week');
+  say(s, 'force-push freely for the slate repo');
+  say(s, 'slate uses pnpm, never npm');
+  say(s, 'staging uses postgres, never mysql');
+  say(s, 'the api uses redis, never memcached');
+  say(s, 'Tests run with vitest, not jest.');
+  s.modelWillSay([
+    { op: 'add', type: 'decision', scope: 'global', body: 'slate uses bun, not pnpm', turn: 1, quote: 'we moved from pnpm to bun' },
+    { op: 'add', type: 'preference', scope: 'global', body: 'For the slate repo, never force-push', turn: 2, quote: 'force-push freely for the slate repo' },
+    // Their own words whole, quoted short of the comma: the "never npm" is still theirs, from the same sentence.
+    { op: 'add', type: 'preference', scope: 'global', body: 'slate uses pnpm, never npm', turn: 3, quote: 'slate uses pnpm' },
+    // Or quoted as nothing but the alternative: it is judged with the clause it is set against.
+    { op: 'add', type: 'preference', scope: 'global', body: 'staging uses postgres, never mysql', turn: 4, quote: 'never mysql' },
+    // Quoted whole, exactly as typed — the commonest quote of all.
+    { op: 'add', type: 'preference', scope: 'global', body: 'the api uses redis, never memcached', turn: 5, quote: 'the api uses redis, never memcached' },
+    // Quoted with quote marks and its full stop: still the words the user typed.
+    { op: 'add', type: 'preference', scope: 'global', body: 'tests run with vitest, not jest', turn: 6, quote: '"Tests run with vitest, not jest."' },
+  ]);
+  const out = s.sumo(['memory', 'run']).out;
+  assert.match(out, /saved m\d+ \[dec·global·stated\] slate uses bun, not pnpm/);
+  assert.match(out, /saved m\d+ \[pref·global·stated\] slate uses pnpm, never npm/);
+  assert.match(out, /saved m\d+ \[pref·global·stated\] staging uses postgres, never mysql/);
+  assert.match(out, /saved m\d+ \[pref·global·stated\] the api uses redis, never memcached/);
+  assert.match(out, /saved m\d+ \[pref·global·stated\] tests run with vitest, not jest/);
+  assert.match(out, /held for confirmation m\d+ \[pref·global·inferred·unconfirmed\] For the slate repo, never force-push — the quote is real but the memory says it the other way round/);
 });

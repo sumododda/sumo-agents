@@ -1,23 +1,28 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { ADVISOR_BETA, ADVISOR_SPENT, ADVISOR_SPENT_AT, ADVISOR_STOP_AT, advisorIn, advisorLine, advisorOf, advisorResult, advisorRuns, advisorTool, isAdvisorCall, isAdvisorResult } from './advisor.mjs';
-import { anthropicClient, authenticatedRequest, resolveAnthropicCredential } from './auth.mjs';
+import { anthropicClient, authenticatedRequest, FALLBACK_BETA, loadSdk, resolveAnthropicCredential } from './auth.mjs';
 import { MODEL_IDS, modelId, MODELS, usableModels } from './catalog.mjs';
 import { getMeta, tx } from './db.mjs';
 import { handleEvent } from './hooks.mjs';
-import { brief, getJob, planOf, readState, runLockFile, settle, takeInbox, toldToClose, treeOf } from './jobs.mjs';
+import { brief, getJob, noteOutsideRead, planOf, readState, runLockFile, settle, takeInbox, toldToClose, treeOf } from './jobs.mjs';
 import { isJobTool, jobTools, runJobTool } from './jobtools.mjs';
 import { takeLock } from './lock.mjs';
 import { DECLINED, gateMcp, isMcpTool, mcpReady, runMcpTool, TOOL_SEARCH } from './mcp.mjs';
 import { UsageError } from './memory.mjs';
+import { noteRewrite, prefixOf } from './cost.mjs';
 import { callLocalModel, costOf, logRun, usageOf } from './model.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
 import { getProject } from './projects.mjs';
+import { noteSessionOutside } from './sessions.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { ASK_TOOL, BASH_TOOL, childEnv, EDITOR_TOOL, INTERRUPTED, killGroup, runTool } from './tools.mjs';
 import { changesSince, diffStat, verdictLines } from './verify.mjs';
-import { isWebCall, isWebResult, WEB_TOOLS, webResult } from './web.mjs';
+import { isWebCall, isWebResult, isWebTool, WEB_TOOLS, webResult } from './web.mjs';
+
+// The loop is what makes requests: whatever imports it is about to, so the SDK is loaded with it (auth.mjs loads it
+// for no one else). Its error classes are what a failed request is told apart by.
+const Anthropic = await loadSdk();
 
 /**
  * The loop every conversation runs in: one request, the policy pipeline over
@@ -28,7 +33,7 @@ import { isWebCall, isWebResult, WEB_TOOLS, webResult } from './web.mjs';
  */
 
 const MAX_TURNS = 150;
-/** Every model but haiku always thinks, and the thinking counts toward this: it holds a long turn's thinking and its reply. */
+/** Every model always thinks, and the thinking counts toward this: it holds a long turn's thinking and its reply. */
 const MAX_OUTPUT_TOKENS = 64_000;
 const REQUEST_TIMEOUT_MS = 600_000;
 const BETAS = ['context-management-2025-06-27'];
@@ -36,10 +41,12 @@ const BETAS = ['context-management-2025-06-27'];
 const CUT_OFF = 'not run: the reply was cut off before this call was complete';
 /**
  * A request sent again after the API or the connection gave way, not the request: how many times, and the wait between
- * tries, doubling from the base to the cap. The SDK itself tries twice more only before the first byte; a stream that
- * breaks half-way, or an overload it has given up on, lands here, and a nine-minute job must not die of one 529.
+ * tries, doubling from the base to the cap. Every try is the loop's — the client's own would be waited on with nothing
+ * said, two under each of these — so each is counted down where the work shows, and a nine-minute job does not die of one 529.
  */
 export const RETRY = { limit: 6, baseMs: 1000, capMs: 30_000 };
+/** The tries a lone request — a summary, a hand-off — gets from the client, in the background: nothing sends it again otherwise. */
+export const QUIET_RETRIES = 2;
 /** The same call with the same input and the same answer, over and over: said to the model at the third, and the run stopped at the fifth. */
 const REPEAT_NUDGE_AT = 3;
 const REPEAT_STOP_AT = 5;
@@ -87,7 +94,7 @@ const CIRCLES_SCHEMA = { type: 'object', properties: { stuck: { type: 'boolean' 
 /** The beta under which one request summarizes the conversation server-side, in place of answering it. */
 const COMPACT_BETA = 'compact-2026-09-04';
 /** Where a job sheds its past rather than stop: the "act" band of the context gauge, where quality is already falling. */
-export const COMPACT_AT = 150_000;
+const COMPACT_AT = 150_000;
 /** Not again until this many responses after the last summary: a conversation at once too big again is not fixed by another. */
 const COMPACT_GAP = 3;
 /** What the summary is to keep, told to the summarizer in place of the server's own prompt. */
@@ -151,11 +158,34 @@ export function codingRules() {
 export const systemPrompt = () => [promptFile('agent.md'), `## How the user wants code changed\n${codingRules()}`].join('\n\n');
 
 /**
- * How a model thinks: every model but haiku always does, and is asked to say in summary what it thought, so a turn that
- * runs for minutes is not silent on the screen — the thinking itself, and its price, are the same either way. Haiku takes
- * no thinking setting at all.
+ * How a model thinks: every model always does, and is asked to say in summary what it thought, so a turn that runs for
+ * minutes is not silent on the screen — the thinking itself, and its price, are the same either way. `model` is kept
+ * for a model that may one day take none.
  */
-export const thinkingFor = (model) => (modelId(model) === MODEL_IDS.haiku ? undefined : { type: 'adaptive', display: 'summarized' });
+export const thinkingFor = (_model) => ({ type: 'adaptive', display: 'summarized' });
+
+/**
+ * Whether a model's declined replies are run again on another, server-side: every model but haiku, whose refusals have no
+ * fallback. A request that goes on from one answered that way carries the `fallback` block as it came, and is priced on
+ * the model that answered.
+ */
+const fallsBack = (model) => modelId(model) !== MODEL_IDS.haiku;
+
+/** A request's fallback set as its model takes it: on, with its beta, or off. The request itself is changed. */
+export function withFallback(params, model) {
+  const betas = (params.betas ?? []).filter((b) => b !== FALLBACK_BETA);
+  if (fallsBack(model)) {
+    params.fallbacks = 'default';
+    params.betas = [...betas, FALLBACK_BETA];
+  } else {
+    delete params.fallbacks;
+    params.betas = betas;
+  }
+  return params;
+}
+
+/** The model a reply fell back to, when it did: the API answered on another model after the first declined. Null otherwise. */
+const fellBackTo = (response) => response.content?.find((b) => b.type === 'fallback')?.to?.model ?? null;
 
 /** The request for a conversation's first turn. */
 export function paramsFor({ model, effort, tools, text, system }) {
@@ -171,7 +201,7 @@ export function paramsFor({ model, effort, tools, text, system }) {
   if (effort && effort !== 'none') params.output_config = { effort };
   const thinking = thinkingFor(model);
   if (thinking) params.thinking = thinking;
-  return params;
+  return withFallback(params, model);
 }
 
 /**
@@ -250,10 +280,14 @@ export function markTail(messages) {
 
 export const textOf = (content) => content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
 
-/** The default transport: streamed, so a long turn never trips the HTTP timeout; the text and the thinking said as they come, and each block of the reply as it ends. */
-export async function sendToApi(params, { onText, onThinking, onBlock, signal } = {}) {
+/**
+ * The default transport: streamed, so a long turn never trips the HTTP timeout; the text and the thinking said as they come,
+ * and each block of the reply as it ends. The client sends nothing again by itself: the loop does, where the wait is
+ * counted on the screen. A request nothing sends again — a summary, a hand-off — asks for the client's quiet `retries`.
+ */
+export async function sendToApi(params, { onText, onThinking, onBlock, signal, retries = 0 } = {}) {
   const credential = resolveAnthropicCredential();
-  const client = anthropicClient({ timeout: REQUEST_TIMEOUT_MS }, credential);
+  const client = anthropicClient({ timeout: REQUEST_TIMEOUT_MS, maxRetries: retries }, credential);
   const stream = client.beta.messages.stream(authenticatedRequest(params, credential), signal ? { signal } : undefined);
   if (onText) stream.on('text', onText);
   if (onThinking) stream.on('thinking', (delta, snapshot) => onThinking(delta, snapshot));
@@ -281,6 +315,9 @@ export function retryDelay(cause, attempt, { baseMs, capMs } = RETRY, random = M
 }
 
 /** What went wrong with a request, in one short line: the status and the API's own words, not the JSON they came in. */
+/** The API's refusal of a conversation too big for the model to take whole: a 400 that says so. */
+const overflowed = (cause) => cause?.status === 400 && /prompt is too long/i.test(describeFailure(cause));
+
 export function describeFailure(cause) {
   if (cause instanceof Anthropic.APIError && (cause.error?.error?.message || cause.type)) {
     const type = cause.type ?? cause.error?.error?.type ?? null;
@@ -384,8 +421,12 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
   const totals = { inputTokens: 0, outputTokens: 0, costUsd: 0, toolCalls: 0, contextTokens: 0 };
   let turns = 0;
   let stop = 'max_turns';
+  /** What the API said with a refusal: the category, when it gave one. */
+  let stopDetail = null;
   let text = '';
   let compactedAt = -Infinity;
+  /** Whether the conversation was summarized because the model would no longer take it whole: once a run. */
+  let shedForLength = false;
   let toldLast = false;
   // The ledger names the model that answered: with a fallback that is not always the one asked for.
   const log = (result, note, model = params.model) => logRun(db, { kind: ledger.kind, model, result, note, now: now(), jobId: ledger.jobId ?? null, sessionId: ledger.sessionId ?? null });
@@ -435,6 +476,34 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     for (const call of hosted.open.values()) onResult?.(call, { content: 'not finished: the request ended first', isError: true });
     hosted.open.clear();
   };
+  /**
+   * The conversation so far summarized server-side, and the run gone on from the summary. A summary that cannot be had
+   * costs nothing but its request: the run goes on as it was. True when the summary stands in place of the history;
+   * 'interrupted' when the user stopped it.
+   */
+  async function shed() {
+    compactedAt = turns;
+    try {
+      const summary = await send(compactionParams(params, compact.instructions), { signal, retries: QUIET_RETRIES });
+      const block = summary.content.find((b) => b.type === 'compaction' && b.content);
+      const by = summary.model ?? params.model;
+      const spent = usageOf(by, summary.usage);
+      totals.inputTokens += spent.inputTokens;
+      totals.outputTokens += spent.outputTokens;
+      totals.costUsd += costOf(by, summary.usage ?? {});
+      log({ ok: Boolean(block), usage: spent }, `turn ${turns} compaction${block ? '' : ': no summary came back'}`, by);
+      if (!block) return false;
+      ledger.cleared = true;
+      // A job's own record of its work rides after the line, from code and not from the summary; whatever cannot be read is left out.
+      params.messages = [{ role: 'assistant', content: summary.content }, { role: 'user', content: [{ type: 'text', text: [RESUMED(compact.brief), recordedBy(compact)].filter(Boolean).join('\n\n') }] }];
+      onCompact?.({ turns, before: totals.contextTokens, summary: block.content });
+      return true;
+    } catch (cause) {
+      if (signal?.aborted) return 'interrupted';
+      log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns} compaction: ${describeFailure(cause).slice(0, 200)}`);
+      return false;
+    }
+  }
 
   while (turns < MAX_TURNS) {
     // A job that has spent its budget sends nothing more: the last round it made is answered, and the run ends there.
@@ -467,6 +536,17 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
           if (await pause(delayMs, signal)) return interrupted();
           continue;
         }
+        // A conversation the model no longer takes whole is summarized, once, and sent again from the summary; refused again, the run ends as any error ends it.
+        if (compact && overflowed(cause) && !shedForLength) {
+          shedForLength = true;
+          log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns}: ${why} — summarizing to go on`);
+          const shedding = await shed();
+          if (shedding === 'interrupted') return interrupted();
+          if (shedding) {
+            markTail(params.messages);
+            continue;
+          }
+        }
         log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns}: ${why}`);
         return { turns, stop: 'error', error: describeFailure(cause).slice(0, 300), status: cause.status ?? null, text, totals, toldLast };
       }
@@ -477,7 +557,9 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     totals.outputTokens += usage.outputTokens;
     totals.costUsd += costOf(served, response.usage ?? {});
     totals.contextTokens = contextOf(served, response.usage);
-    log({ ok: true, usage }, `turn ${turns} ${response.stop_reason}${clearedBy(response)}`, served);
+    log({ ok: true, usage }, `turn ${turns} ${response.stop_reason}${clearedBy(response)}${fellBackTo(response) ? ` fell back from ${params.model}` : ''}`, served);
+    // Why this request wrote its context again, if it did, on its row: the API clearing tool uses before it answered is one reason.
+    noteRewrite(db, ledger, { at: Date.parse(now()), model: served, prefix: prefixOf(params), usage, cleared: clearedBy(response) !== '' });
     // What the advisor read and wrote is not in the reply's own count: it is paid at the advisor's price, and has a row under its name.
     for (const run of advisorRuns(response.usage)) {
       const spent = usageOf(run.model, run);
@@ -487,8 +569,10 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
       log({ ok: true, usage: spent }, `turn ${turns} advisor`, run.model);
     }
 
-    // A refused reply is not kept: what streamed before the refusal is not an answer, and its calls were never made.
+    // A refused reply is not kept: what streamed before the refusal is not an answer, and its calls were never made. Why, when the
+    // API says — the category the classifiers put it in — is said with the stop.
     const refused = response.stop_reason === 'refusal';
+    if (refused) stopDetail = response.stop_details?.category ?? null;
     // A reply with nothing in it is not kept either: the API refuses an empty message once anything follows it.
     if (response.content.length > 0 && !refused) params.messages.push({ role: 'assistant', content: response.content });
     if (!refused) text = textOf(response.content) || text;
@@ -597,30 +681,12 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     // Past the band where the work must either stop or shed its past: the conversation so far is summarized server-side, here, at the
     // end of a tool round, and goes on from the summary. A summary that cannot be had costs nothing but its request: the run goes on as it was.
     if (compact && !overBudget() && !overTime() && totals.contextTokens >= compact.at && turns - compactedAt >= COMPACT_GAP) {
-      compactedAt = turns;
-      try {
-        const summary = await send(compactionParams(params, compact.instructions), { signal });
-        const block = summary.content.find((b) => b.type === 'compaction' && b.content);
-        const by = summary.model ?? params.model;
-        const spent = usageOf(by, summary.usage);
-        totals.inputTokens += spent.inputTokens;
-        totals.outputTokens += spent.outputTokens;
-        totals.costUsd += costOf(by, summary.usage ?? {});
-        log({ ok: Boolean(block), usage: spent }, `turn ${turns} compaction${block ? '' : ': no summary came back'}`, by);
-        if (block) {
-          // A job's own record of its work rides after the line, from code and not from the summary; whatever cannot be read is left out.
-          params.messages = [{ role: 'assistant', content: summary.content }, { role: 'user', content: [{ type: 'text', text: [RESUMED(compact.brief), recordedBy(compact)].filter(Boolean).join('\n\n') }] }];
-          onCompact?.({ turns, before: totals.contextTokens, summary: block.content });
-        }
-      } catch (cause) {
-        if (signal?.aborted) return interrupted();
-        log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns} compaction: ${describeFailure(cause).slice(0, 200)}`);
-      }
+      if ((await shed()) === 'interrupted') return interrupted();
     }
   }
 
   endHosted();
-  return { turns, stop, error: null, text, totals, toldLast };
+  return { turns, stop, stopDetail, error: null, text, totals, toldLast };
 }
 
 /**
@@ -695,7 +761,7 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   const lock = tx(db, () => takeRunLock(id));
   const heard = () => [...(inbox?.() ?? []), ...takeInbox(id)];
   // A command the sandbox blocked is put to the user with the job named, as its MCP calls are; its background commands are its own to end.
-  const ctx = { ...contextFor(project, { jobId: id, sandbox: sandboxOn(db), network: networkOn(db), tree: tree?.path }), approve: approve && ((ask) => approve({ ...ask, job: id })), background: new Set() };
+  const ctx = { ...contextFor(project, { jobId: id, sandbox: sandboxOn(db), network: networkOn(db), tree: tree?.path }), approve: approve && ((ask) => approve({ ...ask, job: id })), opened: new Set(), background: new Set() };
   // The workflow gate holds a job's commands as it holds the chat's: once per session for this job, which has a context of its own,
   // and with the job's own project in scope whether or not its card came up in the session.
   const gate = (call) => {
@@ -718,7 +784,18 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
       const plan = turns % PLAN_EVERY === 0 ? planOf(id) : null;
       return plan && PLAN_AGAIN(plan);
     };
-    const run = () => converse(db, params, { send, now, signal, onTool, onResult, onTurn, onThinking, onRetry, onCompact, compact, budget, clock, circling, remind, inbox: heard, beforeTool: gate, ctx, ledger: { kind: job.agent, jobId: id, sessionId: job.session_id } });
+    // A call that reaches past the machine — a search, a fetch, an MCP server — is written down: what the job then says it
+    // learned is held for the user, not filed as fact.
+    // So is the conversation the job reports to: its report reaches the chat, and what the chat says after it may be what
+    // a page told the job.
+    const told = (call) => {
+      if (isWebTool(call) || isMcpTool(call.name)) {
+        noteOutsideRead(id, call.name);
+        noteSessionOutside(db, job.session_id, call.name);
+      }
+      onTool?.(call);
+    };
+    const run = () => converse(db, params, { send, now, signal, onTool: told, onResult, onTurn, onThinking, onRetry, onCompact, compact, budget, clock, circling, remind, inbox: heard, beforeTool: gate, ctx, ledger: { kind: job.agent, jobId: id, sessionId: job.session_id } });
     let outcome = await run();
     if (outcome.stop === 'end_turn' && getJob(db, id).status === 'running') {
       params.messages.push({ role: 'user', content: [{ type: 'text', text: UNCLOSED }] });
@@ -806,9 +883,9 @@ async function circlingWhy(db, calls) {
 /** One run per job: two would drive two agents over the same tree. */
 const takeRunLock = (id) => takeLock(runLockFile(id), (holder) => `j${id} is already being run (process ${holder}) — wait for it, or stop it there`);
 
-/** Why a conversation ended, when it was neither the model finishing nor the user stopping it nor an error; null otherwise. Said to a chat as to a job. */
-export function stopReason(stop) {
-  if (stop === 'refusal') return 'stopped: the model declined to continue';
+/** Why a conversation ended, when it was neither the model finishing nor the user stopping it nor an error; null otherwise. Said to a chat as to a job. `detail` is the refusal's category, when the API gave one. */
+export function stopReason(stop, detail = null) {
+  if (stop === 'refusal') return `stopped: the model declined to continue${detail ? ` (${detail})` : ''}`;
   if (stop === 'max_tokens') return 'stopped: a reply hit the output limit';
   if (stop === 'model_context_window_exceeded') return 'stopped: the conversation no longer fits in the model\'s context';
   if (stop === 'max_turns') return `stopped: ${MAX_TURNS} turns without an end`;
@@ -831,7 +908,7 @@ export function runLines(outcome) {
   if (stop === 'error') lines.push(`stopped: ${outcome.error}`);
   if (stop === 'interrupted') lines.push(INTERRUPTED);
   if (stop === 'max_turns') lines.push(`stopped: ${MAX_TURNS} turns without closing the job`);
-  else if (stopReason(stop)) lines.push(stopReason(stop));
+  else if (stopReason(stop, outcome.stopDetail)) lines.push(stopReason(stop, outcome.stopDetail));
   if (closed === 'never closed') lines.push(`close it yourself from its report: sumo job show ${job.id}`);
   if (outcome.text) lines.push(...outcome.text.split('\n').slice(-6));
   return lines;

@@ -14,7 +14,7 @@ import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { MODELS } from '../src/catalog.mjs';
 import { chooseRoute, EFFORTS } from '../src/route.mjs';
-import { CONFIG_DEFAULTS } from '../src/setup.mjs';
+import { modelFileOfUrl } from '../src/setup.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 /** Every route on one scale, cheapest first: haiku/none, sonnet/low … fable/max. */
@@ -77,7 +77,8 @@ const real = paths();
 if (!existsSync(real.db)) throw new Error(`no database at ${real.db} — run: sumo setup`);
 const realDb = new DatabaseSync(real.db, { readOnly: true });
 const llama = getMeta(realDb, 'llama.path');
-const modelFile = getMeta(realDb, 'config.model.file') ?? CONFIG_DEFAULTS['model.file'];
+const modelUrl = getMeta(realDb, 'config.model.url');
+const modelFile = modelFileOfUrl(modelUrl ?? undefined);
 realDb.close();
 if (!llama || !existsSync(join(real.models, modelFile))) throw new Error('the router model is not set up — run: sumo setup');
 
@@ -92,7 +93,8 @@ for (const [name, jobs] of Object.entries(HISTORIES)) {
     const db = openDb();
     try {
       setMeta(db, 'llama.path', llama);
-      setMeta(db, 'config.model.file', modelFile);
+      // Only the file is needed here: the address goes without any token in it.
+      if (modelUrl) setMeta(db, 'config.model.url', `${new URL(modelUrl).origin}${new URL(modelUrl).pathname}`);
       const { project } = addProject(db, mkdtempSync(join(tmpdir(), 'sumo-agents-probe-')), { slug: 'probe' });
       const insert = db.prepare(`INSERT INTO jobs (project, title, agent, status, created_at, updated_at, model, effort, important) VALUES (?, 'x', 'worker', ?, ?, ?, ?, ?, ?)`);
       for (const [status, model, effort, important] of jobs) insert.run(project.slug, status, now, now, model, effort, important);

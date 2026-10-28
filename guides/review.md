@@ -4,7 +4,7 @@ when: review, audit, "look over", critique
 # Review
 
 1. Judge the change, not its author's account of it. A report is claims; a stated reason never makes a finding smaller.
-2. First — does it do what was asked? Missing: asked for, not there. Extra: there, not asked for. Misunderstood: the wrong thing, built well. Check every requirement and every named edge case against the change.
+2. First — does it do what was asked? Missing: asked for, not there. Extra: there, not asked for. Misunderstood: the wrong thing, built well. The brief lists what was asked by number; give a verdict on each number, with what in the change shows it, and check every named edge case against the change.
 3. Then — can it be trusted? Wrong behaviour, a regression, damaged data or a race, a broken interface, a check that was weakened, changed behaviour with no test, tests that assert nothing.
 4. Read the change, not the codebase. Look outside it only for a risk you can name — callers of a changed signature, users of changed shared state — one look per risk, and say what you looked at.
 5. The change touches sign-in or permissions, input parsing, SQL, file paths, shell commands, secrets or deserialising → follow what an outsider controls to where it lands. Never call code secure; say what you could not see.

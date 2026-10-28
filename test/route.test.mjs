@@ -85,12 +85,12 @@ test('a scout is routed like every job: what the router says is what it runs on'
   await withRouter({ model: 'opus', effort: 'high', reason: 'deep trace' }, async (db, project) => {
     assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), { model: 'opus', effort: 'high', reason: 'router: deep trace', risky: false });
   });
-  await withRouter({ model: 'haiku', effort: 'none', reason: 'a quick look' }, async (db, project) => {
+  await withRouter({ model: 'haiku', effort: 'low', reason: 'a quick look' }, async (db, project) => {
     // While sonnet is on, a scout's first attempt does not run on haiku: the policy says so after the router's reason.
     assert.deepEqual(await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), {
       model: 'sonnet',
       effort: 'low',
-      reason: "router: a quick look; policy: a scout's first attempt starts on sonnet at low effort, not haiku (the router said haiku/none)",
+      reason: "router: a quick look; policy: a scout's first attempt starts on sonnet at low effort, not haiku (the router said haiku/low)",
       risky: false,
     });
   });
@@ -99,20 +99,19 @@ test('a scout is routed like every job: what the router says is what it runs on'
   });
 });
 
-test('an effort that does not fit the model is outside the schema: haiku takes none, the others need one', async () => {
-  await withRouter({ model: 'haiku', effort: 'low', reason: 'x' }, async (db, project) => {
+test('an effort that is not one is outside the schema, on every model: none would silently run on whatever effort the session has', async () => {
+  await withRouter({ model: 'haiku', effort: 'none', reason: 'x' }, async (db, project) => {
     await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /the router failed: the router answered outside its schema/);
   });
-  // No effort would silently run the plain role sub-agent on whatever effort the session has.
   await withRouter({ model: 'sonnet', effort: 'none', reason: 'x' }, async (db, project) => {
     await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), /the router failed: the router answered outside its schema/);
   });
-  await withRouter({ model: 'haiku', effort: 'none', reason: 'mechanical' }, async (db, project) => {
-    assert.deepEqual(await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), { model: 'haiku', effort: 'none', reason: 'router: mechanical', risky: false });
+  await withRouter({ model: 'haiku', effort: 'low', reason: 'mechanical' }, async (db, project) => {
+    assert.deepEqual(await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), { model: 'haiku', effort: 'low', reason: 'router: mechanical', risky: false });
   });
 });
 
-test('the schema the router answers under pairs haiku with no effort, and every other model with a real one', async () => {
+test('the schema the router answers under pairs every model that is on with a real effort', async () => {
   const capture = join(mkdtempSync(join(tmpdir(), 'sumo-agents-route-capture-')), 'saw.json');
   await withRouter({ model: 'sonnet', effort: 'low', reason: 'x' }, async (db, project) => {
     process.env.STUB_CAPTURE = capture;
@@ -123,11 +122,7 @@ test('the schema the router answers under pairs haiku with no effort, and every 
     }
   });
   const { schema } = JSON.parse(readFileSync(capture, 'utf8'));
-  const pairs = schema.anyOf.map((branch) => [branch.properties.model.enum, branch.properties.effort.enum]);
-  assert.deepEqual(pairs, [
-    [['haiku'], ['none']],
-    [['sonnet', 'opus', 'fable'], ['low', 'medium', 'high', 'xhigh', 'max']],
-  ]);
+  assert.deepEqual([schema.properties.model.enum, schema.properties.effort.enum], [['haiku', 'sonnet', 'opus', 'fable'], ['low', 'medium', 'high', 'xhigh', 'max']]);
 });
 
 test('the router describes the job before it picks: kind, surface and risky come ahead of the model in every answer', async () => {
@@ -141,10 +136,8 @@ test('the router describes the job before it picks: kind, surface and risky come
     }
   });
   const { schema } = JSON.parse(readFileSync(capture, 'utf8'));
-  for (const branch of schema.anyOf) {
-    assert.deepEqual(Object.keys(branch.properties), ['kind', 'surface', 'risky', 'model', 'effort', 'reason']);
-    assert.deepEqual(branch.required, Object.keys(branch.properties));
-  }
+  assert.deepEqual(Object.keys(schema.properties), ['kind', 'surface', 'risky', 'model', 'effort', 'reason']);
+  assert.deepEqual(schema.required, Object.keys(schema.properties));
 });
 
 test('a reason is one line of text: missing is outside the schema, a newline is folded', async () => {
@@ -255,7 +248,7 @@ test('a model that is off is outside the router\'s grammar and prompt; an answer
       delete process.env.STUB_CAPTURE;
     }
     const { schema, prompt } = JSON.parse(readFileSync(capture, 'utf8'));
-    assert.deepEqual(schema.anyOf.map((branch) => branch.properties.model.enum), [['sonnet', 'opus']], 'no haiku branch, no fable');
+    assert.deepEqual(schema.properties.model.enum, ['sonnet', 'opus'], 'no haiku, no fable');
     assert.match(prompt, /^models: sonnet, opus$/m, 'the router is told which models are on');
   });
   await withRouter({ model: 'fable', effort: 'high', reason: 'x' }, async (db, project) => {
@@ -270,7 +263,7 @@ test('a model that is off is outside the router\'s grammar and prompt; an answer
 });
 
 test('a model that is off is never a job\'s route: the router is not offered it, and an answer naming it is refused', async () => {
-  await withRouter({ model: 'haiku', effort: 'none', reason: 'a quick look' }, async (db, project) => {
+  await withRouter({ model: 'haiku', effort: 'low', reason: 'a quick look' }, async (db, project) => {
     setModel(db, 'haiku', false, NOW);
     await assert.rejects(chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' }), /the router failed: the router answered outside its schema/);
   });

@@ -27,7 +27,7 @@ function probe(s, { background = false } = {}) {
       const child = spawnSync(process.execPath, ['--input-type=module', '-e',
         'import tls from "node:tls"; const defaults = new Set(tls.getCACertificates("default")); console.log(JSON.stringify({enabled: process.env.NODE_USE_SYSTEM_CA, missing: tls.getCACertificates("system").filter(c => !defaults.has(c)).length}));'
       ], { env: childEnv(), encoding: 'utf8' });
-      const isBackground = process.argv.includes('scribe');
+      const isBackground = process.argv.includes('memory');
       writeFileSync(${JSON.stringify(s.root)} + (isBackground ? '/background.json' : '/tls.json'), JSON.stringify({
         enabled: process.env.NODE_USE_SYSTEM_CA,
         missing: tls.getCACertificates('system').filter(c => !defaults.has(c)).length,
@@ -36,7 +36,7 @@ function probe(s, { background = false } = {}) {
         extra: tls.getCACertificates('extra'),
         child: { code: child.status, ...JSON.parse(child.stdout) },
       }));
-      if (${background} && !isBackground) spawnDetached(['scribe', 'status']);
+      if (${background} && !isBackground) spawnDetached(['memory', 'status']);
     });
   `);
   return preload;

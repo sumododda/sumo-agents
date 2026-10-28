@@ -10,7 +10,7 @@ import { test } from 'node:test';
 import { openDb } from '../src/db.mjs';
 import { closeMcp } from '../src/mcp.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
-import { resultLine, runTask, scoreWork, seed, summary } from '../probes/coding-eval.mjs';
+import { dropLine, resultLine, runTask, scoreWork, seed, summary } from '../probes/coding-eval.mjs';
 import { TASKS } from '../probes/coding-eval-tasks.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
@@ -121,7 +121,11 @@ test('a stand-in that does each task right passes every one, through the real jo
       assert.equal(r.route, 'sonnet/low');
       assert.ok(r.requests >= 2, `${r.id}: its requests are counted (${r.requests})`);
     }
-    assert.match(summary(results), /^8 runs: 8 passed · 0 said DONE and were not · \d+ requests · /);
+    assert.match(summary(results), /^8 runs: 8 passed · 0 said DONE and were not · \d+ requests · .* · \$\d+\.\d\d$/);
+    assert.doesNotMatch(summary(results), /pass\^/, 'one run each says nothing of consistency');
+    // Run three times, a task that failed once counts toward pass@3 and not pass^3.
+    const thrice = [1, 2, 3].flatMap((run) => results.map((r) => ({ ...r, run, passed: !(run === 2 && r.id === results[0].id) })));
+    assert.match(summary(thrice), /\npass\^3: 7 of 8 tasks passed every run · pass@3: 8 of 8 passed at least once$/);
     assert.match(resultLine(results[0]), /^PASS cart-quantity +worker sonnet\/low +done +\d+ requests +\d+s +\$0\.\d\d$/);
   });
 });
@@ -162,4 +166,41 @@ test('the ways to be wrong are told apart: a DONE taken with the work wrong, a D
     assert.ok(scoreWork(task('open-routes'), tmpdir(), '**OPEN:** `get /account/export`, POST  /login, GET /health\n- UNINTENDED: GET /account/export\n').every((c) => c.ok));
     assert.ok(scoreWork(task('who-calls'), tmpdir(), 'No line at all.').every((c) => !c.ok && c.detail === 'no such line'));
   });
+});
+
+test('--drop takes exactly one line out of a prompt or guide for the run, and puts nothing on disk', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { codingRules, systemPrompt } = await import('../src/loop.mjs');
+  const { guideBody } = await import('../src/guides.mjs');
+  const agents = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8');
+  const target = '- Reuse existing helpers; copy an in-repo example before inventing a pattern.';
+  const at = agents.split('\n').indexOf(target) + 1;
+  assert.ok(at > 0 && systemPrompt().includes(target));
+
+  const dropped = dropLine(`AGENTS.md:${at}`);
+  try {
+    assert.equal(dropped.line, target);
+    assert.ok(!systemPrompt().includes(target), 'the job is not told that line');
+    assert.ok(!codingRules().includes(target));
+    // Through the module, as the loaders read it: a function copied out of it before the drop is the one from before.
+    const fs = await import('node:fs');
+    assert.equal(fs.readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8').split('\n').length, agents.split('\n').length - 1, 'read in this process, the file is one line short');
+  } finally {
+    dropped.restore();
+  }
+  assert.ok(systemPrompt().includes(target), 'and whole again after');
+  assert.equal(readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8'), agents, 'the file on disk was never touched');
+
+  const fix = guideBody('fix');
+  const second = fix.split('\n').find((l) => l.trim());
+  const line = readFileSync(join(REPO_ROOT, 'guides', 'fix.md'), 'utf8').split('\n').indexOf(second) + 1;
+  const guide = dropLine(`guides/fix.md:${line}`);
+  try {
+    assert.ok(!guideBody('fix').split('\n').includes(second));
+  } finally {
+    guide.restore();
+  }
+  for (const [bad, said] of [['src/loop.mjs:1', /a prompt or guide/], ['AGENTS.md', /<file>:<line>/], ['AGENTS.md:99999', /has \d+ lines/], ['../etc/passwd:1', /a prompt or guide/]]) {
+    assert.throws(() => dropLine(bad), said, bad);
+  }
 });

@@ -83,14 +83,14 @@ test('retry refuses a job that is still running, and one that is done without en
   gitProject(s);
   newWorker(s);
   const runningRetry = s.sumo(['job', 'retry', '1']);
-  assert.equal(runningRetry.code, 2);
+  assert.equal(runningRetry.code, 1);
   assert.match(runningRetry.err, /j1 is running — only a failed job, or a done one reviewed with important >= 3, can be retried/);
 
   const p = gitProject(s);
   p.write('src.js', 'export const thing = 2;\n');
   assert.equal(finishWorker(s, '1').code, 0);
   const notEnough = s.sumo(['job', 'retry', '1']);
-  assert.equal(notEnough.code, 2);
+  assert.equal(notEnough.code, 1);
   assert.match(notEnough.err, /j1 is done \(important: 0\) — only a failed job/);
 });
 
@@ -104,10 +104,10 @@ test('retry asks the router again — no ladder — and carries the old attempt 
   s.routerWillSay('opus', 'medium', 'the first attempt failed on lint');
   const retried = s.sumo(['job', 'retry', '1']);
   assert.equal(retried.code, 0, retried.err);
-  assert.match(retried.out, /^created j2 \[worker·proj-route·running\] return 2 \(retry of j1\)/);
+  assert.match(retried.out, /^created j2 \[worker·proj-route·not started\] return 2 \(retry of j1\)/);
   assert.match(retried.out, /^route: opus\/medium — router: the first attempt failed on lint$/m);
-  assert.match(retried.out, /run it: sumo job run \d+/);
-  assert.match(retried.out, /run it: sumo job run 2/);
+  assert.match(retried.out, /run it: sumo job run j\d+/);
+  assert.match(retried.out, /run it: sumo job run j2/);
   assert.equal(s.sql((db) => db.prepare('SELECT retry_of FROM jobs WHERE id = 2').get().retry_of), 1);
   // The router is told what it is retrying, or it would hand back the route that just failed.
   const shown = s.modelWasShown().prompt;
@@ -215,12 +215,12 @@ test('a retried reviewer still reviews the job the original was pointed at', () 
   assert.match(s.sumo(['job', 'brief', '3']).out, /What was asked: .*jobs\/1\/brief\.md/);
 });
 
-test('an effort of none names the plain role sub-agent, never worker-none', () => {
+test('a route on haiku is a model and an effort like any other', () => {
   const s = sandbox();
   gitProject(s);
-  s.routerWillSay('haiku', 'none');
+  s.routerWillSay('haiku', 'low');
   const created = s.sumo(['job', 'new', '--project', 'routeproj', '--title', 'return 2'], { input: TASK });
   assert.equal(created.code, 0, created.err);
-  assert.match(created.out, /^route: haiku\/none/m);
-  assert.match(created.out, /run it: sumo job run \d+/);
+  assert.match(created.out, /^route: haiku\/low/m);
+  assert.match(created.out, /run it: sumo job run j\d+/);
 });

@@ -22,6 +22,19 @@ export function ftsQuery(text) {
   return unique.map((w) => `"${w.replaceAll('"', '""')}"`).join(' OR ');
 }
 
+/** Han, Hiragana, Katakana and Hangul: scripts whose words run on into the next, or into what is joined to them. */
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+/**
+ * The words of a search in Chinese, Japanese or Korean. The index keeps a run of such characters as one word —
+ * "日本語のテスト" is a single token — so a word inside it is never matched there; these are looked for in the text
+ * itself. Read alike from what was typed or from `ftsQuery`'s expression, which quotes the same words.
+ */
+export const cjkTerms = (text) => [...new Set(words(text))].filter((w) => CJK.test(w));
+
+/** A LIKE pattern for `term` anywhere in a text, LIKE's own characters taken as themselves (with ESCAPE '\'). */
+export const containing = (term) => `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+
 /**
  * Crude suffix stripping, for judging whether two short texts are about the
  * same thing. The index itself uses SQLite's porter stemmer.
@@ -44,6 +57,46 @@ export function overlap(a, b) {
   let shared = 0;
   for (const s of sa) if (sb.has(s)) shared++;
   return shared / Math.min(sa.size, sb.size);
+}
+
+/** How much of what a memory says must be in the user's own words for it to be theirs. */
+const SAID_SHARE = 0.8;
+/**
+ * The words that turn a rule round: "never" is not "always", "don't" is not "do". Only a negation counts: an "always"
+ * a model adds to what was said changes how firmly, never which way.
+ */
+const NEGATION = /\b(?:never|not|no|none|avoid|without|cannot|dont|doesnt|didnt|wont|cant|isnt|arent|shouldnt|mustnt)\b|\b\w+n['’]t\b/i;
+/** A trailing "…, not B" or "…, never B", B a word or three: the alternative a statement is chosen over. */
+const ALTERNATIVE = /[,;]\s*(?:but\s+)?(?:not|never)\s+([\w.@/+-]+(?:\s+[\w.@/+-]+){0,2})\s*\.?\s*$/i;
+/** Whether a text is nothing but such an alternative — "never npm" — with no statement of its own to turn round. */
+export const onlyAlternative = (text) => /^\s*(?:but\s+)?(?:not|never)\s+[\w.@/+-]+(?:\s+[\w.@/+-]+){0,2}\s*\.?\s*$/i.test(text);
+/** Whether a text sets `alt` aside itself: moved "from" it, chose "instead of", "rather than" or "over" it, or said "not" it. */
+const setsAside = (text, alt) => {
+  const said = alt.replace(/[.*+?^${}()|[\]\\]/g, (c) => `\\${c}`);
+  return new RegExp(`\\b(?:from|instead of|rather than|over|not|never|no)\\s+(?:the\\s+)?${said}\\b`, 'i').test(text);
+};
+/** The text without its trailing alternative, when the other text sets that alternative aside too. */
+const withoutAlternative = (text, other) => {
+  const m = ALTERNATIVE.exec(text);
+  return m && setsAside(other, m[1].replace(/\.+$/, '')) ? text.slice(0, m.index) : text;
+};
+/**
+ * Whether two texts say a thing the same way round: both negate it, or neither does. "slate uses bun, not pnpm" from "we
+ * moved from pnpm to bun" is not a turn — the "not" sets aside what they moved from; "never force-push" is, from "force-push
+ * freely", which set nothing aside. `aside` is where `a`'s alternative is looked for, when `b` is only part of what was said.
+ */
+export const sameWayRound = (a, b, aside = b) => NEGATION.test(withoutAlternative(a, aside)) === NEGATION.test(withoutAlternative(b, a));
+
+/**
+ * Whether what the user typed says what a memory says: nearly all of the memory's own words are in theirs — not a
+ * few of theirs inside much they never said — and it says it the same way round, never for always, don't for do.
+ */
+export function saysAs(memory, typed, share = SAID_SHARE) {
+  const theirs = new Set(words(typed).map(stem));
+  const its = [...new Set(words(memory).map(stem))];
+  if (its.length === 0) return false;
+  const covered = its.filter((w) => theirs.has(w)).length / its.length;
+  return covered >= share && sameWayRound(memory, typed);
 }
 
 /** How many distinct stems two texts have in common. */
@@ -93,5 +146,51 @@ const VERBS = /describe|explain|delegate|fix|find|investigate|look\s+(?:at|into|
 const FOR_NOW = /\b(?:not|n't|dont|don't)\b[^.!?\n]*\byet\b|\b(?:lmk|let\s+me\s+know)\b/.source;
 const REQUEST = new RegExp(`(?:^|[.,:;!?)]\\s+|\\n\\s*)${OPENERS}(?:${VERBS})\\b|\\?\\s*$|${FOR_NOW}`, 'im');
 
+/** Verbs that change something. Aimed at one thing now, they ask for work; with a condition they are a rule. */
+const CHANGES = new Set(['make', 'change', 'rename', 'update', 'add', 'remove', 'delete', 'move', 'refactor', 'create', 'build', 'run', 'deploy', 'bump', 'revert', 'undo', 'turn', 'fix']);
+/** Verbs that are almost always one change, now: a rule seldom renames, deletes or undoes. */
+const NOW_ONLY = new Set(['rename', 'delete', 'undo', 'revert']);
+const POINTING = new Set(['it', 'this', 'that', 'these', 'those']);
+/** What makes a change a rule: when it happens, or to what, every time. */
+const CONDITION = /\b(?:before|after|when|whenever|each|every|unless|always|never|by default)\b/i;
+/** Asking for an answer, or saying what the work is now — wherever in the sentence it comes. */
+const ANSWER_OR_SWITCH = /\b(?:tell|show|give)\s+me\b|\bcheck\s+(?:if|whether)\b|^(?:switching|switch|moving|going)\s+(?:to|over\s+to)\b|^(?:back|now)\s+(?:on|to)\b|^(?:work|get\s+back)\s+on\b/i;
+const LEADING = /^(?:(?:please|pls|now|then|also|and|so+|ok|okay|yes|yeah|yep|just|actually|lets|let's)[\s,]+)+/i;
+
+/**
+ * A change to one thing, now — "make the button blue", "deploy it", "rename the config file" — whose result lives in
+ * the code, not in memory. Read narrowly, because a rule lost is lost silently: a change verb aimed at it/this/that, a
+ * change to "the X" in four words or fewer, or a rename, delete or undo; never with a condition ("run the tests before
+ * pushing"), and never a longer "the" sentence, which reads the same as a rule ("make the commit messages imperative").
+ */
+function oneChange(sentence) {
+  const words = sentence.replace(LEADING, '').replace(/[.!?,;:]+$/, '').trim().toLowerCase().split(/\s+/);
+  if (!CHANGES.has(words[0]) || CONDITION.test(sentence)) return false;
+  return POINTING.has(words[1]) || NOW_ONLY.has(words[0]) || (words[1] === 'the' && words.length <= 4);
+}
+
 /** Words that ask for work or an answer and state nothing that lasts: nothing in them is a memory. */
-export const asksForWork = (text) => REQUEST.test(String(text ?? '')) && !looksDurable(String(text ?? ''));
+export const asksForWork = (text) => {
+  const said = String(text ?? '');
+  if (looksDurable(said)) return false;
+  const sentences = said.split(/(?<=[.!?;])\s+|\n+/).map((x) => x.trim()).filter(Boolean);
+  return REQUEST.test(said) || sentences.some((x) => oneChange(x) || ANSWER_OR_SWITCH.test(x.replace(LEADING, '')));
+};
+
+/**
+ * The known name a mistyped one was most likely meant to be: two edits away at most, nearer than any other, and with
+ * at least half of what was typed kept — `m` is no guess at `mcp`, nor `xml` at `md`; `serch` is at `search`.
+ */
+export function closest(typed, names) {
+  const distance = (a, b) => {
+    let row = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const next = [i];
+      for (let j = 1; j <= b.length; j++) next.push(Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)));
+      row = next;
+    }
+    return row[b.length];
+  };
+  const ranked = [...new Set(names)].map((name) => ({ name, d: distance(String(typed).toLowerCase(), name) })).sort((x, y) => x.d - y.d);
+  return ranked[0] && ranked[0].d <= 2 && ranked[0].d <= Math.floor(String(typed).length / 2) ? ranked[0].name : null;
+}

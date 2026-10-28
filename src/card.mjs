@@ -16,16 +16,49 @@ export function ago(iso, now) {
   return `${Math.round(hours / 24)}d ago`;
 }
 
+/** How long a guess is put to the user; after that it waits on the memory page and in search. */
+const GUESS_ASKED_DAYS = 14;
+const ASK_LINE_MAX = 120;
+
+/**
+ * What to put to the user about these scopes: guesses newer than two weeks, and notices whose two memories both
+ * still stand — superseding or forgetting either settles one. The session-start block asks about everything and the
+ * session's own project; a project's card asks about that project, wherever the session was started.
+ */
+export function askLines(db, { scopes, now, guesses: maxGuesses, notices: maxNotices }) {
+  const marks = scopes.map(() => '?').join(', ');
+  const since = new Date(Date.parse(now) - GUESS_ASKED_DAYS * 86_400_000).toISOString();
+  const guesses = db.prepare(`SELECT * FROM memories WHERE state = 'unconfirmed' AND scope IN (${marks}) AND created_at >= ? ORDER BY id LIMIT ?`).all(...scopes, since, maxGuesses);
+  const out = guesses.map((m) => `Ask the user (then sumo confirm|reject m${m.id}): is this right? "${clip(m.type === 'procedure' ? `workflow "${m.title}"` : m.body, ASK_LINE_MAX)}"`);
+  const notices = db
+    .prepare(
+      `SELECT n.* FROM notices n
+       JOIN memories a ON a.id = n.memory_a AND a.state = 'active' AND a.scope IN (${marks})
+       JOIN memories b ON b.id = n.memory_b AND b.state = 'active' AND b.scope IN (${marks})
+       ORDER BY n.id LIMIT ?`,
+    )
+    .all(...scopes, ...scopes, maxNotices);
+  for (const n of notices) {
+    const verb = n.kind === 'lookalike' ? 'look alike' : 'disagree';
+    out.push(`Ask the user: m${n.memory_a} and m${n.memory_b} ${verb} — ${clip(n.note, ASK_LINE_MAX)} (sumo show both; settle with sumo supersede or sumo forget)`);
+  }
+  return out;
+}
+
+/** The most a card asks: room is kept for what the project is. */
+const CARD_GUESSES = 2;
+const CARD_NOTICES = 1;
+
 /**
  * What an agent needs the moment a project comes up, under a hard budget.
  * To fit, whole lines are left out — and counted, so the card says how much it
  * is not showing. A single over-long line is clipped with a visible ellipsis;
  * `sumo show <id>` has the rest.
  */
-export function card(db, nameOrAlias, { budget = CARD_BUDGET_TOKENS, now = new Date().toISOString() } = {}) {
+export function card(db, nameOrAlias, { budget = CARD_BUDGET_TOKENS, now = new Date().toISOString(), asks = false } = {}) {
   const project = getProject(db, nameOrAlias);
   // Scratch has no memory to show: its card is how it is used.
-  if (isScratch(project)) return [`<project ${project.slug}> ${project.path}`, ...scratchRules(db), '</project>'].join('\n');
+  if (isScratch(project)) return [`<project ${project.slug}> ${project.path}`, ...scratchRules(), '</project>'].join('\n');
   const scope = `project:${project.slug}`;
   const rows = db
     .prepare(`SELECT * FROM memories WHERE scope = ? AND state = 'active' ORDER BY pinned DESC, importance DESC, hits DESC, id DESC`)
@@ -35,6 +68,10 @@ export function card(db, nameOrAlias, { budget = CARD_BUDGET_TOKENS, now = new D
   let order = 0;
   // A line that is a memory carries its id, so what the card shows can be counted as used.
   const offer = (priority, text, id = null) => candidates.push({ priority, order: order++, text: clip(text, LINE_MAX), id });
+
+  // Asked of the user, so only where the user is: first, and whole — clipped, a question would lose what it asks.
+  // A job's brief and `sumo project show` leave them out.
+  if (asks) for (const text of askLines(db, { scopes: [scope], now, guesses: CARD_GUESSES, notices: CARD_NOTICES })) candidates.push({ priority: 0, order: order++, text, id: null });
 
   for (const m of rows.filter((r) => r.scan_key)) offer(SCAN_PRIORITY[m.scan_key] ?? 11, m.body, m.id);
   for (const m of rows.filter((r) => !r.scan_key && (r.type === 'preference' || r.type === 'decision'))) offer(PRIORITY.rule, `rule m${m.id}: ${m.body}`, m.id);
