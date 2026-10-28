@@ -78,7 +78,9 @@ const screen = (herdr, pane) => {
  */
 export async function startWatcher(herdr, { pane, job, command, sleep = pause, tries = TRIES }) {
   const watching = new RegExp(`job watch ${job}(?!\\d)`);
-  const started = (info) => info.foreground_processes?.some((p) => watching.test(String(p.cmdline))) || screen(herdr, pane)?.includes(`⏺ j${job} `);
+  // The record's first line: the job named in the ledger's gutter, then who works on it.
+  const shown = new RegExp(`(?:^|\\n) *j${job} {2,}\\S`);
+  const started = (info) => info.foreground_processes?.some((p) => watching.test(String(p.cmdline))) || shown.test(screen(herdr, pane) ?? '');
   for (let attempt = 0; attempt < tries; attempt++) {
     let last = null;
     for (let waited = 0; waited < READY_MS; waited += POLL_MS) {

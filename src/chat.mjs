@@ -27,7 +27,7 @@ import { currentProject, describeSaved, findSaved, loadState, lockFile, noteSess
 import { ASK_TOOL, BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTERRUPTED, nextUndoTurn, runCommand, undoLast } from './tools.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { closest, estimateTokens, head } from './text.mjs';
-import { colourEnabled, createRenderer, explained, header, pathFrom, prompt, renderBlock, safeForTerminal, styles, tilde, toolView, widthOf } from './tty.mjs';
+import { colourEnabled, createRenderer, explained, header, ledger, OUT_AT, pathFrom, prompt, renderBlock, safeForTerminal, styles, TEXT_AT, tilde, toolView, widthOf, wrap } from './tty.mjs';
 import { hasCommit } from './verify.mjs';
 import { isWebTool, sourcesOf, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_TOOLS } from './web.mjs';
 
@@ -216,32 +216,33 @@ function parseRoute(args, current, db) {
  * break a secret apart where the redaction after it would no longer see it whole.
  */
 export function jobPrinter(write, s, { width = 98, clean = (text) => text, cwd = null } = {}) {
-  // Each call as the chat names it — Bash(npm test), Read(src/cart.js) — a file from the project the job works in.
+  // Each call as the chat's ledger names it — run npm test, read src/cart.js — a file from the project the job works in.
   const at = () => (typeof cwd === 'function' ? cwd() : cwd);
   return {
-    onStart: (job) => write(`⏺ ${s.bold(`j${job.id}`)} ${job.agent} · ${routeOf(job)} — ${job.title}\n`),
+    onStart: (job) => write(`${s.bold(ledger(`j${job.id}`))}${job.agent} · ${routeOf(job)} — ${job.title}\n`),
     onTool: (call) => {
       const view = toolView(call, null, { cwd: at() });
       // One line, and where more was cut away, the ellipsis that says so.
       const [first, ...rest] = clean(view.detail).split('\n');
       const line = first.length > 160 ? `${first.slice(0, 159)}…` : rest.length > 0 && !first.endsWith('…') ? `${first} …` : first;
-      write(`  ⏺ ${s.bold(view.title)}(${line})\n`);
+      write(`${s.dim(ledger(view.title))}${line}\n`);
     },
-    onRetry: (r) => write(`  ${s.dim(retryLine(r))}\n`),
-    onCompact: (c) => write(`  ${s.dim(compactLine(c))}\n`),
+    onRetry: (r) => write(`${' '.repeat(TEXT_AT)}${s.dim(retryLine(r))}\n`),
+    onCompact: (c) => write(`${' '.repeat(TEXT_AT)}${s.dim(compactLine(c))}\n`),
     onResult: (call, result) => {
-      // The line that says how it went, as the chat's screen would show it: what a command printed first, a read's size, an edit's first change.
+      // The line that says how it went, as the chat's screen would show it: what a command printed first, a read's size, an
+      // edit's first change — under the step's words; a failure with its mark, which says so without the colour.
       const first = toolView(call, { content: String(result.content ?? ''), isError: Boolean(result.isError), edit: result.edit }, { cwd: at() }).lines[0]?.text ?? '';
-      write(`    ⎿  ${s.dim(clean(first).slice(0, 160))}\n`);
+      write(`${' '.repeat(OUT_AT - 2)}${result.isError ? `${s.red('✗')} ` : '  '}${s.dim(clean(first).slice(0, 160))}\n`);
     },
     onTurn: (response) => {
       const text = textOf(response.content);
       if (!text) return;
       const drawn = [];
-      const reply = createRenderer((t) => drawn.push(t), s, { width });
+      const reply = createRenderer((t) => drawn.push(t), s, { width: width - TEXT_AT });
       reply.write(clean(text));
       reply.flush();
-      write(`${drawn.join('').split('\n').map((l) => (l ? `  ${l}` : l)).join('\n')}\n`);
+      write(`${drawn.join('').split('\n').map((l, i) => (i === 0 ? `${s.bold(ledger('sumo'))}${l}` : l ? `${' '.repeat(TEXT_AT)}${l}` : l)).join('\n')}\n`);
     },
   };
 }
@@ -1208,8 +1209,7 @@ async function screen(db, { model, effort, resume }) {
     if (session.spoken) {
       const s = styles(colourEnabled());
       const cost = session.spent();
-      // Two short lines, each with its margin, so a narrow window never wraps one past it.
-      process.stdout.write(`\n${s.dim(`  sumo chat --resume ${shortId(session.sessionId)}`)}\n${s.dim(`  picks this session up again${cost >= 0.005 ? ` · it cost $${cost.toFixed(2)}` : ''}`)}\n\n`);
+      process.stdout.write(farewell({ id: shortId(session.sessionId), cost, columns: process.stdout.columns || 80 }, s));
     }
   } finally {
     // Jobs still at work in the background are stopped with the chat, and let go of what they hold before it closes.
@@ -1218,6 +1218,15 @@ async function screen(db, { model, effort, resume }) {
     await closeMcp();
   }
   return 0;
+}
+
+/**
+ * The way back in, said as the screen closes: the command that picks the session up again, and what it cost — two short
+ * lines, each with its margin, folded to the window under it: a narrow one never has them back at the edge.
+ */
+export function farewell({ id, cost, columns }, s) {
+  const said = wrap(`picks this session up again${cost >= 0.005 ? ` · it cost $${cost.toFixed(2)}` : ''}`, Math.max(20, columns - 3));
+  return `\n${s.dim(`  sumo chat --resume ${id}`)}\n${said.split('\n').map((row) => s.dim(`  ${row}`)).join('\n')}\n\n`;
 }
 
 /**
@@ -1257,7 +1266,7 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
     // Piped, nobody answers a question: one of the model's is not asked, an MCP call not on the allow list is refused, and a server that failed is said.
     watch: (e) => {
       if (e.type === 'retry' && e.job === undefined) return write(`${s.dim(`  › ${retryLine(e)}`)}\n`);
-      if (e.type === 'sources') return write(`\n${e.sources.map((page) => s.dim(`  ⎿  ${safeForTerminal(`${page.title} — ${page.url}`).replace(/\s+/g, ' ')}`)).join('\n')}\n`);
+      if (e.type === 'sources') return write(`\n${e.sources.map((page) => s.dim(`    ${safeForTerminal(`${page.title} — ${page.url}`).replace(/\s+/g, ' ')}`)).join('\n')}\n`);
       if (e.type !== 'mcp') return;
       if (e.error) write(`${s.red(`mcp: ${e.error}`)}\n`);
       for (const server of e.servers.filter((x) => !x.ok)) write(`${s.red(`mcp ${server.name}: ${server.error}`)}\n`);
@@ -1265,7 +1274,7 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
   });
   const rule = () => write(`\n${s.dim('─'.repeat(width))}\n\n`);
   /** A line under what the user typed, as a tool's result is drawn: what a command did. */
-  const result = (text) => write(`${s.dim(`  ⎿  ${text}`)}\n`);
+  const result = (text) => write(`${s.dim(`    ${text}`)}\n`);
   /** The header, then the memory block of a fresh session or the line that says what a resumed one is. */
   const show = (block, after = '') => {
     write(`${header({ route: routeLine(session), cwd: process.cwd() }, s)}\n\n`);
@@ -1319,7 +1328,7 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
           continue;
         }
         if (control === 'model' || control === 'memory' || control === 'mcp' || control === 'undo') {
-          result(control === 'model' ? session.route(args) : control === 'undo' ? session.undo() : control === 'mcp' ? (await session.mcp()).join('\n     ') : await session.memoryPage());
+          result(control === 'model' ? session.route(args) : control === 'undo' ? session.undo() : control === 'mcp' ? (await session.mcp()).join('\n    ') : await session.memoryPage());
           continue;
         }
         if (control === 'context') {

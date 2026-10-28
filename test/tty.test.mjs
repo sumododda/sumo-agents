@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { createRenderer, explained, flow, header, highlight, linked, logoLines, markdownOf, messageAt, pickMessage, prompt, renderBlock, renderLine, renderTable, spinnerMessages, styles, sunset, toolView, transcript, withoutColourCodes, wrap } from '../src/tty.mjs';
+import { createRenderer, explained, GUTTER, header, highlight, ledger, linked, logoLines, markdownOf, messageAt, OUT_AT, pickMessage, prompt, renderBlock, renderLine, renderTable, spinnerMessages, styles, TEXT_AT, toolView, transcript, VERSION, withoutColourCodes, wrap } from '../src/tty.mjs';
 
 const on = styles(true);
 const off = styles(false);
@@ -49,7 +49,7 @@ describe('the chat terminal rendering', () => {
   });
 
   it('keeps the route in the header and the prompt, and the context size once it matters', () => {
-    assert.equal(header({ route: 'opus · high', cwd: '/w' }, off), 'sumo  route opus · high  /w');
+    assert.equal(header({ route: 'opus · high', cwd: '/w' }, off), `  sumo   opus · high${VERSION ? ` · ${VERSION}` : ''} · /w`);
     assert.equal(prompt({ route: 'opus · high', contextTokens: 0 }, off), 'sumo opus · high> ');
     assert.equal(prompt({ route: 'auto → sonnet · medium', contextTokens: 12_400 }, off), 'sumo auto → sonnet · medium 12k> ');
   });
@@ -82,17 +82,14 @@ describe('the chat terminal rendering', () => {
     assert.equal(messageAt(['Working'], 'Working', 60_000), 'Working', 'one message stays');
   });
 
-  it('colours in a sunset — gold into crimson — that flows through words one character a frame', () => {
-    assert.equal(sunset(0), '#ffd166');
-    assert.equal(sunset(1), '#d62828');
-    assert.match(sunset(0.25), /^#[0-9a-f]{6}$/);
-    assert.equal(sunset(-1), sunset(0), 'held to the ends');
-    assert.equal(flow(0, 0), sunset(0));
-    assert.equal(flow(3, 1), flow(2, 0), 'each colour moves one character on, each frame');
-    assert.notEqual(flow(0, 1), flow(0, 0), 'a character changes colour as it flows');
-    const loop = Array.from({ length: 48 }, (_, i) => flow(i, 0));
-    assert.deepEqual(loop.slice(24), loop.slice(0, 24), 'there and back again, round and round');
-    assert.ok(loop.includes(sunset(1)), 'crimson on the way');
+  it('sets each row in a ledger: its name set right in the gutter, its state beside it, its words in one column for every row', () => {
+    assert.equal(ledger('you'), '   you   ');
+    assert.equal(ledger('run', '✗'), '   run ✗ ');
+    assert.equal(ledger('search').length, TEXT_AT, 'a name as wide as the gutter fills it');
+    assert.equal(ledger('advisory'), `${'adviso'} ${' '} `, 'a longer one is cut to the gutter, never pushing the words along');
+    assert.equal(ledger(''), ' '.repeat(TEXT_AT), 'a row that goes on has no name');
+    assert.equal(TEXT_AT, GUTTER + 3);
+    assert.equal(OUT_AT, TEXT_AT + 2, 'what came back stands under the words of its step');
   });
 
   it('reads the logo from a file the user edits: its rows kept as drawn, an empty row inside it kept, comments and the blank edges dropped', () => {
@@ -106,7 +103,7 @@ describe('the chat terminal rendering', () => {
 
   it('shows a tool call the way the work reads: the command whole, and both ends of what came back', () => {
     const bash = { name: 'bash', input: { command: 'npm test\necho more' } };
-    assert.deepEqual(toolView(bash), { title: 'Bash', detail: 'npm test\necho more', lines: [] }, 'before the result there is only the call');
+    assert.deepEqual(toolView(bash), { title: 'run', detail: 'npm test\necho more', lines: [] }, 'before the result there is only the call');
     assert.deepEqual(toolView(bash, { content: 'a\nb\nc\nd\ne', isError: false }).lines.map((l) => l.text), ['a', 'b', 'c', 'd', 'e'], 'a few lines are shown whole');
     // The verdict of a test run is its last lines: the top two and the last three are shown, the middle counted.
     assert.deepEqual(toolView(bash, { content: 'banner\none\ntwo\nthree\nfour\nfive\nFAIL\n(exit 1)', isError: false }).lines, [
@@ -138,7 +135,7 @@ describe('the chat terminal rendering', () => {
     const done = { content: 'edited /p/cart.js', isError: false, edit: { line: 3, old: input.old_str, new: input.new_str } };
     // The line that came stands under the one that went, what it added marked: here nothing went from the old line, so it has no mark.
     assert.deepEqual(toolView(edit, done), {
-      title: 'Update',
+      title: 'edit',
       detail: '/p/cart.js:4',
       stat: { added: 1, removed: 1 },
       rows: 12,
@@ -171,13 +168,13 @@ describe('the chat terminal rendering', () => {
 
     // An insert: the lines that came, numbered from the line they landed on.
     const insert = { name: 'str_replace_based_edit_tool', input: { command: 'insert', path: '/p/a.mjs', insert_line: 2, insert_text: 'x\ny\n' } };
-    assert.deepEqual(toolView(insert, { content: 'inserted', isError: false, edit: { line: 3, old: '', new: 'x\ny' } }), { title: 'Update', detail: '/p/a.mjs:3', stat: { added: 2, removed: 0 }, rows: 12, lines: [{ text: '3 + x', tone: 'add' }, { text: '4 + y', tone: 'add' }] });
+    assert.deepEqual(toolView(insert, { content: 'inserted', isError: false, edit: { line: 3, old: '', new: 'x\ny' } }), { title: 'edit', detail: '/p/a.mjs:3', stat: { added: 2, removed: 0 }, rows: 12, lines: [{ text: '3 + x', tone: 'add' }, { text: '4 + y', tone: 'add' }] });
 
     const view = { name: 'str_replace_based_edit_tool', input: { command: 'view', path: '/p/a.mjs', view_range: [1, 40] } };
-    assert.deepEqual(toolView(view, { content: '1\ta\n2\tb', isError: false }), { title: 'Read', detail: '/p/a.mjs:1-40', lines: [{ text: '2 lines', tone: 'dim' }] });
+    assert.deepEqual(toolView(view, { content: '1\ta\n2\tb', isError: false }), { title: 'read', detail: '/p/a.mjs:1-40', lines: [{ text: '2 lines', tone: 'dim' }] });
     const create = { name: 'str_replace_based_edit_tool', input: { command: 'create', path: '/p/new.mjs', file_text: 'x\ny\n' } };
     // A new file is shown by its top, as what came; past four lines, how many more.
-    assert.deepEqual(toolView(create, { content: 'created /p/new.mjs', isError: false }), { title: 'Write', detail: '/p/new.mjs', lines: [{ text: '+ x', tone: 'add' }, { text: '+ y', tone: 'add' }] });
+    assert.deepEqual(toolView(create, { content: 'created /p/new.mjs', isError: false }), { title: 'write', detail: '/p/new.mjs', lines: [{ text: '+ x', tone: 'add' }, { text: '+ y', tone: 'add' }] });
     const longer = { ...create, input: { ...create.input, file_text: 'a\nb\nc\nd\ne\nf\n' } };
     assert.deepEqual(toolView(longer, { content: 'created', isError: false }).lines.map((l) => l.text), ['+ a', '+ b', '+ c', '+ d', '… +2 lines']);
     assert.deepEqual(toolView({ ...create, input: { ...create.input, file_text: '' } }, { content: 'created', isError: false }).lines, [{ text: '(empty)', tone: 'dim' }]);
@@ -373,17 +370,22 @@ describe('the conversation as text for a pager', () => {
       { kind: 'footer', text: '48s · 2 calls · $0.07' },
     ];
     const text = transcript(log, styles(false), { width: 80, cwd: '/work/shop' });
-    assert.ok(text.startsWith('┃ fix the total\n┃ and say why\n\n⏺ Looking at cart.js.\n\n✗ Bash(npm test # xxx'), text.slice(0, 120));
-    assert.ok(text.includes('x'.repeat(300)), 'the command whole');
-    assert.match(text, /⎿ {2}line 1\n {5}line 2\n[\s\S]* {5}line 30\n/);
+    assert.ok(text.startsWith('   you   fix the total\n         and say why\n\n  sumo   Looking at cart.js.\n\n   run ✗ npm test #\n         xxx'), text.slice(0, 120));
+    // The command whole, folded under its own words at the window's width: never cut, never back at the edge.
+    assert.ok(text.replace(/\n {9}(?=x)/g, '').includes('x'.repeat(300)), 'the command whole');
+    assert.ok(text.split('\n').every((row) => row.length <= 80), 'no row past the window');
+    assert.match(text, /\n {11}line 1\n {11}line 2\n[\s\S]* {11}line 30\n/);
     assert.equal(text.match(/line \d+/g).length, 30, 'every line it printed');
-    assert.match(text, /\n⏺ Update\(cart\.js:4\) \+1 −1\n {2}⎿ {2}4 - a\n {5}4 \+ b\n/);
-    assert.match(text, /\n┃ ! git status\n {2}⎿ {2}clean\n/);
+    assert.match(text, /\n {2}edit {3}cart\.js:4 \+1 −1\n {11}4 - a\n {11}4 \+ b\n/);
+    assert.match(text, /\n {3}you {3}! git status\n {11}clean\n/);
     // A failure has its mark here too, as on the screen.
-    assert.match(text, /\n⏺ j7 scout · sonnet\/low — look\n {2}⎿ {2}Interrupted\n\n✗ error: 529\n\n {2}48s · 2 calls · \$0\.07\n$/);
+    assert.match(text, /\n {4}j7 {3}scout · sonnet\/low — look\n {9}Interrupted\n\n error ✗ 529\n {9}48s · 2 calls · \$0\.07\n$/);
     assert.doesNotMatch(text, /opus · high/, 'the header is the screen\'s');
     // In colour where the terminal has it.
-    assert.match(transcript(log, styles(true), { width: 80 }), /\x1b\[31m✗\x1b\[39m \x1b\[1mBash/);
+    // The failed step's name in red with its mark beside it, the user's name in the chat's colour.
+    const coloured = transcript(log, styles(true), { width: 80 });
+    assert.match(coloured, /\x1b\[31m {3}run\x1b\[39m \x1b\[31m✗\x1b\[39m npm test/);
+    assert.match(coloured, /\x1b\[1m\x1b\[36m {3}you\x1b\[39m\x1b\[22m {3}fix the total/);
   });
 });
 
@@ -428,7 +430,7 @@ describe('what the screen leaves out of a tool call, because it says nothing', (
     const tabled = { ...job, report: '| fn | where |\n|---|---|\n| page | /work/src/page.js:3 |\n' };
     assert.deepEqual(toolView(call, { content: 'STATUS: DONE', job: tabled }, { cwd: '/work' }).lines.map((l) => l.text).slice(1), ['fn · where', 'page · src/page.js:3']);
     // A report that came in from the background is titled as one, by who sent it.
-    assert.deepEqual([toolView({ name: 'delegate', input: { job: 7, report: true, agent: 'scout', title: 'Find callers' } }, { content: 'STATUS: DONE', job }).title, toolView({ name: 'delegate', input: { job: 7, report: true, agent: 'scout', title: 'Find callers' } }, { content: 'STATUS: DONE', job }).detail], ['Report', 'j7 scout · Find callers']);
+    assert.deepEqual([toolView({ name: 'delegate', input: { job: 7, report: true, agent: 'scout', title: 'Find callers' } }, { content: 'STATUS: DONE', job }).title, toolView({ name: 'delegate', input: { job: 7, report: true, agent: 'scout', title: 'Find callers' } }, { content: 'STATUS: DONE', job }).detail], ['report', 'j7 scout · Find callers']);
     const longer = { ...job, report: `${job.report}line 1\n` };
     assert.deepEqual(toolView(call, { content: 'STATUS: DONE', job: longer }).lines.map((l) => l.text).slice(-2), ['line 8', '… +2 lines']);
   });
@@ -492,9 +494,9 @@ describe('code, links and tables, as a reader wants them', () => {
     assert.deepEqual(toolView({ name: 'bash', input: { command: 'cat x' } }, { content: '-a\n+b', isError: false }).lines.map((l) => l.tone), ['plain', 'plain'], 'lines that only start with a sign are not a diff');
   });
 
-  it('shows a question put to the user as a Question, with the answer under it', () => {
+  it('shows a question put to the user as asked, with the answer under it', () => {
     const view = toolView({ name: 'ask', input: { question: 'Which port?\nmore', options: [] } }, { content: 'The user chose: 8080', isError: false });
-    assert.deepEqual(view, { title: 'Question', detail: 'Which port?', lines: [{ text: 'The user chose: 8080', tone: 'plain' }] });
+    assert.deepEqual(view, { title: 'asked', detail: 'Which port?', lines: [{ text: 'The user chose: 8080', tone: 'plain' }] });
   });
 
   it('writes the conversation as Markdown: what was said quoted, replies as written, calls and thinking folded under their names', () => {
@@ -512,7 +514,7 @@ describe('code, links and tables, as a reader wants them', () => {
     );
     assert.equal(
       md,
-      '# Sumo — shop\n\n**You**\n\n> fix it\n> please\n\n<details><summary>Thought for 4s</summary>\n\n```\nThe loop stops short.\n```\n\n</details>\n\nOn it — **now**.\n\n<details><summary>Bash(echo ```)</summary>\n\n````\n```\nok\n````\n\n</details>\n\n**error: the API failed** — 500\n\n_4s · 1 call_\n',
+      '# Sumo — shop\n\n**You**\n\n> fix it\n> please\n\n<details><summary>Thought for 4s</summary>\n\n```\nThe loop stops short.\n```\n\n</details>\n\nOn it — **now**.\n\n<details><summary>run echo ```</summary>\n\n````\n```\nok\n````\n\n</details>\n\n**error: the API failed** — 500\n\n_4s · 1 call_\n',
       'a fence longer than any in what it holds',
     );
   });

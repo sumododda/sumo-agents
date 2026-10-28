@@ -20,16 +20,29 @@ const CODES = { bold: ['1', '22'], dim: ['2', '22'], italic: ['3', '23'], underl
 
 /**
  * The marks the screen draws with. Plain, for a screen reader or a terminal that draws only ASCII, each is a character a
- * reader says as itself: no box drawing, no symbol spelled out by its Unicode name.
+ * reader says as itself: no box drawing, no symbol spelled out by its Unicode name. What a row is, the ledger says in
+ * words; these are only its state — failed, at work, picked, waiting on you — and the markdown's own.
  */
 const GLYPHS = {
-  tool: '⏺', fail: '✗', pick: '❯', under: '⎿', bar: '┃', quote: '│', rule: '─', fenceOpen: '┌─', fenceClose: '└─', todo: '☐', done: '☑', bullet: '•', warn: '⚠', thought: '✻',
+  fail: '✗', pick: '›', ask: '?', live: '•', spin: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'], bar: '│', quote: '│', rule: '─', fenceOpen: '┌─', fenceClose: '└─', todo: '☐', done: '☑', bullet: '•',
   box: { h: '─', v: '│', tl: '┌', tm: '┬', tr: '┐', ml: '├', mm: '┼', mr: '┤', bl: '└', bm: '┴', br: '┘' },
 };
 const PLAIN_GLYPHS = {
-  tool: '*', fail: 'x', pick: '>', under: '|', bar: '>', quote: '|', rule: '-', fenceOpen: '+-', fenceClose: '+-', todo: '[ ]', done: '[x]', bullet: '-', warn: '!', thought: '*',
+  fail: 'x', pick: '>', ask: '?', live: '*', spin: ['*'], bar: '|', quote: '|', rule: '-', fenceOpen: '+-', fenceClose: '+-', todo: '[ ]', done: '[x]', bullet: '-',
   box: { h: '-', v: '|', tl: '+', tm: '+', tr: '+', ml: '+', mm: '+', mr: '+', bl: '+', bm: '+', br: '+' },
 };
+
+/**
+ * The ledger the conversation is set in: each row named in a gutter on the left — you, sumo, read, edit, run, ask — in
+ * words, so what a row is never rests on a colour or a mark; beside the name a column for the row's state; the words from
+ * there on. What came back from a step stands two columns further in, under the words of the step.
+ */
+export const GUTTER = 6;
+export const TEXT_AT = GUTTER + 3;
+export const OUT_AT = TEXT_AT + 2;
+/** A row's start, as text: its name set right in the gutter, its state beside it. */
+export const ledger = (label = '', mark = ' ') => `${String(label).slice(0, GUTTER).padStart(GUTTER)} ${mark} `;
+
 const MAX_WIDTH = 100;
 const MIN_WIDTH = 40;
 
@@ -476,24 +489,6 @@ const MESSAGE_MS = 5000;
 /** The working message `elapsed` ms into work that opened on `first`: the next in the file every five seconds, round and round. */
 export const messageAt = (messages, first, elapsed) => messages[(Math.max(0, messages.indexOf(first)) + Math.floor(elapsed / MESSAGE_MS)) % messages.length];
 
-/** The chat's colours: gold, into orange, into crimson. */
-const SUNSET = [[0xff, 0xd1, 0x66], [0xf7, 0x7f, 0x00], [0xd6, 0x28, 0x28]];
-
-/** The colour `t` of the way through the sunset, 0 its gold and 1 its crimson. */
-export function sunset(t) {
-  const at = Math.min(Math.max(t, 0), 1) * (SUNSET.length - 1);
-  const i = Math.min(Math.floor(at), SUNSET.length - 2);
-  return `#${SUNSET[i].map((v, k) => Math.round(v + (SUNSET[i + 1][k] - v) * (at - i)).toString(16).padStart(2, '0')).join('')}`;
-}
-
-const FLOW_LENGTH = 24;
-
-/** The colour of character `i` at `frame` of a sunset flowing through words: gold to crimson and back, a step a character, moving on a character a frame. */
-export function flow(i, frame) {
-  const step = (((i - frame) % FLOW_LENGTH) + FLOW_LENGTH) % FLOW_LENGTH;
-  return sunset(1 - Math.abs(1 - (2 * step) / FLOW_LENGTH));
-}
-
 /** What the chat draws faint in the empty room above the box you type in: yours, in logo.txt at the top of the repo. */
 const LOGO_FILE = join(REPO_ROOT, 'logo.txt');
 
@@ -684,13 +679,13 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     const command = (there && whole.replace(there, '')) || whole;
     const start = command.split('\n').slice(0, SHOWN_COMMAND_LINES).join('\n').slice(0, SHOWN_COMMAND_CHARS);
     const detail = full || start.length === command.length ? command : `${start} …`;
-    if (!result) return { title: 'Bash', detail, lines: [] };
-    if (result.content === '') return { title: 'Bash', detail, lines: [{ text: '(no output)', tone: 'dim' }] };
-    return { title: 'Bash', detail, lines: output() };
+    if (!result) return { title: 'run', detail, lines: [] };
+    if (result.content === '') return { title: 'run', detail, lines: [{ text: '(no output)', tone: 'dim' }] };
+    return { title: 'run', detail, lines: output() };
   }
   if (call.name === DELEGATE_TOOL.name) {
     // A report a job in the background sent back is titled as one, by who sent it; a call is the delegation itself.
-    const title = input.report ? 'Report' : 'Delegate';
+    const title = input.report ? 'report' : 'job';
     const detail = input.job !== undefined ? `j${input.job}${input.report && input.agent ? ` ${input.agent} · ${input.title ?? ''}` : ''}` : `${input.agent ?? 'worker'} · ${input.title ?? ''}`;
     if (!result) return { title, detail, lines: [] };
     // Started in the background: what the call answered is for the model — how to wait, what not to guess. The screen says the one thing it means.
@@ -711,35 +706,37 @@ export function toolView(call, result = null, { full = false, cwd = null } = {})
     return { title, detail, lines: [{ text: summary, tone }, ...top(report.map((text) => ({ text, tone: 'plain' })), SHOWN_REPORT_LINES)] };
   }
   if (isMcpTool(call.name)) {
-    // A server's tool: the server as the title, the tool with its input as the detail, what came back under it.
+    // A server's tool: the server and the tool with its input as the detail, what came back under it.
     const { server, tool } = splitMcpName(call.name);
-    const detail = `${tool}(${compactInput(input)})`;
-    if (!result) return { title: server, detail, lines: [] };
-    // The line that tells the model whose data this is: here the title says it.
-    return { title: server, detail, lines: output(unlabeled(result.content)) };
+    const detail = `${server} · ${tool}(${compactInput(input)})`;
+    if (!result) return { title: 'mcp', detail, lines: [] };
+    // The line that tells the model whose data this is: here the detail says it.
+    return { title: 'mcp', detail, lines: output(unlabeled(result.content)) };
   }
   if (isWebTool(call)) {
     // The web: what was searched for or which page was read, and under it the pages found or the page and its size.
     const detail = String(input.query ?? input.url ?? '').slice(0, SHOWN_COMMAND_CHARS);
-    return { title: call.name === WEB_SEARCH_TOOL.name ? 'Search' : 'Fetch', detail, lines: result ? output() : [] };
+    return { title: call.name === WEB_SEARCH_TOOL.name ? 'search' : 'fetch', detail, lines: result ? output() : [] };
   }
   if (isAdvisorTool(call)) {
     // The advisor: who was asked. The advice is the model's alone to read, so under it only that it came, or why it did not.
-    return { title: 'Advisor', detail: String(input.asked ?? ''), lines: result ? output() : [] };
+    return { title: 'advise', detail: String(input.asked ?? ''), lines: result ? output() : [] };
   }
   if (call.name === ASK_TOOL.name) {
     // A question put to the user: the question, and under it what they answered.
     const question = String(input.question ?? '').split('\n')[0];
-    return { title: 'Question', detail: question, lines: result ? output() : [] };
+    return { title: 'asked', detail: question, lines: result ? output() : [] };
   }
   if (call.name !== EDITOR_TOOL.name) {
     // A job's own tools: what it was given in a line, what came back under it.
+    // Named in the gutter by the first word of the tool's name: `search_memory` is search.
     const given = String(input.status ?? input.query ?? input.question ?? input.text ?? '').split('\n')[0].slice(0, 80);
-    if (!result) return { title: call.name, detail: given, lines: [] };
-    return { title: call.name, detail: given, lines: output() };
+    const title = String(call.name).split(/[_-]/)[0];
+    if (!result) return { title, detail: given, lines: [] };
+    return { title, detail: given, lines: output() };
   }
   const range = Array.isArray(input.view_range) ? `:${input.view_range.join('-')}` : '';
-  const title = input.command === 'view' ? 'Read' : input.command === 'create' ? 'Write' : input.command === 'str_replace' || input.command === 'insert' ? 'Update' : call.name;
+  const title = input.command === 'view' ? 'read' : input.command === 'create' ? 'write' : input.command === 'str_replace' || input.command === 'insert' ? 'edit' : 'editor';
   const detail = `${pathFrom(input.path ?? '', cwd)}${range}`;
   if (!result) return { title, detail, lines: [] };
   // Folded, a failure names the file as the title does; in full, it is every word as the model read it.
@@ -791,31 +788,45 @@ const helpLines = (rows, s) => {
  * The conversation as text for a pager: every entry of the chat's log in full — the whole command, all a tool gave back,
  * a reply as it is drawn — in the terminal's colours. What the screen folds, this does not; a pager scrolls and searches it.
  */
+/** A failure's words as the ledger sets them: the row is already named `error`, and does not say it twice. */
+export const unnamed = (text) => String(text).replace(/^error: /, '');
+
 export function transcript(log, s, { width = MAX_WIDTH, cwd = null } = {}) {
   const tones = { plain: (t) => t, dim: s.dim, error: s.red, add: s.green, del: s.red, ask: s.yellow };
   const { g } = s;
-  const under = (lines) => lines.map((line, i) => `${i === 0 ? `  ${g.under}  ` : '     '}${(tones[line.tone] ?? tones.plain)(withSpan(line, s))}`);
+  // The ledger, as the screen sets it: a row's name in the gutter, coloured as the screen colours it; the words after.
+  const at = (label, paint = s.dim, mark = ' ') => `${paint(label.slice(0, GUTTER).padStart(GUTTER))} ${mark} `;
+  // Folded here, as the screen folds them, so a long line goes on under its own words and never back at the edge;
+  // each row painted on its own, so a colour never runs on into the gutter.
+  const rows = (t, from = TEXT_AT, paint = (r) => r) =>
+    String(t)
+      .split('\n')
+      .flatMap((line) => fold(line, Math.max(20, width - from - 1)))
+      .map(paint);
+  const words = (t, paint) => rows(t, TEXT_AT, paint).join(`\n${' '.repeat(TEXT_AT)}`);
+  const under = (lines) => lines.flatMap((line) => rows(withSpan(line, s), OUT_AT, tones[line.tone] ?? tones.plain).map((row) => `${' '.repeat(OUT_AT)}${row}`));
   const out = [];
   for (const entry of log) {
-    if (entry.kind === 'user') out.push('', ...untab(entry.text).split('\n').map((line) => `${s.yellow(g.bar)} ${line}`));
+    if (entry.kind === 'user') out.push('', `${at('you', (t) => s.bold(s.cyan(t)))}${words(untab(entry.text))}`);
     else if (entry.kind === 'reply') {
       const drawn = [];
-      const reply = createRenderer((text) => drawn.push(text), s, { width: Math.max(MIN_WIDTH, width - 3) });
+      const reply = createRenderer((t) => drawn.push(t), s, { width: Math.max(MIN_WIDTH, width - TEXT_AT) });
       reply.write(entry.raw);
       reply.flush();
-      out.push('', ...drawn.join('').replace(/\n$/, '').split('\n').map((line, i) => `${i === 0 ? `${g.tool} ` : '  '}${line}`));
+      out.push('', ...drawn.join('').replace(/\n$/, '').split('\n').map((line, i) => (i === 0 ? `${at('sumo', s.bold)}${line}` : line ? `${' '.repeat(TEXT_AT)}${line}` : '')));
     } else if (entry.kind === 'tool') {
       const view = toolView(entry.call, entry.result, { full: true, cwd });
       const stat = view.stat ? ` ${s.green(`+${view.stat.added}`)} ${s.red(`−${view.stat.removed}`)}` : '';
       // A failure has a mark of its own: colour alone does not tell it to someone who cannot see the colour.
-      out.push('', `${entry.result.isError ? s.red(g.fail) : s.green(g.tool)} ${s.bold(view.title)}(${untab(view.detail).split('\n').join('\n  ')})${stat}`, ...under(view.lines));
+      const failed = entry.result.isError;
+      out.push('', `${at(view.title, failed ? s.red : s.dim, failed ? s.red(g.fail) : ' ')}${words(`${untab(view.detail)}${stat}`)}`, ...under(view.lines));
     } else if (entry.kind === 'shell') out.push(...under(toolView({ name: BASH_TOOL.name }, entry.result, { full: true }).lines));
-    else if (entry.kind === 'job') out.push('', `${g.tool} ${s.bold(`j${entry.id}`)} ${entry.agent} · ${entry.route} — ${entry.title}`);
-    else if (entry.kind === 'error') out.push('', s.red(`${g.fail} ${entry.text}`), ...(entry.detail ? [s.dim(`  ${entry.detail}`)] : []));
-    else if (entry.kind === 'thought') out.push('', s.dim(`${g.thought} Thought for ${elapsed(entry.ms)}`), ...String(entry.text ?? '').trim().split('\n').filter(Boolean).map((line) => s.dim(s.italic(`  ${line}`))));
-    else if (entry.kind === 'footer') out.push('', s.dim(`  ${entry.text}`));
+    else if (entry.kind === 'job') out.push('', `${at(`j${entry.id}`, s.bold)}${words(`${entry.agent} · ${entry.route} — ${entry.title}`)}`);
+    else if (entry.kind === 'error') out.push('', `${at('error', s.red, s.red(g.fail))}${words(unnamed(entry.text), s.red)}`, ...(entry.detail ? [`${' '.repeat(TEXT_AT)}${words(entry.detail, s.dim)}`] : []));
+    else if (entry.kind === 'thought') out.push('', `${at('think')}${s.dim(`for ${elapsed(entry.ms)}`)}`, ...String(entry.text ?? '').trim().split('\n').filter(Boolean).flatMap((line) => rows(line, OUT_AT, (r) => s.dim(s.italic(r))).map((row) => `${' '.repeat(OUT_AT)}${row}`)));
+    else if (entry.kind === 'footer') out.push(`${' '.repeat(TEXT_AT)}${words(entry.text, s.dim)}`);
     else if (entry.kind === 'help') out.push('', ...helpLines(entry.rows, s));
-    else if (entry.kind === 'note') out.push(s.dim(`  ${g.under}  ${entry.text.split('\n').join('\n     ')}`));
+    else if (entry.kind === 'note') out.push(`${' '.repeat(TEXT_AT)}${words(entry.text, s.dim)}`);
   }
   return `${out.join('\n').replace(/^\n/, '')}\n`;
 }
@@ -838,7 +849,7 @@ export function markdownOf(log, { cwd = null, title = 'Sumo' } = {}) {
     else if (entry.kind === 'reply') out.push('', entry.raw.trim());
     else if (entry.kind === 'tool') {
       const view = toolView(entry.call, entry.result, { full: true, cwd });
-      folded(`${view.title}(${view.detail.split('\n')[0]})${entry.result.isError ? ' — failed' : ''}`, view.lines.map((line) => line.text).join('\n'));
+      folded(`${view.title} ${view.detail.split('\n')[0]}${entry.result.isError ? ' — failed' : ''}`, view.lines.map((line) => line.text).join('\n'));
     } else if (entry.kind === 'shell') folded('! command', String(entry.result.content));
     else if (entry.kind === 'thought') folded(`Thought for ${elapsed(entry.ms)}`, String(entry.text ?? '').trim());
     else if (entry.kind === 'job') out.push('', `**j${entry.id}** ${entry.agent} · ${entry.route} — ${entry.title}`);
@@ -877,13 +888,13 @@ export function renderBlock(block, s, { width = MAX_WIDTH } = {}) {
 
 /** The line above the memory block: which model is answering, how hard it thinks, where the work is. */
 export function header({ route, cwd }, s) {
-  return `${s.bold(s.green('sumo'))}  ${s.dim('route')} ${route}  ${s.dim(cwd)}`;
+  return `${s.bold(s.cyan('sumo'.padStart(GUTTER)))}   ${route}${s.dim(`${VERSION ? ` · ${VERSION}` : ''} · ${cwd}`)}`;
 }
 
 /** The prompt: the model and effort kept in view, the size of the context once it matters. */
 export function prompt({ route, contextTokens }, s) {
   const k = contextTokens >= 1000 ? ` ${Math.round(contextTokens / 1000)}k` : '';
-  return `${s.bold(s.green('sumo'))}${s.dim(` ${route}${k}`)}${s.bold('>')} `;
+  return `${s.bold(s.cyan('sumo'))}${s.dim(` ${route}${k}`)}${s.bold('>')} `;
 }
 
 /**

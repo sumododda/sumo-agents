@@ -50,6 +50,9 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 - `/new` starts a fresh session, and a new task deserves one. `/handoff` has the model write a hand-off of
   the piece in hand first, and the fresh session starts from it. `/resume` picks an old one up. `/help` lists
   the rest, and `?` on an empty box shows the keys you reach for most.
+- The screen reads like a ledger: each row is named on its left edge in a word — `you`, `read`, `edit`, `run`,
+  `sumo`, `ask` — so a turn is scanned down one column. Colour only repeats what the words say: your theme's cyan
+  is Sumo's own, yellow asks, red fails.
 - Ctrl-R searches what you sent before. `/context` shows how full the context is and what the session has cost.
   `/export` writes the conversation to a Markdown file.
 
@@ -106,7 +109,7 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 | `chat.effort` | `medium` | Effort when the chat model is fixed. |
 | `chat.model` | `opus` | What the chat runs on. `auto` lets the local router pick per turn. |
 | `chat.notify` | `on` | `off` stops the bell and the notification when a long turn ends behind another window. |
-| `chat.screen` | `full` | `still` keeps the working line still. `plain` draws the chat for a screen reader: words, not pictures (no logo, no name in blocks), ASCII marks (`*` a call, `x` a failure), no frame around the box or a question, and nothing that moves or ticks. |
+| `chat.screen` | `full` | `still` keeps the working line's spinner still. `plain` draws the chat for a screen reader: words, not pictures (no logo), ASCII marks (`x` a failure, `*` at work, `>` your prompt), no rule over the box or bar beside a question, and nothing that moves or ticks. |
 | `jobs.advisor` | `off` | `on` lets a job ask the next model up for advice. |
 | `jobs.budget` | `10` | Dollars one job may spend before it is stopped; `0` for no cap. |
 | `jobs.floor` | `haiku` | The smallest model a job may run on: `sonnet` keeps every job off Haiku, `opus` puts them all on Opus or Fable. |

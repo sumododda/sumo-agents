@@ -88,3 +88,27 @@ Testing the theory before it escapes
 Persuading the app to behave in public
 Finding the exact moment it got weird
 Attempting to leave no trace except a commit
+Stomping the ring before the bout
+Throwing salt for a clean match
+Holding the stance
+Pushing the bug out of the ring
+Bowing to the stack trace
+Tightening the mawashi
+Stalking the bug through the tall grass
+Waking the lion, gently
+Roaring quietly at the build
+Grooming the codebase’s mane
+Pretending to nap, actually thinking
+Counting the off-by-ones
+Asking the linter for a second opinion
+Rehearsing the commit message
+Untangling the import graph
+Checking the tests test something
+Holding a short meeting with the call stack
+Sorting the facts from the vibes
+Proofreading the regex
+Herding the async functions
+Looking under the abstraction
+Measuring twice, editing once
+Making the warnings feel heard
+Sweeping dead code under a better rug

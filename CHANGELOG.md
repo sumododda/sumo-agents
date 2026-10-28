@@ -2,9 +2,33 @@
 
 What each release changed for you. The commit of each version has the full detail.
 
-## Unreleased — since 0.4.0, waiting for a version
+## 0.5.0 — 2026-10-28
 
-Not published yet: the version is chosen and approved before it is. What is waiting, newest first:
+Newest first:
+
+### The chat screen in its own look (Oct 28)
+- **A ledger, not a copy.** Every row of the conversation is named on its left edge in a word — `you`, `sumo`,
+  `read`, `edit`, `write`, `run`, `search`, `mcp`, `job`, `report`, `ask`, `error` — and its words start in one
+  column. A column beside the name holds the row's state: `✗` failed, `•` at work, `?` waiting on you, `›` picked.
+  The marks borrowed from other tools (`⏺`, `⎿`, `✻`, `Bash(…)`, `Update(…)`, a rounded box) are gone.
+- **One colour of its own:** the terminal's cyan, so your theme decides the shade, light or dark. Yellow still asks,
+  red fails; everything secondary is faint. Jobs no longer cycle through five colours: their id says who they are.
+- **Lighter.** The header is one row (no block letters); the box you type in is your own row under a faint rule,
+  where the message will stand once sent; a question to approve is a yellow `ask` row with a bar beside all it
+  covers, not a box. The working line turns a one-cell spinner instead of running a gradient through its words.
+- **Cheaper to draw**, measured in a real terminal at 100x34 over the same 50 steps: 48% fewer bytes written in
+  all (473 KB to 250 KB) — a running command 17 KB instead of 49 KB, a streamed reply 12 KB instead of 22 KB, an
+  edit 4.5 KB instead of 7.7 KB, the empty window 4.0 KB instead of 5.4 KB. A keystroke is still about 200 bytes.
+- **A question never wipes your scrollback.** A question to approve that is taller than the window — a long command,
+  a narrow window — used to make the screen and the terminal's scrollback be wiped and the whole conversation drawn
+  again. It now takes the rows the window has left: what would run is shown as far as they go and the rest is
+  counted (`… N more characters not shown — n, and ask the model for less`), with its keys always on the screen. The
+  call waiting under it is one row while it waits, since the question shows it whole. Checked at 40, 60 and 80
+  columns over 282 steps in a real terminal: nothing but Ctrl-L clears the screen.
+- 24 more phrases for the working line in `spinner.txt`, a few from the ring and the savanna (111 in all).
+- The pager (Ctrl-O), `sumo job watch` and a job's open record use the same ledger; the pager folds a long line
+  under its own words at the window's width instead of leaving it to come back at the edge. An error no longer says
+  "error" twice; the keys in a question are bold; the cap on a long question reads whole at 80 columns.
 
 ### What the audits left, finished (Oct 28)
 - **`sumo uninstall`**: shows what it will remove and asks you to type `uninstall` (`--yes` in a script). It copies
