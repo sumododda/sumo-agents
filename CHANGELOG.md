@@ -2,7 +2,9 @@
 
 What each release changed for you. The commit of each version has the full detail.
 
-## 0.6.0 — 2026-11-11
+## 0.6.1 — 2026-11-11
+
+0.6.0 was never published: its build typed `[I` and `[O` into the box when you switched tabs. 0.6.1 is it, fixed.
 
 ### The chat screen from 0.4.0, back and tidied (Nov 11)
 - **The look you had before the ledger.** The name in sunset block letters, each step as `⏺ Bash(npm test)` with
