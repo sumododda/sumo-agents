@@ -60,6 +60,10 @@ const CLEAR = '\x1b[2J\x1b[3J\x1b[H';
  * the drawing starts at the top. For a chat that opens, or starts over — nothing that was on the terminal is lost to it.
  */
 const scrolledClear = (rows) => `\x1b[${rows};1H${'\n'.repeat(rows)}\x1b[H`;
+/** A report that the window came to the front (`ESC[I`) or went behind (`ESC[O`). */
+const FOCUS_REPORT = /\x1b\[[IO]/g;
+/** How long the start of a sequence at the end of a read waits for its rest; and how long after a bare ESC went on as the Esc key a `[I` or `[O` is still the rest of a focus report. */
+const FOCUS_LATE_MS = 1000;
 /** The terminal says when its window comes to the front and goes behind (`[I`, `[O`); and keeps its title, to be given back. */
 const FOCUS_ON = '\x1b[?1004h';
 const FOCUS_OFF = '\x1b[?1004l';
@@ -2236,18 +2240,56 @@ export function runUi({ session, events, resume = null, stdin = process.stdin, s
     }, KITTY_WAIT_MS).unref();
   }
   // The terminal says when its window comes to the front and when it goes behind (`ESC[I`, `ESC[O`): a long turn that ends
-  // behind rings. Ink drops replies like these before they reach the keys, so they are read here, as Ink reads them.
+  // behind rings. The reports are taken out of what is read here, before Ink sees it. Ink drops a whole one, but one that
+  // comes in two reads — the ESC, then `[I` more than 20 ms later, as a multiplexer or a busy terminal may send it — it
+  // reads as the Esc key and then `[I` typed into the box: Esc stopped the turn, and every switch of tabs typed more.
+  // A terminal that speaks the kitty keyboard protocol (Ghostty, kitty, WezTerm: Ink turns it on) sends the Esc key as
+  // `ESC[27u`, never a bare ESC: there a bare ESC at the end of a read is the start of something, and waits for its rest.
+  // Elsewhere a bare ESC is the Esc key and goes on at once; a `[I` or `[O` just after it is still not typed.
   const front = { now: true };
   if (typeof stdin.read === 'function') {
     const read = stdin.read.bind(stdin);
+    let kitty = false;
+    let held = '';
+    let ready = null;
+    let timer = null;
+    let bare = 0;
     stdin.read = (...args) => {
-      const chunk = read(...args);
-      if (chunk !== null && chunk !== undefined) {
-        const text = String(chunk);
-        const at = Math.max(text.lastIndexOf('\x1b[I'), text.lastIndexOf('\x1b[O'));
-        if (at !== -1) front.now = text[at + 2] === 'I';
+      if (ready !== null) {
+        const out = ready;
+        ready = null;
+        return out;
       }
-      return chunk;
+      const chunk = read(...args);
+      if (chunk === null || chunk === undefined) return chunk;
+      clearTimeout(timer);
+      let text = held + String(chunk);
+      held = '';
+      // Ink asks whether the terminal speaks the protocol; the answer comes by here on its way to Ink.
+      if (/\x1b\[\?\d+u/.test(text)) kitty = true;
+      // The rest of a report whose ESC went on as a key: still the report's, not something typed.
+      if (Date.now() - bare < FOCUS_LATE_MS && /^\[[IO]/.test(text)) {
+        front.now = text[1] === 'I';
+        text = text.slice(2);
+      }
+      bare = 0;
+      text = text.replace(FOCUS_REPORT, (report) => {
+        front.now = report[2] === 'I';
+        return '';
+      });
+      const tail = /\x1b\[?$/.exec(text);
+      if (tail && (kitty || tail[0] !== '\x1b')) {
+        // Held for its rest; given on as it came if none comes.
+        held = tail[0];
+        text = text.slice(0, tail.index);
+        timer = setTimeout(() => {
+          ready = held;
+          held = '';
+          stdin.emit('readable');
+        }, FOCUS_LATE_MS);
+        timer.unref?.();
+      } else if (tail) bare = Date.now();
+      return text;
     };
   }
   // Plain (`chat.screen plain`), for a screen reader: ASCII marks, no frames, no pictures, and nothing moving.

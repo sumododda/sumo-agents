@@ -642,3 +642,56 @@ test('a menu half-typed in the box steps aside while a call waits on the user\'s
     await shows(/❯ \/fix/, 'the menu back with the box');
   });
 });
+
+test('the terminal saying its window came to the front or went behind is never typed into the box — split across reads too — and never stops the turn', async () => {
+  await onScreen({}, async ({ tty, shows, turn, finish, session }) => {
+    let stopped = 0;
+    const interrupt = session.interrupt.bind(session);
+    session.interrupt = () => {
+      stopped++;
+      return interrupt();
+    };
+    // A terminal that speaks the kitty keyboard protocol, as Ghostty does: its answer to Ink's question.
+    await tty.type('\x1b[?1u');
+    // Whole, two at once, and split: the ESC in one read, the rest in a later one, as a multiplexer may send it.
+    await tty.type('\x1b[I', '\x1b[O\x1b[I');
+    await tty.type('\x1b');
+    await new Promise((r) => setTimeout(r, 80));
+    await tty.type('[O');
+    await tty.type('\x1b');
+    await new Promise((r) => setTimeout(r, 80));
+    await tty.type('[I');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.match(tty.screen(), /│ > {2}Ask anything/, `nothing typed:\n${tty.screen()}`);
+    await turn();
+    await shows(/Working…/, 'the working line');
+    await tty.type('\x1b');
+    await new Promise((r) => setTimeout(r, 80));
+    await tty.type('[O');
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(stopped, 0, 'the turn goes on');
+    assert.doesNotMatch(tty.screen(), /\[O/, `nothing typed:\n${tty.screen()}`);
+    assert.match(tty.screen(), /Working…/);
+    // Esc is still the key that stops the turn — sent as the protocol sends it.
+    await tty.type('\x1b[27u');
+    for (let i = 0; i < 100 && stopped === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(stopped, 1, 'esc stops the turn');
+    finish();
+  });
+});
+
+test('on a terminal without the kitty protocol a bare ESC is the Esc key at once, and a focus report split after it is still never typed', async () => {
+  await onScreen({}, async ({ tty, shows }) => {
+    await tty.type('/');
+    await shows(/❯ \/fix/, 'the menu');
+    await tty.type('\x1b');
+    await new Promise((r) => setTimeout(r, 60));
+    assert.doesNotMatch(tty.screen(), /❯ \/fix/, 'esc closed the menu at once');
+    await tty.type('[O');
+    await tty.type('\x1b[');
+    await new Promise((r) => setTimeout(r, 80));
+    await tty.type('I');
+    await new Promise((r) => setTimeout(r, 200));
+    assert.match(tty.screen(), /│ > {2}Ask anything/, `nothing typed:\n${tty.screen()}`);
+  });
+});

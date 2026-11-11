@@ -23,6 +23,10 @@ What each release changed for you. The commit of each version has the full detai
 - **The question box is laid out:** why it asks, faint, under the question; what would run set in; each key bold.
   In a short window it gives up the blank rows around what would run before anything else, and a menu half-typed in
   the box steps aside while it waits.
+- **Switching tabs no longer types `[I` and `[O` into the box.** The terminal's word that its window came to the front
+  or went behind is taken out before the keys are read, even when it arrives in two pieces — which made it the Esc key
+  (stopping a turn) and the rest text in the box. On a terminal with the kitty keyboard protocol (Ghostty, kitty,
+  WezTerm) a bare ESC waits for the rest; elsewhere Esc acts at once, as before.
 - Kept from 0.5.0: a question never wipes the screen or your scrollback, Ink 8, the pager folding long lines, a
   failed call marked `✗` in a job's record.
   The flowing sunset writes more than the ledger's spinner did (34.5 KB against 9.2 KB over 5 s of work at 100×34);
