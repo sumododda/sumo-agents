@@ -50,9 +50,9 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 - `/new` starts a fresh session, and a new task deserves one. `/handoff` has the model write a hand-off of
   the piece in hand first, and the fresh session starts from it. `/resume` picks an old one up. `/help` lists
   the rest, and `?` on an empty box shows the keys you reach for most.
-- The screen reads like a ledger: each row is named on its left edge in a word — `you`, `read`, `edit`, `run`,
-  `sumo`, `ask` — so a turn is scanned down one column. Colour only repeats what the words say: your theme's cyan
-  is Sumo's own, yellow asks, red fails.
+- Each step shows as `⏺ Bash(npm test)` with what came back under it: a failed run by the lines that say what
+  failed, a test run that passed in one row (`✓ 14 passed`). Your messages stand behind a bar, a question to
+  approve in a yellow frame. `chat.screen still` stops the colours flowing through the working line.
 - Ctrl-R searches what you sent before. `/context` shows how full the context is and what the session has cost.
   `/export` writes the conversation to a Markdown file.
 

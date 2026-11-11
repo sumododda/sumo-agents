@@ -1300,7 +1300,7 @@ test('piped, /resume alone lists the saved sessions and /resume <id> picks one u
       // The piped chat keeps real time, so how long ago is whatever it is today.
       assert.match(all, new RegExp(`>   ${short} · (?:just now|\\d+[hd] ago) · no project · “plan the briefing redesign” · 1 turn · \\d+k tokens\n`), 'the list');
       assert.match(all, /no saved session starts with "nope" — one of: /);
-      assert.match(all, new RegExp(` {4}resumed ${short} · (?:just now|\\d+[hd] ago) · no project`));
+      assert.match(all, new RegExp(`⎿  resumed ${short} · (?:just now|\\d+[hd] ago) · no project`));
       assert.equal(seen.length, 1);
       assert.equal(seen[0].messages[1].content[0].text, 'plan the briefing redesign', 'the model reads the earlier conversation');
       assert.equal(seen[0].messages.at(-2).content[0].text, 'go on');
@@ -1326,13 +1326,13 @@ test('piped, a command that belongs to the screen is said back and never sent to
       });
       assert.equal(await chat(db, { model: 'opus', effort: 'high', send, input: Readable.from(['/help\n', '/copy\n', '/export\n', '/context\n', 'hi\n', '/handoff\n', '/clear\n']), output }), 0);
       const all = printed.join('');
-      for (const name of ['help', 'copy', 'export']) assert.match(all, new RegExp(` {4}/${name} is for the chat on a terminal screen`));
+      for (const name of ['help', 'copy', 'export']) assert.match(all, new RegExp(`⎿  /${name} is for the chat on a terminal screen`));
       assert.match(all, /Context 0 tokens/, '/context answers here too');
       assert.equal(seen.length, 2, 'only what was said went to the model, and the hand-off request');
       assert.equal(seen[0].messages.at(-1).content[0].text, 'hi');
       assert.match(seen[1].compaction?.instructions ?? '', /^Write a hand-off/, '/handoff asks for the summary');
       assert.match(all, /the thread so far[\s\S]*handed off from [0-9a-f]+: the hand-off rides in with your next message/);
-      assert.equal(all.match(/^ {2}sumo {3}opus · high/gm).length, 3, '/handoff and /clear each start a fresh session, as /new does');
+      assert.equal(all.match(/sumo {2}route/g).length, 3, '/handoff and /clear each start a fresh session, as /new does');
     } finally {
       db.close();
     }
@@ -1562,7 +1562,7 @@ describe('the watcher in a job\'s Herdr tab', () => {
     assert.equal(calls.filter((c) => c === 'pane run').length, 3);
   });
 
-  it('counts the watcher started when its tab shows the record\'s first line, the job named in the gutter — and j3 is not j32 there either', async () => {
+  it('counts the watcher started when its tab shows the record\'s first line — and j3 is not j32 there either', async () => {
     const written = [];
     jobPrinter((t) => written.push(t), styles(false)).onStart({ id: 32, agent: 'scout', model: 'sonnet', effort: 'low', title: 'map the parser' });
     // A Herdr that cannot say what runs in the pane: only the screen tells.
@@ -1658,7 +1658,7 @@ test('the chat offers the MCP tools behind tool search, names the servers to the
         },
       });
       await chat(db, { model: 'opus', effort: 'high', send: () => assert.fail('nothing is asked of the model'), input: Readable.from(['/mcp\n']), output });
-      assert.match(printed.join(''), / {4}demo\s+stdio: [\s\S]*9 tools · allowed: echo/);
+      assert.match(printed.join(''), /⎿  demo\s+stdio: [\s\S]*9 tools · allowed: echo/);
     } finally {
       await closeMcp();
       db.close();
@@ -2295,4 +2295,13 @@ test('the way back in is said as the screen closes, folded under its margin in a
   assert.ok(narrow.every((row) => row.startsWith('  ') && row.length <= 40), narrow.join('\n'));
   assert.equal(narrow.join(' ').replace(/\s+/g, ' ').trim(), 'sumo chat --resume ab12cd34 picks this session up again · it cost $0.01');
   assert.doesNotMatch(farewell({ id: 'ab12cd34', cost: 0, columns: 80 }, off), /cost/, 'nothing said of a cost under a cent');
+});
+
+test('a job\'s record marks a call that failed with ✗ under it — the record is written without colour, so the mark is all that says so', () => {
+  const written = [];
+  const record = jobPrinter((t) => written.push(t), styles(false));
+  const call = { name: 'bash', input: { command: 'npm test' } };
+  record.onResult(call, { content: '✖ cart › coupon\n(exit 1)', isError: true });
+  record.onResult(call, { content: 'ok', isError: false });
+  assert.deepEqual(written, ['    ⎿  ✗ ✖ cart › coupon\n', '    ⎿  ok\n']);
 });

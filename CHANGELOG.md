@@ -2,6 +2,32 @@
 
 What each release changed for you. The commit of each version has the full detail.
 
+## 0.6.0 — 2026-11-11
+
+### The chat screen from 0.4.0, back and tidied (Nov 11)
+- **The look you had before the ledger.** The name in sunset block letters, each step as `⏺ Bash(npm test)` with
+  what came back under `⎿`, your messages behind an orange bar, a rounded box to type in, a question to approve in
+  a yellow frame, the sunset flowing through the working line. The ledger of 0.5.0 is gone.
+- **A failed run shows why it failed:** the lines that say what failed (a test's `✖`, an assertion, an error — never
+  a passing test whose name says "error") come first, then its last two lines (the exit code, why it was stopped,
+  what you said declining it), the rest counted. Before, its banner and its counts were shown and the failing test
+  folded away. Six lines or fewer still show whole.
+- **A test run that passed is one row:** `✓ 14 passed` (node, TAP, jest/vitest, pytest, cargo, mocha), not seven
+  rows of `ℹ tests / pass / fail` — only for a command that runs tests, and never when its count has a failure in
+  it (a run piped to `tail` exits 0 all the same). A grep's output still shows whole.
+- **The header's second row names the project and its branch** — `shop-api (main) · ~/code/shop-api` — before the
+  folder.
+- **No stray rows:** a blank line at the end of a reply is the row before what follows, never two blank rows; `+3`
+  not `+3 −0`; which guide rode in with your message is in the pager, not under your words; the empty box says
+  `Ask anything` and the keys stay in the row under it.
+- **The question box is laid out:** why it asks, faint, under the question; what would run set in; each key bold.
+  In a short window it gives up the blank rows around what would run before anything else, and a menu half-typed in
+  the box steps aside while it waits.
+- Kept from 0.5.0: a question never wipes the screen or your scrollback, Ink 8, the pager folding long lines, a
+  failed call marked `✗` in a job's record.
+  The flowing sunset writes more than the ledger's spinner did (34.5 KB against 9.2 KB over 5 s of work at 100×34);
+  `chat.screen still` keeps it still (2.0 KB).
+
 ## 0.5.0 — 2026-10-28
 
 Newest first:
