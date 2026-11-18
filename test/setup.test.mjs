@@ -5,9 +5,9 @@ import { homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { SCHEMA_VERSION } from '../src/db.mjs';
-import { ENTRY } from '../src/paths.mjs';
+import { ENTRY, REPO_ROOT } from '../src/paths.mjs';
 import { blockedWrite } from '../src/sandbox.mjs';
-import { HAS_PTY, sandbox } from './helpers.mjs';
+import { HAS_PTY, NO_KEY, sandbox } from './helpers.mjs';
 
 const mode = (file) => statSync(file).mode & 0o777;
 
@@ -191,8 +191,7 @@ test('a block budget that is not a positive whole number is refused, never taken
 test('config never prints the credentials in a model address, and keeps them for the download', () => {
   const s = sandbox();
   const url = 'https://me:hf_SECRETTOKEN@artifactory.example/hf/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf';
-  for (const args of [['config', 'model.url', url], ['config', 'model.url'], ['config']]) {
-    const run = s.sumo(args);
+  for (const run of [s.page(['config', 'model.url', url]), s.sumo(['config', 'model.url']), s.sumo(['config'])]) {
     assert.equal(run.code, 0, run.err);
     assert.doesNotMatch(run.out, /hf_SECRETTOKEN/);
     assert.match(run.out, /^model\.url = https:\/\/artifactory\.example\/hf\/Qwen\/Qwen3-4B-GGUF\/resolve\/main\/Qwen3-4B-Q4_K_M\.gguf$/m);
@@ -209,8 +208,8 @@ test('config lists its fifteen settings by name, and an old one says what it bec
     'memory.model', 'model.url', 'projects.home', 'shell.network', 'shell.sandbox',
   ]);
   for (const [key, said] of [
-    ['chat.plain', /chat\.plain is now chat\.screen: sumo config chat\.screen plain/],
-    ['chat.motion', /chat\.motion is now chat\.screen: sumo config chat\.screen still/],
+    ['chat.plain', /chat\.plain is now chat\.screen — Chat › Screen, plain, on the settings page/],
+    ['chat.motion', /chat\.motion is now chat\.screen — Chat › Screen, still, on the settings page/],
     ['model.source', /model\.source is now part of model\.url/],
     ['model.repo', /model\.repo is now part of model\.url/],
     ['model.file', /model\.file is now part of model\.url/],
@@ -228,17 +227,20 @@ test('config lists its fifteen settings by name, and an old one says what it bec
   assert.equal(s.sql((db) => db.prepare(`SELECT COUNT(*) AS n FROM meta WHERE key LIKE 'config.%'`).get().n), 0, 'nothing was stored under an old name');
 });
 
-test('--model-source puts another source in front of the model\'s address, and a whole .gguf address is taken as it is', () => {
-  const s = sandbox();
-  const stored = () => s.sql((db) => db.prepare(`SELECT value FROM meta WHERE key = 'config.model.url'`).get().value);
-  const setup = (source) => s.sumo(['setup', '--no-link', '--no-model', '--model-source', source]);
-  assert.equal(setup('https://jfrog.example/artifactory/api/huggingfaceml/hf/').code, 0);
-  assert.equal(stored(), 'https://jfrog.example/artifactory/api/huggingfaceml/hf/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf', 'the file keeps its path there');
-  assert.equal(s.sumo(['config', 'model.url', 'https://mirror.example/models/Qwen3-4B-Q8_0.gguf']).code, 0);
-  setup('https://other.example/m');
-  assert.equal(stored(), 'https://other.example/m/Qwen3-4B-Q8_0.gguf', 'an address in no repository keeps its file');
-  setup('https://hf.example/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q5_K_M.gguf');
-  assert.equal(stored(), 'https://hf.example/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q5_K_M.gguf');
+test("a model source given to setup puts another source in front of the model's address, and a whole .gguf address is taken as it is", async () => {
+  const { freshHome, withHome } = await import('./fixtures/env-sandbox.mjs');
+  const { config, setup } = await import('../src/setup.mjs');
+  await withHome(freshHome(), { ...NO_KEY, SUMO_AGENTS_MODEL_CMD: join(REPO_ROOT, 'test', 'fixtures', 'model-stub.mjs') }, async () => {
+    const stored = () => config('model.url')[0].replace('model.url = ', '');
+    const from = (modelSource) => setup({ link: false, noModel: true, modelSource });
+    await from('https://jfrog.example/artifactory/api/huggingfaceml/hf/');
+    assert.equal(stored(), 'https://jfrog.example/artifactory/api/huggingfaceml/hf/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf', 'the file keeps its path there');
+    config('model.url', 'https://mirror.example/models/Qwen3-4B-Q8_0.gguf');
+    await from('https://other.example/m');
+    assert.equal(stored(), 'https://other.example/m/Qwen3-4B-Q8_0.gguf', 'an address in no repository keeps its file');
+    await from('https://hf.example/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q5_K_M.gguf');
+    assert.equal(stored(), 'https://hf.example/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q5_K_M.gguf');
+  });
 });
 
 test('the model file is the last part of its address and never a path: an encoded separator stays in the name', async () => {
@@ -262,25 +264,25 @@ test('where new projects are made is a directory that is there, and the advisor 
   const s = sandbox();
   assert.match(s.sumo(['config', 'projects.home']).out, /projects\.home = ~$/m);
   mkdirSync(join(s.root, 'code'));
-  assert.match(s.sumo(['config', 'projects.home', join(s.root, 'code')]).out, /projects\.home = .*code$/m);
-  const missing = s.sumo(['config', 'projects.home', join(s.root, 'nowhere')]);
+  assert.match(s.page(['config', 'projects.home', join(s.root, 'code')]).out, /projects\.home = .*code$/m);
+  const missing = s.page(['config', 'projects.home', join(s.root, 'nowhere')]);
   assert.equal(missing.code, 2);
   assert.match(missing.err, /is not a directory/);
   assert.match(s.sumo(['config', 'projects.home']).out, /code$/m, 'a refused value is not stored');
 
 
   assert.match(s.sumo(['config', 'jobs.advisor']).out, /jobs\.advisor = off/);
-  assert.match(s.sumo(['config', 'jobs.advisor', 'on']).out, /jobs\.advisor = on/);
-  assert.match(s.sumo(['config', 'jobs.advisor', 'opus']).err, /jobs\.advisor is on or off/);
+  assert.match(s.page(['config', 'jobs.advisor', 'on']).out, /jobs\.advisor = on/);
+  assert.match(s.page(['config', 'jobs.advisor', 'opus']).err, /jobs\.advisor is on or off/);
 });
 
 test('config reads defaults, stores changes and rejects names it does not know', () => {
   const s = sandbox();
   assert.match(s.sumo(['config', 'memory.model']).out, /memory\.model = local/);
-  assert.match(s.sumo(['config', 'memory.model', 'sonnet']).out, /memory\.model = sonnet/);
+  assert.match(s.page(['config', 'memory.model', 'sonnet']).out, /memory\.model = sonnet/);
   assert.match(s.sumo(['config']).out, /memory\.model = sonnet/);
 
-  const typo = s.sumo(['config', 'memory.modle', 'sonnet']);
+  const typo = s.page(['config', 'memory.modle', 'sonnet']);
   assert.equal(typo.code, 2);
   assert.match(typo.err, /unknown setting/);
 });
@@ -385,18 +387,18 @@ test('config refuses an effort the API does not take and a model address that is
     [['config', 'chat.screen', 'slow'], /chat\.screen is full, still or plain/],
     [['config', 'jobs.floor', 'gpt'], /jobs\.floor is haiku, sonnet, opus or fable/],
   ]) {
-    const run = s.sumo(args);
+    const run = s.page(args);
     assert.equal(run.code, 2, `${args.join(' ')} → ${run.out}`);
     assert.match(run.err, message);
   }
-  assert.match(s.sumo(['config', 'chat.effort', 'xhigh']).out, /chat\.effort = xhigh/);
+  assert.match(s.page(['config', 'chat.effort', 'xhigh']).out, /chat\.effort = xhigh/);
   assert.match(s.sumo(['config', 'chat.notify']).out, /chat\.notify = on/, 'the bell is on until it is turned off');
-  assert.match(s.sumo(['config', 'chat.notify', 'off']).out, /chat\.notify = off/);
+  assert.match(s.page(['config', 'chat.notify', 'off']).out, /chat\.notify = off/);
   assert.match(s.sumo(['config', 'chat.screen']).out, /chat\.screen = full/, 'the working line moves, in frames, until told otherwise');
-  assert.match(s.sumo(['config', 'chat.screen', 'still']).out, /chat\.screen = still/);
-  assert.match(s.sumo(['config', 'chat.screen', 'plain']).out, /chat\.screen = plain/);
-  assert.match(s.sumo(['config', 'model.url', 'http://127.0.0.1:8080/Qwen3-4B-Q8_0.gguf']).out, /model\.url = http:\/\/127\.0\.0\.1:8080\/Qwen3-4B-Q8_0\.gguf/, 'a mirror on this machine may be plain http');
-  assert.match(s.sumo(['config', 'jobs.floor', 'opus']).out, /jobs\.floor = opus/);
+  assert.match(s.page(['config', 'chat.screen', 'still']).out, /chat\.screen = still/);
+  assert.match(s.page(['config', 'chat.screen', 'plain']).out, /chat\.screen = plain/);
+  assert.match(s.page(['config', 'model.url', 'http://127.0.0.1:8080/Qwen3-4B-Q8_0.gguf']).out, /model\.url = http:\/\/127\.0\.0\.1:8080\/Qwen3-4B-Q8_0\.gguf/, 'a mirror on this machine may be plain http');
+  assert.match(s.page(['config', 'jobs.floor', 'opus']).out, /jobs\.floor = opus/);
   const { CHAT_EFFORTS } = await import('../src/setup.mjs');
   const { EFFORTS } = await import('../src/route.mjs');
   assert.deepEqual(CHAT_EFFORTS, EFFORTS);
@@ -404,11 +406,9 @@ test('config refuses an effort the API does not take and a model address that is
 
 test('a model source that is not a web address is refused before it is stored, and a stored one that cannot be read never stops setup', async () => {
   const s = sandbox();
-  for (const args of [['config', 'model.url', 'huggingface.co/x.gguf'], ['setup', '--no-link', '--model-source', 'huggingface.co']]) {
-    const run = s.sumo(args);
-    assert.equal(run.code, 2, `${args.join(' ')} → ${run.out}`);
-    assert.match(run.err, /is not a web address/);
-  }
+  const run = s.page(['config', 'model.url', 'huggingface.co/x.gguf']);
+  assert.equal(run.code, 2, run.out);
+  assert.match(run.err, /is not a web address/);
   assert.match(s.sumo(['config', 'model.url']).out, /^model\.url = https:\/\/huggingface\.co\/Qwen\/Qwen3-4B-GGUF\/resolve\/main\/Qwen3-4B-Q4_K_M\.gguf$/m, 'nothing was stored');
 
   const { freshHome, withHome } = await import('./fixtures/env-sandbox.mjs');

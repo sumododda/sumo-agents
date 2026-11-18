@@ -147,12 +147,12 @@ test("the router's word on risky work comes back with the route and is kept with
 test('jobs.review is risky, all or off, risky by default', () => {
   const s = sandbox();
   assert.match(s.sumo(['config']).out, /^jobs\.review = risky$/m);
-  const review = s.sumo(['config', 'jobs.review', 'some']);
+  const review = s.page(['config', 'jobs.review', 'some']);
   assert.notEqual(review.code, 0);
   assert.match(review.err, /jobs\.review is risky, all or off/);
   assert.match(s.sumo(['config', 'jobs.review']).out, /^jobs\.review = risky$/m, 'a refused value is not stored');
-  assert.match(s.sumo(['config', 'jobs.review', 'all']).out, /^jobs\.review = all$/m);
-  assert.match(s.sumo(['config', 'jobs.review', 'off']).out, /^jobs\.review = off$/m);
+  assert.match(s.page(['config', 'jobs.review', 'all']).out, /^jobs\.review = all$/m);
+  assert.match(s.page(['config', 'jobs.review', 'off']).out, /^jobs\.review = off$/m);
 });
 
 test('a first attempt that fails is retried once, one step up, without being asked; the chat is told so, then how the retry went', async () => {

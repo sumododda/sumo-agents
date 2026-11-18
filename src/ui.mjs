@@ -12,6 +12,7 @@ import { INPUT_SHOWN } from './mcp.mjs';
 import { paths } from './paths.mjs';
 import { scratchDir } from './projects.mjs';
 import { redact } from './redact.mjs';
+import { keyName, settingsPage, SettingsView } from './settings.mjs';
 import { elapsed } from './text.mjs';
 import { cleanPaste, editor, keysOf, matchFiles, menuOf, paste, press, under } from './editor.mjs';
 import { clipboardImage, copyText, droppedImages } from './images.mjs';
@@ -990,8 +991,7 @@ const HELP_KEYS = [
   ['enter', 'send; while the model works, it reads it next'],
   ['\\ enter', 'a new line (shift-enter and ctrl-j too)'],
   ['esc', 'interrupt the turn, or close a menu'],
-  ['↑ ↓', 'what you sent before'],
-  ['ctrl-r', 'search what you sent'],
+  ['↑ ↓ · ctrl-r', 'what you sent before · a search through it'],
   ['ctrl-c', 'clear the box; twice on an empty one to leave'],
   ['ctrl-o', 'the whole conversation in your pager'],
   ['ctrl-g', 'write the message in your editor'],
@@ -1054,8 +1054,9 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   const st = useRef(null);
   // `live` is what each running command has printed so far and since when; `heard`, when the model last said or did anything;
   // `turn`, what the turn in hand has done; `talking`, that the model — not a `!` command — is what the screen is working on;
-  // `pick`, the job under the box that Down has stepped onto; `open`, the one whose record is shown.
-  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, raw: '', ed: editor(readHistory()), images: [], pastes: [], keys: false, notice: null, queue: [], started: new Map(), known: new Map(), working: null, talking: false, tokens: 0, thought: '', thinking: null, showThinking: true, heard: 0, running: new Map(), live: new Map(), drawSoon: null, jobs: new Map(), pick: null, open: null, asks: [], why: null, reply: null, fresh: true, leaving: null, gone: false, title: null, turn: null, where: session.where(), spent: session.spent(), files: { cwd: null, at: 0, list: [] }, away: false };
+  // `pick`, the job under the box that Down has stepped onto; `open`, the one whose record is shown; `settings`, the
+  // settings page while /config has it open.
+  st.current ??= { log: [], items: [], unmeasured: [], used: 0, next: 0, epoch: 0, raw: '', ed: editor(readHistory()), images: [], pastes: [], keys: false, notice: null, queue: [], started: new Map(), known: new Map(), working: null, talking: false, tokens: 0, thought: '', thinking: null, showThinking: true, heard: 0, running: new Map(), live: new Map(), drawSoon: null, jobs: new Map(), pick: null, open: null, asks: [], why: null, reply: null, fresh: true, leaving: null, gone: false, title: null, turn: null, where: session.where(), spent: session.spent(), files: { cwd: null, at: 0, list: [] }, away: false, settings: null };
   const state = st.current;
   state.columns = columns;
   state.rows = rows;
@@ -1479,6 +1480,13 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         record({ kind: 'user', text: line });
         session.route(args);
         return record({ kind: 'note', text: args ? `${routeLine(session)} from the next message` : `${routeLine(session)} · /model <model> <effort> changes it` });
+      }
+      // The settings page, in the box's place until Esc: what it changes is saved as it changes, and said once when it closes.
+      if (control === 'config') {
+        record({ kind: 'user', text: line });
+        const left = () => `${routeLine(session)}   ${state.where.name}${state.where.branch ? ` (${state.where.branch})` : ''}`;
+        state.settings = settingsPage({ live: { route: (to) => session.route(to), servers: () => session.mcpServers(), left }, cwd: state.where.cwd, onChange: redraw });
+        return;
       }
       if (control === 'memory' || control === 'mcp' || control === 'undo') {
         record({ kind: 'user', text: line });
@@ -1981,6 +1989,15 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     // The terminal's answer to Ink's keyboard-protocol query, when it comes after Ink stopped waiting for it.
     if (/^\[\?\d+u$/.test(input)) return;
     for (const [one, oneKey] of keysOf(input, key)) {
+      // The settings page takes every key while it is open — Esc and Ctrl-C close it — unless a question waits: that comes first.
+      if (state.settings && state.asks.length === 0) {
+        if (state.settings.key(keyName(one, oneKey))) {
+          const changed = state.settings.summary();
+          state.settings = null;
+          if (changed.length > 0) record({ kind: 'note', text: `settings: ${changed.join(' · ')}` });
+        }
+        continue;
+      }
       // Ctrl-R looking back through what was sent takes every key, Esc and Ctrl-C too: they put the draft back, and stop nothing.
       if (state.ed.search) {
         state.ed = press(state.ed, one, oneKey, session.commands, files).state;
@@ -2115,6 +2132,12 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
   });
   // A file dropped on the terminal arrives pasted as its path: an image's path becomes the image.
   usePaste((text) => {
+    // On the settings page a paste is a field's: a server's command or address, mostly.
+    if (state.settings && state.asks.length === 0) {
+      state.settings.paste(cleanPaste(text).text);
+      redraw();
+      return;
+    }
     // Saying why a call is refused, a paste is part of the reason — on one line — and never lands in the box behind it.
     if (state.why && state.why.ask === state.asks[0]) {
       state.why.text += cleanPaste(text).text.replace(/\s+/g, ' ');
@@ -2173,6 +2196,8 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     : 0;
   const under = approving ? (state.open !== null ? 2 + Math.min(Math.max(1, recorded), openRows(rows)) + (recorded > openRows(rows) ? 1 : 0) : 0) + (said ? 0 : STARTER_ROWS - 1) + 2 + state.queue.length + rowsUnderBox().length : 0;
   const asked = approving ? rows - 1 - over - under : null;
+  // A question waiting comes before the settings page: it is drawn, and answered, while the page waits behind it.
+  const paging = state.settings !== null && state.asks.length === 0;
   return h(
     Box,
     { flexDirection: 'column', minHeight: room },
@@ -2188,18 +2213,21 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     state.open !== null ? h(JobOpen, { id: state.open, job: state.jobs.get(state.open), rows }) : null,
     // The logo and what to try are the empty room's: once something has been said, the room is the conversation's.
     h(Room, { logo: said ? [] : logo, rows, from: state.used, starter: !said }),
-    h(
-      Box,
-      { flexDirection: 'column', marginTop: 1 },
-      // A message for the model is read with its next request — which, while it waits on a delegated job, is when that job reports.
-      ...state.queue.map(({ line, steer }, i) => h(Text, { key: i, dimColor: true, wrap: 'truncate' }, `  ${steer ? reading : 'queued'}: ${line.split('\n')[0]}${line.includes('\n') ? ' …' : ''}`)),
-      // While a call waits on the user's word every key is the answer's: no box stands there to type into.
-      state.asks.length > 0 && !state.asks[0].options ? null : h(Input, { state: state.ed, width: columns, rows, placeholder: said ? '' : 'Ask anything' }),
-      // The jobs at work in the background, under the box, and the chat over them: they go on whether or not there is a turn.
-      ...rowsUnderBox().map((id) => (id === MAIN ? h(MainAtWork, { key: MAIN, working: Boolean(state.working), picked: state.pick === MAIN, shown: state.open === null }) : h(JobAtWork, { key: `j${id}`, id, job: state.jobs.get(id), alone: true, picked: id === state.pick, open: id === state.open }))),
-      // While a call waits on the user's word there is no box, and so nothing of the box's under it: the status row alone.
-      menu.length > 0 && !approving ? h(Menu, { menu, pick: state.ed.pick, columns }) : state.ed.search && !approving ? h(Search, { search: state.ed.search }) : state.keys && !approving ? h(Keys, { columns }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, jobs: [...state.jobs.keys()], aside: session.running(), pick: state.pick, open: state.open, where: state.where, spent: state.spent, overBudget: state.overBudget, waiting: state.queue.length > 0, columns }),
-    ),
+    // The settings page stands where the box and the rows under it were, one row short of the window so it never fills it.
+    paging
+      ? h(Box, { marginTop: 1 }, h(SettingsView, { page: state.settings, columns, rows: Math.max(8, rows - 2), plain }))
+      : h(
+          Box,
+          { flexDirection: 'column', marginTop: 1 },
+          // A message for the model is read with its next request — which, while it waits on a delegated job, is when that job reports.
+          ...state.queue.map(({ line, steer }, i) => h(Text, { key: i, dimColor: true, wrap: 'truncate' }, `  ${steer ? reading : 'queued'}: ${line.split('\n')[0]}${line.includes('\n') ? ' …' : ''}`)),
+          // While a call waits on the user's word every key is the answer's: no box stands there to type into.
+          state.asks.length > 0 && !state.asks[0].options ? null : h(Input, { state: state.ed, width: columns, rows, placeholder: said ? '' : 'Ask anything' }),
+          // The jobs at work in the background, under the box, and the chat over them: they go on whether or not there is a turn.
+          ...rowsUnderBox().map((id) => (id === MAIN ? h(MainAtWork, { key: MAIN, working: Boolean(state.working), picked: state.pick === MAIN, shown: state.open === null }) : h(JobAtWork, { key: `j${id}`, id, job: state.jobs.get(id), alone: true, picked: id === state.pick, open: id === state.open }))),
+          // While a call waits on the user's word there is no box, and so nothing of the box's under it: the status row alone.
+          menu.length > 0 && !approving ? h(Menu, { menu, pick: state.ed.pick, columns }) : state.ed.search && !approving ? h(Search, { search: state.ed.search }) : state.keys && !approving ? h(Keys, { columns }) : h(Status, { session, leaving: Boolean(state.leaving), notice: state.notice?.text, jobs: [...state.jobs.keys()], aside: session.running(), pick: state.pick, open: state.open, where: state.where, spent: state.spent, overBudget: state.overBudget, waiting: state.queue.length > 0, columns }),
+        ),
   );
 }
 

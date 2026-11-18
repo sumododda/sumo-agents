@@ -2,6 +2,19 @@
 
 What each release changed for you. The commit of each version has the full detail.
 
+## Unreleased
+
+- Every setting is on one page: `/config` in the chat, or `sumo config` at a terminal. The arrows change a setting and
+  it is saved as it changes; Esc closes the page and says what changed. Turning the sandbox off, and removing an MCP
+  server, ask first.
+- No config file: MCP servers and their allow lists live in the database. An old `mcp.json` is moved in once and renamed
+  `mcp.json.imported`; one that would not read is left where it is, and `sumo doctor` says so.
+- On the page you add an MCP server by pasting its command or address, or bring one in from Claude Code's list. A token
+  typed in is refused: a header or variable names it as `${NAME}`.
+- Retired, each pointing at the page (exit 2): `sumo config <key> <value>`, `sumo models enable|disable|discover`,
+  `sumo mcp add|remove|allow|revoke`, `sumo setup --model-source`. Setup no longer asks where to get the local model;
+  a new address set on the page is downloaded as it is set. `sumo config` piped, with a key, or with `--json` still prints.
+
 ## 0.6.1 — 2026-11-11
 
 0.6.0 was never published: its build typed `[I` and `[O` into the box when you switched tabs. 0.6.1 is it, fixed.

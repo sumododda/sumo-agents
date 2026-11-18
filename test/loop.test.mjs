@@ -1294,7 +1294,7 @@ test('a job routed to a model that is off is refused before anything is sent', a
       setModel(db, 'fable', false, NOW);
       await assert.rejects(
         runJob(db, id, { send: () => assert.fail('nothing is sent'), now: () => NOW }),
-        (err) => err instanceof UsageError && err.message === `j${id} is routed to fable, which is off — sumo models enable fable, or abandon it and create it again`,
+        (err) => err instanceof UsageError && err.message === `j${id} is routed to fable, which is off — turn it on under API models, on the settings page (sumo config), or abandon it and create it again`,
       );
     } finally {
       db.close();
@@ -1416,7 +1416,7 @@ test('a job gets the MCP tools too, deferred behind tool search and named in its
       assert.match(request.system[0].text, /demo \(9 tools\)/, 'the job is told which servers there are');
       const refused = alone.seen[1].messages.at(-1).content[0];
       assert.equal(refused.is_error, true);
-      assert.match(refused.content, /needs the user's approval[\s\S]*sumo mcp allow demo echo/);
+      assert.match(refused.content, /needs the user's approval[\s\S]*on the settings page: \/config in the chat, or sumo config \(MCP servers, demo, echo\)/);
 
       // Run inside the chat: the question reaches the screen with the job's id on it, and "always" is kept.
       const asked = [];

@@ -182,14 +182,14 @@ test('doctor finds files of the home that others can read, and --fix makes them 
   assert.equal(mode(join(s.home, 'jobs', '7', 'tree')), 0o755);
 });
 
-test('doctor checks the shell sandbox, git, and that the MCP file reads', () => {
+test('doctor checks the shell sandbox, git, and says when an old mcp.json could not be moved into the database', () => {
   const s = sandbox();
   s.sumo(['config']);
+  writeFileSync(join(s.home, 'mcp.json'), '{ not json', { mode: 0o600 });
   const ok = s.sumo(['doctor']);
   if (process.platform === 'darwin') assert.match(ok.out, /^ok {4}shell sandbox \(\/usr\/bin\/sandbox-exec\)$/m);
   assert.match(ok.out, /^ok {4}git on PATH$/m);
-  writeFileSync(join(s.home, 'mcp.json'), '{ not json', { mode: 0o600 });
-  assert.match(s.sumo(['doctor']).out, /^FAIL {2}MCP servers file reads \(mcp\.json\) — .*mcp\.json/m);
+  assert.match(ok.out, /^FAIL {2}MCP servers moved from mcp\.json — .*mcp\.json.* — add them on the settings page \(sumo config\), then delete the file$/m);
   const noGit = s.sumo(['doctor'], { extraEnv: { PATH: '/nonexistent' } });
   assert.match(noGit.out, /^warn {2}git on PATH — /m);
 });

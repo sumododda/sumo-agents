@@ -85,12 +85,12 @@ test('a budget set with sumo config is a number of dollars, 0 or more; anything 
   const s = sandbox();
   assert.match(s.sumo(['config', 'jobs.budget']).out, /^jobs\.budget = 10$/m);
   for (const bad of ['lots', '-1', '1,000', '$5', '', '0x10']) {
-    const run = s.sumo(['config', 'jobs.budget', bad]);
+    const run = s.page(['config', 'jobs.budget', bad]);
     assert.equal(run.code, 2, `"${bad}" → ${run.out}`);
     assert.match(run.err, /jobs\.budget needs a number of dollars, 0 or more/);
   }
   assert.match(s.sumo(['config', 'jobs.budget']).out, /^jobs\.budget = 10$/m, 'a refused value is not stored');
-  for (const good of ['2.5', '0', '25']) assert.ok(s.sumo(['config', 'jobs.budget', good]).out.split('\n').includes(`jobs.budget = ${good}`), good);
+  for (const good of ['2.5', '0', '25']) assert.ok(s.page(['config', 'jobs.budget', good]).out.split('\n').includes(`jobs.budget = ${good}`), good);
 });
 
 test('a job near its budget is told once to close, and at the budget it is stopped with its last round answered; the stop is said', async () => {
@@ -117,7 +117,7 @@ test('a job near its budget is told once to close, and at the budget it is stopp
       const warned = seen.map((m) => m.content.filter((b) => b.type === 'text' && /budget/.test(b.text)).map((b) => b.text));
       assert.deepEqual(warned.map((w) => w.length), [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
       assert.match(warned[9][0], /^This job has spent \$\d+\.\d\d of its \$\d+\.\d\d budget[\s\S]*`finish` now: DONE only if the work is verified, otherwise FAILED with where it stands/);
-      assert.equal(stopReason('budget'), 'stopped: the job reached its budget — sumo config jobs.budget sets it, 0 for none');
+      assert.equal(stopReason('budget'), 'stopped: the job reached its budget — Jobs › Budget, on the settings page (sumo config), sets it; 0 for none');
       assert.ok(runLines(outcome).includes(stopReason('budget')));
     } finally {
       await closeMcp();

@@ -154,7 +154,7 @@ test("the model's shell: a job writes no memory; the chat remembers only what th
   assert.match(s.sumo(['config', 'chat.effort'], chat).out, /^chat\.effort = medium$/m, 'read, not changed');
   assert.equal(s.sumo(['mcp'], chat).code, 0);
   assert.equal(s.sumo(['models'], chat).code, 0);
-  assert.equal(s.sumo(['config', 'chat.effort', 'low'], {}).code, 0, 'the user still can');
+  assert.equal(s.page(['config', 'chat.effort', 'low'], {}).code, 0, 'the user still can');
 });
 
 test('help fits a terminal and says where to go next: per command, the docs, and how to report a bug', () => {

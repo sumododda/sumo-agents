@@ -207,13 +207,13 @@ const reply = (stop, content, usage) => ({ stop_reason: stop, content, usage, mo
 test('a session that costs more than chat.budget is told so on the screen once, and the model never reads it; 0 turns it off', async () => {
   const s = sandbox();
   for (const [value, message] of [['five', /chat\.budget is a sum in US dollars/], ['-1', /chat\.budget is a sum in US dollars/]]) {
-    const refused = s.sumo(['config', 'chat.budget', value]);
+    const refused = s.page(['config', 'chat.budget', value]);
     assert.equal(refused.code, 2, refused.out);
     assert.match(refused.err, message);
   }
   assert.match(s.sumo(['config', 'chat.budget']).out, /^chat\.budget = 5$/m, 'five dollars, unless it is changed');
-  assert.match(s.sumo(['config', 'chat.budget', '2.50']).out, /^chat\.budget = 2\.50$/m);
-  assert.match(s.sumo(['config', 'chat.budget', '0']).out, /^chat\.budget = 0$/m);
+  assert.match(s.page(['config', 'chat.budget', '2.50']).out, /^chat\.budget = 2\.50$/m);
+  assert.match(s.page(['config', 'chat.budget', '0']).out, /^chat\.budget = 0$/m);
 
   for (const budget of ['5', '0']) {
     await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
@@ -235,7 +235,7 @@ test('a session that costs more than chat.budget is told so on the screen once, 
           assert.deepEqual(said, [], 'off');
         } else {
           assert.equal(said.length, 1, 'once a session');
-          assert.equal(said[0].text, 'this session has cost $6.00 — /new starts a fresh one; sumo config chat.budget changes when this is said');
+          assert.equal(said[0].text, 'this session has cost $6.00 — /new starts a fresh one; Spend notice, on the settings page (/config), changes when this is said');
           assert.deepEqual(lines, [said[0].text], 'the same line where the piped chat says its notices');
           assert.ok(!JSON.stringify(session.params.messages).includes('has cost'), 'the model is not told');
         }
@@ -262,10 +262,10 @@ test('on the screen the budget line is a note under the turn, where a retry is s
       const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
       try {
         await tty.type('hello\r');
-        for (let i = 0; i < 300 && !/this session has cost \$6\.00 — \/new starts a fresh one; sumo config chat\.budget changes when this is said/.test(tty.screen()); i++) {
+        for (let i = 0; i < 300 && !/this session has cost \$6\.00 — \/new starts a fresh one; Spend notice, on the settings page \(\/config\), changes when this is said/.test(tty.screen()); i++) {
           await new Promise((r) => setTimeout(r, 10));
         }
-        assert.match(tty.screen(), /this session has cost \$6\.00 — \/new starts a fresh one; sumo config chat\.budget changes when this is said/, tty.screen());
+        assert.match(tty.screen(), /this session has cost \$6\.00 — \/new starts a fresh one; Spend notice, on the settings page \(\/config\), changes when this is said/, tty.screen());
       } finally {
         ui.unmount();
       }

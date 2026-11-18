@@ -5,7 +5,6 @@ import {
 } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
-import { createInterface } from 'node:readline/promises';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
 import { anthropicClient, authenticatedRequest, FALLBACK_BETA, resolveAnthropicCredential } from './auth.mjs';
@@ -26,7 +25,7 @@ const NODE_REQUIREMENT = '22.19+ or 24.6+';
 // route.mjs's EFFORTS, spelled out: importing it would close a cycle (route → model → setup). A test keeps them equal.
 export const CHAT_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-/** The settings `sumo config` accepts, with the value used when none is stored. */
+/** The settings the settings page shows and `sumo config` prints, with the value used when none is stored. */
 export const CONFIG_DEFAULTS = {
   'chat.budget': '5',
   'chat.effort': 'medium',
@@ -47,11 +46,11 @@ export const CONFIG_DEFAULTS = {
 
 /** What a setting that is gone became, said when its old name is used, instead of "unknown setting". */
 const RETIRED = {
-  'chat.motion': 'chat.motion is now chat.screen: sumo config chat.screen still',
-  'chat.plain': 'chat.plain is now chat.screen: sumo config chat.screen plain',
-  'model.source': 'model.source is now part of model.url, the model file\'s whole address: sumo config model.url https://<host>/…/<file>.gguf',
-  'model.repo': 'model.repo is now part of model.url, the model file\'s whole address: sumo config model.url https://<host>/…/<file>.gguf',
-  'model.file': 'model.file is now part of model.url, the model file\'s whole address: sumo config model.url https://<host>/…/<file>.gguf',
+  'chat.motion': 'chat.motion is now chat.screen — Chat › Screen, still, on the settings page (sumo config)',
+  'chat.plain': 'chat.plain is now chat.screen — Chat › Screen, plain, on the settings page (sumo config)',
+  'model.source': 'model.source is now part of model.url, the model file\'s whole address — Memory › Local model, on the settings page (sumo config)',
+  'model.repo': 'model.repo is now part of model.url, the model file\'s whole address — Memory › Local model, on the settings page (sumo config)',
+  'model.file': 'model.file is now part of model.url, the model file\'s whole address — Memory › Local model, on the settings page (sumo config)',
   'prime.budget': 'prime.budget is no longer a setting: the memory block every session starts with holds 800 tokens; the rest is found by search',
   'scratch.days': 'scratch.days is no longer a setting: a scratch folder nothing is written in for 14 days is deleted',
   'jobs.escalate': 'jobs.escalate is no longer a setting: a worker\'s first attempt that fails is always retried once, one step up',
@@ -134,7 +133,7 @@ export const modelFileOfUrl = (url = CONFIG_DEFAULTS['model.url']) => new URL(ur
 export const modelFileOf = (db) => modelFileOfUrl(modelUrlOf(db));
 
 /**
- * The address with another source in front: `--model-source` and setup's question name a host, or a JFrog
+ * The address with another source in front: `setup({ modelSource })` names a host, or a JFrog
  * Artifactory Hugging Face remote's huggingfaceml URL, and the file keeps its path there (`<org>/<repo>/resolve/main/<file>`
  * in Hugging Face's layout, else the file alone). A source that is itself a .gguf address is the whole answer.
  */
@@ -143,12 +142,6 @@ function withSource(url, source) {
   const parts = url.split('/');
   const tail = parts.slice(parts.at(-3) === 'resolve' ? -5 : -1).join('/');
   return `${source.replace(/\/+$/, '')}/${tail}`;
-}
-
-/** The source part of an address, what setup's question offers to keep. */
-function sourceOf(url) {
-  const parts = url.split('/');
-  return parts.slice(0, parts.at(-3) === 'resolve' ? -5 : -1).join('/');
 }
 
 /**
@@ -186,7 +179,7 @@ async function ensureModel(db) {
     const why = redactUrl(cause.message);
     // Offline, with the model already here: that is a model that could not be checked, not one that is missing.
     if (existsSync(dest)) return `model     ${dest} (${formatBytes(statSync(dest).size)}, present; not checked against ${shown}: ${why})`;
-    return `could not download the router model from ${shown}: ${why}`;
+    return `could not download the router model from ${shown}: ${why} — another address: Memory › Local model, on the settings page (sumo config)`;
   }
 }
 
@@ -243,28 +236,18 @@ function modelUrlOrRefuse(value) {
   return value;
 }
 
-/** The one question `sumo setup` ever asks, and only when nothing is stored yet and a person is there to answer it. */
-async function askModelSource(defaultSource) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+/**
+ * The local model fetched again for the address the settings page now holds, and the server that ran the old one
+ * stopped, so the next local call starts on the new file. Never throws: what happened is the line returned.
+ */
+export async function fetchModel() {
+  const db = openDb();
   try {
-    // A slip at the prompt is asked again, not the end of setup.
-    for (;;) {
-      // Ctrl-C at the prompt stops setup; Ctrl-D is no answer, so the default. Neither is a stack trace.
-      const answer = (
-        await rl.question(`Download the router model from [${defaultSource}]: `).catch((cause) => {
-          if (cause?.name === 'AbortError') throw new UsageError('setup stopped — nothing was downloaded');
-          return '';
-        })
-      ).trim();
-      if (!answer) return defaultSource;
-      try {
-        return sourceOrRefuse(answer);
-      } catch (cause) {
-        process.stdout.write(`${cause.message}\n`);
-      }
-    }
+    const line = await ensureModel(db);
+    stopLocalServer(db);
+    return line;
   } finally {
-    rl.close();
+    db.close();
   }
 }
 
@@ -284,19 +267,17 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
   const llama = commandOnPath('llama-server');
   if (llama) setMeta(db, 'llama.path', llama);
 
-  let source = modelSource === undefined ? undefined : sourceOrRefuse(modelSource);
-  if (source === undefined && !noModel && !getMeta(db, 'config.model.url') && process.stdin.isTTY) {
-    source = await askModelSource(sourceOf(CONFIG_DEFAULTS['model.url']));
-  }
+  // Setup asks nothing: the default address is fetched, and another is set on the settings page, which fetches it then.
+  const source = modelSource === undefined ? undefined : sourceOrRefuse(modelSource);
   if (source !== undefined) setMeta(db, 'config.model.url', modelUrlOrRefuse(withSource(modelUrlOf(db), source)));
 
   // SUMO_AGENTS_MODEL_CMD marks a hermetic test/dev harness, the same way it tells callModel and
-  // callLocalModel never to run a real model — an explicit --model-source still means "go fetch it".
+  // callLocalModel never to run a real model — an explicit modelSource still means "go fetch it".
   const harnessSkip = Boolean(process.env.SUMO_AGENTS_MODEL_CMD) && modelSource === undefined;
   let modelLine = null;
   if (!noModel) {
     modelLine = harnessSkip
-      ? 'model     not downloaded — SUMO_AGENTS_MODEL_CMD is set (unset it, or pass --model-source, to fetch it)'
+      ? 'model     not downloaded — SUMO_AGENTS_MODEL_CMD is set (unset it to fetch it)'
       : await ensureModel(db);
   }
   const modelsLine = await checkModels(db);
@@ -330,12 +311,12 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
 
 /**
  * Which of Sumo's models this credential can use, asked of the API the first time only: a later setup
- * leaves the switches as they are, since the user may have set some by hand — `sumo models discover` asks again.
+ * leaves the switches as they are, since the user may have set some by hand — API models › Discover, on the settings page, asks again.
  * Never throws: a check that could not be made is not a reason for `sumo setup` to fail.
  */
 async function checkModels(db) {
   const checked = modelsChecked(db);
-  if (checked) return `models    checked ${checked.slice(0, 10)} — sumo models discover to check again`;
+  if (checked) return `models    checked ${checked.slice(0, 10)} — API models › Discover, on the settings page (sumo config), checks again`;
   const result = await discoverModels(db);
   return result.ok ? `models    ${discoverySummary(result)}` : `models    not checked — ${result.error}`;
 }
@@ -406,10 +387,10 @@ export async function doctor() {
   if (stored.models) {
     const on = MODELS.filter((name) => stored.models[name].on);
     const off = MODELS.filter((name) => !stored.models[name].on);
-    check(on.length > 0, `models on: ${on.join(', ') || 'none'}${off.length > 0 ? `; off: ${off.join(', ')}` : ''}`, 'sumo models enable <name>');
-    check(stored.checked !== null, `models checked against the API${stored.checked ? ` (${stored.checked.slice(0, 10)})` : ''}`, 'run: sumo models discover', true);
+    check(on.length > 0, `models on: ${on.join(', ') || 'none'}${off.length > 0 ? `; off: ${off.join(', ')}` : ''}`, 'turn one on under API models, on the settings page: sumo config');
+    check(stored.checked !== null, `models checked against the API${stored.checked ? ` (${stored.checked.slice(0, 10)})` : ''}`, 'API models › Discover, on the settings page: sumo config', true);
     for (const [key, value] of stored.configured) {
-      if (MODELS.includes(value)) check(stored.models[value].on, `${key} is on (${value})`, `sumo models enable ${value}, or sumo config ${key} <name>`);
+      if (MODELS.includes(value)) check(stored.models[value].on, `${key} is on (${value})`, `turn ${value} on under API models, or pick another model, on the settings page: sumo config`);
     }
   }
 
@@ -442,19 +423,27 @@ export async function doctor() {
   // The shell's sandbox is on by default: where it cannot be, every command writes wherever the user can, and that is said.
   if (stored.sandbox !== 'off') {
     const why = unsandboxable();
-    check(why === null, 'shell sandbox (/usr/bin/sandbox-exec)', `${why} — the model's shell can write wherever you can; sumo config shell.sandbox off says you know`, true);
+    check(why === null, 'shell sandbox (/usr/bin/sandbox-exec)', `${why} — the model's shell can write wherever you can; turning Sandbox off on the settings page (sumo config) says you know`, true);
   }
   check(commandOnPath('git') !== null, 'git on PATH', "install git — a job's worktree, its changes and the checks that judge it need it", true);
-  // A file that does not read takes every MCP server with it, in the chat and in every job.
-  if (existsSync(join(p.home, 'mcp.json'))) {
+  // The MCP servers moved from mcp.json into the database the first time anything read them — asked for here, so that
+  // has happened — and a file that would not read was left where it was: said, since its servers are not in use.
+  if (stored.models) {
     const { readConfig } = await import('./mcp.mjs');
     let unread = null;
     try {
       readConfig();
+      const db = openDb();
+      try {
+        unread = getMeta(db, 'mcp.import_failed');
+      } finally {
+        db.close();
+      }
     } catch (cause) {
       unread = cause.message;
     }
-    check(unread === null, 'MCP servers file reads (mcp.json)', unread ?? '');
+    if (unread) check(false, 'MCP servers moved from mcp.json', `${unread} — add them on the settings page (sumo config), then delete the file`);
+    else if (readdirSync(p.home).some((name) => name.startsWith('mcp.json.imported'))) check(true, 'MCP servers moved from mcp.json — mcp.json.imported is a copy nothing reads; delete it when you like');
   }
 
   const launcherOk = existsSync(p.launcher) && readFileSync(p.launcher, 'utf8') === launcherScript();
@@ -784,7 +773,7 @@ function launcherRuns() {
 
 /** What sumo makes in its home, by name: an uninstall removes these and leaves anything else where it is. */
 const MADE_HERE = new Set(['memory.db', 'memory.db-wal', 'memory.db-shm', 'backups', 'bin', 'logs', 'jobs', 'models', 'scratch', 'history', 'mcp.json', 'scribe', 'sumo.db']);
-const madeHere = (name) => MADE_HERE.has(name) || /^memory\.db\.(?:pre-v\d+\.bak|damaged-|replaced-)/.test(name);
+const madeHere = (name) => MADE_HERE.has(name) || /^memory\.db\.(?:pre-v\d+\.bak|damaged-|replaced-)/.test(name) || /^mcp\.json\.imported(?:-\d+)?$/.test(name);
 
 /** The local model's servers for this home: every llama-server whose command line names its models folder. */
 function serversFor(home) {
