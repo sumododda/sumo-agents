@@ -998,9 +998,9 @@ test('a change to a file outside the project is put to the user: refused with no
 });
 
 test('a guarded file — one the shell, a tool or an editor reads later — is changed only when the user says so, this once, in the project or anywhere, and nobody there is a refusal that says why', async () => {
-  await withHome(freshHome(), {}, async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-user-home-')));
+  await withHome(freshHome(), { HOME: home }, async () => {
     const root = mkdtempSync(join(tmpdir(), 'sumo-agents-guarded-'));
-    const home = process.env.HOME;
     writeFileSync(join(root, '.envrc'), 'export A=1\n');
     mkdirSync(join(root, '.vscode'));
     writeFileSync(join(root, '.vscode', 'settings.json'), '{}\n');

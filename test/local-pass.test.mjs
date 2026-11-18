@@ -20,7 +20,7 @@ test('by default the writer asks the local model, thinking on, and the ledger sa
   assert.equal(shown.think, true);
   const rows = s.sql((db) => db.prepare('SELECT kind, model, ok FROM model_runs ORDER BY id').all().map((r) => ({ ...r })));
   assert.deepEqual(rows, [{ kind: 'scribe', model: 'local', ok: 1 }]);
-  assert.equal(s.sql((db) => db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE body = 'Always squash merge'`).get().n), 1);
+  assert.equal(s.sql((db) => db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE body = 'from now on always squash merge'`).get().n), 1);
   assert.match(s.sumo(['memory', 'status']).out, /^model {6}local/m);
 });
 
@@ -51,7 +51,7 @@ test('without a credential a failed local call is the failure: nothing is filed,
   const rows = s.sql((db) => db.prepare('SELECT kind, model, ok FROM model_runs ORDER BY id').all().map((r) => ({ ...r })));
   assert.deepEqual(rows, [{ kind: 'scribe', model: 'local', ok: 0 }]);
   assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM user_turns WHERE scribed = 0').get().n), 1);
-  assert.match(s.sumo(['memory', 'status'], { extraEnv: NO_KEY }).out, /^failing {4}filing failed 1 time in a row/m);
+  assert.match(s.sumo(['memory', 'status'], { extraEnv: NO_KEY }).out, /^filing {5}on — failed 1 time in a row, pauses at three$/m);
 });
 
 test('a writer set to haiku still goes straight to the API model, as before', () => {

@@ -257,7 +257,7 @@ test('a watcher is told what ran, what came back and what it cost; an interrupt 
       session.interrupt();
       const stopped = await first;
       assert.equal(stopped.stop, 'interrupted');
-      assert.equal(readFileSync(spawned, 'utf8'), 'memory run\n', 'a turn the user stopped is still a turn that ended: what they said is filed');
+      assert.equal(existsSync(spawned), false, 'a turn the user stopped starts no memory pass: a conversation is read once, when it is over');
       assert.deepEqual(watched.map((e) => e.type).filter((t) => t !== 'output'), ['usage', 'tool', 'result'], 'the cost comes with the reply, before its tools run');
       assert.ok(watched.findIndex((e) => e.type === 'output') > watched.findIndex((e) => e.type === 'tool'), 'and what a command prints, while it runs');
       assert.equal(watched[0].totals.outputTokens, 40);
@@ -1375,6 +1375,64 @@ test('/model with a new effort on the same model says it in the conversation, so
       await again.say('four');
       assert.equal(seen[3].messages.filter((m) => m.role === 'system' && m.content.length === 0).length, 0, 'a saved conversation comes back without the efforts said in it');
       assert.deepEqual(seen[3].output_config, { effort: 'xhigh' });
+    } finally {
+      db.close();
+    }
+  });
+});
+
+/**
+ * Where the API refuses a system message, as it said on Nov 11 2026: operator text only where the model answers next, past
+ * any other system messages beside it; an effort said alone may stand anywhere. The index of the first refused one, or -1.
+ */
+function stranded(messages) {
+  return messages.findIndex((m, i) => m.role === 'system' && !(Array.isArray(m.content) && m.content.length === 0 && m.output_config) && ![...messages.slice(i + 1), { role: 'assistant' }].find((n) => n.role !== 'system').role.startsWith('assistant'));
+}
+
+test('an effort said after a turn that never got its answer leaves no operator message stranded behind it, and a session saved stranded is mended when it is picked up', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const root = mkdtempSync(join(tmpdir(), 'sumo-agents-chat-'));
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'simba' }));
+      addProject(db, root, { slug: 'simba', now: NOW });
+      const seen = [];
+      let down = true;
+      const send = async (params) => {
+        seen.push(structuredClone(params));
+        const at = stranded(params.messages);
+        if (at >= 0) throw Object.assign(new Error(`messages.${at}: role 'system' must precede an 'assistant' message or end the array`), { status: 400 });
+        if (down) throw new Error('the API answered 529: overloaded');
+        return reply('end_turn', [{ type: 'text', text: 'ok' }]);
+      };
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
+      session.start('startup');
+
+      // The project's card rides in as an operator message, and the request fails before the model answers it.
+      assert.equal((await session.say('fix the briefing bug in simba')).stop, 'error');
+      assert.equal(seen[0].messages.at(-1).role, 'system');
+      // A new effort is said in the conversation, after the card left unanswered.
+      assert.equal(session.route('opus low'), 'opus/low');
+      down = false;
+      const outcome = await session.say('continue');
+      assert.equal(outcome.stop, 'end_turn', outcome.error);
+      const sent = seen.at(-1).messages;
+      assert.equal(stranded(sent), -1);
+      assert.ok(sent.some((m) => m.role === 'user' && /^<sumo>\n<project simba> /.test(m.content[0].text)), 'the card is still there, as text');
+      assert.deepEqual(sent.filter((m) => m.role === 'system' && m.output_config).map((m) => m.output_config.effort), ['low'], 'the effort is still said');
+
+      // A session an earlier version saved stranded — the card, the effort, then the user — answers when it is picked up.
+      const file = stateFile(session.sessionId);
+      const state = JSON.parse(readFileSync(file, 'utf8'));
+      state.messages.push({ role: 'system', content: '<project simba> a card' }, { role: 'system', content: [] }, { role: 'user', content: [{ type: 'text', text: 'continue' }] });
+      writeFileSync(file, JSON.stringify(state));
+      const short = session.sessionId.slice(0, 8);
+      session.end();
+      const again = createChat(db, { cwd: '/', send, now: () => NOW });
+      again.resume(short);
+      const picked = await again.say('and again');
+      assert.equal(picked.stop, 'end_turn', picked.error);
+      assert.equal(stranded(seen.at(-1).messages), -1);
     } finally {
       db.close();
     }

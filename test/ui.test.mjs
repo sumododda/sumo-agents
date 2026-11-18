@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { createChat } from '../src/chat.mjs';
-import { openDb, setMeta } from '../src/db.mjs';
+import { openDb } from '../src/db.mjs';
+import { notePass } from '../src/ledger.mjs';
 import { add } from '../src/memory.mjs';
 import { appendLive, startLive, takeInbox } from '../src/jobs.mjs';
 import { paths } from '../src/paths.mjs';
@@ -307,7 +308,8 @@ test('the screen is as wide as the window; Ctrl-C clears what is typed, then ask
     try {
       const wide = 'Keep every line of the chat as wide as the window it is drawn in, however wide that window turns out to be';
       add(db, { type: 'preference', body: 'Always squash before merging', now: NOW });
-      setMeta(db, 'scribe.failures', 3);
+      // Three passes that failed, as the ledger counts them: the block reads what the status reads.
+      for (let n = 0; n < 3; n++) notePass(db, { ok: false, error: 'the model did not answer' });
       const events = new EventEmitter();
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: () => assert.fail('nothing here talks to the model'), now: () => NOW });
       const tty = fakeTty({ columns: 150 });

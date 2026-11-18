@@ -8,6 +8,9 @@ import { join } from 'node:path';
 // FORCE_COLOR as the user's, so every line a test reads would be coloured at a terminal and plain in CI: it is taken
 // away here, before any test runs. A test about colour sets it itself.
 delete process.env.FORCE_COLOR;
+// Run from inside Claude Code, the suite carries its CLAUDECODE=1, and a memory command would say on stderr that the
+// harness is not being heard: a test about that line sets the variable itself.
+delete process.env.CLAUDECODE;
 
 /** A fresh SUMO_AGENTS_HOME nothing else has touched. */
 export function freshHome() {

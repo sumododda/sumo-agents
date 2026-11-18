@@ -39,7 +39,8 @@ test('a memory whose words never say "lint" is found by a search for it through 
   assert.equal(keyed.sql((db) => db.prepare('SELECT keys FROM memories WHERE id = 1').get().keys), 'lint, pre-commit');
   const found = keyed.sumo(['search', 'lint']);
   assert.equal(found.code, 0, found.err);
-  assert.equal(found.out.trim(), `m1 [pref·global·stated] ${BODY}`, 'found, and shown by its body alone');
+  assert.ok(found.out.startsWith(`m1 [pref·global·stated] ${SAID}`), found.out);
+  assert.doesNotMatch(found.out, /pre-commit/, 'found, and shown by its body alone');
 
   const plain = sandbox();
   plain.sumo(['add', 'preference', BODY]);
@@ -53,7 +54,7 @@ test('a question about linting is held back by the memory it is about, through i
   const keyed = sandbox();
   filed(keyed, ['lint', 'pre-commit']);
   const held = JSON.parse(stop(keyed, asked).out);
-  assert.match(held.context, /memory already holds\nm1 \[pref·global·stated\] Always run eslint --fix before you commit\n/);
+  assert.match(held.context, /memory already holds\nm1 \[pref·global·stated\] always run eslint --fix before you commit\n/);
 
   // The same rule without them shares one word with the question, which is an accident, not an answer.
   const plain = sandbox();
@@ -67,11 +68,11 @@ test('search terms are never shown as the user\'s words: not in the startup bloc
   filed(s, ['lint', 'pre-commit']);
 
   const block = s.sumo(['prime']).out;
-  assert.match(block, /- m1 Always run eslint --fix before you commit/);
+  assert.match(block, /- m1 always run eslint --fix before you commit/);
   assert.doesNotMatch(block, /\blint\b|pre-commit/);
 
   const shown = s.sumo(['show', 'm1']).out.trim().split('\n');
-  assert.equal(shown.at(-1), BODY, 'the body is the user\'s sentence, as it was filed');
+  assert.equal(shown.at(-1), SAID, 'the body is the user\'s sentence, as they typed it');
   assert.ok(shown.some((l) => /^keys: lint, pre-commit {3}\(/.test(l)), shown.join('\n'));
 });
 
@@ -83,16 +84,15 @@ test('search terms a model gets wrong are dropped and the memory is kept', () =>
   }
 });
 
-test('the writer and the slow pass are asked for search terms with every memory they file, and may give none', () => {
+test('the writer is asked for search terms with every memory it files, and may give none', () => {
   const s = sandbox();
   s.sumo(['config']); // first touch creates the database
-  const schema = s.sql((db) => opsSchema(db, ['add', 'supersede', 'gotcha', 'procedure']));
+  const schema = s.sql((db) => opsSchema(db, ['add', 'supersede', 'gotcha']));
   const byOp = Object.fromEntries(schema.properties.ops.items.anyOf.map((branch) => [branch.properties.op.enum[0], branch]));
   for (const op of ['add', 'supersede', 'gotcha']) {
     assert.deepEqual({ ...byOp[op].properties.keys, description: undefined }, { type: 'array', items: { type: 'string' }, description: undefined }, op);
     assert.ok(byOp[op].required.includes('keys'), `${op}: an empty list is how none is given — no optional field for the grammar`);
   }
-  assert.equal(byOp.procedure.properties.keys, undefined, 'a workflow is found by its title and cue');
 });
 
 test('a gotcha from the writer is found by its search terms too', () => {

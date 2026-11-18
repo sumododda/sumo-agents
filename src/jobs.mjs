@@ -15,6 +15,7 @@ import { preferences } from './prime.mjs';
 import { getProject, isScratch } from './projects.mjs';
 import { chooseRoute, RETRY_IMPORTANT_THRESHOLD, statsLines } from './route.mjs';
 import { verifyCommands } from './scan.mjs';
+import { filingState } from './ledger.mjs';
 import { runScribe } from './scribe.mjs';
 import { addCheckpoint, pendingTurns } from './sessions.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
@@ -377,8 +378,9 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
   const guide = chosen ? guideFor(chosen) : null;
   const judged = agent === 'reviewer' ? changeToJudge(db, { project, reviews }) : null;
 
-  // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory.
-  if (pendingTurns(db, 1).length > 0) await runScribe(db, { now });
+  // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory: the conversation
+  // still going on is read now. Not while filing is paused — a job starting is not the user asking for it by hand.
+  if (pendingTurns(db, 1).length > 0 && !filingState(db, now).paused) await runScribe(db, { now });
 
   const route = routed ?? (await chooseRoute(db, { agent, project, task, title: title.trim(), retryOf, reviews }));
 

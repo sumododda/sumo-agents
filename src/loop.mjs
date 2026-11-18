@@ -145,7 +145,7 @@ function clearedBy(response) {
   return ` cleared ${uses} tool use${uses === 1 ? '' : 's'} (${Math.round(tokens / 1000)}k)`;
 }
 
-export const promptFile = (name) => readFileSync(join(REPO_ROOT, 'prompts', name), 'utf8').trim();
+const promptFile = (name) => readFileSync(join(REPO_ROOT, 'prompts', name), 'utf8').trim();
 /**
  * A sub-agent works by the user's coding rules as the chat does: the Coding section of AGENTS.md, read from its one
  * home, without the lines that point at guides — a job is handed its guide in the brief.

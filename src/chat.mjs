@@ -804,10 +804,22 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     return id;
   }
 
-  /** A turn that ended before the model answered left its operator message at the tail; the API takes one only where the model answers next, so before anything follows it, it becomes text. An effort said there may stand anywhere, and stays. */
+  /**
+   * A turn that ended before the model answered left its operator message unanswered. The API takes one only where the model
+   * answers next, past any other system messages beside it — an effort said after it does not shelter it — so before anything
+   * follows it, it becomes text. A request with one stranded was refused, or sent it as this same text to a model that takes
+   * none, so no reply rests on what changes; a session saved stranded is mended here too. An effort said alone may stand anywhere, and stays.
+   */
   function settleTail() {
-    const tail = params.messages.at(-1);
-    if (tail?.role === 'system' && !effortOnly(tail)) params.messages[params.messages.length - 1] = asText(tail.content);
+    let next = null;
+    for (let i = params.messages.length - 1; i >= 0; i--) {
+      const m = params.messages[i];
+      if (m.role !== 'system') next = m.role;
+      else if (!effortOnly(m) && next !== 'assistant') {
+        params.messages[i] = asText(m.content);
+        next = 'user';
+      }
+    }
   }
 
   /**
@@ -982,7 +994,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       const asked = outcome.stop === 'end_turn';
       const edited = [...unchecked].map((path) => relative(workspace().cwd, path));
       const checks = declared();
-      const held = continued ? '' : event('stop', asked ? { last_assistant_message: outcome.text, stop_hook_active: false, edited, checks } : { stop_hook_active: true });
+      // The reply goes with the event either way, for the journal: also the one a continued turn ends on, which asks nothing more.
+      const held = event('stop', asked && !continued ? { last_assistant_message: outcome.text, stop_hook_active: false, edited, checks } : { last_assistant_message: outcome.text, stop_hook_active: true });
       if (!held) return outcome;
       const { context } = JSON.parse(held);
       if (context.includes('<check>')) watch({ type: 'check', edited, checks });

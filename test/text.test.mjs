@@ -268,3 +268,35 @@ test('a did-you-mean keeps at least half of what was typed: search for serch, no
   assert.equal(closest('xml', ['json', 'md']), null, 'two edits of three letters is no guess');
   assert.equal(closest('m', ['mcp', 'memory']), null);
 });
+
+test('an opposite turns a rule round as a negation does: enabled for disabled, allowed for forbidden, before for after, added for removed, on for off', async () => {
+  const { sameWayRound } = await import('../src/text.mjs');
+  assert.equal(sameWayRound('Telemetry is disabled in production builds', 'we keep telemetry enabled in production builds'), false);
+  assert.equal(sameWayRound('Force-pushing to feature branches is forbidden on slate', 'force-pushing to feature branches is allowed on slate'), false);
+  assert.equal(sameWayRound('Uploads are blocked on staging', 'uploads are permitted on staging'), false);
+  assert.equal(sameWayRound('Deploy slate before the tests pass', 'always deploy slate after the tests pass'), false);
+  assert.equal(sameWayRound('Remove a changelog entry for every release', 'add a changelog entry for every release'), false);
+  assert.equal(sameWayRound('Dark mode is off', 'keep dark mode on'), false);
+  assert.equal(sameWayRound('Turn telemetry on in production', 'turn telemetry off in production'), false);
+  // The same side on both, or both sides in what was typed, is no turn — and "on" is seldom a state.
+  assert.equal(sameWayRound('Telemetry stays enabled in production builds', 'we keep telemetry enabled in production builds'), true);
+  assert.equal(sameWayRound('Run the linter before committing', 'always run the linter before you commit'), true);
+  assert.equal(sameWayRound('Deploys run on fridays', 'we deploy on fridays, the freeze is off'), true, '"on fridays" is a day, not a switch');
+  assert.equal(sameWayRound('Squash merge on github', 'always squash merge on github'), true);
+  assert.equal(sameWayRound('Add a test, then remove the old fixture', 'add a test and remove the old fixture after'), true);
+});
+
+test('a named value that differs is not what was said: another branch, another version, another tool where theirs stood', async () => {
+  const { sameWayRound } = await import('../src/text.mjs');
+  assert.equal(sameWayRound('Deploy slate from the release branch', 'always deploy slate from the main branch'), false);
+  assert.equal(sameWayRound('Slate runs on node 20', 'slate runs on node 22 now'), false);
+  assert.equal(sameWayRound('The api targets python 3.11', 'the api targets python 3.12'), false);
+  assert.equal(sameWayRound('Slate uses npm for installs', 'slate uses pnpm for installs'), false);
+  // The same value, or one the user named themselves, is theirs.
+  assert.equal(sameWayRound('Use biome for linting, not eslint', 'we use biome now, not eslint'), true);
+  assert.equal(sameWayRound('slate uses bun, not pnpm', 'in slate we moved from pnpm to bun last week'), true);
+  assert.equal(sameWayRound('Deploy slate from the main branch', 'always deploy slate from the main branch after the tests pass'), true);
+  assert.equal(sameWayRound('Slate runs on node 22', 'slate runs on node 22 now'), true);
+  assert.equal(sameWayRound('Billing uses Postgres', 'we use postgres for billing'), true);
+  assert.equal(sameWayRound('The user uses pnpm', 'we used to use npm but now we use pnpm'), true);
+});

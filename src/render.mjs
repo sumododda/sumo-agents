@@ -44,3 +44,25 @@ export function historyLine(m) {
   const span = `${m.valid_from.slice(0, 10)} → ${m.invalid_at ? m.invalid_at.slice(0, 10) : '          '}`;
   return `m${m.id}  ${span}  ${m.state.padEnd(11)} ${clip(m.type === 'procedure' ? m.title : m.body, LINE_BODY_MAX)}`;
 }
+
+/** A memory as a search prints it: its line, and the day it was said. */
+export const foundLine = (m) => `${line(m)} · ${m.valid_from.slice(0, 10)}`;
+
+const SAID_BY = { turn: 'you said', reply: 'sumo said' };
+const AROUND_MAX = 110;
+const saidTags = (e) => `[${SAID_BY[e.kind]}${e.project ? `·${e.project}` : ''}]`;
+
+/** A turn or a reply as a search prints it: `t481 [you said·simba] …the part around the words… · 2026-11-02`. */
+export const saidLine = (hit) => `${hit.ref} ${saidTags(hit)} ${hit.excerpt} · ${hit.ts.slice(0, 10)}`;
+
+/** One turn or reply whole, then what was said around it in its conversation, the one asked for marked. */
+export function saidDetail({ entry, around }) {
+  const when = (e) => `${e.ts.slice(0, 10)} ${e.ts.slice(11, 16)}`;
+  const cut = entry.full_len > entry.text.length ? ` · the first ${entry.text.length} of ${entry.full_len} characters, the rest was not kept` : '';
+  const out = [`${entry.ref} ${saidTags(entry)} ${when(entry)} · conversation ${entry.session_id.slice(0, 8)}${cut}`, '', entry.text];
+  if (around.length > 1) {
+    out.push('', 'around it (sumo show <id> opens one whole):');
+    for (const e of around) out.push(`${e === entry ? '>' : ' '} ${e.ref} ${saidTags(e)} ${when(e)} ${clip(e.text, AROUND_MAX)}`);
+  }
+  return out.join('\n');
+}

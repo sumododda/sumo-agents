@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-// A live measurement, not a test: scripted conversations go through the real hooks, the memory pass files each one and
-// tidies at the end, and what memory ends up holding is judged. It answers one question — over time, does
-// memory stay right: a correction replaces what it corrects, a thing said twice is one memory, two that cannot both be
-// true are raised, and a request for work is never filed? On the local model it costs $0.
+// A live measurement, not a test: scripted conversations go through the real hooks, the memory pass reads each one when
+// it is over and tidies at the end, and what memory ends up holding is judged. It answers one question — over time, does
+// memory stay right: a correction replaces what it corrects and stays in history, a thing said twice is one memory, two
+// that cannot both be true are raised, a request for work is never filed, nothing is held as a guess, and every memory
+// cites words from the turn it names and is that turn's own sentence, as typed? On the local model it costs $0.
 //   node probes/memory-quality.mjs                 → the configured memory.model, once
 //   node probes/memory-quality.mjs --runs 3        → three fresh homes: pass^3 says what holds every time
 //   node probes/memory-quality.mjs --model haiku   → another model for the memory pass, to compare
@@ -34,6 +35,8 @@ export const TURNS = [
 ];
 
 const mentions = (pattern) => (m) => pattern.test(m.body);
+/** Words as a quote is compared: case, curly quotes and runs of space aside. */
+const flat = (text) => String(text).toLowerCase().replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, ' ').trim();
 /** Whether two memories are tied by a notice the user will be asked to settle. */
 const noticed = (notices, a, b) => notices.some((n) => (n.memory_a === a.id && n.memory_b === b.id) || (n.memory_a === b.id && n.memory_b === a.id));
 /** Of two groups of memories, a pair that stands side by side, both active, with no notice tying them. */
@@ -93,12 +96,38 @@ export const SCENARIOS = [
     },
   },
   {
-    name: 'what the user said is filed as theirs, never held as a guess',
+    name: 'nothing is ever held as a guess',
     judge(state) {
-      const said = ['slate uses pnpm, never npm', "don't ever force-push on slate", 'in slate we moved from pnpm to bun last week'];
-      const ids = new Set(said.map((text) => state.turns.get(text)).filter(Boolean));
-      const held = state.memories.filter((m) => ids.has(m.source_turn) && m.state === 'unconfirmed');
-      return held.length > 0 ? `held as a guess: ${held.map((m) => `"${m.body}"`).join(' · ')}` : null;
+      // The one thing still held for the user is a trap from a conversation that read the web or an MCP server.
+      const held = state.memories.filter((m) => m.state === 'unconfirmed' && m.held_for !== 'outside');
+      return held.length > 0 ? `held as a guess: ${held.map((m) => `"${m.title ?? m.body}"`).join(' · ')}` : null;
+    },
+  },
+  {
+    name: 'a memory cites words from the turn it names, never another turn of the batch',
+    judge(state) {
+      const text = new Map([...state.turns].map(([said, id]) => [id, flat(said)]));
+      const wrong = state.memories.filter((m) => m.source_turn != null && m.source_quote != null && !(text.get(m.source_turn) ?? '').includes(flat(m.source_quote)));
+      return wrong.length > 0 ? `the quote is not in the turn named: ${wrong.map((m) => `m${m.id} "${m.source_quote}" (t${m.source_turn})`).join(' · ')}` : null;
+    },
+  },
+  {
+    name: "a memory drawn from a turn is that turn's own sentence, as typed",
+    judge(state) {
+      // Not as a model worded it: runs of space aside, the body is found in the turn letter for letter.
+      const typed = new Map([...state.turns].map(([said, id]) => [id, said.replace(/\s+/g, ' ').trim()]));
+      const reworded = state.memories.filter((m) => m.source_turn != null && m.source_quote != null && !(typed.get(m.source_turn) ?? '').includes(m.body));
+      return reworded.length > 0 ? `not what was typed: ${reworded.map((m) => `m${m.id} "${m.body}" (t${m.source_turn})`).join(' · ')}` : null;
+    },
+  },
+  {
+    name: 'a changed fact supersedes the old one and keeps it in history',
+    judge(state) {
+      const old = state.memories.filter((m) => m.source_turn === state.turns.get('slate uses pnpm, never npm') && /\bpnpm\b/i.test(m.body) && m.state !== 'rejected');
+      if (old.length === 0) return 'the first statement is not in memory at all: there is no history of it';
+      const by = new Map(state.memories.map((m) => [m.id, m]));
+      const kept = old.filter((m) => m.state === 'superseded' && by.get(m.superseded_by)?.state === 'active' && /\bbun\b/i.test(by.get(m.superseded_by).body));
+      return kept.length > 0 ? null : `"${old[0].body}" is ${old[0].state}, not superseded by the statement that slate moved to bun`;
     },
   },
 ];
@@ -143,7 +172,7 @@ export function summary(runs, counts = []) {
   return [...lines, '', held, ...noise].join('\n');
 }
 
-/** One fresh home: the conversations through the real hooks, the memory pass after each session, a tidy at the end. */
+/** One fresh home: the conversations through the real hooks, the memory pass when each is over, a tidy at the end. */
 function runOnce(model) {
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-memprobe-'));
   // Its llama-server stopped and its home removed, however the run ends.
@@ -183,9 +212,10 @@ function runIn(root, model) {
 
   const said = [];
   let session = null;
+  // A conversation is read once, when it is over.
   const close = () => {
-    said.push(`session ${session}: ${sumo(['memory', 'run']).stdout.split('\n')[0]}`);
     sumo(['hook', 'session-end'], JSON.stringify({ session_id: `probe-${session}` }));
+    said.push(`session ${session}: ${sumo(['memory', 'run']).stdout.split('\n')[0]}`);
   };
   for (const [id, text] of TURNS) {
     if (session !== null && id !== session) close();
@@ -197,7 +227,7 @@ function runIn(root, model) {
 
   const db = new DatabaseSync(join(root, 'home', 'memory.db'));
   const state = {
-    memories: db.prepare('SELECT id, state, scope, title, cue, body, source_turn FROM memories ORDER BY id').all(),
+    memories: db.prepare('SELECT id, state, scope, title, cue, body, source_turn, source_quote, superseded_by, held_for FROM memories ORDER BY id').all(),
     notices: db.prepare('SELECT memory_a, memory_b, kind FROM notices').all(),
     turns: new Map(db.prepare('SELECT id, text FROM user_turns').all().map((t) => [t.text, t.id])),
   };

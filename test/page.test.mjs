@@ -38,7 +38,7 @@ async function withPage(fn) {
       addProject(db, project, { slug: 'simba' });
       const pref = add(db, { type: 'preference', body: 'keep pull requests small', topic: 'git' }).memory;
       const dec = add(db, { type: 'decision', body: 'simba ships on fridays', project: 'simba' }).memory;
-      const guess = add(db, { type: 'preference', body: 'prefers tabs over spaces', provenance: 'inferred' }).memory;
+      const guess = add(db, { type: 'preference', body: 'prefers tabs over spaces', heldFor: 'shell' }).memory;
       await fn({ db, page, pref, dec, guess });
     } finally {
       await page.close();
@@ -75,9 +75,13 @@ test('yes, no, an edit and forget from the page change the store as the commands
     assert.equal(again.status, 400);
     assert.match(JSON.parse(again.text).error, /only an unconfirmed memory can be confirmed/);
 
-    const no = add(db, { type: 'fact', body: 'uses yarn', provenance: 'inferred' }).memory;
+    const no = add(db, { type: 'fact', body: 'uses yarn', heldFor: 'shell' }).memory;
     assert.equal((await post(`${page.url}memories/${no.id}/reject`)).status, 200);
     assert.equal(get(db, no.id).state, 'rejected');
+    // The page is the user's hand: each change says so in the memory's history.
+    const did = (id) => ({ ...db.prepare('SELECT op, actor FROM memory_events WHERE memory_id = ? ORDER BY id DESC LIMIT 1').get(id) });
+    assert.deepEqual(did(guess.id), { op: 'confirmed', actor: 'user' });
+    assert.deepEqual(did(no.id), { op: 'rejected', actor: 'user' });
 
     const edited = await post(`${page.url}memories/${dec.id}/edit`, { body: 'simba ships on thursdays' });
     assert.equal(edited.status, 200);

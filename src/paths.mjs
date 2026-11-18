@@ -39,6 +39,7 @@ export function paths() {
     jobs: join(home, 'jobs'),
     models: join(home, 'models'),
     scratch: join(home, 'scratch'),
+    spool: join(home, 'spool'),
   };
 }
 

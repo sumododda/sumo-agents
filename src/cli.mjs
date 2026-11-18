@@ -5,26 +5,26 @@ import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
 import { discoverModels, knownModel, MODEL_IDS, modelLines, setModel } from './catalog.mjs';
 import { openDb } from './db.mjs';
-import { backup, damaged, exportJson, exportMarkdown, liveDatabase, purgeFromBackups, restoreCandidate, restoreHint, restoreLines, restoreQuestion } from './export.mjs';
+import { backup, damaged, exportJson, exportMarkdown, liveDatabase, purgeFromBackups, purgeRowFromBackups, restoreCandidate, restoreHint, restoreLines, restoreQuestion } from './export.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
 import { costLines } from './cost.mjs';
 import { runHook } from './hooks.mjs';
 import * as jobs from './jobs.mjs';
 import * as memory from './memory.mjs';
 import { NeedsCredential, Refusal, UsageError } from './memory.mjs';
-import { prime } from './prime.mjs';
+import { noteUsedFrom, prime } from './prime.mjs';
 import * as projects from './projects.mjs';
-import { detail, historyLine, line, scopeLabel } from './render.mjs';
-import { memoryStatus, passLines as memoryPassLines, runMemoryPass } from './keeper.mjs';
+import { detail, foundLine, historyLine, line, saidDetail, saidLine, scopeLabel } from './render.mjs';
+import { passLines as memoryPassLines, runMemoryPass } from './keeper.mjs';
 import { buildBundle, outcomeLines } from './scribe.mjs';
-import { findSaved, searchTurns, taskEndedNudge } from './sessions.mjs';
-import { closest, saysAs } from './text.mjs';
+import { searchAll } from './search.mjs';
+import { findSaved, journalEntry, taskEndedNudge } from './sessions.mjs';
+import { clip, closest, saysAs } from './text.mjs';
 import { heldBy } from './lock.mjs';
 import { redact } from './redact.mjs';
 import { VERSION } from './paths.mjs';
 import { CHAT_EFFORTS, config, doctor, makePrivate, positiveInteger, reportOf, setup, uninstall, uninstallPlan, uninstallQuestion } from './setup.mjs';
 import { colourEnabled, safeForTerminal, styles } from './tty.mjs';
-import { ftsQuery } from './text.mjs';
 import { verdictLines } from './verify.mjs';
 
 const DOCS = 'https://github.com/sumododda/sumo-agents/wiki';
@@ -33,11 +33,11 @@ const ISSUES = 'https://github.com/sumododda/sumo-agents/issues';
 const HELP = `sumo — one chat across your projects, memory that lasts, and jobs checked before they say done
 
   sumo chat [--model M] [--effort E] [--resume [id]]   talk, with this memory behind it
-  sumo search <query> [--project S] [--type T] [-n N]  what is remembered; --turns: what was said
+  sumo search <query> [--project S] [--type T] [-n N]  what is remembered, then what was said
   sumo add <type> "<text>" [--project S]               a preference · fact · decision · gotcha
   sumo learn "<title>" --cue "<action>"                a workflow, its steps on stdin · sumo gate
   sumo show|history|confirm|reject|forget <id>         sumo supersede <old> <new>
-  sumo memory [run [--tidy] | status | show]           the page · the pass that files and tidies
+  sumo memory [run|status|check|eval|rebuild|show]     the page · the pass that files and tidies
   sumo project add <path> [--slug S] [--alias A]...    show · list · rescan · alias · archive
   sumo job new --project S --title T [--agent A]       a job, its task on stdin
         by id: run · watch · tell · note · ask · answer · show · brief · baseline · verify · changes
@@ -70,26 +70,33 @@ EOF
 const USAGE = {
   chat: 'sumo chat [--model auto|<model>] [--effort <effort>] [--resume [id]]    (piped: plain lines, the memory block first; --resume picks a saved session up, the newest without an id)',
   search: `sumo search <query> [--project S] [--type T] [--since <YYYY-MM-DD|Nd>] [--before <YYYY-MM-DD>]
-  --project S    that project's memories beside the global ones; other projects stay hidden
-  --everywhere   every project's memories
-  --type T       preference, fact, decision, gotcha or workflow
+one search: memories first (m12), then the conversations — what you said (t481) and what sumo answered (r3).
+every word is looked for first; only when nothing holds them all, any word. sumo show <id> opens any line whole.
+  --project S    that project's memories and conversations beside the global ones; other projects are only counted
+  --everywhere   every project's memories and conversations
+  --type T       preference, fact, decision, gotcha or workflow — memories only
   --all          forgotten and replaced memories too
   --since        said or changed since that day, or in the last N days (7d); --before: said before that day
-  -n N           at most N, the best first (8 unless said)
-  --json         one object for a script: {memories, more, elsewhere} (with --turns: {turns})
-  --turns        what the user typed, not what is remembered`,
+  -n N           at most N memories, the best first (8 unless said); three lines of conversation follow memories
+  --json         one object for a script: {memories, conversations, more, moreConversations, elsewhere, loose}
+  --turns        only the conversations, no memories`,
   add: `sumo add preference|fact|decision|gotcha "<one sentence>" [--project S] [--topic T] [--pin] [--supersedes ID] [--observed]
 a workflow (steps to repeat) is saved with sumo learn instead:
 ${LEARN_USAGE}`,
   learn: LEARN_USAGE,
-  show: 'sumo show <id> [--json]',
+  show: 'sumo show <id> [--json]    (m12 a memory; t481 something you said, r3 something sumo answered — whole, with what was said around it)',
   history: 'sumo history <id>',
   supersede: 'sumo supersede <old-id> <new-id>',
   gate: "sumo gate <workflow-id> '<regex over the shell command>'    |    sumo gate <workflow-id> off",
-  forget: 'sumo forget <id> [--purge [--yes]]    (--purge erases it for good, from every backup; it asks first, or --yes)',
+  forget: 'sumo forget <id> [--purge [--yes]]    (--purge erases it for good, from every backup, with the turns and replies that say it whole — listed first; it asks, or --yes. One turn or reply: sumo forget --purge t12)',
   confirm: 'sumo confirm <id>',
   reject: 'sumo reject <id>',
-  memory: 'sumo memory [run [--tidy] | status | show]    (no argument serves the page on this machine and opens it; Ctrl-C stops it)',
+  memory: `sumo memory [run [--tidy] | status | check [--fix] | eval [--limit N] [--json] | rebuild [--dry-run] [--since D] [--limit N] [--yes] | show]    (no argument serves the page on this machine and opens it; Ctrl-C stops it)
+        run: reads the conversations not yet read — also one still going on, and when filing is paused — and tidies when a week has gone by, or now with --tidy (--auto is how a session runs it: finished conversations only, nothing while paused)
+        rebuild: reads your conversations again with the extractor as it is now and shows what it would add and which memories it derived that it would no longer file; --dry-run only shows. It never touches what you said to remember, confirmed or pinned; --since a day or 7d, --limit the newest N conversations (each is a model call), --yes for a change wider than a pass may make; one that replaced another memory is kept
+        status: whether you are heard and from where, the model in use, what waits, whether filing is on
+        check: the search indexes, the newest turn found by search, the spool, the backup, passes left unfinished — exit 1 when one fails; --fix rebuilds an index that fails and tries the spool's set-aside lines again
+        eval: the searches that once found nothing run again, and the extractor replayed on your own history (--limit N memories of each kind, 20 unless said; each is a model call) — exit 1 when this extractor scores below the last other one`,
   project: `sumo project add <path> [--slug S] [--alias A]...
 sumo project show <name> | list [--all] [--json] | rescan <name> | alias <name> <alias> | archive <name>   (add it again to bring it back)`,
   job: `sumo job new --project S --title T [--agent scout|worker|reviewer]   (task on stdin)
@@ -129,7 +136,7 @@ sumo mcp allow <name> <tool>|all      let it run without asking      sumo mcp re
   uninstall: 'sumo uninstall [--yes] [--discard-memory]    (removes what setup made — the home\'s own files, its sumo links, the local model\'s server — after copying the memory out beside the home; asks first, or --yes)',
   doctor: 'sumo doctor [--fix] [--report]    (--fix: make the files of the home private · --report: version, checks, settings, MCP server names, the last crash and the logs\' tails — redacted, printed here, sent nowhere)',
   config: 'sumo config [key [value]]',
-  hook: 'sumo hook session-start|prompt|pre-tool|stop|session-end    (for a harness\'s hook configuration: the event\'s JSON on stdin, what to add to the session on stdout; never fails the session)',
+  hook: 'sumo hook session-start|prompt|pre-tool|stop|session-end    (for a harness\'s hook configuration: the event\'s JSON on stdin, what to add to the session on stdout; never fails the session — sumo help hooks prints the lines for Claude Code)',
 };
 
 /** A usage text as `--help` prints it: a line too wide for the terminal (100 columns at most, or piped) goes on, indented, below. */
@@ -155,6 +162,8 @@ function wrapped(text, width = Math.min(process.stdout.columns || 100, 100)) {
 }
 
 const ADDABLE = ['preference', 'fact', 'decision', 'gotcha'];
+/** The memory commands a model runs in another harness's shell: each says, there, when that harness is not being heard. */
+const HEARD_CHECKED = ['search', 'add', 'prime'];
 
 /**
  * Who runs this command: the model's shell carries SUMO_TOOL, a job's SUMO_JOB too. Under either, what only the user does is
@@ -163,21 +172,23 @@ const ADDABLE = ['preference', 'fact', 'decision', 'gotcha'];
  */
 const fromTool = () => Boolean(process.env.SUMO_TOOL || process.env.SUMO_JOB);
 const fromJob = () => process.env.SUMO_JOB || null;
+/** A count with its noun: `1 turn`, `3 replies`. */
+const counted = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 /** Typed by the user at a terminal: no model's shell, and a terminal at both ends — another harness's tool runs without one. */
 const byUser = () => (!fromTool() && process.stdin.isTTY && process.stdout.isTTY ? 'user' : undefined);
 const OWNER_ONLY = "Refused: the model's shell does not change what the user controls — the MCP allow list, the models and the configuration. If the user wants it, they run it themselves: `! sumo …`";
 const jobWrites = () => `Refused: j${fromJob()} runs this command, and a job never writes memory. Put what you learned in your report; the user, or the chat, decides what is kept.`;
 const RECENT_TURNS = 40;
 /**
- * Whether something the user typed lately says what the memory says — nearly all of its words, the same way round — so
- * a memory the model files as the user's is really theirs. A few of the user's words inside much they never said, or
+ * The turn the user typed lately that says what the memory says — nearly all of its words, the same way round — or
+ * null: so a memory the model files as the user's is really theirs, and is kept with the turn it was said in. A few of the user's words inside much they never said, or
  * their rule turned round, is not.
  */
 function saidByUser(db, text) {
   return db
-    .prepare('SELECT text FROM user_turns ORDER BY id DESC LIMIT ?')
+    .prepare('SELECT id, session_id, text FROM user_turns ORDER BY id DESC LIMIT ?')
     .all(RECENT_TURNS)
-    .some((turn) => saysAs(text, turn.text));
+    .find((turn) => saysAs(text, turn.text)) ?? null;
 }
 const HELD = (id) => `held as unconfirmed: nothing the user typed lately says this, so it is theirs to confirm — sumo confirm m${id}, or sumo reject m${id}`;
 /** The docs say "workflow", the store says "procedure"; whoever types either means the same thing. */
@@ -189,13 +200,13 @@ const COMMANDS = {
   add: { value: ['project', 'topic', 'supersedes'], bool: ['pin', 'observed'], run: runAdd },
   learn: { value: ['project', 'cue', 'gate', 'from-file'], bool: [], run: runLearn },
   gate: { value: [], bool: [], run: runGate },
-  show: { value: [], bool: ['json'], max: 1, run: (db, { args, flags }) => (flags.json ? asJson({ memory: memory.get(db, memory.parseId(args[0])) }) : [detail(memory.get(db, memory.parseId(args[0])))]) },
+  show: { value: [], bool: ['json'], max: 1, run: runShow },
   history: { value: [], bool: [], max: 1, run: (db, { args }) => memory.history(db, memory.parseId(args[0])).map(historyLine) },
   supersede: { value: [], bool: [], max: 2, run: runSupersede },
   forget: { value: [], bool: ['purge', 'yes'], max: 1, run: runForget },
   confirm: { value: [], bool: [], max: 1, run: runConfirm },
-  reject: { value: [], bool: [], max: 1, run: (db, { args }) => [`rejected ${line(memory.reject(db, memory.parseId(args[0])))}`] },
-  memory: { value: [], bool: ['tidy'], run: runMemoryCommand },
+  reject: { value: [], bool: [], max: 1, run: (db, { args }) => [`rejected ${line(memory.reject(db, memory.parseId(args[0]), undefined, { actor: fromTool() ? 'model-shell' : 'user' }))}`] },
+  memory: { value: ['limit', 'since'], bool: ['tidy', 'auto', 'fix', 'json', 'dry-run', 'yes'], run: runMemoryCommand },
   project: { value: ['slug'], multi: ['alias'], bool: ['all', 'json'], run: runProject },
   job: { value: ['project', 'title', 'agent', 'status', 'from-file', 'guide', 'reviews', 'accept', 'attempts'], bool: ['all', 'tests-may-change', 'json'], run: runJob },
   prime: { value: ['budget'], bool: [], max: 0, run: (db, { flags }) => [forPerson(prime(db, { budget: flags.budget === undefined ? undefined : positiveInteger(flags.budget, '--budget needs a positive number') }))] },
@@ -328,38 +339,49 @@ function runSearch(db, { args, flags }) {
   const limit = flags.n === undefined ? undefined : positiveInteger(flags.n, '-n needs a positive number');
   const since = dayFlag(flags.since, '--since', { back: true });
   const before = dayFlag(flags.before, '--before');
+  if (flags.turns && flags.type) throw new UsageError('--type picks a kind of memory, and --turns leaves memories out — use one of the two');
+  const asked = args.join(' ');
 
-  if (flags.turns) {
-    if (since || before) throw new UsageError('--since and --before hold memories to a time, not what the user typed — leave out --turns, or the dates');
-    const match = ftsQuery(args.join(' '));
-    if (!match) throw new UsageError('nothing to search for');
-    const turns = searchTurns(db, match, limit);
-    if (flags.json) return asJson({ turns });
-    return turns.length > 0 ? turns.map((t) => `t${t.id} ${t.ts.slice(0, 10)} ${t.text.replace(/\s+/g, ' ').slice(0, 200)}`) : [`the user never said anything like: ${args.join(' ')}`];
-  }
-
-  const { results, elsewhere, more } = memory.search(db, args.join(' '), {
+  const { memories, conversations, more, moreSaid, elsewhere, loose } = searchAll(db, asked, {
     project: flags.project,
     type: WORKFLOW_NAMES.includes(flags.type) ? 'procedure' : flags.type,
     everywhere: flags.everywhere,
     all: flags.all,
+    turns: flags.turns,
     since,
     before,
     limit,
   });
 
-  if (flags.json) return asJson({ memories: results.map(plainMemory), more, elsewhere });
+  const said = conversations.map(({ rank, ...hit }) => hit);
+  if (flags.json) return asJson(flags.turns ? { conversations: said, moreConversations: moreSaid, elsewhere } : { memories: memories.map(plainMemory), conversations: said, more, moreConversations: moreSaid, elsewhere, loose });
+  const out = memories.map(foundLine);
+  // A list cut short says so, and how to see the rest.
+  if (more > 0) out.push(`… ${more} more — -n ${memories.length + more} shows them all, or narrow the words`);
+  if (said.length > 0) {
+    // What is not a memory says so: nobody settled these words as true, they are what was said that day.
+    if (!flags.turns) out.push(`${memories.length > 0 ? 'also said' : 'no memory of this — said'} in the conversations (sumo show <id> opens one whole):`);
+    out.push(...said.map(saidLine));
+    if (moreSaid > 0) out.push(flags.turns ? `… ${moreSaid} more — -n ${said.length + moreSaid} shows them all, or narrow the words` : `… ${moreSaid} more in the conversations — sumo search "${asked}" --turns`);
+  }
   // An explicit "nothing" is an answer: it is what lets an agent say
   // "not in memory" instead of guessing.
-  const out = results.length > 0 ? results.map(line) : [`nothing in memory for: ${args.join(' ')}`];
-  // A list cut short says so, and how to see the rest.
-  if (more > 0) out.push(`… ${more} more — -n ${results.length + more} shows them all, or narrow the words`);
+  if (out.length === 0) out.push(flags.turns ? `nothing in the conversations for: ${asked}` : `nothing in memory for: ${asked}${flags.type ? '' : ' — nor in the conversations'}`);
+  else if (loose) out.push('a loose match: no line holds two of these words — not an answer to rely on');
   const others = Object.entries(elsewhere);
   if (others.length > 0) {
     const where = others.map(([scope, n]) => `${scopeLabel(scope)} (${n})`).join(', ');
     out.push(`matches in other projects, not shown: ${where} — add --project <name> or --everywhere`);
   }
   return out;
+}
+
+/** One line of a search, whole: a memory (m12), or a turn (t481) or a reply (r3) with what was said around it. */
+function runShow(db, { args, flags }) {
+  const said = journalEntry(db, args[0]);
+  if (said) return flags.json ? asJson({ [said.entry.kind]: said.entry, around: said.around }) : [saidDetail(said)];
+  const row = memory.get(db, memory.parseId(args[0]));
+  return flags.json ? asJson({ memory: row }) : [detail(row)];
 }
 
 function savedLines({ memory: saved, similar, redacted }) {
@@ -379,16 +401,22 @@ function runAdd(db, { args, flags }) {
   if (WORKFLOW_NAMES.includes(type)) throw new UsageError(`a workflow has a title and steps, so it is saved with sumo learn, not sumo add:\n${LEARN_USAGE}`);
   if (!ADDABLE.includes(type)) throw new UsageError(`unknown type "${type}" — one of: ${ADDABLE.join(', ')} (for a workflow: sumo learn)`);
   const body = text.join(' ');
-  // From the model's shell, the user's word is checked against the user's words: an inferred memory waits unconfirmed.
-  const held = fromTool() && !saidByUser(db, body);
+  // From the model's shell, the user's word is checked against the user's words: what they never typed is held for
+  // them (`held_for = 'shell'`) and asked about in the block, never active and never dropped unseen.
+  // Said in a turn, it is kept with that turn: forgotten later, the pass that reads the conversation does not file it again.
+  const said = fromTool() ? saidByUser(db, body) : null;
+  const held = fromTool() && !said;
   const saved = memory.add(db, {
     type,
     body,
+    sourceSession: said?.session_id,
+    sourceTurn: said?.id,
     project: flags.project,
     topic: flags.topic,
     pin: flags.pin,
     supersedes: flags.supersedes === undefined ? undefined : memory.parseId(flags.supersedes),
-    provenance: held ? 'inferred' : flags.observed ? 'observed' : 'stated',
+    provenance: flags.observed ? 'observed' : 'stated',
+    heldFor: held ? 'shell' : undefined,
     writtenBy: byUser(),
   });
   return savedLines(saved).concat(held ? [HELD(saved.memory.id)] : []);
@@ -401,7 +429,7 @@ function runLearn(db, { args, flags }) {
   if (!body.trim()) throw new UsageError('no steps given — pipe them in, or use --from-file <path>');
   const title = args.join(' ');
   const held = fromTool() && !saidByUser(db, [title, flags.cue ?? '', body].join(' '));
-  const saved = memory.add(db, { type: 'procedure', title, cue: flags.cue, gate: flags.gate, body, project: flags.project, provenance: held ? 'inferred' : 'stated', writtenBy: byUser() });
+  const saved = memory.add(db, { type: 'procedure', title, cue: flags.cue, gate: flags.gate, body, project: flags.project, heldFor: held ? 'shell' : undefined, writtenBy: byUser() });
   return savedLines(saved).concat(flags.gate ? [`gates shell commands matching: ${flags.gate}`] : [], held ? [HELD(saved.memory.id)] : []);
 }
 
@@ -413,7 +441,7 @@ function runGate(db, { args }) {
 
 function runSupersede(db, { args }) {
   need(args, 2, 'supersede');
-  const old = memory.supersede(db, memory.parseId(args[0]), memory.parseId(args[1]));
+  const old = memory.supersede(db, memory.parseId(args[0]), memory.parseId(args[1]), undefined, { actor: fromTool() ? 'model-shell' : 'user' });
   return [`superseded ${line(old)}`];
 }
 
@@ -421,9 +449,10 @@ function runSupersede(db, { args }) {
 const AFFIRMS = /^\s*(?:yes|yep|yeah|yup|y|correct|right|that['’]?s right|confirm(?:ed)?|ok(?:ay)?|sure|true|exactly|agreed?|keep (?:it|that)|do it)\b/i;
 
 /**
- * A guess made a memory of the user's. From the model's shell only once the user has spoken since the guess was made,
- * and said yes, or said the thing itself: a model may not add a guess and vouch for it in one go, nor a page tell it
- * to. One held because its conversation read the web or an MCP server only the user confirms (memory.confirm).
+ * A memory held for the user made theirs. One the model's shell saved without the user's words (`held_for = 'shell'`,
+ * a guess) is confirmed from that shell only once the user has spoken since it was made, and said yes, or said the
+ * thing itself: a model may not add a guess and vouch for it in one go, nor a page tell it to. One held because its
+ * conversation read the web or an MCP server only the user confirms (memory.confirm).
  */
 function runConfirm(db, { args }) {
   const id = memory.parseId(args[0]);
@@ -437,23 +466,75 @@ function runConfirm(db, { args }) {
   return [`confirmed ${line(memory.confirm(db, id, { byUser: !fromTool() }))}`];
 }
 
+/** One turn or reply as a purge lists it: its id, its day, the start of its words. */
+const SAID_SHOWN = 100;
+const saidRow = (mark, row) => `  ${mark}${row.id} · ${row.ts.slice(0, 10)} · ${clip(row.text, SAID_SHOWN)}`;
+const MENTIONS = 'other mentions may remain — find them: sumo search "<words>" --turns, erase one: sumo forget --purge t12';
+const stillIn = (failed) => (failed.length > 0 ? [`still in ${failed.length} backup${failed.length === 1 ? '' : 's'} that could not be cleaned — delete ${failed.length === 1 ? 'it' : 'them'} by hand: ${failed.join(' ')}`] : []);
+const fromCopies = (cleaned, spooled) => `${cleaned > 0 ? `, and from ${cleaned} backup${cleaned === 1 ? '' : 's'}` : ''}${spooled > 0 ? `, and ${counted(spooled, 'line')} of the spool` : ''}`;
+
+/**
+ * `sumo forget --purge t12`: one turn or reply erased for good, from the database, the backups and the spool — shown
+ * first, its id typed back. How a mention that a memory's purge left behind is taken out.
+ */
+async function purgeSaid(db, entry, flags) {
+  const mark = `${entry.kind === 'turn' ? 't' : 'r'}${entry.id}`;
+  const shown = `${saidRow(entry.kind === 'turn' ? 't' : 'r', entry).trimStart()}\nErase ${mark} for good, from every backup too? Type ${mark} to confirm: `;
+  if (!(await confirmed(flags, `erasing ${mark} for good cannot be undone`, shown, [mark]))) throw new Error(`nothing was erased — the answer was not ${mark}`);
+  const cites = memory.purgeRow(db, entry);
+  const { cleaned, failed } = purgeRowFromBackups(entry);
+  // The same words still waiting to be written would bring the row back.
+  const same = entry.text.replace(/\s+/g, ' ').trim();
+  const spooled = (await import('./spool.mjs')).purgeSpool((text) => String(text).replace(/\s+/g, ' ').trim() === same);
+  return [
+    `purged ${mark} — erased, not recoverable${fromCopies(cleaned, spooled)}`,
+    ...cites.map((id) => `m${id} was drawn from it and still holds its words: sumo forget m${id} --purge erases it too`),
+    ...stillIn(failed),
+  ];
+}
+
 async function runForget(db, { args, flags }) {
   need(args, 1, 'forget');
+  // A turn or a reply by its id: never merely forgotten — the journal has no history to keep it in — only erased.
+  const entry = /^[tr]\d+$/i.test(args[0]) ? args[0].toLowerCase() : null;
+  if (entry && !flags.purge) throw new UsageError(`${entry} is a turn or a reply, which is erased or kept: sumo forget --purge ${entry} erases it for good. A memory is forgotten by its id, like m12`);
   // Erased for good, from the backups too: only the user decides that. A forget without --purge keeps the history.
-  if (flags.purge && fromTool()) throw new Refusal(`erasing a memory for good is the user's to do: they run sumo forget ${args[0]} --purge themselves. sumo forget ${args[0]} stops it being true and keeps its history`);
+  if (flags.purge && fromTool()) {
+    throw new Refusal(entry ? `erasing a turn or a reply for good is the user's to do: they run sumo forget --purge ${entry} themselves` : `erasing a memory for good is the user's to do: they run sumo forget ${args[0]} --purge themselves. sumo forget ${args[0]} stops it being true and keeps its history`);
+  }
+  if (entry) return purgeSaid(db, journalEntry(db, entry).entry, flags);
   const id = memory.parseId(args[0]);
   if (flags.purge) {
-    // Seen before it goes: the memory as it stands, and its id typed back — the strongest yes, for what no backup brings back.
-    const shown = `${line(memory.get(db, id))}\nErase m${id} for good, from every backup too? Type m${id} to confirm: `;
+    // Seen before it goes: the memory as it stands, each turn and reply that goes with it, and its id typed back — the strongest yes, for what no backup brings back.
+    const reach = memory.purgeReach(db, memory.get(db, id));
+    const with_ = [reach.turns.length > 0 ? counted(reach.turns.length, 'turn') : '', reach.replies.length > 0 ? counted(reach.replies.length, 'reply', 'replies') : ''].filter(Boolean);
+    const going = with_.length > 0 ? [`with it go ${with_.join(' and ')} that say${reach.turns.length + reach.replies.length === 1 ? 's' : ''} it:`, ...reach.turns.map((r) => saidRow('t', r)), ...reach.replies.map((r) => saidRow('r', r))] : [];
+    const shown = [line(memory.get(db, id)), ...going, `Erase m${id} for good, from every backup too? Type m${id} to confirm: `].join('\n');
     if (!(await confirmed(flags, `erasing m${id} for good cannot be undone`, shown, [`m${id}`, String(id)]))) throw new Error(`nothing was erased — the answer was not m${id}`);
   }
-  const gone = memory.forget(db, id, { purge: flags.purge });
+  const gone = memory.forget(db, id, { purge: flags.purge, actor: fromTool() ? 'model-shell' : 'user' });
   if (!flags.purge) return [`forgot ${line(gone)}`];
   const { cleaned, failed } = purgeFromBackups(gone);
-  const copies = cleaned > 0 ? `, and from ${cleaned} backup${cleaned === 1 ? '' : 's'}` : '';
-  const lines = [gone.source_turn !== null ? `purged m${gone.id} — erased, not recoverable, with the sentence it came from${copies}` : `purged m${gone.id} — erased, not recoverable${copies}; no sentence of the user's was tied to it — sumo search --turns finds one if it is there`];
-  if (failed.length > 0) lines.push(`still in ${failed.length} backup${failed.length === 1 ? '' : 's'} that could not be cleaned — delete ${failed.length === 1 ? 'it' : 'them'} by hand: ${failed.join(' ')}`);
-  return lines;
+  // What still waits to be written, or was set aside, may say it too.
+  const spooled = (await import('./spool.mjs')).purgeSpool(memory.saying([gone.source_quote, gone.body]));
+  const turns = gone.erased_turns.length;
+  const echoes = gone.erased_replies.length;
+  // Said as it was done: the sentence it cites, then whatever else of the journal said it whole.
+  const cited = gone.erased_source !== null;
+  const more = turns - (cited ? 1 : 0);
+  const went = cited
+    ? `, with the sentence it came from${more > 0 ? ` and ${more} more turn${more === 1 ? ' that says it' : 's that say it'}` : ''}${echoes > 0 ? ` and ${counted(echoes, 'reply', 'replies')} of sumo's that said it back` : ''}`
+    : turns + echoes > 0 ? `, with ${[turns > 0 ? counted(turns, 'turn') : '', echoes > 0 ? counted(echoes, 'reply', 'replies') : ''].filter(Boolean).join(' and ')} that say${turns + echoes === 1 ? 's' : ''} it`
+    : '';
+  return [
+    `purged m${gone.id} — erased, not recoverable${went}${fromCopies(cleaned, spooled)}${cited || turns + echoes > 0 ? '' : "; no sentence of the user's was tied to it — sumo search --turns finds one if it is there"}`,
+    // Each row that went, as the question listed them: with --yes this is the only place they are said.
+    ...gone.erased_turns.map((r) => saidRow('t', r)),
+    ...gone.erased_replies.map((r) => saidRow('r', r)),
+    ...stillIn(failed),
+    // Only what says the memory whole went with it: a conversation that mentions part of it is the user's to find and judge.
+    MENTIONS,
+  ];
 }
 
 function runProject(db, { args, flags }) {
@@ -751,8 +832,32 @@ async function runMemoryCommand(db, { args, flags }) {
   // Nor with no terminal: piped or in a script, nobody is there to look at it, or to press Ctrl-C.
   if (args[0] === undefined && (!process.stdin.isTTY || !process.stdout.isTTY)) throw new UsageError('the memory page runs until Ctrl-C, so it needs a terminal — run sumo memory in one; sumo memory status and sumo search work anywhere');
   if (args[0] === undefined) return runMemoryPage(db);
-  if (args[0] === 'run') return memoryPassLines(await runMemoryPass(db, { tidy: flags.tidy === true }), { asked: flags.tidy === true });
-  if (args[0] === 'status') return memoryStatus(db);
+  if (args[0] === 'run') return memoryPassLines(await runMemoryPass(db, { tidy: flags.tidy === true, auto: flags.auto === true }), { asked: flags.tidy === true });
+  if (args[0] === 'rebuild') {
+    // It lets memories go, past the bound with --yes: from the model's shell — this command runs outside the sandbox — only the difference is shown.
+    if (fromTool() && flags['dry-run'] !== true) throw new Refusal("rebuilding memory is the user's to do: they run sumo memory rebuild themselves. sumo memory rebuild --dry-run shows what it would change");
+    const { rebuild } = await import('./rebuild.mjs');
+    const limit = flags.limit === undefined ? undefined : positiveInteger(flags.limit, '--limit needs a positive number');
+    return rebuild(db, { dryRun: flags['dry-run'] === true, since: dayFlag(flags.since, '--since', { back: true }), limit, yes: flags.yes === true });
+  }
+  // The checks load with the commands that report them: a hook reaches this file on every prompt.
+  if (args[0] === 'status') return (await import('./check.mjs')).memoryStatus(db);
+  if (args[0] === 'check') {
+    // Mending rewrites the indexes and replays what was set aside: the model's shell reads the checks, and no more.
+    if (fromTool() && flags.fix === true) throw new Refusal("mending memory is the user's to do: they run sumo memory check --fix themselves. sumo memory check says what is wrong");
+    const { memoryCheck, memoryHealth, memoryHealthLine } = await import('./check.mjs');
+    const heard = memoryHealthLine(memoryHealth(db));
+    const checks = [{ ...heard, warn: !heard.fail }, ...memoryCheck(db, undefined, { fix: flags.fix === true })];
+    const lines = checks.map((c) => checkLine(c, styles(colourEnabled())));
+    return checks.some((c) => !c.ok && !c.warn) ? Object.assign(lines, { exitCode: 1 }) : lines;
+  }
+  if (args[0] === 'eval') {
+    // Dozens of model calls, and a score kept that the next eval is judged against: not something a model starts.
+    if (fromTool()) throw new Refusal("measuring the extractor asks the model about every case, and is the user's to do: they run sumo memory eval themselves");
+    const { evalLines, memoryEval } = await import('./memeval.mjs');
+    const result = await memoryEval(db, { limit: flags.limit === undefined ? undefined : positiveInteger(flags.limit, '--limit needs a positive number') });
+    return flags.json ? Object.assign(asJson(result), { exitCode: result.worse || result.replay.failed ? 1 : 0 }) : evalLines(result);
+  }
   if (args[0] === 'show') return [buildBundle(db)?.prompt ?? 'nothing waits to be filed: the next memory pass has nothing new to read'];
   throw new UsageError(`usage: ${USAGE.memory}`);
 }
@@ -928,6 +1033,11 @@ export async function main(argv) {
         process.stdout.write(HELP);
         return 0;
       }
+      // Not a command: the lines that make another harness heard, with this home's launcher in them.
+      if (topic === 'hooks') {
+        process.stdout.write(`${(await import('./check.mjs')).hooksHelp().join('\n')}\n`);
+        return 0;
+      }
       if (!Object.hasOwn(USAGE, topic)) {
         const near = closest(topic, Object.keys(USAGE));
         throw new UsageError(`no help for "${topic}" — ${near ? `did you mean "${near}"? ` : ''}the commands are in: sumo help`);
@@ -1024,8 +1134,15 @@ export async function main(argv) {
     if (command === 'backup' && parsed.args.length > 0) throw new UsageError(`usage: ${USAGE.backup}`);
     const db = openDb();
     try {
+      // Evidence that Claude Code is in use, for the heartbeat: a command run from it (this is never the hook's path).
+      noteUsedFrom(db);
       const lines = await spec.run(db, parsed);
       process.stdout.write(`${lines.join('\n')}\n`);
+      // Run inside Claude Code, which sumo does not hear: said to the model that ran this, once a day.
+      if (process.env.CLAUDECODE === '1' && (HEARD_CHECKED.includes(command) || (command === 'memory' && parsed.args[0] === 'status'))) {
+        const unheard = (await import('./check.mjs')).notHeardLine(db);
+        if (unheard) process.stderr.write(`${unheard}\n`);
+      }
       return lines.exitCode ?? 0;
     } finally {
       db.close();

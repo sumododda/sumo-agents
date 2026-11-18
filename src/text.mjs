@@ -26,6 +26,16 @@ export function ftsQuery(text) {
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
 /**
+ * The same words as an expression that wants every one of them (AND): what a search tries first, `ftsQuery` being what
+ * it falls back on. Words in Chinese, Japanese or Korean are left out — the index keeps a run of them as one word, so
+ * the caller looks for those in the text itself (`cjkTerms`). Empty when no other word is left.
+ */
+export function ftsAllQuery(text) {
+  const unique = [...new Set(words(text))].filter((w) => !CJK.test(w));
+  return unique.map((w) => `"${w.replaceAll('"', '""')}"`).join(' AND ');
+}
+
+/**
  * The words of a search in Chinese, Japanese or Korean. The index keeps a run of such characters as one word —
  * "日本語のテスト" is a single token — so a word inside it is never matched there; these are looked for in the text
  * itself. Read alike from what was typed or from `ftsQuery`'s expression, which quotes the same words.
@@ -59,6 +69,19 @@ export function overlap(a, b) {
   return shared / Math.min(sa.size, sb.size);
 }
 
+/**
+ * Share of `text`'s own stems also found in `source`: 0..1. Not `overlap`, which takes the smaller text's share: a
+ * long sentence is not about a three-word one because those three words are in it.
+ */
+export function coverage(text, source) {
+  const its = new Set(words(text).map(stem));
+  const theirs = new Set(words(source).map(stem));
+  if (its.size === 0) return 0;
+  let shared = 0;
+  for (const s of its) if (theirs.has(s)) shared++;
+  return shared / its.size;
+}
+
 /** How much of what a memory says must be in the user's own words for it to be theirs. */
 const SAID_SHARE = 0.8;
 /**
@@ -68,8 +91,6 @@ const SAID_SHARE = 0.8;
 const NEGATION = /\b(?:never|not|no|none|avoid|without|cannot|dont|doesnt|didnt|wont|cant|isnt|arent|shouldnt|mustnt)\b|\b\w+n['’]t\b/i;
 /** A trailing "…, not B" or "…, never B", B a word or three: the alternative a statement is chosen over. */
 const ALTERNATIVE = /[,;]\s*(?:but\s+)?(?:not|never)\s+([\w.@/+-]+(?:\s+[\w.@/+-]+){0,2})\s*\.?\s*$/i;
-/** Whether a text is nothing but such an alternative — "never npm" — with no statement of its own to turn round. */
-export const onlyAlternative = (text) => /^\s*(?:but\s+)?(?:not|never)\s+[\w.@/+-]+(?:\s+[\w.@/+-]+){0,2}\s*\.?\s*$/i.test(text);
 /** Whether a text sets `alt` aside itself: moved "from" it, chose "instead of", "rather than" or "over" it, or said "not" it. */
 const setsAside = (text, alt) => {
   const said = alt.replace(/[.*+?^${}()|[\]\\]/g, (c) => `\\${c}`);
@@ -80,12 +101,69 @@ const withoutAlternative = (text, other) => {
   const m = ALTERNATIVE.exec(text);
   return m && setsAside(other, m[1].replace(/\.+$/, '')) ? text.slice(0, m.index) : text;
 };
+/** "on" or "off" as a switch's state — turned on, kept off, "is off" ending its clause — never the "on" of "on fridays". */
+const switched = (state) =>
+  new RegExp(`\\b(?:turn(?:ed|s|ing)?|switch(?:ed|es|ing)?)\\s+(?:[\\w-]+\\s+){0,3}?${state}\\b|\\b(?:is|are|be|stays?|left|leave|keeps?|kept)\\s+(?:[\\w-]+\\s+){0,3}?${state}\\b(?=\\s+(?:in|by|for|at|when|while|during|everywhere)\\b|\\s*[,.;!?]|\\s*$)`, 'i');
+/**
+ * Words that turn a rule round with no negation between them: "disabled" filed from "enabled" is as much the opposite
+ * as "never" from "always" (an independent review, Nov 18 2026, filed each of these from the user's own quote).
+ */
+const OPPOSITES = [
+  [/\benabl(?:e|es|ed|ing)\b/i, /\bdisabl(?:e|es|ed|ing)\b/i],
+  [/\b(?:allow(?:s|ed|ing)?|permit(?:s|ted|ting)?)\b/i, /\b(?:forbid(?:s|den|ding)?|prohibit(?:s|ed|ing)?|disallow(?:s|ed|ing)?|block(?:s|ed|ing)?)\b/i],
+  [/\bbefore\b/i, /\bafter\b/i],
+  [/\badd(?:s|ed|ing)?\b/i, /\bremov(?:e|es|ed|ing)\b/i],
+  [switched('on'), switched('off')],
+];
+/** Whether one text holds one side of a pair and the other text only the other side: both sides in one text is no turn. */
+const opposite = (a, b) =>
+  OPPOSITES.some(([one, other]) => {
+    const [a1, a2, b1, b2] = [one.test(a), other.test(a), one.test(b), other.test(b)];
+    return (a1 && !a2 && b2 && !b1) || (a2 && !a1 && b1 && !b2);
+  });
+
+/** A text's words with what a name or a version is written with kept in them: `3.12`, `feature/login`, `node-22`. */
+const named = (text) => (text.toLowerCase().match(/[\p{L}\p{N}_][\p{L}\p{N}_./+-]*/gu) ?? []).map((w) => w.replace(/[./+-]+$/, ''));
+const DETERMINERS = new Set(['the', 'a', 'an', 'our', 'my', 'your', 'their']);
+/**
+ * The values a text names where one can be told from prose: the word before "branch", a word with a digit (with the
+ * word before it — "node 22"), and what is used ("uses pnpm"). Narrow on purpose: a synonym elsewhere is a paraphrase.
+ */
+function valuesNamed(text) {
+  const all = named(text);
+  const out = { branch: [], version: [], tool: [] };
+  all.forEach((w, i) => {
+    if (w === 'branch' && i > 0 && !STOPWORDS.has(all[i - 1])) out.branch.push({ value: all[i - 1], after: '' });
+    if (/\d/.test(w) && i > 0) out.version.push({ value: w, after: stem(all[i - 1]) });
+    if (/^us(?:e|es|ed|ing)$/.test(w)) {
+      let next = i + 1;
+      while (DETERMINERS.has(all[next])) next++;
+      if (all[next] && !STOPWORDS.has(all[next])) out.tool.push({ value: all[next], after: '' });
+    }
+  });
+  return { all: new Set(all.map(stem)), ...out };
+}
+/**
+ * Whether `a` names a branch, a version or a tool that `b` nowhere holds, where `b` names another: "the release
+ * branch" from "the main branch", "node 20" from "node 22", "uses npm" from "uses pnpm". A value `b` holds anywhere is
+ * the user's own — "uses bun" from "we moved from pnpm to bun".
+ */
+function namesAnother(a, b) {
+  const [its, theirs] = [valuesNamed(a), valuesNamed(b)];
+  return ['branch', 'version', 'tool'].some((kind) => its[kind].some((v) => !theirs.all.has(stem(v.value)) && theirs[kind].some((t) => t.after === v.after)));
+}
+
 /**
  * Whether two texts say a thing the same way round: both negate it, or neither does. "slate uses bun, not pnpm" from "we
  * moved from pnpm to bun" is not a turn — the "not" sets aside what they moved from; "never force-push" is, from "force-push
- * freely", which set nothing aside. `aside` is where `a`'s alternative is looked for, when `b` is only part of what was said.
+ * freely", which set nothing aside. Nor is it the same way round when one says the opposite in a word (`OPPOSITES`) or
+ * names another value (`namesAnother`). `aside` is the whole of what was said, when `b` is only part of it: where
+ * `a`'s alternative and the values it names are looked for.
  */
-export const sameWayRound = (a, b, aside = b) => NEGATION.test(withoutAlternative(a, aside)) === NEGATION.test(withoutAlternative(b, a));
+export const sameWayRound = (a, b, aside = b) => {
+  const [said, typed] = [withoutAlternative(a, aside), withoutAlternative(b, a)];
+  return NEGATION.test(said) === NEGATION.test(typed) && !opposite(said, typed) && !namesAnother(a, aside);
+};
 
 /**
  * Whether what the user typed says what a memory says: nearly all of the memory's own words are in theirs — not a
@@ -103,6 +181,16 @@ export function saysAs(memory, typed, share = SAID_SHARE) {
 export function sharedStems(a, b) {
   const sb = new Set(words(b).map(stem));
   return [...new Set(words(a).map(stem))].filter((s) => sb.has(s)).length;
+}
+
+/**
+ * How many of a search's distinct words a text holds: by stem, and for a Chinese, Japanese or Korean word by its
+ * characters anywhere in the text, as it is searched.
+ */
+export function termsHeld(query, text) {
+  const lower = text.toLowerCase();
+  const stems = new Set(words(text).map(stem));
+  return [...new Set(words(query))].filter((w) => (CJK.test(w) ? lower.includes(w) : stems.has(stem(w)))).length;
 }
 
 /**
@@ -130,10 +218,10 @@ export function clip(text, max) {
   return flat.length <= max ? flat : `${head(flat, max - 1)}…`;
 }
 
-/** Words that mark a sentence as a standing instruction, which is worth filing right away rather than in the next batch. */
+/** Words that mark a sentence as a standing instruction: whatever else it does, it is not only a request for work. */
 const DURABLE = /\b(always|never|from now on|going forward|remember|don'?t ever|i (prefer|like|want(?! to\b)|hate|use)|we (use|moved|switched|decided)|make sure|by default|every time|stop (doing|using))\b/i;
 
-export const looksDurable = (text) => DURABLE.test(text);
+const looksDurable = (text) => DURABLE.test(text);
 
 /**
  * A clause that asks for work or an answer — describe this, fix that, delegate, a question — rather than stating
@@ -176,6 +264,30 @@ export const asksForWork = (text) => {
   const sentences = said.split(/(?<=[.!?;])\s+|\n+/).map((x) => x.trim()).filter(Boolean);
   return REQUEST.test(said) || sentences.some((x) => oneChange(x) || ANSWER_OR_SWITCH.test(x.replace(LEADING, '')));
 };
+
+/** Words that agree, thank or wave on, and nouns that only stand for something said before: none of them is what a sentence is about. */
+const EMPTY_WORDS = new Set(
+  `ok okay yes yeah yep yup sure please pls thanks thank good great fine nice cool perfect right agreed sounds sound looks look seems
+   works go ahead just well plan idea approach option suggestion proposal thing way one same lets let`.split(/\s+/),
+);
+/** Words that point at something said elsewhere. */
+const POINTS = /\b(?:it|this|that|these|those|them|so|same)\b/i;
+/** A sentence whose whole statement is approval. */
+const APPROVES = /\b(?:sounds?|looks?|seems?)\s+(?:good|great|fine|right|ok|okay|perfect|nice)\b|\bworks\s+for\s+me\b|\b(?:that|it|this)(?:'s|\s+is)\s+(?:good|great|fine|right|ok|okay|perfect)\b/i;
+
+/**
+ * Whether a sentence says something by itself, so it can be a memory when stored as typed. "ok that plan sounds
+ * good", "yes do that always" and "use it" are the user's words and say nothing: what they agree to or point at was
+ * said by someone else. Not so when nothing is left once the words of agreement are taken out, when what is left is
+ * under three words beside a pointing word, or when the sentence only approves and gives no rule of its own. A short
+ * rule stands: "no emojis", "never push to main".
+ */
+export function standsAlone(sentence) {
+  const content = new Set(words(sentence).filter((w) => !STOPWORDS.has(w) && !EMPTY_WORDS.has(w)).map(stem));
+  if (content.size === 0) return false;
+  if (content.size < 3 && POINTS.test(sentence)) return false;
+  return !(APPROVES.test(sentence) && !looksDurable(sentence));
+}
 
 /**
  * The known name a mistyped one was most likely meant to be: two edits away at most, nearer than any other, and with

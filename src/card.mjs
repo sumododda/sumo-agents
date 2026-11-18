@@ -16,20 +16,25 @@ export function ago(iso, now) {
   return `${Math.round(hours / 24)}d ago`;
 }
 
-/** How long a guess is put to the user; after that it waits on the memory page and in search. */
-const GUESS_ASKED_DAYS = 14;
+/** How long a held memory is put to the user; after that it waits on the memory page. */
+const HELD_ASKED_DAYS = 14;
 const ASK_LINE_MAX = 120;
+/** The question put, by why the memory is held: read from outside, or saved from the model's shell without the user's words. */
+const HELD_ASKS = { outside: 'is this right?', shell: 'they never typed this — keep it?' };
 
 /**
- * What to put to the user about these scopes: guesses newer than two weeks, and notices whose two memories both
- * still stand — superseding or forgetting either settles one. The session-start block asks about everything and the
- * session's own project; a project's card asks about that project, wherever the session was started.
+ * What to put to the user about these scopes: memories newer than two weeks that are held for them — because the
+ * conversation they came from read the web or an MCP server, or because the model saved from its shell what the user
+ * never typed; nothing else is held: what the memory pass cannot tie to the user's own words is dropped, not queued
+ * as a guess — and notices whose two memories both still stand (superseding
+ * or forgetting either settles one). The session-start block asks about everything and the session's own project; a
+ * project's card asks about that project, wherever the session was started.
  */
-export function askLines(db, { scopes, now, guesses: maxGuesses, notices: maxNotices }) {
+export function askLines(db, { scopes, now, held: maxHeld, notices: maxNotices }) {
   const marks = scopes.map(() => '?').join(', ');
-  const since = new Date(Date.parse(now) - GUESS_ASKED_DAYS * 86_400_000).toISOString();
-  const guesses = db.prepare(`SELECT * FROM memories WHERE state = 'unconfirmed' AND scope IN (${marks}) AND created_at >= ? ORDER BY id LIMIT ?`).all(...scopes, since, maxGuesses);
-  const out = guesses.map((m) => `Ask the user (then sumo confirm|reject m${m.id}): is this right? "${clip(m.type === 'procedure' ? `workflow "${m.title}"` : m.body, ASK_LINE_MAX)}"`);
+  const since = new Date(Date.parse(now) - HELD_ASKED_DAYS * 86_400_000).toISOString();
+  const held = db.prepare(`SELECT * FROM memories WHERE state = 'unconfirmed' AND held_for IS NOT NULL AND scope IN (${marks}) AND created_at >= ? ORDER BY id LIMIT ?`).all(...scopes, since, maxHeld);
+  const out = held.map((m) => `Ask the user (then sumo confirm|reject m${m.id}): ${HELD_ASKS[m.held_for] ?? HELD_ASKS.outside} "${clip(m.type === 'procedure' ? `workflow "${m.title}"` : m.body, ASK_LINE_MAX)}"`);
   const notices = db
     .prepare(
       `SELECT n.* FROM notices n
@@ -46,7 +51,7 @@ export function askLines(db, { scopes, now, guesses: maxGuesses, notices: maxNot
 }
 
 /** The most a card asks: room is kept for what the project is. */
-const CARD_GUESSES = 2;
+const CARD_HELD = 2;
 const CARD_NOTICES = 1;
 
 /**
@@ -71,7 +76,7 @@ export function card(db, nameOrAlias, { budget = CARD_BUDGET_TOKENS, now = new D
 
   // Asked of the user, so only where the user is: first, and whole — clipped, a question would lose what it asks.
   // A job's brief and `sumo project show` leave them out.
-  if (asks) for (const text of askLines(db, { scopes: [scope], now, guesses: CARD_GUESSES, notices: CARD_NOTICES })) candidates.push({ priority: 0, order: order++, text, id: null });
+  if (asks) for (const text of askLines(db, { scopes: [scope], now, held: CARD_HELD, notices: CARD_NOTICES })) candidates.push({ priority: 0, order: order++, text, id: null });
 
   for (const m of rows.filter((r) => r.scan_key)) offer(SCAN_PRIORITY[m.scan_key] ?? 11, m.body, m.id);
   for (const m of rows.filter((r) => !r.scan_key && (r.type === 'preference' || r.type === 'decision'))) offer(PRIORITY.rule, `rule m${m.id}: ${m.body}`, m.id);

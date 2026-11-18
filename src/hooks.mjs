@@ -1,5 +1,5 @@
 import { card } from './card.mjs';
-import { getMeta, openDb, setMeta } from './db.mjs';
+import { getMeta, openDb, setMeta, tx } from './db.mjs';
 import { backup } from './export.mjs';
 import { guardCommand, guardPath } from './guard.mjs';
 import { autoGuides, firingGuides, matchGuide, renderGuide } from './guides.mjs';
@@ -11,7 +11,8 @@ import { closingQuestions, recallBeforeAsking } from './recall.mjs';
 import { line } from './render.mjs';
 import { shouldRun, spawnDetached } from './scribe.mjs';
 import { tidyDue } from './dream.mjs';
-import { clearInjections, contextBand, contextNudge, contextUse, currentProject, endSession, ensureSession, injectedSlugs, markInjected, pruneStates, recordTurn } from './sessions.mjs';
+import { clearInjections, contextBand, contextNudge, contextUse, currentProject, endedThen, endSession, ensureSession, heardSession, injectedSlugs, markInjected, noteHeard, pruneStates, recordReply, recordTurn, replyText, turnText } from './sessions.mjs';
+import { drainSpool, retrySetAside, spoolEvent } from './spool.mjs';
 import { claim, renderWorkflow, withoutSumoCalls } from './workflows.mjs';
 
 /**
@@ -118,14 +119,21 @@ function unchecked(db, e) {
   return `<check>\nNot done yet: ${shown} ${were} edited and ${next}\n</check>`;
 }
 
+/** The memory pass as a session starts it by itself: finished conversations only, and nothing filed while filing is paused. */
+const PASS = ['memory', 'run', '--auto'];
+
+/** The ways a session starts with its context wiped: Claude Code's compact and clear, the chat's /new. */
+const CARDS_GONE = new Set(['compact', 'clear', 'new']);
+
 const HANDLERS = {
   'session-start'(db, e, now) {
-    ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
-    // A fresh start wipes the cards from context; forgetting they were shown lets them come back.
-    if (e.source === 'compact' || e.source === 'new') clearInjections(db, e.sessionId);
+    ensureSession(db, { id: e.sessionId, harness: e.harness, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
+    // A fresh start wipes the cards from context; forgetting they were shown lets them come back. Claude Code names its
+    // start startup, resume, clear or compact: a resume still holds the cards, a clear or a compaction does not.
+    if (CARDS_GONE.has(e.source)) clearInjections(db, e.sessionId);
 
-    // One memory pass: it files what waits, and tidies too when conversations have finished or a week has gone by.
-    if (shouldRun(db, { event: 'session-start', now }) || tidyDue(db, now)) spawnDetached(['memory', 'run']);
+    // One memory pass: it reads the conversations that have finished since the last one, and tidies when a week has gone by.
+    if (shouldRun(db, { now }) || tidyDue(db, now)) spawnDetached(PASS);
 
     const last = getMeta(db, 'last_backup');
     if (!last || Date.parse(now) - Date.parse(last) > BACKUP_EVERY_MS) {
@@ -161,8 +169,12 @@ const HANDLERS = {
   },
 
   prompt(db, e, now) {
-    ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
-    if (recordTurn(db, { sessionId: e.sessionId, text: e.prompt, now }) === null) return '';
+    ensureSession(db, { id: e.sessionId, harness: e.harness, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
+    const turn = recordTurn(db, { sessionId: e.sessionId, text: e.prompt, now });
+    if (turn === null) {
+      noteHeard(db, e.harness, now);
+      return '';
+    }
 
     const shown = new Set(injectedSlugs(db, e.sessionId));
     const cards = [];
@@ -183,6 +195,8 @@ const HANDLERS = {
       // Its questions come with it, unless the block this session started with asked them: a session started inside the project.
       cards.push(card(db, slug, { now, asks: slug !== (e.cwd ? projectAt(db, e.cwd) : null) }));
     }
+    // The turn was stamped before its own words were read: one that names a project is about that project.
+    if (here || named.length > 0) db.prepare('UPDATE user_turns SET project = ? WHERE id = ?').run(currentProject(db, e.sessionId), turn);
 
     const asked = claim(db, { sessionId: e.sessionId, text: e.prompt, scopes: scopesOf(db, e.sessionId), now });
     if (asked.length > 0) {
@@ -204,7 +218,7 @@ const HANDLERS = {
   'pre-tool'(db, e, now) {
     // A question on its way to the user: what memory holds close to it is read first, and holds it back once.
     if (e.toolName === 'ask') {
-      ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
+      ensureSession(db, { id: e.sessionId, harness: e.harness, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
       const known = recallBeforeAsking(db, { sessionId: e.sessionId, agentId: e.agentId, asked: e.question, now });
       return known.length > 0 ? deny(`Not asked yet: ${alreadyKnown(known)} If none does, ask again.`) : '';
     }
@@ -212,7 +226,7 @@ const HANDLERS = {
     // Teaching or reading a workflow names its own cue; `sumo` must never be gated by what it manages — and nothing else rides through on it.
     const judged = withoutSumoCalls(e.command);
     if (!judged) return '';
-    ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
+    ensureSession(db, { id: e.sessionId, harness: e.harness, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
 
     const due = claim(db, { sessionId: e.sessionId, agentId: e.agentId, text: judged, scopes: [...scopesOf(db, e.sessionId), ...(e.project ? [`project:${e.project}`] : [])], forCommand: true, now });
     if (due.length === 0) return '';
@@ -223,8 +237,9 @@ const HANDLERS = {
   },
 
   stop(db, e, now) {
-    ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
-    if (shouldRun(db, { event: 'stop', now })) spawnDetached(['memory', 'run']);
+    ensureSession(db, { id: e.sessionId, harness: e.harness, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
+    // The journal first: what the assistant ended the turn on, whether or not a gate then sends the turn on.
+    if (e.reply) recordReply(db, { sessionId: e.sessionId, text: e.reply, now });
 
     // The other gates: a turn that ends on an edit nothing checked, or by asking the user something memory may
     // already hold. Already continuing because of one → whatever the turn ends on now goes to the user.
@@ -235,23 +250,88 @@ const HANDLERS = {
   },
 
   'session-end'(db, e, now) {
-    ensureSession(db, { id: e.sessionId, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
+    ensureSession(db, { id: e.sessionId, harness: e.harness, cwd: e.cwd, transcriptPath: e.transcriptPath, now });
     endSession(db, e.sessionId, now);
-    if (shouldRun(db, { event: 'session-end', now })) spawnDetached(['memory', 'run']);
+    // The conversation is over: it is read for memory now, once.
+    if (shouldRun(db, { now })) spawnDetached(PASS);
     return '';
   },
 };
 
-/** One event, in process: the guard first, then the handler. Throws only for an unknown event or a payload with no session. */
-export function handleEvent(db, event, payload, now = new Date().toISOString()) {
+/**
+ * One event, in process: the guard first, then the handler. Throws only for an unknown event or a payload with no
+ * session. `harness` is who drives the session — sumo's own chat and jobs unless said; `runHook` says 'claude' — and
+ * is written on a session's row when it is first heard of. Events an earlier hook could not write are replayed first.
+ */
+export function handleEvent(db, event, payload, now = new Date().toISOString(), { harness = 'sumo' } = {}) {
   const handler = HANDLERS[event];
   if (!handler) throw new Error(`no handler for ${event}`);
-  const e = fieldsOf(payload);
+  const e = { ...fieldsOf(payload), harness };
   if (!e.sessionId) throw new Error('the event had no session id');
   const refused = event === 'pre-tool' ? earlyRefusal(e) : '';
   if (refused) return deny(refused);
+  drain(db);
   return handler(db, e, now);
 }
+
+/** The events with something for the journal: a session's row, a turn, a reply, a goodbye. A tool about to run has nothing. */
+const JOURNALED = new Set(['session-start', 'prompt', 'stop', 'session-end']);
+/** The harness `sumo hook` is wired into. */
+const HOOKED = 'claude';
+
+/**
+ * An event that could not be written, kept in the spool for the next one that gets through: only what the journal
+ * needs — who, when, where, and the words, redacted and cut as the journal would keep them. Never the tool's input, the
+ * gates or the cards: those were for the moment that has passed. A slash command or a turn that ended on nothing has
+ * nothing to keep.
+ */
+function keepForLater(event, payload, at) {
+  const e = fieldsOf(payload);
+  if (!JOURNALED.has(event) || !e.sessionId) return;
+  const said = event === 'prompt' ? turnText(e.prompt) : event === 'stop' ? replyText(e.reply) : null;
+  if ((event === 'prompt' || event === 'stop') && !said) return;
+  const text = (value) => (typeof value === 'string' ? value : null);
+  spoolEvent({ v: 1, at, event, harness: HOOKED, session_id: String(e.sessionId), cwd: text(e.cwd), transcript_path: text(e.transcriptPath), ...(said ? { text: said.text, full_len: said.fullLen, redacted: said.redacted } : {}) });
+}
+
+/** A line of the spool that is not an event: no later try would make it one, so it is set aside at once. */
+function notAnEvent(why) {
+  return Object.assign(new Error(why), { bad: true });
+}
+
+/**
+ * One spooled event written into the journal with the time it happened: the session's row, and the turn, the reply or
+ * the goodbye. Nothing else an event does is done again — no card, no gate, no memory pass woken, no backup.
+ */
+function replay(db, line) {
+  if (line.v !== 1 || !JOURNALED.has(line.event)) throw notAnEvent('not an event this version replays');
+  if (typeof line.session_id !== 'string' || !line.session_id) throw notAnEvent('no session id');
+  const happened = typeof line.at === 'string' ? Date.parse(line.at) : NaN;
+  if (Number.isNaN(happened)) throw notAnEvent('no time it happened');
+  const at = new Date(happened).toISOString();
+  const text = (value) => (typeof value === 'string' ? value : null);
+  const kept = { text: line.text, fullLen: line.full_len, redacted: line.redacted };
+  if ((line.event === 'prompt' || line.event === 'stop') && typeof line.text !== 'string') throw notAnEvent('no words');
+  heardSession(db, { id: line.session_id, harness: text(line.harness) ?? HOOKED, cwd: text(line.cwd), transcriptPath: text(line.transcript_path), now: at });
+  if (line.event === 'prompt') recordTurn(db, { sessionId: line.session_id, now: at, kept });
+  if (line.event === 'stop') recordReply(db, { sessionId: line.session_id, now: at, kept });
+  if (line.event === 'session-end') endedThen(db, line.session_id, at);
+}
+
+/** What waits in the spool, into the journal, before the event in hand. It never stops that event: what went wrong is logged, and the lines wait on. */
+function drain(db) {
+  try {
+    const done = drainSpool((line) => replay(db, line), { within: (fn) => tx(db, fn) });
+    if (!done) return;
+    const parts = [`${done.replayed} replayed`, done.retried > 0 ? `${done.retried} to try again` : '', done.bad > 0 ? `${done.bad} set aside in spool/events.bad.jsonl (sumo memory check counts them)` : ''].filter(Boolean);
+    appendLog('hook.log', `${new Date().toISOString()} spool: ${parts.join(', ')}\n`);
+  } catch (cause) {
+    logFailure('spool', cause);
+  }
+}
+
+/** The lines set aside in the spool tried again, for `sumo memory check --fix`: `{ replayed, left }`. */
+export const replaySetAside = (db) => retrySetAside((line) => replay(db, line), { within: (fn) => tx(db, fn) });
 
 /** What went wrong, in logs/hook.log. If even the log cannot be written there is nothing left to do but stay out of the way. */
 function logFailure(what, cause) {
@@ -266,21 +346,34 @@ function logFailure(what, cause) {
  * One event from outside the process, JSON on stdin. It never throws and never
  * exits non-zero: memory is a convenience, and a convenience that can break the
  * session it serves is worse than none. Whatever goes wrong is written to
- * logs/hook.log and the session simply carries on without this contribution.
+ * logs/hook.log and the session simply carries on without this contribution —
+ * but what was said is not lost with it: an event the database could not take,
+ * or a handler broke on, waits in the spool for the next one that gets through.
  */
 export function runHook(event, stdin) {
   let db = null;
+  let payload = null;
+  const now = new Date().toISOString();
   try {
-    const payload = JSON.parse(stdin || '{}');
+    payload = JSON.parse(stdin || '{}');
     // The guard needs no database, and a database that cannot be opened must not stop it.
     const refused = event === 'pre-tool' ? earlyRefusal(fieldsOf(payload)) : '';
     if (refused) return deny(refused);
     db = openDb();
-    return handleEvent(db, event, payload);
+    return handleEvent(db, event, payload, now, { harness: HOOKED });
   } catch (cause) {
     logFailure(event, cause);
+    try {
+      if (payload && typeof payload === 'object') keepForLater(event, payload, now);
+    } catch (unkept) {
+      logFailure(`${event} spool`, unkept);
+    }
     return '';
   } finally {
-    db?.close();
+    try {
+      db?.close();
+    } catch (cause) {
+      logFailure(`${event} close`, cause);
+    }
   }
 }

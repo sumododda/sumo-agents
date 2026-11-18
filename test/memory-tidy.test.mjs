@@ -1,5 +1,5 @@
-// The tidy the consolidation pass does to memory itself: what it is shown, the pairs it has judged, the search terms it
-// fills in, and when it is owed. Every model is a stand-in; nothing here is decided by one.
+// The tidy the memory pass does to memory itself, weekly: the pairs it has judged, the rules it checks for being said
+// twice, the search terms it fills in, and when it is due. Every model is a stand-in; nothing here is decided by one.
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -18,14 +18,6 @@ function seed(s, memories) {
   });
 }
 
-/** A finished conversation whose turns the writer has already filed. */
-function finishedSession(s, id, prompts) {
-  for (const prompt of prompts) s.hook('prompt', { session_id: id, prompt });
-  s.hook('session-end', { session_id: id, reason: 'other' });
-  // Marked filed by hand: a memory pass run here would tidy by itself once the third is over.
-  s.sql((db) => db.prepare('UPDATE user_turns SET scribed = 1 WHERE session_id = ?').run(id));
-}
-
 /** What the local model answers one kind of tidy call; the other calls get the usual answer. */
 const willAnswer = (s, kind, output) => writeFileSync(join(s.root, `model-answer.json.${kind}`), JSON.stringify({ is_error: false, structured_output: output, usage: { input_tokens: 900, output_tokens: 40 }, total_cost_usd: 0 }));
 
@@ -37,35 +29,6 @@ const asked = (s) => {
 
 /** Marks memory tidied at `at`, so a pass owes none. */
 const tidiedAt = (s, at) => s.sql((db) => db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES ('dream.last_tidy', ?)`).run(at));
-
-test('past sixty memories a pass still reads the oldest: a slice of them that moves on each pass, beside the newest', () => {
-  const s = sandbox();
-  seed(s, [
-    { body: 'deploys run from the mac mini in the office' },
-    { body: 'deploys run from the linux box in the rack' },
-    ...Array.from({ length: 68 }, (_, i) => ({ body: `rule number ${i + 3} about subject ${i + 3}` })),
-  ]);
-  tidiedAt(s, new Date().toISOString());
-  finishedSession(s, 'one', ['thanks, that is all']);
-  finishedSession(s, 'two', ['nothing else today']);
-
-  s.modelWillSay([]);
-  assert.equal(s.sumo(['memory', 'run', '--tidy']).code, 0);
-  const first = s.modelWasShown().prompt;
-  assert.match(first, /^m1 \[.*mac mini/m, 'the oldest clash is read');
-  assert.match(first, /^m2 \[.*linux box/m);
-  assert.match(first, /^m70 \[/m, 'and the newest');
-  const shown = (prompt) => [...prompt.matchAll(/^m(\d+) \[/gm)].map((m) => Number(m[1]));
-  assert.ok(shown(first).length <= 60, `${shown(first).length} memories shown`);
-  assert.equal(shown(first).includes(25), false, 'past the slice and before the newest: not this time');
-
-  finishedSession(s, 'three', ['see you tomorrow']);
-  s.modelWillSay([]);
-  assert.equal(s.sumo(['memory', 'run', '--tidy']).code, 0);
-  const second = shown(s.modelWasShown().prompt);
-  assert.ok(second.includes(25), 'the slice moved on');
-  assert.equal(second.includes(1), false, 'and the start waits for its turn again');
-});
 
 test('code picks the pairs, the local model judges them, and the user settles them: nothing is superseded or forgotten by the pass', () => {
   const s = sandbox();
@@ -84,7 +47,7 @@ test('code picks the pairs, the local model judges them, and the user settles th
 
   const run = s.sumo(['memory', 'run', '--tidy']);
   assert.equal(run.code, 0, run.err);
-  assert.match(run.out, /^tidy: read 0 sessions/, 'a tidy with no conversation waiting');
+  assert.match(run.out, /^tidy: went over memory/, 'the tidy reads memory, never a conversation');
   const pairsCall = asked(s).find((r) => r.kind === 'dream-pairs');
   assert.match(pairsCall.prompt, /^Pairs to judge — /);
   assert.match(pairsCall.system, /"Pairs to judge": for each \[pN\]/, 'the pass\'s own instructions');
@@ -157,7 +120,7 @@ test('search terms and a topic are filled in for memories that have none, each c
   assert.match(s.sumo(['search', 'linter']).out, /m1 .*eslint/);
 });
 
-test('the tidy is owed weekly, or when three conversations wait; with nothing owed a pass has nothing to do', async () => {
+test('the tidy is due weekly and for no other reason — conversations finishing bring none; with nothing to tidy a pass has nothing to do', async () => {
   const s = sandbox();
   const { tidyDue } = await import('../src/dream.mjs');
   const { openDb } = await import('../src/db.mjs');
@@ -176,18 +139,21 @@ test('the tidy is owed weekly, or when three conversations wait; with nothing ow
     assert.equal(due(), false, 'no memory, no conversation: nothing to tidy');
     seed(s, [{ body: 'keep pull request descriptions short' }]);
     assert.equal(due(), true, 'never tidied');
-    assert.match(s.sumo(['memory', 'status']).out, /^last tidy {2}never · weekly sweep: never — owed: the next pass sweeps$/m);
+    assert.match(s.sumo(['memory', 'status']).out, /^last tidy {2}never · weekly sweep: never — due: the next pass tidies$/m);
 
     willAnswer(s, 'dream-keys', { memories: [] });
     willAnswer(s, 'dream-pairs', { pairs: [] });
     s.sumo(['memory', 'run', '--tidy']);
     assert.equal(due(), false, 'just tidied');
     assert.match(s.sumo(['memory', 'status']).out, /^last tidy {2}\d{4}-\d{2}-\d{2} · weekly sweep: \d{4}-\d{2}-\d{2}$/m);
-    assert.match(s.sumo(['memory', 'run', '--tidy']).out, /^tidy: nothing to do — no finished sessions are waiting/);
+    assert.doesNotMatch(s.sumo(['memory', 'run']).out, /tidy:/, 'tidied within the week: a pass not asked to tidy does not');
     assert.equal(due(new Date(Date.now() + 8 * DAY).toISOString()), true, 'a week on');
 
-    for (const id of ['one', 'two', 'three']) finishedSession(s, id, [`a message in ${id}`]);
-    assert.equal(due(), true, 'three conversations waiting');
+    for (const id of ['one', 'two', 'three']) {
+      s.hook('prompt', { session_id: id, prompt: `a message in ${id}` });
+      s.hook('session-end', { session_id: id, reason: 'other' });
+    }
+    assert.equal(due(), false, 'conversations that finished are read once, by the filing: they bring no tidy');
   } finally {
     if (home === undefined) delete process.env.SUMO_AGENTS_HOME;
     else process.env.SUMO_AGENTS_HOME = home;
@@ -202,14 +168,14 @@ test('the tidy calls the local model only, and one that could not answer leaves 
   ]);
   // On a paid model the tidy is not run at all.
   s.sql((db) => db.prepare(`INSERT INTO meta (key, value) VALUES ('config.memory.model', 'haiku')`).run());
-  assert.match(s.sumo(['memory', 'run', '--tidy']).out, /^tidy: nothing to do — no finished sessions are waiting, and memory has nothing to tidy/);
+  assert.match(s.sumo(['memory', 'run', '--tidy']).out, /^tidy: nothing to do — memory is tidied by the local model only/);
   assert.deepEqual(asked(s).filter((r) => String(r.kind).startsWith('dream-')), []);
 
   s.sql((db) => db.prepare(`DELETE FROM meta WHERE key IN ('config.memory.model', 'dream.last_tidy')`).run());
   const failing = s.sumo(['memory', 'run', '--tidy'], { extraEnv: { STUB_LOCAL_FAILS: '1' } });
   assert.match(failing.out, /^tidy: failed — /);
-  assert.equal(s.sql((db) => db.prepare(`SELECT value FROM meta WHERE key = 'dream.last_tidy'`).get()), undefined, 'still owed');
-  assert.match(s.sumo(['memory', 'status']).out, /owed/);
+  assert.equal(s.sql((db) => db.prepare(`SELECT value FROM meta WHERE key = 'dream.last_tidy'`).get()), undefined, 'still due');
+  assert.match(s.sumo(['memory', 'status']).out, /due: the next pass tidies/);
 });
 
 test('pairs are picked from a bounded index, never every pair: two thousand memories in a moment, and a shared topic alone makes no pair', async () => {
@@ -260,99 +226,21 @@ test('pairs are picked from a bounded index, never every pair: two thousand memo
   }
 });
 
-test('the tidy does not file again what the writer already filed from the same sentence', () => {
-  const s = sandbox();
-  s.hook('prompt', { session_id: 'one', prompt: 'I prefer short answers, everywhere' });
-  s.modelWillSay([{ op: 'add', type: 'preference', scope: 'global', topic: 'style', body: 'I prefer short answers', turn: 1, quote: 'I prefer short answers' }]);
-  assert.match(s.sumo(['memory', 'run']).out, /saved m\d+ \[pref·global·stated\] I prefer short answers/);
-  const filed = s.sql((db) => db.prepare(`SELECT id FROM memories WHERE body = 'I prefer short answers'`).get().id);
-  s.hook('session-end', { session_id: 'one', reason: 'other' });
-
-  willAnswer(s, 'dream-keys', { memories: [] });
-  willAnswer(s, 'dream-pairs', { pairs: [] });
-  s.modelWillSay([
-    { op: 'add', type: 'preference', scope: 'global', topic: 'style', body: 'I prefer short answers, everywhere', turn: 1, quote: 'I prefer short answers, everywhere' },
-    // Another rule from the same sentence is a rule of its own.
-    { op: 'add', type: 'preference', scope: 'global', topic: 'style', body: 'Answers should avoid emojis', turn: 1, quote: null },
-  ]);
-  const run = s.sumo(['memory', 'run', '--tidy']);
-  assert.equal(run.code, 0, run.err);
-  assert.match(run.out, new RegExp(`dropped — add: already filed from that sentence: m${filed}`));
-  assert.deepEqual(s.sql((db) => db.prepare(`SELECT body FROM memories WHERE body LIKE '%short answers%'`).all().map((r) => r.body)), ['I prefer short answers']);
-});
-
-test('two memories that say one thing in other words are raised by the pass that reads them once the pair, judged alone, says so: a pair named by a wrong number is not put to the user, and nothing is retired', () => {
-  const s = sandbox();
-  seed(s, [
-    { body: 'I prefer short answers' },
-    { body: 'keep your replies brief' },
-    { body: 'the coffee machine is on the second floor', state: 'active' },
-    { body: 'never force-push on slate' },
-    { type: 'decision', body: 'slate uses bun, not pnpm' },
-  ]);
-  s.sql((db) => db.prepare(`UPDATE memories SET state = 'superseded' WHERE id = 3`).run());
-  finishedSession(s, 'one', ["don't ever force-push on slate"]);
-  willAnswer(s, 'dream-keys', { memories: [] });
-  // Asked about each pair alone, the model holds the first and calls the second unrelated.
-  willAnswer(s, 'dream-pairs', { pairs: [{ pair: 1, label: 'same' }, { pair: 2, label: 'unrelated' }] });
-  willAnswer(s, 'dream-repeats', { repeats: [] });
-  s.modelWillSay([
-    { op: 'same', ids: [1, 2], note: 'both ask for brevity' },
-    // The number of the turn the rule was said in, read as a memory's: what a small model reading a list does.
-    { op: 'same', ids: [4, 5], note: 't5 repeats the rule against force-push on slate' },
-    { op: 'same', ids: [1, 99], note: 'not a memory' },
-    { op: 'same', ids: [2, 3], note: 'one of them is gone' },
-  ]);
-  const run = s.sumo(['memory', 'run', '--tidy']);
-  assert.equal(run.code, 0, run.err);
-  assert.match(run.out, /to be judged on their own: m1 and m2 say the same thing — both ask for brevity/);
-  assert.match(run.out, /raised for the user: m1 and m2 say the same thing — both ask for brevity/);
-  assert.match(run.out, /dropped — m4 and m5, named as saying the same thing: judged on their own, they are unrelated/);
-  assert.match(run.out, /dropped — same: m99 is not one of the memories this pass was shown/);
-  assert.match(run.out, /dropped — same: m3 is not one of the memories this pass was shown/);
-  const judge = asked(s).filter((r) => r.kind === 'dream-pairs').at(-1);
-  assert.match(judge.prompt, /\[p1\]\n {2}A: m1 [^\n]*short answers\n {2}B: m2 [^\n]*brief\n\[p2\]\n {2}A: m4 [^\n]*force-push[^\n]*\n {2}B: m5 [^\n]*bun[^\n]*$/, 'each pair named is put to the model alone');
-  assert.match(s.sumo(['prime']).out, /m1 and m2 look alike — both ask for brevity/);
-  assert.deepEqual(s.sql((db) => db.prepare(`SELECT memory_a, memory_b FROM notices`).all().map((n) => [n.memory_a, n.memory_b])), [[1, 2]], 'only the pair that held');
-  assert.deepEqual(s.sql((db) => db.prepare(`SELECT id FROM memories WHERE state = 'active' ORDER BY id`).all().map((r) => r.id)), [1, 2, 4, 5]);
-
-  // Asked once: the pair judged unrelated is not named again, nor put to the model.
-  finishedSession(s, 'two', ['thanks again']);
-  s.modelWillSay([{ op: 'same', ids: [4, 5], note: 'the same rule' }]);
-  const again = s.sumo(['memory', 'run', '--tidy']);
-  assert.match(again.out, /dropped — same: m4 and m5 were judged on their own already: unrelated/);
-  assert.equal(asked(s).filter((r) => r.kind === 'dream-pairs').length, 1, 'no second call');
-});
-
-test('a pair named while the local model cannot judge it waits, and the next tidy judges it first', () => {
+test('a pair the repeat check named while the local model cannot judge it waits, and the next tidy judges it first', () => {
   const s = sandbox();
   seed(s, [{ body: 'I prefer short answers' }, { body: 'keep your replies brief' }]);
-  finishedSession(s, 'one', ['thanks, that is all']);
-  willAnswer(s, 'dream-repeats', { repeats: [] });
+  willAnswer(s, 'dream-keys', { memories: [] });
+  willAnswer(s, 'dream-repeats', { repeats: [{ rule: 2, same_as: 1 }] });
   writeFileSync(join(s.root, 'model-answer.json.dream-pairs'), JSON.stringify({ is_error: true, result: 'server busy', usage: {}, total_cost_usd: 0 }));
-  s.modelWillSay([{ op: 'same', ids: [1, 2], note: 'both ask for brevity' }]);
   const first = s.sumo(['memory', 'run', '--tidy']);
-  assert.match(first.out, /dropped — the pairs named wait to be judged: model call failed: server busy/);
+  assert.match(first.out, /^tidy: failed — model call failed: server busy/);
   assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM notices').get().n), 0, 'nothing raised unjudged');
 
-  finishedSession(s, 'two', ['see you tomorrow']);
   willAnswer(s, 'dream-pairs', { pairs: [{ pair: 1, label: 'same' }] });
-  s.modelWillSay([]);
   const next = s.sumo(['memory', 'run', '--tidy']);
-  assert.match(next.out, /raised for the user: m1 and m2 say the same thing — both ask for brevity/);
+  assert.match(next.out, /raised for the user: m1 and m2 say the same thing/);
   assert.match(asked(s).filter((r) => r.kind === 'dream-pairs').at(-1).prompt, /\[p1\]\n {2}A: m1 [^\n]*\n {2}B: m2 [^\n]*$/);
-});
-
-test('read by a paid model, the conversations\' pairs are raised as named: the pair judge is the local model\'s alone, and no local call is made', () => {
-  const s = sandbox();
-  seed(s, [{ body: 'I prefer short answers' }, { body: 'keep your replies brief' }]);
-  s.sql((db) => db.prepare(`INSERT INTO meta (key, value) VALUES ('config.memory.model', 'haiku')`).run());
-  finishedSession(s, 'one', ['thanks, that is all']);
-  s.modelWillSay([{ op: 'same', ids: [1, 2], note: 'both ask for brevity' }]);
-  const run = s.sumo(['memory', 'run', '--tidy']);
-  assert.equal(run.code, 0, run.err);
-  assert.match(run.out, /to be judged on their own: m1 and m2 say the same thing — both ask for brevity\n[\s\S]*raised for the user: m1 and m2 say the same thing — both ask for brevity/);
-  assert.deepEqual(asked(s).filter((r) => r.model === 'local').map((r) => r.kind), []);
+  assert.equal(asked(s).filter((r) => r.kind === 'dream-repeats').length, 1, 'the rules were checked once: the pair waited, it was not looked for again');
   assert.equal(s.sql((db) => db.prepare(`SELECT value FROM meta WHERE key = 'dream.named_pairs'`).get().value), '[]', 'nothing left waiting');
 });
 
@@ -377,7 +265,7 @@ test('a rule said again in other words, sharing no word, is checked against the 
   assert.match(run.out, /dropped — repeat m9 of m1/);
   const sent = asked(s).find((r) => r.kind === 'dream-repeats');
   assert.ok(sent, 'one call asks');
-  assert.match(sent.prompt, /Rules checked:[\s\S]*\[m1\] I prefer short answers[\s\S]*\[m3\] keep your replies brief/);
+  assert.match(sent.prompt, /^Rules said twice — these are the user's own words, as they typed them\. [^\n]*\nm1 \(preference, global\): I prefer short answers[^\n]*\nm2 \([^\n]*\nm3 \(preference, global\): keep your replies brief[^\n]*$/, 'one list, each rule once, with its kind and where it holds');
   assert.doesNotMatch(sent.prompt, /the laptop is a mac/, 'only rules are shown');
   assert.deepEqual(s.sql((db) => db.prepare(`SELECT kind, memory_a, memory_b FROM notices`).all().map((n) => ({ ...n }))), [{ kind: 'lookalike', memory_a: 1, memory_b: 3 }]);
   assert.deepEqual(s.sql((db) => db.prepare(`SELECT id FROM memories WHERE state = 'active' ORDER BY id`).all().map((r) => r.id)), [1, 2, 3, 4], 'nothing retired');

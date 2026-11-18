@@ -242,28 +242,3 @@ test('a log made readable by others before logs were private is made private on 
     assert.equal(readFileSync(file, 'utf8'), 'from before\nnow\n');
   });
 });
-
-test('doctor says in one line how memory is doing: when the user was last heard, the last pass, what waits to be asked, and old scans — a failed pass or a month-old scan is a warning', () => {
-  const s = sandbox();
-  s.sumo(['config']);
-  assert.match(s.sumo(['doctor']).out, /^ok {4}memory: nothing heard yet · no memory pass yet · no guesses waiting$/m);
-
-  const ago = (days) => new Date(Date.now() - days * 86_400_000).toISOString();
-  s.sql((db) => {
-    db.prepare(`INSERT INTO sessions (id, harness, started_at) VALUES ('s1', 'sumo', ?)`).run(ago(3));
-    db.prepare(`INSERT INTO user_turns (session_id, ts, text, redacted) VALUES ('s1', ?, 'we ship on fridays', 0)`).run(ago(3));
-    db.prepare(`INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, note) VALUES (?, 'scribe', 'local', 1, 1, 0, 1, 'applied=1 dropped=0')`).run(ago(2));
-    db.prepare(`INSERT INTO memories (type, scope, body, provenance, state, importance, written_by, valid_from, created_at) VALUES ('preference', 'global', 'likes tabs', 'inferred', 'unconfirmed', 1, 'scribe', ?, ?)`).run(ago(16), ago(16));
-    db.prepare(`INSERT INTO memories (type, scope, body, provenance, state, importance, written_by, valid_from, created_at) VALUES ('preference', 'global', 'likes yaml', 'inferred', 'rejected', 1, 'scribe', ?, ?)`).run(ago(20), ago(20));
-    db.prepare(`INSERT INTO memories (type, scope, body, provenance, state, importance, written_by, valid_from, created_at) VALUES ('preference', 'global', 'likes pnpm', 'stated', 'active', 1, 'scribe', ?, ?)`).run(ago(20), ago(20));
-  });
-  const healthy = s.sumo(['doctor']).out;
-  assert.match(healthy, /^ok {4}memory: last heard 3d ago · last pass 2d ago · 1 guess waiting, the oldest 16d · 50% of guesses confirmed$/m);
-
-  s.sql((db) => {
-    db.prepare(`INSERT INTO model_runs (ts, kind, model, input_tokens, output_tokens, cost_usd, ok, note) VALUES (?, 'dream', 'local', 1, 1, 0, 0, 'llama-server did not become healthy')`).run(ago(1));
-    db.prepare(`INSERT INTO projects (slug, name, path, created_at, scanned_at) VALUES ('old', 'old', '/nowhere/old', ?, ?)`).run(ago(40), ago(40));
-  });
-  const failing = s.sumo(['doctor']).out;
-  assert.match(failing, /^warn {2}memory: last heard 3d ago · last pass 1d ago, failed · 1 guess waiting, the oldest 16d · 50% of guesses confirmed · 1 project scan over 7 days old \(old, 40d\) — the last pass failed: llama-server did not become healthy; rescan: sumo project rescan old$/m);
-});

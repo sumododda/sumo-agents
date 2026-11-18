@@ -35,14 +35,16 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 - Just talk. Name the project you mean; the first time, Sumo confirms its path and registers it. Started inside a
   registered project, the chat works there from the start.
 - Say how you like things done. "Always run the linter before you commit" is remembered in your words and
-  loaded next time. What Sumo only guessed you meant is asked in sessions about that project, for two weeks;
-  after that it waits on the memory page (`/memory`).
-- Memory looks after itself, in one background pass on the local model. After a turn it files what you said;
-  once three conversations have finished, or a week has passed, it also reads them side by side and raises two
-  memories that say one thing, or cannot both be true, for you to settle. A project's facts are read again when
-  its files change. A trap an agent filed that nobody was shown in 45 days is let go, history kept. What a job
-  learned while reading the web or an MCP server waits for you to confirm. `sumo memory status` says how it is
-  doing; `sumo memory run --tidy` tidies now.
+  loaded next time. Nothing is kept as a guess: what cannot be found in your own words is not filed. What the
+  model saved without your saying it, or learned while reading the web or an MCP server, is asked in sessions
+  about that project, for two weeks; after that it waits on the memory page (`/memory`).
+- Everything you say and every answer is kept whole in a journal on this machine, and `sumo search` looks in
+  memories first, then in those conversations. Memory looks after itself, in one background pass on the local
+  model: when a conversation is over it files what you stated, in your words; once a week it also goes over
+  memory and raises two memories that say one thing, or cannot both be true, for you to settle. A project's
+  facts are read again when its files change. A trap an agent filed that nobody was shown in 45 days is let go,
+  history kept. `sumo memory status` says how it is doing, `sumo memory check` tests it, and `sumo memory run
+  --tidy` tidies now. To have Claude Code heard too, `sumo help hooks` prints the lines to add to its settings.
 - `/fix`, `/feature` and `/review` load a short written procedure for that kind of work. They also load on
   their own when your message asks for one.
 - Big work is delegated without being asked. A row for the job appears under the box, you keep talking,
@@ -94,8 +96,11 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
   and weekly into `~/.sumo-agents/backups`. A database that will not open is said with the newest copy:
   `sumo backup restore` puts it back (or `sumo backup restore <file>`), keeping the damaged one aside. Over a
   database that is fine, it says what would be lost and asks first (`--yes` in a script).
-- `sumo forget <id> --purge` erases a memory for good, from every backup and set-aside copy too; it shows the memory
-  and asks you to type its id (`--yes` in a script).
+- `sumo forget <id> --purge` erases a memory for good, with the turn it came from and every turn and reply that says
+  it whole (a phrase of five words or more), from every backup and set-aside copy and the spool too; it shows the
+  memory, lists each turn and reply that will go, and asks you to type its id (`--yes` in a script). A conversation
+  that only mentions part of it stays: `sumo search "<words>" --turns` finds it, and `sumo forget --purge t12` erases
+  that one turn or reply (`r3`) the same way.
 - `NO_COLOR=1` turns colour off everywhere, the chat screen included; the cursor in the box and the changed part of an
   edit stay in reverse video, which is not colour. `sumo --version` says which sumo this is.
 

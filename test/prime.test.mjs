@@ -104,24 +104,70 @@ test('the block says where work that belongs to no project goes; scratch is not 
   });
 });
 
-test('the questions put to the user are about everything or this session\'s project, and two weeks old at most: older ones wait on the memory page', async () => {
+test('the questions put to the user are about memories held for them — an outside read, or a save from the model\'s shell they never typed — everything or this session\'s project, two weeks old at most; nothing else waits as a guess', async () => {
   const { mkdtempSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { addProject } = await import('../src/projects.mjs');
   await withDb(async (db) => {
     for (const slug of ['alpha', 'beta']) addProject(db, mkdtempSync(join(tmpdir(), `sumo-agents-${slug}-`)), { slug, now: NOW });
     const days = (n) => new Date(Date.parse(NOW) - n * 86_400_000).toISOString();
-    const guess = (body, project, age) => add(db, { type: 'preference', body, project, provenance: 'inferred', writtenBy: 'scribe', now: days(age) }).memory.id;
-    const everywhere = guess('the user wants answers in British English', undefined, 2);
-    const alpha = guess('alpha deploys only from the release branch', 'alpha', 3);
-    const beta = guess('beta keeps its fixtures in testdata', 'beta', 3);
-    const stale = guess('the user prefers tabs over spaces', undefined, 20);
+    const held = (body, project, age, heldFor = 'outside') => add(db, { type: 'preference', body, project, heldFor, writtenBy: 'scribe', now: days(age) }).memory.id;
+    // A guess of the old kind — unconfirmed, held for nothing — is something only an old database holds: nothing writes one now.
+    const unconfirmed = (body, project, age) => {
+      const id = held(body, project, age);
+      db.prepare('UPDATE memories SET held_for = NULL WHERE id = ?').run(id);
+      return id;
+    };
+    const everywhere = held('the vendor api allows ten requests a minute', undefined, 2);
+    const alpha = held('alpha deploys only from the release branch', 'alpha', 3);
+    const beta = held('beta keeps its fixtures in testdata', 'beta', 3);
+    const stale = held('the vendor sandbox resets nightly', undefined, 20);
+    const guess = unconfirmed('the user prefers tabs over spaces', undefined, 1);
+    const shell = held('the user wants every branch rebased before review', 'beta', 1, 'shell');
     const asked = (block) => [...block.matchAll(/sumo confirm\|reject m(\d+)/g)].map((m) => Number(m[1]));
 
     assert.deepEqual(asked(prime(db, { now: NOW })), [everywhere], 'no project: only what is about everything');
     assert.deepEqual(asked(prime(db, { now: NOW, project: 'alpha' })), [everywhere, alpha], 'in alpha: alpha\'s too, never beta\'s');
-    assert.ok(!asked(prime(db, { now: NOW, project: 'beta' })).includes(stale), 'a guess twenty days old is not asked in every session');
+    assert.ok(!asked(prime(db, { now: NOW, project: 'beta' })).includes(stale), 'one twenty days old is not asked in every session');
     assert.ok(asked(prime(db, { now: NOW, project: 'beta' })).includes(beta));
+    const inBeta = prime(db, { now: NOW, project: 'beta' });
+    assert.match(inBeta, new RegExp(`^Ask the user \\(then sumo confirm\\|reject m${beta}\\): is this right\\? "beta keeps its fixtures in testdata"$`, 'm'));
+    assert.match(inBeta, new RegExp(`^Ask the user \\(then sumo confirm\\|reject m${shell}\\): they never typed this — keep it\\? "the user wants every branch rebased before review"$`, 'm'), 'what the model\'s shell saved unsaid is asked too, in words that say why');
     assert.equal(db.prepare('SELECT state FROM memories WHERE id = ?').get(stale).state, 'unconfirmed', 'it is still there, waiting');
+    assert.ok(!asked(prime(db, { now: NOW })).includes(guess), 'a guess is not a queue any more: one left unconfirmed with no outside read behind it is never asked');
+  });
+});
+
+test('where a project was left is said for two weeks, then no longer', async () => {
+  const { addCheckpoint } = await import('../src/sessions.mjs');
+  await withDb((db) => {
+    const insert = db.prepare('INSERT INTO projects (slug, name, path, created_at) VALUES (?, ?, ?, ?)');
+    for (const slug of ['fresh', 'edge', 'stale']) insert.run(slug, slug, `/work/${slug}`, NOW);
+    const days = (n) => new Date(Date.parse(NOW) - n * 86_400_000).toISOString();
+    addCheckpoint(db, { project: 'fresh', done: 'wired the journal', next: 'the search', now: days(2) });
+    addCheckpoint(db, { project: 'edge', done: 'cut the release', now: days(13) });
+    addCheckpoint(db, { project: 'stale', done: 'tried the rust rewrite', now: days(15) });
+    const block = prime(db, { now: NOW });
+    assert.match(block, /^Left off: fresh — wired the journal → next: the search \(2d ago\)$/m);
+    assert.match(block, /^Left off: edge — cut the release \(13d ago\)$/m);
+    assert.doesNotMatch(block, /Left off: stale/, 'fifteen days on it is history, a search away');
+  });
+});
+
+test('a block squeezed to fit counts the lines it left out, in the line that says more is behind search', async () => {
+  await withDb((db) => {
+    for (let i = 0; i < 12; i++) {
+      db.prepare('INSERT INTO projects (slug, name, path, created_at) VALUES (?, ?, ?, ?)').run(`p${i}`, `p${i}`, `/work/${'long-directory/'.repeat(15)}project-${i}`, NOW);
+    }
+    for (let i = 0; i < 10; i++) add(db, { type: 'procedure', title: `workflow ${i} ${'x'.repeat(60)}`, cue: 'when shipping '.repeat(10), body: '1. test\n2. ship', now: NOW });
+    for (let i = 0; i < 5; i++) add(db, { type: 'preference', body: `preference number ${i} about one specific style choice`, now: NOW });
+    const block = prime(db, { now: NOW });
+    assert.ok(estimateTokens(block) <= 800, `${estimateTokens(block)} tokens`);
+    const said = /^More memory \((\d+) lines? left out for room\): sumo search · sumo project list · sumo job list$/m.exec(block);
+    assert.ok(said, block);
+    assert.ok(Number(said[1]) >= 1);
+
+    // A small block leaves nothing out and has nothing to count.
+    assert.doesNotMatch(prime(db, { now: NOW, budget: 4000 }), /left out for room/);
   });
 });

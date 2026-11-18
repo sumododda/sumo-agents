@@ -227,7 +227,8 @@ test('a database made by 0.4.0, with real rows in it, upgrades whole: every row 
     assert.equal(states['Use bun in shop'], 'active');
     assert.equal(states['Use pnpm in shop, never npm'], 'superseded');
     assert.equal(states['The shop tests need TZ=UTC'], 'invalid');
-    assert.equal(states['Prefer short answers'], 'unconfirmed');
+    // A guess still waiting: guesses are no longer kept (schema 16), so it is rejected — the row stays.
+    assert.equal(states['Prefer short answers'], 'rejected');
     // Still found by what it says: the search index came through the upgrade.
     assert.deepEqual(db.prepare(`SELECT m.body FROM memories_fts f JOIN memories m ON m.id = f.rowid WHERE memories_fts MATCH 'bun'`).all().map((r) => r.body), ['Use bun in shop']);
     assert.equal(db.prepare(`SELECT title FROM jobs`).get().title, 'Fix the cart total');
@@ -250,4 +251,198 @@ test('a database made by 0.4.0, with real rows in it, upgrades whole: every row 
   } finally {
     kept.close();
   }
+});
+
+test('a database at schema 15, with rows in every state, becomes the layered memory: turns gain their journal columns, replies and the ledgers are there, what a model filed is marked derived, history starts from what the rows say, the old writer\'s guesses still waiting are rejected once while what the model\'s shell saved is held for the user, and the turns already read are not owed again', async () => {
+  const { copyFileSync, existsSync, mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { DatabaseSync } = await import('node:sqlite');
+  // An empty database made by the code as it stood at schema 15 (0.6.1), filled here with a row in every state.
+  const dir = mkdtempSync(join(tmpdir(), 'sumo-agents-v15-'));
+  const file = join(dir, 'memory.db');
+  copyFileSync(fileURLToPath(new URL('./fixtures/db-schema-15.sqlite', import.meta.url)), file);
+  const raw = new DatabaseSync(file);
+  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 15);
+  const memory = raw.prepare(
+    `INSERT INTO memories (id, type, scope, body, provenance, state, importance, written_by, source_turn, source_quote, valid_from, invalid_at, superseded_by, held_for, created_at)
+     VALUES (?, ?, 'global', ?, ?, ?, 0.5, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const day = (n) => `2026-10-${String(n).padStart(2, '0')}T09:00:00.000Z`;
+  raw.exec(`
+    INSERT INTO sessions (id, harness, started_at, last_turn_at) VALUES ('read', 'claude', '${day(1)}', '${day(1)}'), ('half', 'claude', '${day(2)}', '${day(2)}'), ('unread', 'claude', '${day(3)}', '${day(3)}'), ('silent', 'claude', '${day(4)}', NULL);
+    INSERT INTO user_turns (id, session_id, ts, text, scribed) VALUES
+      (1, 'read', '${day(1)}', 'always squash-merge', 1), (2, 'read', '${day(1)}', 'and use pnpm', 1),
+      (3, 'half', '${day(2)}', 'the tests need TZ=UTC', 1), (4, 'half', '${day(2)}', 'short answers please', 0),
+      (5, 'unread', '${day(3)}', 'never push to main', 0), (6, 'half', '${day(2)}', 'and tabs, not spaces', 1);
+  `);
+  //      id  type          body                      provenance  state          writer        turn  quote                  from     invalid  by    held        created
+  memory.run(1, 'preference', 'Use pnpm',               'stated',   'active',      'user',       null, null,                  day(1),  null,    null, null,       day(1));
+  memory.run(2, 'preference', 'Always squash-merge',    'stated',   'active',      'scribe',     1,    'always squash-merge', day(1),  null,    null, null,       day(1));
+  memory.run(3, 'preference', 'Short answers',          'stated',   'active',      'scribe',     null, null,                  day(5),  null,    null, null,       day(2));
+  memory.run(4, 'preference', 'Likes tabs',             'inferred', 'unconfirmed', 'scribe',     null, null,                  day(2),  null,    null, null,       day(2));
+  memory.run(5, 'gotcha',     'The API is rate limited','inferred', 'unconfirmed', 'scribe',     null, null,                  day(2),  null,    null, 'outside',  day(2));
+  memory.run(6, 'preference', 'Use npm',                'stated',   'superseded',  'user',       null, null,                  day(1),  day(3),  1,    null,       day(1));
+  memory.run(7, 'fact',       'Tests need TZ=UTC',      'stated',   'invalid',     'dream',      3,    'the tests need TZ=UTC', day(2), day(4), null, null,       day(2));
+  memory.run(8, 'preference', 'Likes spaces',           'inferred', 'rejected',    'scribe',     null, null,                  day(2),  day(3),  null, null,       day(2));
+  memory.run(9, 'gotcha',     'The build needs Node 22', 'observed', 'active',     'worker',     null, null,                  day(3),  null,    null, null,       day(3));
+  memory.run(10, 'fact',      'Uses vitest',            'scanned',  'active',      'scanner',    null, null,                  day(3),  null,    null, null,       day(3));
+  memory.run(11, 'preference', 'Prefers dark mode',     'inferred', 'unconfirmed', 'chat-model', null, null,                  day(3),  null,    null, null,       day(3));
+  raw.exec(`INSERT INTO notices (kind, memory_a, note, created_at) VALUES ('conflict', 4, 'a notice about a guess', '${day(2)}')`);
+  raw.close();
+
+  const before = Date.now();
+  const db = openDb(file);
+  try {
+    assert.equal(schemaVersion(db), 17);
+    const columns = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((c) => `${c.name} ${c.type}`);
+    assert.deepEqual(columns('user_turns').slice(-3), ['project TEXT', 'full_len INTEGER', 'sha TEXT']);
+    assert.equal(columns('memories').at(-1), 'derived_by TEXT');
+    assert.deepEqual(columns('replies'), ['id INTEGER', 'session_id TEXT', 'ts TEXT', 'text TEXT', 'project TEXT', 'full_len INTEGER', 'sha TEXT']);
+    assert.deepEqual(columns('extractions'), ['id INTEGER', 'session_id TEXT', 'extractor_version TEXT', 'status TEXT', 'attempts INTEGER', 'first_turn INTEGER', 'last_turn INTEGER', 'ops_json TEXT', 'error TEXT', 'started_at TEXT', 'ended_at TEXT']);
+    assert.deepEqual(columns('memory_events'), ['id INTEGER', 'ts TEXT', 'memory_id INTEGER', 'op TEXT', 'actor TEXT', 'run_id INTEGER', 'reason TEXT']);
+
+    // The turns are as they were, the scribed mark kept; nothing is guessed for the new columns.
+    assert.deepEqual(db.prepare('SELECT id, text, scribed, project, full_len, sha FROM user_turns ORDER BY id').all().map((t) => ({ ...t })), [
+      { id: 1, text: 'always squash-merge', scribed: 1, project: null, full_len: null, sha: null },
+      { id: 2, text: 'and use pnpm', scribed: 1, project: null, full_len: null, sha: null },
+      { id: 3, text: 'the tests need TZ=UTC', scribed: 1, project: null, full_len: null, sha: null },
+      { id: 4, text: 'short answers please', scribed: 0, project: null, full_len: null, sha: null },
+      { id: 5, text: 'never push to main', scribed: 0, project: null, full_len: null, sha: null },
+      { id: 6, text: 'and tabs, not spaces', scribed: 1, project: null, full_len: null, sha: null },
+    ]);
+    // A digest names one row: the same one twice is refused, on turns as on replies.
+    db.prepare(`UPDATE user_turns SET sha = 'abc' WHERE id = 1`).run();
+    assert.throws(() => db.prepare(`UPDATE user_turns SET sha = 'abc' WHERE id = 2`).run(), /UNIQUE constraint failed/);
+    db.prepare(`UPDATE user_turns SET sha = NULL WHERE id = 1`).run();
+    db.prepare(`INSERT INTO replies (session_id, ts, text, sha) VALUES ('read', '${day(1)}', 'Squash-merging from now on.', 'r1')`).run();
+    assert.throws(() => db.prepare(`INSERT INTO replies (session_id, ts, text, sha) VALUES ('read', '${day(1)}', 'again', 'r1')`).run(), /UNIQUE constraint failed/);
+    assert.throws(() => db.prepare(`INSERT INTO replies (session_id, ts, text) VALUES ('nobody', '${day(1)}', 'no such session')`).run(), /FOREIGN KEY constraint failed/);
+    assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM replies_fts WHERE replies_fts MATCH 'squash'`).get().n, 1);
+    assert.throws(() => db.prepare(`INSERT INTO extractions (session_id, extractor_version, status, started_at) VALUES ('read', 'e1', 'done', '${day(1)}')`).run(), /CHECK constraint failed/);
+
+    // Derived: what a model filed and the user never made their own. One they confirmed, or said themselves, is primary.
+    const memories = Object.fromEntries(db.prepare('SELECT id, state, derived_by, invalid_at, held_for FROM memories').all().map((m) => [m.id, m]));
+    assert.deepEqual(Object.fromEntries(Object.entries(memories).map(([id, m]) => [id, m.derived_by])), { 1: null, 2: 'v0', 3: null, 4: 'v0', 5: 'v0', 6: null, 7: 'v0', 8: 'v0', 9: 'v0', 10: null, 11: null });
+    // The old writer's guess still waiting is rejected, its row kept; one held for an outside read waits for the user, and so
+    // does what the model's shell saved and the user had not answered — held as the shell's from now on; the rest are as they were.
+    assert.deepEqual(Object.fromEntries(Object.entries(memories).map(([id, m]) => [id, m.state])), { 1: 'active', 2: 'active', 3: 'active', 4: 'rejected', 5: 'unconfirmed', 6: 'superseded', 7: 'invalid', 8: 'rejected', 9: 'active', 10: 'active', 11: 'unconfirmed' });
+    assert.deepEqual([memories[5].held_for, memories[11].held_for, memories[4].held_for], ['outside', 'shell', null]);
+    assert.equal(memories[11].invalid_at, null);
+    for (const id of [4]) assert.ok(Date.parse(memories[id].invalid_at) >= before - 1000 && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(memories[id].invalid_at), `m${id} says when, as every other time is written`);
+    assert.equal(memories[8].invalid_at, day(3), 'one rejected before keeps its own time');
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notices').get().n, 1, 'notices are left alone');
+
+    // History starts from what the rows say.
+    const events = db.prepare('SELECT ts, memory_id, op, actor, run_id, reason FROM memory_events ORDER BY id').all();
+    const told = (id) => events.filter((e) => e.memory_id === id).map((e) => `${e.op} by ${e.actor} at ${e.ts.slice(0, 10)}: ${e.reason}`);
+    assert.equal(events.filter((e) => e.op === 'added' && e.reason === 'backfilled').length, 11, 'every memory came once');
+    assert.deepEqual(told(1), ['added by user at 2026-10-01: backfilled']);
+    assert.deepEqual(told(3), ['added by scribe at 2026-10-02: backfilled', 'confirmed by user at 2026-10-05: backfilled']);
+    assert.deepEqual(told(6), ['added by user at 2026-10-01: backfilled', 'superseded by unknown at 2026-10-03: backfilled']);
+    assert.deepEqual(told(7), ['added by dream at 2026-10-02: backfilled', 'forgotten by unknown at 2026-10-04: backfilled']);
+    assert.deepEqual(told(8), ['added by scribe at 2026-10-02: backfilled', 'rejected by unknown at 2026-10-03: backfilled']);
+    assert.deepEqual(told(5), ['added by scribe at 2026-10-02: backfilled']);
+    // Migration 16 rejected it with the guesses; 17 gave it back to the user to answer, and the history says both.
+    assert.deepEqual(told(11).map((l) => l.replace(/ at \d{4}-\d\d-\d\d/, '')), ['added by chat-model: backfilled', 'rejected by migration: a guess still waiting when guesses stopped being kept', "held by migration: saved by the model's shell and never answered: it waits for the user again"]);
+    for (const id of [4]) {
+      const [, rejected] = events.filter((e) => e.memory_id === id);
+      assert.deepEqual({ op: rejected.op, actor: rejected.actor, reason: rejected.reason, ts: rejected.ts }, { op: 'rejected', actor: 'migration', reason: 'a guess still waiting when guesses stopped being kept', ts: memories[id].invalid_at });
+    }
+    assert.equal(events.length, 11 + 1 + 3 + 2 + 1);
+    assert.ok(events.every((e) => e.run_id === null));
+
+    // A conversation the old writer read to its end is not owed again; of one half read, the turns it had read are not, and the rest are; one never read is.
+    assert.deepEqual(db.prepare('SELECT session_id, extractor_version, status, attempts, first_turn, last_turn, ops_json, error, started_at, ended_at FROM extractions ORDER BY first_turn').all().map((x) => ({ ...x })), [
+      { session_id: 'read', extractor_version: 'v0', status: 'ok', attempts: 1, first_turn: 1, last_turn: 2, ops_json: null, error: null, started_at: day(1), ended_at: day(1) },
+      { session_id: 'half', extractor_version: 'v0', status: 'ok', attempts: 1, first_turn: 3, last_turn: 3, ops_json: null, error: null, started_at: day(2), ended_at: day(2) },
+      { session_id: 'half', extractor_version: 'v0', status: 'ok', attempts: 1, first_turn: 6, last_turn: 6, ops_json: null, error: null, started_at: day(2), ended_at: day(2) },
+    ]);
+    const { turnsAwaitingExtraction } = await import('../src/sessions.mjs');
+    assert.deepEqual(['read', 'half', 'unread'].map((id) => turnsAwaitingExtraction(db, id).map((t) => t.id)), [[], [4], [5]]);
+  } finally {
+    db.close();
+  }
+  assert.equal(existsSync(join(dir, 'memory.db.pre-v15.bak')), true, 'the database as it was, kept before the upgrade');
+
+  // Opened again, nothing is done twice — nor when the step is run again over a database that has had it.
+  openDb(file).close();
+  const lowered = new DatabaseSync(file);
+  lowered.exec('PRAGMA user_version = 15');
+  lowered.close();
+  const again = openDb(file);
+  try {
+    assert.equal(again.prepare('SELECT COUNT(*) AS n FROM memory_events').get().n, 18);
+    assert.equal(again.prepare('SELECT COUNT(*) AS n FROM extractions').get().n, 3);
+    assert.deepEqual({ ...again.prepare('SELECT state, held_for FROM memories WHERE id = 11').get() }, { state: 'unconfirmed', held_for: 'shell' });
+  } finally {
+    again.close();
+  }
+});
+
+test('a database that ran migration 16 as it first shipped is mended by 17: what the model\'s shell saved and 16 rejected waits for the user again, a pass\'s guess stays rejected, and the turns the old writer had read in a half-read conversation are not owed again', async () => {
+  const { copyFileSync, mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { DatabaseSync } = await import('node:sqlite');
+  const { turnsAwaitingExtraction } = await import('../src/sessions.mjs');
+  // The schema-15 fixture with rows in it, opened once by the code as it stood when the owner's database was migrated
+  // (the first migration 16): memories 2, 3, 5, 6 were waiting with no hold named, and all four were rejected.
+  const file = join(mkdtempSync(join(tmpdir(), 'sumo-agents-v16-')), 'memory.db');
+  copyFileSync(fileURLToPath(new URL('./fixtures/db-schema-16.sqlite', import.meta.url)), file);
+  const raw = new DatabaseSync(file);
+  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 16);
+  assert.deepEqual(raw.prepare('SELECT id, state, held_for FROM memories ORDER BY id').all().map((m) => `m${m.id} ${m.state} ${m.held_for}`), ['m1 active null', 'm2 rejected null', 'm3 rejected null', 'm4 unconfirmed outside', 'm5 rejected null', 'm6 rejected null', 'm7 rejected null']);
+  assert.deepEqual(raw.prepare('SELECT session_id, first_turn, last_turn FROM extractions').all().map((x) => ({ ...x })), [{ session_id: 'read', first_turn: 1, last_turn: 2 }]);
+  // Since then: a pass of the new writer read the conversation 'reread' whole, and the user forgot nothing.
+  raw.exec(`INSERT INTO extractions (session_id, extractor_version, status, attempts, first_turn, last_turn, started_at, ended_at) VALUES ('reread', 'abc12345', 'ok', 1, 7, 8, '2026-11-17T09:00:00.000Z', '2026-11-17T09:00:00.000Z')`);
+  raw.close();
+
+  const db = openDb(file);
+  try {
+    assert.equal(schemaVersion(db), 17);
+    const memories = db.prepare('SELECT id, type, state, held_for, invalid_at FROM memories ORDER BY id').all();
+    assert.deepEqual(memories.map((m) => `m${m.id} ${m.state} ${m.held_for}`), [
+      'm1 active null',
+      'm2 rejected null', // the scribe's guess
+      'm3 rejected null', // the tidy's
+      'm4 unconfirmed outside',
+      'm5 unconfirmed shell', // a memory the chat model saved from its shell
+      'm6 unconfirmed shell', // a workflow it taught
+      'm7 rejected null', // rejected before the migration, by the user: theirs to have refused
+    ]);
+    assert.deepEqual(memories.filter((m) => m.held_for === 'shell').map((m) => m.invalid_at), [null, null]);
+    const told = (id) => db.prepare('SELECT op, actor, reason FROM memory_events WHERE memory_id = ? ORDER BY id').all(id).map((e) => `${e.op} by ${e.actor}`);
+    assert.deepEqual(told(5), ['added by chat-model', 'rejected by migration', 'held by migration']);
+    assert.deepEqual(told(2), ['added by scribe', 'rejected by migration']);
+    assert.deepEqual(told(7), ['added by chat-model', 'rejected by unknown']);
+
+    assert.deepEqual(db.prepare(`SELECT session_id, extractor_version, first_turn, last_turn FROM extractions ORDER BY first_turn`).all().map((x) => `${x.session_id} ${x.extractor_version} ${x.first_turn}-${x.last_turn}`), ['read v0 1-2', 'half v0 3-3', 'half v0 6-6', 'reread abc12345 7-8']);
+    assert.deepEqual(['read', 'half', 'unread', 'reread'].map((id) => turnsAwaitingExtraction(db, id).map((t) => t.id)), [[], [4], [5], []]);
+  } finally {
+    db.close();
+  }
+  // Opened again, and with the step run again, nothing is done twice.
+  const lowered = new DatabaseSync(file);
+  lowered.exec('PRAGMA user_version = 16');
+  lowered.close();
+  const again = openDb(file);
+  try {
+    assert.equal(again.prepare(`SELECT COUNT(*) AS n FROM memory_events WHERE op = 'held'`).get().n, 2);
+    assert.equal(again.prepare('SELECT COUNT(*) AS n FROM extractions').get().n, 4);
+  } finally {
+    again.close();
+  }
+});
+
+test('a new database is made at the current schema, with nothing for migration 17 to mend', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      assert.equal(schemaVersion(db), 17);
+      assert.deepEqual(['memories', 'memory_events', 'extractions'].map((table) => db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n), [0, 0, 0]);
+    } finally {
+      db.close();
+    }
+  });
 });

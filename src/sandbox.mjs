@@ -136,8 +136,11 @@ const whyOf = (lists) => [...Object.entries(lists)].flatMap(([why, names]) => na
 const GUARDED_WHY = whyOf(GUARDED);
 const HOME_WHY = [...GUARDED_WHY, ...whyOf(HOME_GUARDED)];
 
-/** What sumo keeps for itself, which only sumo writes: its memory and settings, its MCP servers, its own program and model. */
-const SUMO_PRIVATE = ['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env'];
+/**
+ * What sumo keeps for itself, which only sumo writes: its memory and settings, its MCP servers, its own program and model —
+ * and the spool, whose lines are replayed into the journal as what the user said.
+ */
+const SUMO_PRIVATE = ['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool'];
 
 /** The directories on the PATH, absolute: a program put in one runs whenever its name is typed. */
 const pathDirs = (env = process.env) => [...new Set(String(env.PATH ?? '').split(':').filter((d) => d.startsWith('/')).map((d) => resolve(d)))];

@@ -1,7 +1,7 @@
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { getMeta, setMeta } from './db.mjs';
-import { UsageError } from './memory.mjs';
+import { eraseRow, eraseSaid, UsageError } from './memory.mjs';
 import { paths } from './paths.mjs';
 import { DatabaseSync } from './sqlite.mjs';
 
@@ -185,14 +185,14 @@ export function restoreLines(copy, live, now = new Date()) {
 }
 
 /**
- * A purge reaches the backups too: "erased, not recoverable" must hold for every copy this machine keeps. Each backup
- * loses the memory and the sentence it came from, and is rewritten so the pages that held them are gone.
- * Returns how many were cleaned, and the ones that could not be — said, never hidden.
+ * Every copy this machine keeps of the database — the weekly backups, and what was set aside beside it before a
+ * migration or by a restore — put through `erase(db, has)`, which says how much it took out: a copy it changed is
+ * rewritten whole, indexes and pages, so nothing of what went is left in it. All of it or none: a copy that cannot be
+ * cleaned whole is left as it was, and named. `{ cleaned, failed }`.
  */
-export function purgeFromBackups({ id, body, created_at: createdAt, source_turn: sourceTurn }) {
+function cleanBackups(erase) {
   const { backups, db: live } = paths();
   const within = (dir, keep) => (existsSync(dir) ? readdirSync(dir).filter(keep).map((f) => join(dir, f)) : []);
-  // The weekly copies, and every copy set aside beside the database: before a migration, or by a restore.
   const aside = (f) => f.startsWith(`${basename(live)}.`) && (/\.pre-v\d+\.bak$/.test(f) || /\.(?:damaged|replaced)-[^/]*$/.test(f)) && !/-(?:wal|shm)$/.test(f);
   const files = [...within(backups, (f) => /^memory-.*\.db$/.test(f)), ...within(dirname(live), aside)];
   const failed = [];
@@ -202,21 +202,23 @@ export function purgeFromBackups({ id, body, created_at: createdAt, source_turn:
     try {
       db = new DatabaseSync(file);
       db.exec('PRAGMA secure_delete = ON;');
-      // The same memory, not just the same number: a backup from after a restore may hold another one under this id.
-      const row = db.prepare('SELECT source_turn FROM memories WHERE id = ? AND body = ? AND created_at = ?').get(id, body, createdAt);
-      if (row) {
-        // All of it or none: a backup this cannot clean whole is left as it was, and named.
-        db.exec('BEGIN');
-        try {
-          db.prepare('DELETE FROM memories WHERE id = ?').run(id);
-          if (sourceTurn !== null) db.prepare('DELETE FROM user_turns WHERE id = ?').run(sourceTurn);
+      const has = (name) => db.prepare('SELECT 1 FROM sqlite_master WHERE name = ?').get(name) !== undefined;
+      let changed = 0;
+      db.exec('BEGIN');
+      try {
+        changed = erase(db, has);
+        if (changed > 0) {
           // A deleted row's words stay in the full-text index's pages until it is rebuilt; VACUUM keeps those pages.
           db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('rebuild'); INSERT INTO user_turns_fts(user_turns_fts) VALUES ('rebuild');`);
-          db.exec('COMMIT');
-        } catch (cause) {
-          db.exec('ROLLBACK');
-          throw cause;
+          // A copy from before replies were kept has none to clean.
+          if (has('replies_fts')) db.exec(`INSERT INTO replies_fts(replies_fts) VALUES ('rebuild');`);
         }
+        db.exec('COMMIT');
+      } catch (cause) {
+        db.exec('ROLLBACK');
+        throw cause;
+      }
+      if (changed > 0) {
         db.exec('VACUUM');
         cleaned++;
       }
@@ -228,3 +230,26 @@ export function purgeFromBackups({ id, body, created_at: createdAt, source_turn:
   }
   return { cleaned, failed };
 }
+
+/**
+ * A purge reaches the backups too: "erased, not recoverable" must hold for every copy this machine keeps. Each backup
+ * loses the memory, every turn and reply that says it whole and what its passes proposed — by the one rule the
+ * database itself is held to (`eraseSaid` in memory.mjs). A copy from before the memory was filed may hold the
+ * sentence without the memory: it is cleaned all the same. Returns how many were cleaned, and the ones that could
+ * not be — said, never hidden.
+ */
+export function purgeFromBackups({ id, body, created_at: createdAt, source_turn: sourceTurn, source_session: sourceSession = null, source_quote: sourceQuote = null }) {
+  return cleanBackups((db, has) => {
+    // The same memory, not just the same number: a backup from after a restore may hold another one under this id.
+    const row = db.prepare('SELECT source_turn FROM memories WHERE id = ? AND body = ? AND created_at = ?').get(id, body, createdAt);
+    // The passes that filed it, while its history still names them; a copy from before histories were kept has none.
+    const runs = row && has('memory_events') ? db.prepare('SELECT run_id FROM memory_events WHERE memory_id = ? AND run_id IS NOT NULL').all(id).map((e) => e.run_id) : [];
+    if (row) db.prepare('DELETE FROM memories WHERE id = ?').run(id);
+    // The turn it cites goes by its number only where the memory is this one: in another copy that number may be another turn.
+    const erased = eraseSaid(db, { body, source_quote: sourceQuote, source_turn: row ? sourceTurn : null, source_session: sourceSession }, { runs });
+    return (row ? 1 : 0) + erased.turns.length + erased.replies.length + erased.ops;
+  });
+}
+
+/** One turn or reply purged (`sumo forget --purge t12`) goes from every copy that holds it, the same way. */
+export const purgeRowFromBackups = (entry) => cleanBackups((db) => (eraseRow(db, entry) ? 1 : 0));

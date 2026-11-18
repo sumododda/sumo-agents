@@ -12,7 +12,9 @@ test('each memory operation has one closed branch with only its own required fie
   const byOp = Object.fromEntries(branches.map((branch) => [branch.properties.op.enum[0], branch]));
 
   assert.deepEqual(Object.keys(byOp), ['add', 'supersede', 'gotcha', 'checkpoint']);
-  assert.deepEqual(Object.keys(byOp.add.properties), ['op', 'type', 'scope', 'topic', 'body', 'turn', 'quote', 'keys']);
+  // What the user stated has no body to write: it is stored in their words. Only a trap is a sentence of the model's.
+  assert.deepEqual(Object.keys(byOp.add.properties), ['op', 'type', 'scope', 'topic', 'turn', 'quote', 'keys']);
+  assert.deepEqual(Object.keys(byOp.supersede.properties), ['op', 'old', 'type', 'scope', 'topic', 'turn', 'quote', 'keys']);
   assert.deepEqual(Object.keys(byOp.gotcha.properties), ['op', 'scope', 'body', 'keys']);
   assert.deepEqual(Object.keys(byOp.checkpoint.properties), ['op', 'project', 'done', 'next']);
   for (const branch of branches) {

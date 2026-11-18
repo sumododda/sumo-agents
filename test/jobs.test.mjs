@@ -186,7 +186,22 @@ test('a rule stated a minute ago is filed before the brief is built, so the work
   s.modelWillSay([{ op: 'add', type: 'preference', scope: 'project:proj-simba', body: 'Never touch the vendored ios directory', turn: 1, quote: 'never touch the vendored ios directory' }]);
 
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'tidy imports'], { input: TASK });
-  assert.match(s.sumo(['job', 'brief', '1']).out, /rule m\d+: Never touch the vendored ios directory/);
+  assert.match(s.sumo(['job', 'brief', '1']).out, /rule m\d+: in simba, never touch the vendored ios directory/);
+});
+
+test('while filing is paused a new job does not ask the model again: its brief is built from memory as it stands', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  withSimba(s);
+  s.hook('prompt', { session_id: 'now', prompt: 'in simba, never touch the vendored ios directory' });
+  s.modelWillSay([], { isError: true });
+  for (let i = 0; i < 3; i++) s.sumo(['memory', 'run']);
+  const passes = () => s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM extractions').get().n);
+  assert.equal(passes(), 3);
+
+  const made = s.sumo(['job', 'new', '--project', 'simba', '--title', 'tidy imports'], { input: TASK });
+  assert.equal(made.code, 0, made.err);
+  assert.equal(passes(), 3, 'paused: only sumo memory run, asked by hand, tries again');
 });
 
 test('an abandoned or failed job stops being announced', () => {

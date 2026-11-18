@@ -5,19 +5,19 @@ import { test } from 'node:test';
 import { judgeAll, noticeCounts, SCENARIOS, summary, TURNS } from '../probes/memory-quality.mjs';
 
 const turns = new Map(TURNS.map(([, text], i) => [text, i + 1]));
-const memory = (id, body, { state = 'active', scope = 'global', source_turn = null, title = null, cue = null } = {}) => ({ id, body, state, scope, source_turn, title, cue });
+const memory = (id, body, { state = 'active', scope = 'global', source_turn = null, title = null, cue = null, source_quote = null, superseded_by = null, held_for = null } = {}) => ({ id, body, state, scope, source_turn, title, cue, source_quote, superseded_by, held_for });
 /** The state memory should be in after the conversations: every scenario holds. */
 const right = () => ({
   turns,
   notices: [{ memory_a: 3, memory_b: 6, kind: 'lookalike' }],
   memories: [
-    memory(1, 'slate uses pnpm, never npm', { state: 'superseded', scope: 'project:slate', source_turn: 2 }),
-    memory(2, 'slate moved from pnpm to bun', { scope: 'project:slate', source_turn: 8 }),
-    memory(3, 'the user prefers short answers', { source_turn: 3 }),
-    memory(4, 'slate staging runs on the mac mini', { state: 'superseded', scope: 'project:slate', source_turn: 5 }),
-    memory(5, 'slate staging runs on the hetzner box', { scope: 'project:slate', source_turn: 12 }),
-    memory(6, 'keep replies brief in every project', { source_turn: 10 }),
-    memory(7, 'never force-push on slate', { scope: 'project:slate', source_turn: 7 }),
+    memory(1, 'slate uses pnpm, never npm', { state: 'superseded', scope: 'project:slate', source_turn: 2, source_quote: 'slate uses pnpm, never npm', superseded_by: 2 }),
+    memory(2, 'in slate we moved from pnpm to bun last week', { scope: 'project:slate', source_turn: 8, source_quote: 'we moved from pnpm to bun' }),
+    memory(3, 'I prefer short answers, everywhere', { source_turn: 3, source_quote: 'I prefer short answers' }),
+    memory(4, 'the staging server for slate runs on the mac mini in the office', { state: 'superseded', scope: 'project:slate', source_turn: 5, source_quote: 'the staging server for slate runs on the mac mini' }),
+    memory(5, 'slate staging runs on the hetzner box now, remember that', { scope: 'project:slate', source_turn: 12, source_quote: 'slate staging runs on the hetzner box now' }),
+    memory(6, 'keep your replies brief, always, in every project', { source_turn: 10, source_quote: 'keep your replies brief, always' }),
+    memory(7, "don't ever force-push on slate", { scope: 'project:slate', source_turn: 7, source_quote: "don't ever force-push on slate" }),
   ],
 });
 const failing = (state) => judgeAll(state).filter((v) => v.why !== null).map((v) => v.name);
@@ -30,10 +30,14 @@ test('each way memory can go wrong fails its own scenario, and only it', () => {
   // The correction left standing beside what it corrects, with no notice between them.
   const stale = right();
   stale.memories[0].state = 'active';
-  assert.deepEqual(failing(stale), ['a correction replaces what it corrects']);
-  // …unless a notice raises the pair for the user.
+  assert.deepEqual(failing(stale), ['a correction replaces what it corrects', 'a changed fact supersedes the old one and keeps it in history']);
+  // A notice raises the pair for the user, which the first accepts; the old fact is still not superseded.
   stale.notices.push({ memory_a: 1, memory_b: 2, kind: 'contradiction' });
-  assert.deepEqual(failing(stale), []);
+  assert.deepEqual(failing(stale), ['a changed fact supersedes the old one and keeps it in history']);
+  // Replaced by being erased: nothing stale stands, and the history is gone.
+  const erased = right();
+  erased.memories.shift();
+  assert.deepEqual(failing(erased), ['a changed fact supersedes the old one and keeps it in history']);
 
   const twice = right();
   twice.notices = [];
@@ -57,12 +61,24 @@ test('each way memory can go wrong fails its own scenario, and only it', () => {
   // A one-off ask turned into a workflow guess, with no turn to point at, is filed from a request all the same.
   const routine = right();
   routine.memories.push(memory(9, '1. open the theme\n2. set the colour', { state: 'unconfirmed', title: 'change button color', cue: 'make the button blue' }));
-  assert.deepEqual(failing(routine), ['a request for work is never filed']);
+  assert.deepEqual(failing(routine), ['a request for work is never filed', 'nothing is ever held as a guess']);
 
-  // The user's own rule, held as a guess as if they had said it the other way round.
+  // Anything waiting on the user to say whether it is true is a guess — but for a trap from a conversation that read the web.
   const doubted = right();
-  doubted.memories[0].state = 'unconfirmed';
-  assert.deepEqual(failing(doubted), ['what the user said is filed as theirs, never held as a guess']);
+  doubted.memories.push(memory(10, 'the user likes long commit messages', { state: 'unconfirmed' }));
+  assert.deepEqual(failing(doubted), ['nothing is ever held as a guess']);
+  doubted.memories.at(-1).held_for = 'outside';
+  assert.deepEqual(failing(doubted), []);
+
+  // The user's rule in a model's words: close, and not what they typed.
+  const reworded = right();
+  reworded.memories[2].body = 'The user prefers short answers';
+  assert.deepEqual(failing(reworded), ["a memory drawn from a turn is that turn's own sentence, as typed"]);
+
+  // Words the user did type, filed under the number of another turn of the same batch.
+  const misplaced = right();
+  misplaced.memories[6].source_quote = 'slate uses pnpm';
+  assert.deepEqual(failing(misplaced), ['a memory cites words from the turn it names, never another turn of the batch']);
 });
 
 test('runs judged more than once say pass^k and pass@k', () => {

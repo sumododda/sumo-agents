@@ -314,6 +314,137 @@ const MIGRATIONS = [
   DELETE FROM meta WHERE key IN ('config.chat.plain', 'config.chat.motion', 'config.model.source', 'config.model.repo', 'config.model.file',
     'config.prime.budget', 'config.scratch.days', 'config.jobs.escalate', 'config.guides.auto');
   `,
+  // 16 — memory in layers. The journal is the source of truth: a turn is kept whole (full_len is how long it was before
+  // any cut), stamped with the project it was about, and carries a digest (sha) of its session, time and words, so an
+  // event kept aside while the database could not be written is replayed without ever landing twice; the assistant's
+  // final replies are kept beside the turns (replies), searchable like them. What a model drew from the journal is
+  // marked (memories.derived_by, the extractor's version; NULL is what the user said to remember) and every pass over
+  // a conversation is written down before it runs (extractions), so one that died or failed is seen. memory_events is
+  // each change of a memory's state from here on, started from what the state columns already say. Guesses are no
+  // longer kept: the ones still waiting are rejected here, once — their rows and history stay — except what is held
+  // because the conversation read the web or an MCP server (held_for), which only the user settles.
+  (db) => {
+    addColumnsIfMissing(db, 'user_turns', ['project TEXT', 'full_len INTEGER', 'sha TEXT']);
+    addColumnsIfMissing(db, 'memories', ['derived_by TEXT']);
+    db.exec(`
+      -- ADD COLUMN takes no UNIQUE: the index says it. Rows from before carry no digest, and any number of those may.
+      CREATE UNIQUE INDEX IF NOT EXISTS user_turns_sha ON user_turns(sha) WHERE sha IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS user_turns_session ON user_turns(session_id, id);
+
+      CREATE TABLE IF NOT EXISTS replies (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        ts         TEXT NOT NULL,
+        text       TEXT NOT NULL,
+        project    TEXT,
+        full_len   INTEGER,
+        sha        TEXT UNIQUE
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS replies_session ON replies(session_id, id);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS replies_fts USING fts5(
+        text, content='replies', content_rowid='id', tokenize='porter unicode61'
+      );
+      CREATE TRIGGER IF NOT EXISTS replies_fts_insert AFTER INSERT ON replies BEGIN
+        INSERT INTO replies_fts(rowid, text) VALUES (new.id, new.text);
+      END;
+      CREATE TRIGGER IF NOT EXISTS replies_fts_delete AFTER DELETE ON replies BEGIN
+        INSERT INTO replies_fts(replies_fts, rowid, text) VALUES ('delete', old.id, old.text);
+      END;
+
+      -- Written 'running' before the model is called: one still 'running' after its process died is a failure.
+      -- first_turn and last_turn are user_turns ids, both ends included.
+      CREATE TABLE IF NOT EXISTS extractions (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        extractor_version TEXT NOT NULL,
+        status            TEXT NOT NULL CHECK (status IN ('running', 'ok', 'failed', 'quarantined')),
+        attempts          INTEGER NOT NULL DEFAULT 0,
+        first_turn        INTEGER,
+        last_turn         INTEGER,
+        ops_json          TEXT,
+        error             TEXT,
+        started_at        TEXT NOT NULL,
+        ended_at          TEXT
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS extractions_session ON extractions(session_id, extractor_version, status);
+
+      -- memory_id has no REFERENCES on purpose: the history of a memory outlives a purge of it (ids are never handed
+      -- out twice), so nothing here may hold a memory's words. run_id is the extractions row a pass made the change in.
+      CREATE TABLE IF NOT EXISTS memory_events (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts        TEXT NOT NULL,
+        memory_id INTEGER NOT NULL,
+        op        TEXT NOT NULL,
+        actor     TEXT NOT NULL,
+        run_id    INTEGER,
+        reason    TEXT
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS memory_events_memory ON memory_events(memory_id, id);
+    `);
+    // What follows reads the rows as they are and is done once: a history already begun is not begun again, should
+    // this step ever be run against a database that has had it.
+    if (db.prepare('SELECT 1 FROM memory_events LIMIT 1').get()) return;
+    db.exec(`
+      -- What a model filed and the user never made their own is derived, by the extractor from before versions were
+      -- kept. One the user confirmed is stated and keeps no quote (memory.mjs): that one is theirs now.
+      UPDATE memories SET derived_by = 'v0'
+        WHERE derived_by IS NULL AND written_by IN ('scribe', 'dream', 'worker') AND NOT (provenance = 'stated' AND source_quote IS NULL);
+
+      -- History so far, as the state columns tell it: when each memory came, and how it ended if it has.
+      INSERT INTO memory_events (ts, memory_id, op, actor, reason)
+        SELECT created_at, id, 'added', written_by, 'backfilled' FROM memories ORDER BY id;
+      INSERT INTO memory_events (ts, memory_id, op, actor, reason)
+        SELECT valid_from, id, 'confirmed', 'user', 'backfilled' FROM memories
+        WHERE written_by IN ('scribe', 'dream', 'worker') AND provenance = 'stated' AND source_quote IS NULL AND state != 'unconfirmed' ORDER BY id;
+      INSERT INTO memory_events (ts, memory_id, op, actor, reason)
+        SELECT COALESCE(invalid_at, created_at), id,
+               CASE state WHEN 'superseded' THEN 'superseded' WHEN 'invalid' THEN 'forgotten' ELSE 'rejected' END, 'unknown', 'backfilled'
+        FROM memories WHERE state IN ('superseded', 'invalid', 'rejected') ORDER BY id;
+
+      -- The guesses still waiting, rejected once. The event first: it names the rows while they are still waiting.
+      INSERT INTO memory_events (ts, memory_id, op, actor, reason)
+        SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), id, 'rejected', 'migration', 'a guess still waiting when guesses stopped being kept'
+        FROM memories WHERE state = 'unconfirmed' AND held_for IS NULL ORDER BY id;
+      UPDATE memories SET state = 'rejected', invalid_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE state = 'unconfirmed' AND held_for IS NULL;
+
+      -- A conversation the old writer had read to its end is not read again as if new.
+      INSERT INTO extractions (session_id, extractor_version, status, attempts, first_turn, last_turn, started_at, ended_at)
+        SELECT session_id, 'v0', 'ok', 1, MIN(id), MAX(id), MIN(ts), MAX(ts) FROM user_turns GROUP BY session_id HAVING MIN(scribed) = 1;
+    `);
+  },
+  // 17: two things migration 16 got wrong, mended for a database that has had it — 16 itself stays as it ran.
+  (db) => {
+    const now = new Date().toISOString();
+    // 16 rejected everything still waiting with no hold named. A pass's guess was meant; a memory or a taught workflow
+    // the model's shell had saved, which the user had not yet answered, was not. Those it rejected — its own line of
+    // the history says which — wait for the user again, under the name that hold has now. One the user has touched
+    // since is no longer `rejected` and is left alone.
+    const held = db
+      .prepare(
+        `SELECT m.id FROM memories m WHERE m.state = 'rejected' AND m.written_by = 'chat-model'
+           AND EXISTS (SELECT 1 FROM memory_events e WHERE e.memory_id = m.id AND e.op = 'rejected' AND e.actor = 'migration') ORDER BY m.id`,
+      )
+      .all();
+    for (const { id } of held) {
+      db.prepare(`UPDATE memories SET state = 'unconfirmed', held_for = 'shell', invalid_at = NULL WHERE id = ?`).run(id);
+      db.prepare(`INSERT INTO memory_events (ts, memory_id, op, actor, reason) VALUES (?, ?, 'held', 'migration', 'saved by the model''s shell and never answered: it waits for the user again')`).run(now, id);
+    }
+    // 16 counted a conversation as read only when the old writer had read all of it. Of one half read, the turns it
+    // had got to (`scribed`) and no pass has covered since are covered now, each run of them, so only the rest is owed.
+    db.exec(`
+      INSERT INTO extractions (session_id, extractor_version, status, attempts, first_turn, last_turn, started_at, ended_at)
+        SELECT session_id, 'v0', 'ok', 1, MIN(id), MAX(id), MIN(ts), MAX(ts)
+        FROM (SELECT id, session_id, ts, was_read,
+                     ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY id) - ROW_NUMBER() OVER (PARTITION BY session_id, was_read ORDER BY id) AS run
+              FROM (SELECT t.id, t.session_id, t.ts,
+                           (t.scribed = 1 AND NOT EXISTS (SELECT 1 FROM extractions x WHERE x.session_id = t.session_id AND x.status IN ('ok', 'quarantined')
+                                                            AND t.id BETWEEN x.first_turn AND x.last_turn)) AS was_read
+                    FROM user_turns t))
+        WHERE was_read = 1 GROUP BY session_id, run ORDER BY MIN(id);
+    `);
+  },
 ];
 
 /**

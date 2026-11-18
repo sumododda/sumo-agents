@@ -2,6 +2,43 @@
 
 What each release changed for you. The commit of each version has the full detail.
 
+## Unreleased
+
+- **A new effort after a turn that failed no longer breaks the chat.** When a turn ended before the model answered
+  (an error, or Esc), and the effort then changed (`/model opus high`, or auto picking a new one), every later
+  message was refused: `400 … role 'system' must precede an 'assistant' message`, until `/new`. The note sumo had
+  left for the model is now turned into plain text first, and a session saved in that state is mended when you
+  pick it up again.
+
+### Memory, rebuilt in layers
+- **Everything said is kept, and found.** Each thing you say and each final answer goes whole into a journal on
+  this machine (up to 64,000 characters, secrets redacted). `sumo search` is one search: memories first (`m12`),
+  then the conversations (`t481` you said, `r3` sumo said), each line with its date; every word is looked for
+  first, any word only when nothing holds them all, and a match on one stray word is called loose. `sumo show
+  t481` opens a turn or a reply whole. `--turns` takes `--since` and `--before` now.
+- **No guesses.** The memory pass reads a conversation once, when it is over, and files only what it finds in
+  your exact words in the turn it names; anything else is dropped and counted. The guesses still waiting were
+  rejected once, history kept. Two things are still held for you to confirm: what a conversation learned from
+  the web or an MCP server, and what the model saved from its shell that you never typed — both asked in the
+  session's block, each in words that say why.
+- **A failure is loud.** A hook that cannot write keeps the event in a spool and replays it. A pass is written
+  down before it runs: three failed passes, or most of what was filed thrown out, pause filing and say so; a
+  turn that fails three times alone is set aside and the rest are filed. `sumo memory check` tests the search
+  indexes, the backup, the spool and that the newest turn is found; `sumo doctor` carries those checks.
+- **Not heard is said — silence is not.** When sumo commands are run from Claude Code and no turn arrives from
+  it (its hook lines are gone), `sumo memory status`, `sumo memory check` and `sumo doctor` fail, the block
+  says so in one line, and the command itself says it once a day. Being away, however long, is never a
+  failure. `sumo help hooks` prints the lines to add. A session cleared with `/clear` gets its project cards
+  again.
+- **Derived memory can be rebuilt and measured.** What the pass drew from the journal is marked with the
+  extractor that drew it; `sumo memory rebuild --dry-run` shows what today's extractor would add and no longer
+  file, and never touches what you said to remember, confirmed or pinned. `sumo memory eval` runs the searches
+  that once found nothing again and replays the extractor on your own history. Every change to a memory is
+  logged with who made it and in which pass.
+- **Changed for scripts:** `sumo search --json` gives `{memories, conversations, more, moreConversations,
+  elsewhere, loose}`; a turn the user stops no longer starts a memory pass; the tidy runs weekly, no longer
+  after three conversations; `sumo memory status` exits 1 when Claude Code is in use and not heard.
+
 ## 0.6.1 — 2026-11-11
 
 0.6.0 was never published: its build typed `[I` and `[O` into the box when you switched tabs. 0.6.1 is it, fixed.

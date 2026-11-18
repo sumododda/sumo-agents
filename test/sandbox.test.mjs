@@ -116,9 +116,11 @@ test('the guarded files — read later by the shell, a tool or an editor — are
   assert.equal(guardedWhy(join(home, 'code', 'other', 'src', 'git.js'), { roots: [root], home }), null);
   assert.deepEqual(
     guardedPlaces([root], { home: join(scratch, 'nohome'), sumo: join(scratch, 'nosumo'), env: { PATH: '' } }),
-    [realpathSync(join(root, '.envrc')), realpathSync(join(root, '.vscode')), ...['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env'].map((n) => join(scratch, 'nosumo', n))],
+    [realpathSync(join(root, '.envrc')), realpathSync(join(root, '.vscode')), ...['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool'].map((n) => join(scratch, 'nosumo', n))],
     "the guarded files that are there, and sumo's own by name whether or not they are",
   );
+  // The spool is replayed into the journal as what the user said: a line the shell could add there would be the user's words.
+  assert.equal(guardedWhy(join(scratch, 'nosumo', 'spool', 'events.jsonl'), { roots: [root], home, sumo: join(scratch, 'nosumo') }), "it is sumo's own: its memory, settings or program");
   // Programs' own setup in the home, and anything on the PATH; a project's bin folder is the project's.
   for (const [rel, why] of [
     ['.gitconfig', 'git reads it, and runs what it names'],

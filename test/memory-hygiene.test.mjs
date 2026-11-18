@@ -1,7 +1,7 @@
 // Memory that is used stays in view, memory that is not steps back without being lost, a search can be held to a time,
-// and the slow pass cannot rewrite memory wholesale.
+// and no pass can rewrite memory wholesale.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { applyOps } from '../src/apply.mjs';
@@ -132,9 +132,10 @@ test('search can be held to what was said or changed since a day, or before one'
     assert.equal(run.code, 2, `${flag} ${value}`);
     assert.match(run.err, why);
   }
-  const turns = s.sumo(['search', 'deploy', '--turns', '--since', '7d']);
-  assert.equal(turns.code, 2);
-  assert.match(turns.err, /--since and --before hold memories to a time, not what the user typed/);
+  // The conversations are held to a time the same way: a turn typed today is since a week ago, and not before today.
+  s.hook('prompt', { session_id: 'one', prompt: 'the deploy went out late on friday' });
+  assert.match(s.sumo(['search', 'deploy', '--turns', '--since', '7d']).out, /^t1 \[you said\] the deploy went out late on friday · /);
+  assert.match(s.sumo(['search', 'deploy', '--turns', '--before', dayOf(0)]).out, /^nothing in the conversations for: deploy/);
   assert.match(s.sumo(['search', '--help']).out, /\[--since <YYYY-MM-DD\|Nd>\] \[--before <YYYY-MM-DD>\]/);
   assert.match(s.sumo(['help', 'search']).out, /sumo search <query> .*\[--since <YYYY-MM-DD\|Nd>\] \[--before <YYYY-MM-DD>\]/);
 });
@@ -142,15 +143,16 @@ test('search can be held to what was said or changed since a day, or before one'
 const TOOLS = ['eslint', 'prettier', 'vitest', 'webpack', 'rollup', 'docker', 'podman', 'terraform', 'pulumi', 'bazel', 'gradle', 'maven'];
 
 /**
- * A global memory with `filler` unrelated memories beside it and one per tool, and, for each tool, the user's turn that
- * replaces its memory and the slow pass's op that says so.
+ * A global memory with `filler` unrelated memories beside it and one per tool — each derived by a pass, as only such
+ * a memory is a pass's to replace — and, for each tool, the user's turn that replaces its memory, one word changed,
+ * and the slow pass's op that says so.
  */
 function rewriteOf(db, { filler, tools }) {
   for (let i = 0; i < filler; i++) add(db, { type: 'fact', body: `unrelated fact number ${i} about item${i}`, now: at('2026-09-01') });
   const turns = new Map();
   const ops = tools.map((tool, i) => {
-    const old = add(db, { type: 'preference', body: `pin ${tool} at major version one`, now: at('2026-09-01') }).memory.id;
-    const turn = { id: 1000 + i, session_id: 'side-by-side', text: `from now on pin ${tool} at major version two` };
+    const old = add(db, { type: 'preference', body: `pin ${tool} at major version one`, derivedBy: 'old00000', now: at('2026-09-01') }).memory.id;
+    const turn = { id: 1000 + i, session_id: 'side-by-side', text: `pin ${tool} at major version two` };
     turns.set(turn.id, turn);
     return { op: 'supersede', old, type: 'preference', scope: 'global', topic: 'tooling', body: `pin ${tool} at major version two`, turn: turn.id, quote: `pin ${tool} at major version two` };
   });
@@ -159,7 +161,7 @@ function rewriteOf(db, { filler, tools }) {
 
 const active = (db) => db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE state = 'active'`).get().n;
 
-test('the slow pass retires a few memories at a time, never more than ten in one pass: past that its replacements are refused and its additions kept', async () => {
+test('a file of operations retires a few memories at a time, never more than ten: past that its replacements are refused and its additions kept', async () => {
   await withDb((db) => {
     // Eleven of 51: under a quarter, but more than ten at once.
     const { ops, turns } = rewriteOf(db, { filler: 40, tools: TOOLS.slice(0, 11) });
@@ -175,7 +177,7 @@ test('the slow pass retires a few memories at a time, never more than ten in one
   });
 });
 
-test('the slow pass may not retire more than a quarter of the memories in a scope; what retires nothing does not count', async () => {
+test('no more than a quarter of the memories in a scope are retired at once; what retires nothing does not count, and the pass that read the conversation keeps what the user said', async () => {
   await withDb((db) => {
     // Four of 12 in global: a third.
     const { ops, turns } = rewriteOf(db, { filler: 8, tools: TOOLS.slice(0, 4) });
@@ -187,13 +189,13 @@ test('the slow pass may not retire more than a quarter of the memories in a scop
   });
 
   await withDb((db) => {
-    // Ten of 50 retire, under both bounds; an eleventh replacement is a guess, which retires nothing and is not counted.
+    // Ten of 50 retire, under both bounds; an eleventh replacement nobody said is dropped, retires nothing and is not counted.
     const { ops, turns } = rewriteOf(db, { filler: 39, tools: TOOLS.slice(0, 11) });
     ops[10].quote = 'words the user never typed';
     const { applied, dropped } = applyOps(db, ops, { source: 'dream', turns, now: NOW });
-    assert.deepEqual(dropped, []);
+    assert.deepEqual(dropped, ["supersede: not the user's words, not kept — the user never typed the quoted words in the turn it names"]);
     assert.equal(applied.filter((l) => l.startsWith('saved ')).length, 10);
-    assert.equal(applied.filter((l) => l.startsWith('held for confirmation ')).length, 1);
+    assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE state = 'unconfirmed'`).get().n, 0, 'nothing is held as a guess');
     assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE state = 'superseded'`).get().n, 10);
   });
 
@@ -205,37 +207,43 @@ test('the slow pass may not retire more than a quarter of the memories in a scop
   });
 
   await withDb((db) => {
-    // The writer files each conversation as it happens; the bound is the slow pass's, which reads many side by side.
+    // The pass that read the conversation is held to the same bound, and loses nothing the user said: both statements
+    // are kept beside what they would have replaced, and the user is asked about each pair.
     const { ops, turns } = rewriteOf(db, { filler: 0, tools: TOOLS.slice(0, 2) });
-    assert.deepEqual(applyOps(db, ops, { source: 'scribe', turns, now: NOW }).dropped, []);
-    assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE state = 'superseded'`).get().n, 2);
+    const { applied, dropped, refused } = applyOps(db, ops, { source: 'scribe', turns, now: NOW });
+    assert.deepEqual(dropped, []);
+    assert.match(refused, /would retire 2 of the 2 memories in global, more than a quarter/);
+    assert.match(applied[0], /^saved m3 \[pref·global·stated\] pin eslint at major version two — m1 is left as it is, and the user is asked: this pass would retire 2 of the 2/);
+    assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE state = 'superseded'`).get().n, 0);
+    assert.equal(active(db), 4);
+    const asked = db.prepare(`SELECT memory_a || ':' || memory_b AS pair FROM notices WHERE kind = 'lookalike'`).all().map((n) => n.pair);
+    assert.ok(asked.includes('1:3') && asked.includes('2:4'), asked.join(' '));
   });
 });
 
 test('a refused rewrite is said where the pass says what it did, and written to its log', () => {
   const s = sandbox();
   for (const rule of ['use tabs for indentation', 'write commit messages in the present tense', 'keep pull request descriptions short', 'run the linter before every commit']) s.sumo(['add', 'preference', rule]);
-  for (const [id, prompt] of [['one', 'from now on use two spaces for indentation'], ['two', 'commit messages go in the past tense from now on'], ['three', 'thanks, that is all for today']]) {
-    s.hook('prompt', { session_id: id, prompt });
-    s.hook('session-end', { session_id: id, reason: 'other' });
-    // Marked filed by hand: a memory pass run here would tidy by itself once the third is over.
-    s.sql((db) => db.prepare('UPDATE user_turns SET scribed = 1 WHERE session_id = ?').run(id));
-  }
+  // Filed by a pass, and each called a replacement by the pair judge: what a pass may replace, were it not so many at once.
+  s.sql((db) => db.prepare(`UPDATE memories SET derived_by = 'old00000'`).run());
+  writeFileSync(join(s.root, 'model-answer.json.dream-pairs'), JSON.stringify({ is_error: false, structured_output: { pairs: [{ pair: 1, label: 'replaces' }, { pair: 2, label: 'replaces' }] }, usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 }));
+  s.hook('prompt', { session_id: 'one', prompt: 'from now on use two spaces for indentation' });
+  s.hook('prompt', { session_id: 'one', prompt: 'commit messages go in the past tense from now on' });
+  s.hook('session-end', { session_id: 'one', reason: 'other' });
   s.modelWillSay([
     { op: 'supersede', old: 1, type: 'preference', scope: 'global', topic: 'style', body: 'use two spaces for indentation', turn: 1, quote: 'use two spaces for indentation' },
     { op: 'supersede', old: 2, type: 'preference', scope: 'global', topic: 'git', body: 'write commit messages in the past tense', turn: 2, quote: 'in the past tense from now on' },
     { op: 'gotcha', scope: 'global', body: 'the staging database is wiped every night at two' },
   ]);
 
-  const run = s.sumo(['memory', 'run', '--tidy']);
+  const run = s.sumo(['memory', 'run']);
   assert.equal(run.code, 0, run.err);
-  assert.match(run.out, /^ {2}saved m5 \[gotcha·global·observed\]/m);
-  assert.match(run.out, /^ {2}dropped — supersede: m1 is left as it is — this pass would retire 2 of the 4 memories in global, more than a quarter/m);
-  assert.match(run.out, /^ {2}dropped — supersede: m2 is left as it is/m);
-  assert.deepEqual(s.sql((db) => db.prepare(`SELECT id FROM memories WHERE state = 'active' ORDER BY id`).all().map((r) => r.id)), [1, 2, 3, 4, 5]);
-  assert.match(readFileSync(join(s.home, 'logs', 'scribe.log'), 'utf8'), /dropped — supersede: m1 is left as it is — this pass would retire 2 of the 4 memories in global/);
-  // The pass's own row, after the tidy's: the conversations' answer, applied and dropped.
-  assert.match(s.sql((db) => db.prepare(`SELECT note FROM model_runs WHERE kind = 'dream' ORDER BY id DESC`).get().note), /^applied=1 dropped=2$/);
+  assert.match(run.out, /^ {2}saved m5 \[pref·global·stated\] from now on use two spaces for indentation — m1 is left as it is, and the user is asked: this pass would retire 2 of the 4 memories in global, more than a quarter/m);
+  assert.match(run.out, /^ {2}saved m6 [^\n]* — m2 is left as it is/m);
+  assert.match(run.out, /^ {2}saved m7 \[gotcha·global·observed\]/m);
+  assert.deepEqual(s.sql((db) => db.prepare(`SELECT id FROM memories WHERE state = 'active' ORDER BY id`).all().map((r) => r.id)), [1, 2, 3, 4, 5, 6, 7], 'nothing was retired, and nothing the user said was lost');
+  assert.match(s.sumo(['prime']).out, /m1 and m5 look alike/);
+  assert.match(readFileSync(join(s.home, 'logs', 'scribe.log'), 'utf8'), /nothing retired — this pass would retire 2 of the 4 memories in global/);
 });
 
 test('a gotcha an agent filed, never shown and never pinned, lets go after 45 days — history kept; what the user said, pinned or was shown stays', async () => {
@@ -256,44 +264,6 @@ test('a gotcha an agent filed, never shown and never pinned, lets go after 45 da
     assert.deepEqual({ ...state(unused) }, { state: 'invalid', invalid_at: NOW }, 'let go the way sumo forget does: the row and its history stay');
     for (const id of [pinned, shown, young, said, stated]) assert.equal(state(id).state, 'active', `m${id} stays`);
     assert.equal(expireUnusedGotchas(db, NOW), 0, 'and once is all');
-  });
-});
-
-test('memory health says when the user was last heard, how the last pass went, what waits to be asked and how often a guess was right, and which scans are old', async () => {
-  const { memoryHealth } = await import('../src/memory.mjs');
-  const { logRun } = await import('../src/model.mjs');
-  const { ensureSession, recordTurn } = await import('../src/sessions.mjs');
-  const { addProject } = await import('../src/projects.mjs');
-  const { mkdtempSync } = await import('node:fs');
-  const { tmpdir } = await import('node:os');
-  await withDb(async (db) => {
-    const days = (n) => new Date(Date.parse(NOW) - n * 86_400_000).toISOString();
-    const empty = memoryHealth(db, NOW);
-    assert.deepEqual({ ...empty, scans: empty.scans.length }, { lastTurnAt: null, lastPass: null, waiting: 0, oldestWaitingDays: null, guesses: { confirmed: 0, rejected: 0, rate: null }, scans: 0 });
-
-    ensureSession(db, { id: 's1', now: days(3) });
-    recordTurn(db, { sessionId: 's1', text: 'we deploy on fridays now', now: days(3) });
-    const usage = { inputTokens: 1, outputTokens: 1, costUsd: 0 };
-    logRun(db, { kind: 'scribe', model: 'local', result: { ok: true, usage }, note: 'applied=1 dropped=0', now: days(3) });
-    logRun(db, { kind: 'dream', model: 'local', result: { ok: false, usage }, note: 'llama-server did not become healthy', now: days(1) });
-    // Two guesses the user confirmed, one rejected, two still waiting — the oldest twenty days.
-    const guess = (body, age) => add(db, { type: 'preference', body, provenance: 'inferred', writtenBy: 'scribe', now: days(age) }).memory.id;
-    for (const id of [guess('likes short answers', 30), guess('uses pnpm', 30)]) db.prepare(`UPDATE memories SET state = 'active', provenance = 'stated' WHERE id = ?`).run(id);
-    db.prepare(`UPDATE memories SET state = 'rejected' WHERE id = ?`).run(guess('prefers yaml', 30));
-    guess('works mostly at night', 20);
-    guess('wants emoji in commits', 2);
-    // Said by the user themselves: not a guess, whatever its words.
-    add(db, { type: 'preference', body: 'no trailing summaries', now: days(5) });
-    addProject(db, mkdtempSync(join(tmpdir(), 'sumo-agents-old-scan-')), { slug: 'old', now: days(40) });
-    addProject(db, mkdtempSync(join(tmpdir(), 'sumo-agents-new-scan-')), { slug: 'new', now: days(1) });
-
-    const health = memoryHealth(db, NOW);
-    assert.equal(health.lastTurnAt, days(3));
-    assert.deepEqual(health.lastPass, { at: days(1), ok: false, error: 'llama-server did not become healthy' });
-    assert.equal(health.waiting, 2);
-    assert.equal(health.oldestWaitingDays, 20);
-    assert.deepEqual(health.guesses, { confirmed: 2, rejected: 1, rate: 2 / 3 });
-    assert.deepEqual(health.scans, [{ slug: 'old', days: 40 }]);
   });
 });
 

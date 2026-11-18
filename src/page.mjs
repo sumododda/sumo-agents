@@ -14,9 +14,9 @@ const MAX_BODY = 64 * 1024;
 
 /** What the page may do. Erasing for good is not here: `sumo forget --purge` stays a command someone types. */
 const ACTIONS = {
-  confirm: (db, id) => ({ memory: memory.confirm(db, id) }),
-  reject: (db, id) => ({ memory: memory.reject(db, id) }),
-  forget: (db, id) => ({ memory: memory.forget(db, id) }),
+  confirm: (db, id) => ({ memory: memory.confirm(db, id, { byUser: true }) }),
+  reject: (db, id) => ({ memory: memory.reject(db, id, undefined, { actor: 'user' }) }),
+  forget: (db, id) => ({ memory: memory.forget(db, id, { actor: 'user' }) }),
   edit: (db, id, { body }) => edit(db, id, body),
 };
 

@@ -117,7 +117,8 @@ test('sumo memory status reads as one pass: aligned, in words, without the names
   const out = s.sumo(['memory', 'status']).out;
   assert.match(out, /^ok {4}memory: /m);
   assert.match(out, /^model {6}\S/m);
-  assert.match(out, /^waiting {4}0 turns to file · 0 finished conversations to read \(tidied by itself at 3, and weekly\)$/m);
+  assert.match(out, /^waiting {4}0 finished conversations to read · 0 spooled events · 0 quarantined turns$/m);
+  assert.match(out, /^filing {5}on$/m);
   assert.match(out, /^last tidy {2}never · weekly sweep: never$/m);
   assert.doesNotMatch(out, /scribe|dream|sessions waiting|runs by itself/i);
 });

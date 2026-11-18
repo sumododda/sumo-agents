@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { score } from '../src/memory.mjs';
+import { add, score } from '../src/memory.mjs';
+import { REPO_ROOT } from '../src/paths.mjs';
 import { redact } from '../src/redact.mjs';
 import { overlap } from '../src/text.mjs';
 import { HAS_PTY, sandbox } from './helpers.mjs';
@@ -127,13 +128,13 @@ test('ranking: the project being worked on beats global, and what was stated bea
   assert.ok(score({ ...stated, rank: -0.2 }, ctx) < score({ ...scanned, rank: -1 }, ctx));
 });
 
-test('a guess stays out of search until the user says yes, and is gone for good on no', () => {
+test('a memory held for the user stays out of search until they say yes, and is gone for good on no', () => {
   const s = sandbox();
   s.sumo(['config']);
   s.sql((db) => {
     const insert = db.prepare(
-      `INSERT INTO memories (type, scope, body, provenance, state, importance, written_by, valid_from, created_at)
-       VALUES ('preference', 'global', ?, 'inferred', 'unconfirmed', 0.8, 'dream', ?, ?)`,
+      `INSERT INTO memories (type, scope, body, provenance, state, importance, written_by, valid_from, created_at, held_for, derived_by)
+       VALUES ('preference', 'global', ?, 'inferred', 'unconfirmed', 0.8, 'dream', ?, ?, 'outside', 'x1')`,
     );
     const at = new Date().toISOString();
     insert.run('prefers short pull request descriptions', at, at);
@@ -143,11 +144,41 @@ test('a guess stays out of search until the user says yes, and is gone for good 
   assert.match(s.sumo(['search', 'pull request descriptions']).out, /^nothing in memory/);
 
   assert.match(s.sumo(['confirm', 'm1']).out, /^confirmed m1 \[pref·global·stated\]/);
+  assert.equal(s.sql((db) => db.prepare('SELECT derived_by FROM memories WHERE id = 1').get().derived_by), null, 'confirmed, it is the user\'s: no rebuild takes it');
   assert.match(s.sumo(['search', 'pull request descriptions']).out, /m1 /);
 
   assert.match(s.sumo(['reject', 'm2']).out, /^rejected m2/);
   assert.match(s.sumo(['search', 'tabs spaces']).out, /^nothing in memory/);
   assert.equal(s.sumo(['confirm', 'm2']).code, 1);
+});
+
+test('a memory waits unconfirmed only when it is held for the user, for one of two reasons — an outside read, or a save from the model\'s shell they never typed; a guess is refused, and nothing else in the code holds one', () => {
+  const s = sandbox();
+  s.sumo(['config']);
+  s.sql((db) => {
+    assert.throws(() => add(db, { type: 'preference', body: 'probably likes tabs', provenance: 'inferred' }), /a guess is not kept/);
+    assert.throws(() => add(db, { type: 'preference', body: 'probably likes tabs', heldFor: 'hunch' }), /unknown reason to hold a memory "hunch" — one of: outside, shell/);
+    const outside = add(db, { type: 'gotcha', body: 'the vendor api allows ten requests a minute', heldFor: 'outside', writtenBy: 'scribe', derivedBy: 'x1' }).memory;
+    assert.deepEqual([outside.state, outside.provenance, outside.held_for], ['unconfirmed', 'inferred', 'outside']);
+    assert.equal(add(db, { type: 'fact', body: 'the staging server runs on the mac mini', writtenBy: 'scribe', derivedBy: 'x1' }).memory.state, 'active', 'what the pass files is active, or it is not filed');
+  });
+  // From the model's shell, what the user never typed: held, said why, and theirs once they say yes.
+  const shell = s.sumo(['add', 'preference', 'always rebase before review'], { extraEnv: { SUMO_TOOL: '1' } });
+  assert.match(shell.out, /held as unconfirmed/);
+  assert.deepEqual({ ...s.sql((db) => db.prepare('SELECT state, held_for FROM memories WHERE id = 3').get()) }, { state: 'unconfirmed', held_for: 'shell' });
+  assert.match(s.sumo(['confirm', 'm3']).out, /^confirmed m3 \[pref·global·stated\]/);
+  assert.deepEqual({ ...s.sql((db) => db.prepare('SELECT state, provenance, derived_by FROM memories WHERE id = 3').get()) }, { state: 'active', provenance: 'stated', derived_by: null });
+  assert.deepEqual(s.sql((db) => db.prepare(`SELECT held_for FROM memories WHERE state = 'unconfirmed'`).all().map((r) => r.held_for)), ['outside']);
+
+  // The code itself: one door sets the state (memory.add, from heldFor), and the one statement that holds a job's
+  // gotchas after the fact names the outside read in the same breath. The migrations are history, not a path.
+  const src = join(REPO_ROOT, 'src');
+  const writers = readdirSync(src)
+    .filter((f) => f.endsWith('.mjs') && f !== 'db.mjs')
+    .flatMap((f) => readFileSync(join(src, f), 'utf8').split('\n').filter((l) => /SET [^`]*state = 'unconfirmed'|'unconfirmed' *:|\? *'unconfirmed'/.test(l)).map((l) => [f, l.trim()]));
+  assert.deepEqual(writers.map(([f]) => f).sort(), ['jobs.mjs', 'memory.mjs'], writers.map(([f, l]) => `${f}: ${l}`).join('\n'));
+  assert.match(writers.find(([f]) => f === 'jobs.mjs')[1], /held_for = 'outside'/);
+  assert.match(writers.find(([f]) => f === 'memory.mjs')[1], /^heldFor \? 'unconfirmed' : 'active',$/);
 });
 
 test('a forgotten memory is said as forgotten, not by the name it is stored under', () => {

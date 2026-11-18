@@ -14,7 +14,7 @@ import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mj
 import { damaged, restoreHint } from './export.mjs';
 import { stopLocalServer } from './local-server.mjs';
 import { latestCrash, crashFiles, logFiles, tailOf } from './logs.mjs';
-import { memoryHealth, memoryHealthLine, Refusal, UsageError } from './memory.mjs';
+import { Refusal, UsageError } from './memory.mjs';
 import { COMPILED, ENTRY, homeProblem, paths, REPO_ROOT, VERSION } from './paths.mjs';
 import { redact } from './redact.mjs';
 import { unsandboxable } from './sandbox.mjs';
@@ -394,8 +394,11 @@ export async function doctor() {
       checked: modelsChecked(db),
       configured: ['chat.model', 'memory.model'].map((key) => [key, setting(key)]),
       sandbox: setting('shell.sandbox'),
-      memory: memoryHealth(db),
     };
+    // Loaded here: the hooks reach this module for its settings, and only doctor needs the checks.
+    const { memoryCheck, memoryHealth, memoryHealthLine } = await import('./check.mjs');
+    stored.memory = memoryHealthLine(memoryHealth(db));
+    stored.checks = memoryCheck(db);
   } catch (cause) {
     check(false, 'database opens', damaged(cause) ? `${cause.message} — ${restoreHint()}` : cause.message);
   } finally {
@@ -433,11 +436,11 @@ export async function doctor() {
   const crash = latestCrash(new Date(Date.now() - CRASH_SHOWN_MS));
   if (crash) check(false, `crash on ${crash.at.toISOString().slice(0, 19).replace('T', ' ')}: ${crash.said}`, `${crash.file}; sumo doctor --report bundles it for a bug report`, true);
 
-  // Memory, in one line: whether the user is being heard and filed, what waits for them, and scans gone stale.
-  if (stored.memory) {
-    const said = memoryHealthLine(stored.memory);
-    check(said.ok, said.label, said.fix, true);
-  }
+  // Memory, in one line: whether the user is being heard and filed, and scans gone stale. Claude Code in use and not
+  // heard is a failure — capture once stopped for 35 days behind a line marked ok; silence alone is not. Then each
+  // check of the layer itself.
+  if (stored.memory) check(stored.memory.ok, stored.memory.label, stored.memory.fix, !stored.memory.fail);
+  for (const c of stored.checks ?? []) check(c.ok, `memory: ${c.label}`, c.fix);
 
   // The shell's sandbox is on by default: where it cannot be, every command writes wherever the user can, and that is said.
   if (stored.sandbox !== 'off') {
@@ -555,11 +558,11 @@ const LOOSE_SHOWN = 5;
 /** How far back doctor looks for a crash to say. */
 const CRASH_SHOWN_MS = 7 * 24 * 60 * 60 * 1000;
 /** The folders of the home whose every file and folder holds the user's words or settings. */
-const PRIVATE_TREES = ['logs', 'backups', 'scribe'];
+const PRIVATE_TREES = ['logs', 'backups', 'scribe', 'spool'];
 
 /**
- * What in the home others can read, by full path: the home and its own files; everything in the logs, the backups and
- * the scribe's folder; the jobs folder, each job's folder and the files directly in it — never deeper, where a job's
+ * What in the home others can read, by full path: the home and its own files; everything in the logs, the backups,
+ * the scribe's folder and the spool; the jobs folder, each job's folder and the files directly in it — never deeper, where a job's
  * worktree holds a copy of a project whose files keep their own modes. The models, the launcher's folder and scratch (a
  * project) are not the user's words. Only group and other bits count: what the owner may do is the owner's.
  */
@@ -783,7 +786,7 @@ function launcherRuns() {
 }
 
 /** What sumo makes in its home, by name: an uninstall removes these and leaves anything else where it is. */
-const MADE_HERE = new Set(['memory.db', 'memory.db-wal', 'memory.db-shm', 'backups', 'bin', 'logs', 'jobs', 'models', 'scratch', 'history', 'mcp.json', 'scribe', 'sumo.db']);
+const MADE_HERE = new Set(['memory.db', 'memory.db-wal', 'memory.db-shm', 'backups', 'bin', 'logs', 'jobs', 'models', 'scratch', 'history', 'mcp.json', 'scribe', 'spool', 'sumo.db']);
 const madeHere = (name) => MADE_HERE.has(name) || /^memory\.db\.(?:pre-v\d+\.bak|damaged-|replaced-)/.test(name);
 
 /** The local model's servers for this home: every llama-server whose command line names its models folder. */

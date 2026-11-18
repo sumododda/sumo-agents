@@ -1,4 +1,4 @@
-// The one memory pass: it files, then tidies when that is due, and says what each half did; a tidy that fails rests
+// The one memory pass: it files, then tidies when the week is up, and says what each half did; a tidy that fails rests
 // before it is tried again by itself; the page is the user's, never the model's shell's.
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
@@ -6,43 +6,47 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { sandbox } from './helpers.mjs';
 
-/** A finished conversation with its turns marked filed, so three of them make a tidy due. */
-function finishedSession(s, id, prompt) {
-  s.hook('prompt', { session_id: id, prompt });
-  s.hook('session-end', { session_id: id, reason: 'other' });
-  s.sql((db) => db.prepare('UPDATE user_turns SET scribed = 1 WHERE session_id = ?').run(id));
-}
+/** A memory from before the week began: with it, and no tidy yet, the weekly tidy is due. */
+const oldMemory = (s) => {
+  s.sumo(['add', 'preference', 'keep pull request descriptions short']);
+  s.sql((db) => db.prepare('UPDATE memories SET created_at = ?, valid_from = ?').run('2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z'));
+};
 
-/** The tidy's own answer — the stub's answer for calls of kind `dream` — failing, or nothing to add. */
-const tidyWill = (s, { fails }) =>
-  writeFileSync(
-    join(s.root, 'model-answer.json.dream'),
-    JSON.stringify(fails ? { is_error: true, result: 'local model unavailable', structured_output: null, usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 } : { is_error: false, result: '', structured_output: { ops: [] }, usage: { input_tokens: 900, output_tokens: 40 }, total_cost_usd: 0 }),
-  );
+/** What the tidy's calls to the local model answer: each kind its own, failing or with nothing to change. */
+const tidyWill = (s, { fails }) => {
+  const answers = { 'dream-keys': { memories: [] }, 'dream-repeats': { repeats: [] }, 'dream-pairs': { pairs: [] } };
+  for (const [kind, output] of Object.entries(answers)) {
+    writeFileSync(
+      join(s.root, `model-answer.json.${kind}`),
+      JSON.stringify(fails ? { is_error: true, result: 'local model unavailable', structured_output: null, usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 } : { is_error: false, result: '', structured_output: output, usage: { input_tokens: 900, output_tokens: 40 }, total_cost_usd: 0 }),
+    );
+  }
+};
 
 test('a pass that also tidies says what it filed and what the tidy did, each under its own name', () => {
   const s = sandbox();
-  for (const id of ['one', 'two', 'three']) finishedSession(s, id, `a message in ${id}`);
+  oldMemory(s);
   s.hook('prompt', { session_id: 'four', prompt: 'always use bun in every project' });
-  s.modelWillSay([{ op: 'add', type: 'preference', scope: 'global', body: 'Use bun in every project', turn: 4, quote: 'always use bun in every project' }]);
+  s.modelWillSay([{ op: 'add', type: 'preference', scope: 'global', body: 'Use bun in every project', turn: 1, quote: 'always use bun in every project' }]);
   tidyWill(s, { fails: false });
   const run = s.sumo(['memory', 'run']);
   assert.equal(run.code, 0, run.err);
-  assert.match(run.out, /^read 1 turns[\s\S]*saved m\d+ \[pref·global·stated\] Use bun in every project[\s\S]*^tidy: read 3 sessions/m);
+  assert.match(run.out, /^read 1 turns[\s\S]*saved m\d+ \[pref·global·stated\] always use bun in every project[\s\S]*^tidy: went over memory/m);
 });
 
 test('a tidy that fails rests for six hours: the passes after it file and do not tidy, until asked to', () => {
   const s = sandbox();
-  for (const id of ['one', 'two', 'three']) finishedSession(s, id, `a message in ${id}`);
+  oldMemory(s);
   s.modelWillSay([]);
   tidyWill(s, { fails: true });
   const first = s.sumo(['memory', 'run']);
   assert.match(first.out, /tidy: failed — /, first.out);
-  assert.equal(first.code, 0, 'the filing went through: a tidy nobody asked for failing is said, not an exit code');
-  assert.match(s.sumo(['memory', 'status']).out, /^failing {4}the last tidy, at .*; tried again by itself six hours on, or now: sumo memory run --tidy$/m);
+  assert.equal(first.code, 0, 'a tidy nobody asked for failing is said, not an exit code');
+  assert.match(s.sumo(['memory', 'status']).out, /the last tidy, at .*; tried again by itself six hours on, or now: sumo memory run --tidy$/m);
 
   s.hook('prompt', { session_id: 'four', prompt: 'thanks' });
   const next = s.sumo(['memory', 'run']);
+  assert.match(next.out, /^read 1 turns/);
   assert.doesNotMatch(next.out, /tidy:/, 'resting: the next pass only files');
 
   const asked = s.sumo(['memory', 'run', '--tidy']);
