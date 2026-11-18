@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -16,6 +16,20 @@ const ABOUT_MAX = 200;
 const READ_MAX_BYTES = 1024 * 1024;
 
 /**
+ * A plain file's text, judged and read through one descriptor, so what is read is what was judged — or null when it
+ * is not a plain file (a FIFO is opened without waiting on a writer) or is over `maxBytes`. Throws when it cannot be opened.
+ */
+export function readPlainFile(path, maxBytes = Infinity) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    return stat.isFile() && stat.size <= maxBytes ? readFileSync(fd, 'utf8') : null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
  * A file of the repository's own, as text — or null. A link that leads out of the repository (a README that is
  * really ~/.netrc) is not the repository's to say, and what is not a plain file of sane size (a FIFO, /dev/zero)
  * would hang the scan or fill memory, while the database waits on it.
@@ -25,9 +39,7 @@ const read = (root, name) => {
     const real = realpathSync(join(root, name));
     const home = realpathSync(root);
     if (!real.startsWith(`${home}/`)) return null;
-    const stat = statSync(real);
-    if (!stat.isFile() || stat.size > READ_MAX_BYTES) return null;
-    return readFileSync(real, 'utf8');
+    return readPlainFile(real, READ_MAX_BYTES);
   } catch {
     return null;
   }

@@ -32,7 +32,8 @@ function importedNames(text) {
 }
 
 const EXPORTED = /^export\s+(?:async\s+)?(?:function\*?|const|let|class)\s+(\w+)/gm;
-const count = (text, name) => (text.match(new RegExp(`(?<![\\w$.])${name.replace(/\$/g, '\\$')}(?![\\w$])`, 'g')) ?? []).length + (text.match(new RegExp(`\\.${name}\\b`, 'g')) ?? []).length;
+const literal = (name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const count = (text, name) => (text.match(new RegExp(`(?<![\\w$.])${literal(name)}(?![\\w$])`, 'g')) ?? []).length + (text.match(new RegExp(`\\.${literal(name)}\\b`, 'g')) ?? []).length;
 
 test('no file imports a name it never uses', () => {
   const unused = [];

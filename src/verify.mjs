@@ -1,11 +1,11 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, ftruncateSync, openSync, readFileSync, readSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { isSecretPath } from './guard.mjs';
 import { UsageError } from './memory.mjs';
 import { secretShape } from './redact.mjs';
-import { verifyCommands } from './scan.mjs';
+import { readPlainFile, verifyCommands } from './scan.mjs';
 import { killGroup } from './tools.mjs';
 
 /**
@@ -129,19 +129,14 @@ function timeoutMs() {
 }
 
 /** The last lines of a check's log, read from its end rather than whole. */
-function tailOf(file) {
-  const fd = openSync(file, 'r');
-  try {
-    const size = fstatSync(fd).size;
-    const start = Math.max(0, size - OUTPUT_TAIL_BYTES);
-    const bytes = Buffer.alloc(size - start);
-    const lines = bytes.subarray(0, readSync(fd, bytes, 0, bytes.length, start)).toString('utf8').trimEnd().split('\n');
-    // Read from inside a line, the first piece is half of one.
-    if (start > 0 && lines.length > 1) lines.shift();
-    return lines.slice(-OUTPUT_TAIL_LINES).join('\n');
-  } finally {
-    closeSync(fd);
-  }
+function tailOf(fd) {
+  const size = fstatSync(fd).size;
+  const start = Math.max(0, size - OUTPUT_TAIL_BYTES);
+  const bytes = Buffer.alloc(size - start);
+  const lines = bytes.subarray(0, readSync(fd, bytes, 0, bytes.length, start)).toString('utf8').trimEnd().split('\n');
+  // Read from inside a line, the first piece is half of one.
+  if (start > 0 && lines.length > 1) lines.shift();
+  return lines.slice(-OUTPUT_TAIL_LINES).join('\n');
 }
 
 /** The sandbox a job's process hands down for its checks: the wrap's words, or null — none given, or one that is not a list of words. */
@@ -167,25 +162,26 @@ function runChecks(root, commands, dir, prefix) {
     named.set(name, nth);
     const file = join(dir, `${prefix}-${name}${nth > 1 ? `-${nth}` : ''}.txt`);
     // Printed into the file, not a pipe: a pipe stays open while anything the check left running holds it, and would be waited on to the time limit.
-    const into = openSync(file, 'w', 0o600);
-    let run;
+    // Its end is read and written back through the same descriptor, so the file kept is the file the check printed into.
+    const into = openSync(file, 'w+', 0o600);
     try {
       // A job's checks run the project's code, perhaps tests the model wrote: in the sandbox its shell is in, handed down by the
       // job's own process (SUMO_CHECKS_WRAP), while this process — which records the verdict in sumo's memory — stays outside it.
       const wrap = checksWrapOf(process.env);
       const script = `${watcher}${command}`;
-      run = wrap
+      const run = wrap
         ? spawnSync(wrap[0], [...wrap.slice(1), '/bin/sh', '-c', script], { cwd: root, detached: true, stdio: ['ignore', into, into], timeout: timeoutMs(), killSignal: 'SIGKILL' })
         : spawnSync(script, { cwd: root, shell: true, detached: true, stdio: ['ignore', into, into], timeout: timeoutMs(), killSignal: 'SIGKILL' });
+      const timedOut = run.error?.code === 'ETIMEDOUT';
+      // Whatever it left running goes with it, so nothing writes to the file once it is read.
+      killGroup(run.pid);
+      const output = tailOf(into);
+      ftruncateSync(into);
+      writeSync(into, `$ ${command}\n${output}\n${timedOut ? '\n(stopped: it ran past the time limit)\n' : ''}`, 0);
+      return { name, command, ok: run.status === 0, status: run.status, timedOut, ms: Date.now() - started, file };
     } finally {
       closeSync(into);
     }
-    const timedOut = run.error?.code === 'ETIMEDOUT';
-    // Whatever it left running goes with it, so nothing writes to the file once it is read.
-    killGroup(run.pid);
-    const output = tailOf(file);
-    writeFileSync(file, `$ ${command}\n${output}\n${timedOut ? '\n(stopped: it ran past the time limit)\n' : ''}`, { mode: 0o600 });
-    return { name, command, ok: run.status === 0, status: run.status, timedOut, ms: Date.now() - started, file };
   });
 }
 
@@ -253,9 +249,9 @@ function scanAdded(root, snap, changes) {
   // A new file is read whole, and so is one that git never tracked: there is no diff to take its added lines from.
   for (const created of [...changes.created, ...changes.tracked.filter((c) => c.untracked && c.status === 'M').map((c) => c.path)]) {
     try {
-      const full = join(root, created);
-      if (statSync(full).size > MAX_SCANNED_FILE_BYTES) continue;
-      readFileSync(full, 'utf8').split('\n').forEach((l, i) => look(`${created}:${i + 1}`, l));
+      const text = readPlainFile(join(root, created), MAX_SCANNED_FILE_BYTES);
+      if (text === null) continue;
+      text.split('\n').forEach((l, i) => look(`${created}:${i + 1}`, l));
     } catch {
       // unreadable or binary: nothing to say about it
     }

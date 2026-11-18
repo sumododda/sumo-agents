@@ -549,15 +549,15 @@ export function loadState(id) {
 function summaryOf(file) {
   try {
     const fd = openSync(file, 'r');
-    let text;
     try {
       const buffer = Buffer.alloc(SUMMARY_BYTES);
-      text = buffer.toString('utf8', 0, readSync(fd, buffer, 0, SUMMARY_BYTES, 0));
+      const text = buffer.toString('utf8', 0, readSync(fd, buffer, 0, SUMMARY_BYTES, 0));
+      const cut = text.indexOf(',"messages":');
+      // The read above was at a position, so the descriptor is still at the start: a head with no cut is read whole from it.
+      return JSON.parse(cut === -1 ? readFileSync(fd, 'utf8') : `${text.slice(0, cut)}}`);
     } finally {
       closeSync(fd);
     }
-    const cut = text.indexOf(',"messages":');
-    return JSON.parse(cut === -1 ? readFileSync(file, 'utf8') : `${text.slice(0, cut)}}`);
   } catch {
     return null;
   }

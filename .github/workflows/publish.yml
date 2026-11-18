@@ -20,16 +20,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  # The suite on every Node the package promises (engines), on macOS: sumo runs on macOS only, and there the shell's
-  # sandbox — and every test of what it keeps out — runs. Nothing is published unless all of them pass.
+  # The suite on the Node the package promises (engines: 24.6+), on macOS: sumo runs on macOS only, and there the shell's
+  # sandbox — and every test of what it keeps out — runs. Nothing is published unless it passes.
   test:
-    name: test (${{ matrix.os }}, node ${{ matrix.node }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest]
-        node: [22, 24]
-    runs-on: ${{ matrix.os }}
+    name: test
+    runs-on: macos-latest
     timeout-minutes: 20
     permissions:
       contents: read # to check out the code
@@ -39,7 +34,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 24
       # Exactly the lockfile, and no package's install script runs: a compromised dependency gets no code run here.
       - run: npm ci --ignore-scripts
       # Every installed package as the registry signed it, and its provenance where it has one.

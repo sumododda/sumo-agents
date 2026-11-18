@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { alive } from './lock.mjs';
 import { paths } from './paths.mjs';
@@ -36,13 +36,15 @@ function addLine(name, line) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (statSync(dir).mode & 0o077) chmodSync(dir, 0o700);
   const file = join(dir, name);
-  // A mode is given only to a file being made: one already there and readable by others is closed before more is added.
+  // A mode is given only to a file being made: one already there and readable by others is closed before more is added,
+  // through the descriptor the line goes in by, so the file made private is the file written.
+  const fd = openSync(file, 'a', 0o600);
   try {
-    if (statSync(file).mode & 0o077) chmodSync(file, 0o600);
-  } catch {
-    // Not there yet: made private below.
+    if (fstatSync(fd).mode & 0o077) fchmodSync(fd, 0o600);
+    appendFileSync(fd, `${line}\n`);
+  } finally {
+    closeSync(fd);
   }
-  appendFileSync(file, `${line}\n`, { mode: 0o600 });
 }
 
 /**

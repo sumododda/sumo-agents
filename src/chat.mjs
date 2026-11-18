@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { isAdvisorTool } from './advisor.mjs';
@@ -173,7 +173,12 @@ function branchOf(dir) {
   for (let at = resolve(dir); ; at = dirname(at)) {
     const git = join(at, '.git');
     try {
-      const home = statSync(git).isDirectory() ? git : resolve(at, /^gitdir: (.+)$/m.exec(readFileSync(git, 'utf8'))[1]);
+      let home = git;
+      try {
+        home = resolve(at, /^gitdir: (.+)$/m.exec(readFileSync(git, 'utf8'))[1]);
+      } catch (cause) {
+        if (cause.code !== 'EISDIR') throw cause;
+      }
       const head = readFileSync(join(home, 'HEAD'), 'utf8').trim();
       return /^ref: refs\/heads\/(.+)$/.exec(head)?.[1] ?? head.slice(0, 8);
     } catch {

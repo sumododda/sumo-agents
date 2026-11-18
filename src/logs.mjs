@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { paths } from './paths.mjs';
 import { redact } from './redact.mjs';
@@ -84,10 +84,15 @@ export function crashFiles() {
 export function latestCrash(since) {
   const [file] = crashFiles();
   if (!file) return null;
-  const at = statSync(file).mtime;
-  if (at < since) return null;
-  const said = readFileSync(file, 'utf8').split('\n').find((line) => line.startsWith('error: '))?.slice('error: '.length) ?? 'see the file';
-  return { file, at, said };
+  const fd = openSync(file, 'r');
+  try {
+    const at = fstatSync(fd).mtime;
+    if (at < since) return null;
+    const said = readFileSync(fd, 'utf8').split('\n').find((line) => line.startsWith('error: '))?.slice('error: '.length) ?? 'see the file';
+    return { file, at, said };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**

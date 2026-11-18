@@ -21,7 +21,7 @@ import { DatabaseSync } from './sqlite.mjs';
 import { closest } from './text.mjs';
 import { tilde } from './tty.mjs';
 
-const NODE_REQUIREMENT = '22.19+ or 24.6+';
+const NODE_REQUIREMENT = '24.6+';
 // route.mjs's EFFORTS, spelled out: importing it would close a cycle (route → model → setup). A test keeps them equal.
 export const CHAT_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -347,7 +347,7 @@ export async function doctor() {
   check(code !== null, `code ${code ?? 'unknown'}`, 'neither a git checkout nor an installed package — reinstall: npm i -g sumo-agents', true);
 
   const [major, minor] = process.versions.node.split('.').map(Number);
-  const nodeOk = (major === 22 && minor >= 19) || (major === 24 && minor >= 6) || major > 24;
+  const nodeOk = (major === 24 && minor >= 6) || major > 24;
   // The binary Bun builds carries its own runtime, whatever Node version that says it is.
   if (process.versions.bun) check(true, `bun ${process.versions.bun} (a built binary: no Node needed)`, '');
   else check(nodeOk, `node ${process.versions.node}`, `needs Node ${NODE_REQUIREMENT}`);

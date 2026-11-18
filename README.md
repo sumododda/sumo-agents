@@ -16,7 +16,7 @@ and a personal one learn separately.
 
 ## Install
 
-You need Node 22.19+ or 24.6+, [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp`)
+You need Node 24.6+, [llama.cpp](https://github.com/ggml-org/llama.cpp) (`brew install llama.cpp`)
 for the local model, and `ANTHROPIC_API_KEY` or a `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) in
 your environment.
 
@@ -180,7 +180,7 @@ npm run build:bin          # optional: a standalone binary in dist/sumo-agents/ 
 tests; `--hard` runs the harder set, `--no-guides` and `--advisor` change one thing at a time. It costs money.
 
 A release is a commit on `main` that raises the version in `package.json`. The workflow runs the suite on
-macOS, the platform sumo runs on, with Node 22 and 24; when both pass, the publish waits in the `release` environment for the
+macOS, the platform sumo runs on, with Node 24; when it passes, the publish waits in the `release` environment for the
 maintainer's approval, then goes to npm with provenance and no stored token. How CI is locked down is in
 [SECURITY.md](SECURITY.md#releases-and-the-supply-chain). Probes, the coding eval and the repository layout are in
 [Development](https://github.com/sumododda/sumo-agents/wiki/Development).

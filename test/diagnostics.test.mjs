@@ -56,11 +56,12 @@ test('help opens on what sumo is now, and a mistyped command is answered with th
 test('NO_COLOR turns colour off on the chat screen too: chalk, which ink draws with, is told before it loads', () => {
   const s = sandbox();
   const chalk = import.meta.resolve('chalk');
-  const probe = `setTimeout(async () => { const c = (await import(${JSON.stringify(chalk)})).default; process.stderr.write('FORCE_COLOR=' + process.env.FORCE_COLOR + ' level=' + c.level + '\\n'); }, 0);`;
-  assert.match(sumoAfter(s.home, probe, ['--version'], { NO_COLOR: '1' }).err, /FORCE_COLOR=0 level=0/);
+  // Where chalk is goes in as data, never spliced into the code.
+  const probe = `setTimeout(async () => { const c = (await import(process.env.PROBE_CHALK)).default; process.stderr.write('FORCE_COLOR=' + process.env.FORCE_COLOR + ' level=' + c.level + '\\n'); }, 0);`;
+  assert.match(sumoAfter(s.home, probe, ['--version'], { PROBE_CHALK: chalk, NO_COLOR: '1' }).err, /FORCE_COLOR=0 level=0/);
   // Empty is not set (no-color.org), and a FORCE_COLOR the user gave wins.
-  assert.match(sumoAfter(s.home, probe, ['--version'], { NO_COLOR: '' }).err, /FORCE_COLOR=undefined /);
-  assert.match(sumoAfter(s.home, probe, ['--version'], { NO_COLOR: '1', FORCE_COLOR: '2' }).err, /FORCE_COLOR=2 level=[23]/);
+  assert.match(sumoAfter(s.home, probe, ['--version'], { PROBE_CHALK: chalk, NO_COLOR: '' }).err, /FORCE_COLOR=undefined /);
+  assert.match(sumoAfter(s.home, probe, ['--version'], { PROBE_CHALK: chalk, NO_COLOR: '1', FORCE_COLOR: '2' }).err, /FORCE_COLOR=2 level=[23]/);
 });
 
 test('a FORCE_COLOR the user set wins for sumo\'s own lines too: colour in a pipe for a CI log, even over NO_COLOR; 0 is none', () => {
@@ -80,11 +81,11 @@ test('a FORCE_COLOR the user set wins for sumo\'s own lines too: colour in a pip
 test('in a real terminal, NO_COLOR takes chalk from full colour to none', { skip: process.platform !== 'darwin' && 'script(1) is spelled differently here' }, () => {
   const s = sandbox();
   const chalk = import.meta.resolve('chalk');
-  const probe = `setTimeout(async () => { const c = (await import(${JSON.stringify(chalk)})).default; console.log('level=' + c.level); }, 0);`;
+  const probe = `setTimeout(async () => { const c = (await import(process.env.PROBE_CHALK)).default; console.log('level=' + c.level); }, 0);`;
   const inTerminal = (noColor) =>
     // script(1) needs a terminal or nothing on its stdin, not a pipe.
     spawnSync('script', ['-q', '/dev/null', process.execPath, '--disable-warning=ExperimentalWarning', '--import', before(probe), ENTRY, '--version'], {
-      env: plainEnv(s.home, { TERM: 'xterm-256color', NO_COLOR: noColor }),
+      env: plainEnv(s.home, { TERM: 'xterm-256color', NO_COLOR: noColor, PROBE_CHALK: chalk }),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     }).stdout;
@@ -94,7 +95,7 @@ test('in a real terminal, NO_COLOR takes chalk from full colour to none', { skip
 
 test('a crash leaves a private file with the version and the stack, and no secret from the command or the error', () => {
   const s = sandbox();
-  const run = sumoAfter(s.home, `setTimeout(() => { throw new Error('boom with ' + ${JSON.stringify(PLANTED_KEY)}); }, 30);`, ['help', PLANTED_SLACK]);
+  const run = sumoAfter(s.home, `setTimeout(() => { throw new Error('boom with ' + process.env.PROBE_SECRET); }, 30);`, ['help', PLANTED_SLACK], { PROBE_SECRET: PLANTED_KEY });
   assert.equal(run.code, 1, 'it still ends as an uncaught error ends');
   assert.match(run.err, /Error: boom with/, 'the stack still goes to stderr');
   assert.match(run.err, /sumo: crashed — written to .*crash-.*\.log \(sumo doctor --report bundles it\)/);
@@ -149,7 +150,7 @@ test('doctor says a recent crash, and --report bundles what is needed to read a 
   assert.doesNotMatch(report.out, /line 9\n/);
   assert.doesNotMatch(report.out, new RegExp(PLANTED_KEY));
   assert.doesNotMatch(report.out, new RegExp(PLANTED_SLACK));
-  assert.doesNotMatch(report.out, /mcp\.slack\.com/, 'a server is named, not where it is or what it is given');
+  assert.ok(!report.out.includes('mcp.slack.com'), 'a server is named, not where it is or what it is given');
 });
 
 test('doctor finds files of the home that others can read, and --fix makes them private, never touching a job\'s project files', () => {

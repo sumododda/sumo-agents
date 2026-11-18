@@ -44,6 +44,7 @@ test('an edit whose new text stands for code instead of holding it is refused, a
     '/* rest of file */',
     '// (unchanged)',
     '<!-- ... -->',
+    '<!-- ... --!>',
     '...existing code...',
     '  // ... other methods ...',
     '{/* ... */}',

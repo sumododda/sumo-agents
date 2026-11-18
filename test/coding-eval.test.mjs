@@ -163,8 +163,9 @@ test('the ways to be wrong are told apart: a DONE taken with the work wrong, a D
     assert.equal(missed.passed, false);
     assert.equal(missed.failed.length, 2, 'both lines are wrong');
     // The answer line in another order and another dress is the same answer.
-    assert.ok(scoreWork(task('open-routes'), tmpdir(), '**OPEN:** `get /account/export`, POST  /login, GET /health\n- UNINTENDED: GET /account/export\n').every((c) => c.ok));
-    assert.ok(scoreWork(task('who-calls'), tmpdir(), 'No line at all.').every((c) => !c.ok && c.detail === 'no such line'));
+    const empty = mkdtempSync(join(tmpdir(), 'sumo-agents-eval-score-'));
+    assert.ok(scoreWork(task('open-routes'), empty, '**OPEN:** `get /account/export`, POST  /login, GET /health\n- UNINTENDED: GET /account/export\n').every((c) => c.ok));
+    assert.ok(scoreWork(task('who-calls'), empty, 'No line at all.').every((c) => !c.ok && c.detail === 'no such line'));
   });
 });
 

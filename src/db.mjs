@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { homeProblem, paths } from './paths.mjs';
 import { DatabaseSync } from './sqlite.mjs';
@@ -494,7 +494,12 @@ function opened(file) {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   // SQLite gives the -wal and -shm files the database's own mode: the file is made private before SQLite first opens
   // it, or they are born readable by everyone (umask 022) and keep the latest writes there.
-  if (!existsSync(file)) closeSync(openSync(file, 'a', 0o600));
+  try {
+    closeSync(openSync(file, 'wx', 0o600));
+  } catch (cause) {
+    // There already: as it is, whatever it is — SQLite says below when it is not a database it can open.
+    if (cause.code !== 'EEXIST') throw cause;
+  }
   for (const side of [file, `${file}-wal`, `${file}-shm`]) {
     try {
       if (statSync(side).mode & 0o077) chmodSync(side, 0o600);

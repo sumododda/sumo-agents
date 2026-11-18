@@ -4,6 +4,8 @@ What each release changed for you. The commit of each version has the full detai
 
 ## Unreleased
 
+## 0.7.0 — 2026-11-18
+
 - **A new effort after a turn that failed no longer breaks the chat.** When a turn ended before the model answered
   (an error, or Esc), and the effort then changed (`/model opus high`, or auto picking a new one), every later
   message was refused: `400 … role 'system' must precede an 'assistant' message`, until `/new`. The note sumo had
@@ -48,6 +50,11 @@ What each release changed for you. The commit of each version has the full detai
 - Retired, each pointing at the page (exit 2): `sumo config <key> <value>`, `sumo models enable|disable|discover`,
   `sumo mcp add|remove|allow|revoke`, `sumo setup --model-source`. Setup no longer asks where to get the local model;
   a new address set on the page is downloaded as it is set. `sumo config` piped, with a key, or with `--json` still prints.
+- A file is judged and read through one descriptor — the editor, the project scan, a job's checks and its review, the
+  spool, the crash note — so a file swapped between the look and the read is never the one read. A named pipe among a
+  job's new files no longer stalls its review, and a comment closed HTML's other way (`--!>`) is seen as one. The
+  Anthropic SDK is 1.8.0.
+- **Node 24.6 or newer is needed.** Node 22 is no longer supported or tested; `sumo doctor` says so on it.
 
 ## 0.6.1 — 2026-11-11
 

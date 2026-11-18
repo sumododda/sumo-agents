@@ -195,7 +195,7 @@ export function highlight(line, lang, s, code = null) {
     state.comment = false;
   }
   const quotes = [...language.quotes].map((q) => `${q === '`' ? '`' : `\\${q}`}(?:[^${q === '`' ? '`' : `\\${q}`}\\\\]|\\\\.)*${q === '`' ? '`' : `\\${q}`}`).join('|');
-  const comment = language.line === '#' ? '(?:^|(?<=\\s))#.*' : language.line ? `${language.line.replace(/\//g, '\\/')}.*` : '(?!)';
+  const comment = language.line === '#' ? '(?:^|(?<=\\s))#.*' : language.line ? `${language.line.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}.*` : '(?!)';
   const pattern = new RegExp(`(${comment})|(${language.block ? '\\/\\*' : '(?!)'})|(${quotes || '(?!)'})|(\\b0x[0-9a-fA-F]+\\b|\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b)|(\\b[A-Za-z_][\\w]*\\b)`, 'g');
   pattern.lastIndex = at;
   for (let m; (m = pattern.exec(line)); ) {

@@ -424,7 +424,7 @@ test('an image dropped on the box or pasted with Ctrl-V stands in it as a marker
         await shows(/opus · high/, 'the footer');
 
         // A file dropped on the terminal arrives as its path, pasted: the box shows a marker, not the path.
-        await tty.type(`\x1b[200~${shot.replace(/ /g, '\\ ')}\x1b[201~`);
+        await tty.type(`\x1b[200~${shot.replace(/[\\ ]/g, '\\$&')}\x1b[201~`);
         await shows(/│ > \[Image #1\] /, 'the dropped image');
         await tty.type('\x16');
         await shows(/│ > \[Image #1\] \[Image #2\] /, 'the image from the clipboard');
@@ -1844,7 +1844,7 @@ test('the screen as a reader wants it: a long word keeps the margin, the box say
         events.emit('sources', { sources: [{ title: 'The docs', url: page }] });
         await shows(/sources:/, 'the pages cited');
         const frame = written.at(-1);
-        assert.ok((frame.match(new RegExp(`\x1b\\]8;;${page.replace(/[.]/g, '\\.')}\x07`, 'g')) ?? []).length >= 2, 'each piece of the folded address opens the whole of it');
+        assert.ok((frame.match(new RegExp(`\x1b\\]8;;${page.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\x07`, 'g')) ?? []).length >= 2, 'each piece of the folded address opens the whole of it');
         assert.ok(tty.screen().replace(/\x1b\]8;;[^\x07]*\x07/g, '').split('\n').every((l) => l.length <= 60), 'and the link takes no room');
 
         // Ctrl-L draws the screen again.

@@ -5,6 +5,7 @@ import { delimiter, dirname, extname, join, relative, resolve, sep } from 'node:
 import { CREDENTIAL_NAMES } from './auth.mjs';
 import { guardCommand, guardPath } from './guard.mjs';
 import { SELF } from './paths.mjs';
+import { readPlainFile } from './scan.mjs';
 import { redact } from './redact.mjs';
 import { blockedWrite, guardedPlaces, guardedWhy, readOnlyPlaces, sandboxWrap, unsandboxable, writablePlaces } from './sandbox.mjs';
 
@@ -710,8 +711,13 @@ async function blocked(command, shown, ctx, jail, options) {
 const BINARY_PROBE_BYTES = 8192;
 
 function view(path, range) {
-  if (statSync(path).isDirectory()) return result(cap(readdirSync(path).join('\n')));
-  const bytes = readFileSync(path);
+  let bytes;
+  try {
+    bytes = readFileSync(path);
+  } catch (cause) {
+    if (cause.code === 'EISDIR') return result(cap(readdirSync(path).join('\n')));
+    throw cause;
+  }
   // A binary shown as text is pages of nonsense, every page billed: say what it is instead.
   if (bytes.subarray(0, BINARY_PROBE_BYTES).includes(0)) return result(`${path} is a binary file (${bytes.length} bytes) — not shown; use a tool that reads its kind, or \`file\` and \`xxd | head\` for a look`, true);
   const lines = bytes.toString('utf8').split('\n');
@@ -948,9 +954,9 @@ function change(path, ctx, write, { created = false } = {}) {
 }
 
 /** A whole line that is one comment — `//`, `#`, `/* *\/`, `<!-- -->`, `--`, JSX's `{/* *\/}` — and what it says. */
-const COMMENT_LINE = /^(?:\/\/+|#+|\/\*+|<!--|--|\{\/\*+)\s*(.*?)\s*(?:\*+\/\}?|-->)?$/;
-/** The block comments that close on their line: only dots in one is a gap left in the code, where `// ...` alone may be a deliberate stub. */
-const CLOSED_COMMENT = /(?:\*\/\}?|-->)$/;
+const COMMENT_LINE = /^(?:\/\/+|#+|\/\*+|<!--|--|\{\/\*+)\s*(.*?)\s*(?:\*+\/\}?|--!?>)?$/;
+/** The block comments that close on their line (HTML's closes on `--!>` too): only dots in one is a gap left in the code, where `// ...` alone may be a deliberate stub. */
+const CLOSED_COMMENT = /(?:\*\/\}?|--!?>)$/;
 const DOTS = /\.{3,}|…/g;
 /** That what was left out stays as it was: optional after `rest of the code`; needed after `other methods` with no dots around it, which could be a heading. */
 const STAYS = String.raw`(?:\s+(?:is\s+|are\s+|stays\s+|remains\s+|goes\s+)?(unchanged|the same|as before|as is|omitted|here|goes here|follows|not shown))?`;
@@ -1143,8 +1149,13 @@ export function runEditor(input, ctx) {
         const gap = placeholderIn(path, 'file_text', input.file_text);
         if (gap) return result(gap, true);
         // The write below refuses a file that is there anyway; said here in words that tell the model what to do instead.
-        if (existsSync(path) && statSync(path).isFile()) {
-          const held = readFileSync(path, 'utf8');
+        let held = null;
+        try {
+          held = readPlainFile(path);
+        } catch {
+          // Not there: made below.
+        }
+        if (held !== null) {
           const lines = held.split('\n').length - (held.endsWith('\n') ? 1 : 0);
           return result(`${path} already exists (${lines} line${lines === 1 ? '' : 's'}): change the lines that change with str_replace or insert — a file is never rewritten whole`, true);
         }
