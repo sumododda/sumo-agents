@@ -184,10 +184,10 @@ test('the writable places take the per-user cache macOS gives clang and swift, a
 test('shell.network is on or off, on unless the user turns it off; both switches are read once a process, so a change takes at the next start', () => {
   const s = throwaway();
   assert.match(s.sumo(['config', 'shell.network']).out, /shell\.network = on/);
-  assert.match(s.sumo(['config', 'shell.network', 'maybe']).err, /shell\.network is on or off/);
+  assert.match(s.page(['config', 'shell.network', 'maybe']).err, /shell\.network is on or off/);
   assert.equal(s.sql((db) => sandboxOn(db)), true);
   assert.equal(s.sql((db) => networkOn(db)), true);
-  assert.match(s.sumo(['config', 'shell.network', 'off']).out, /shell\.network = off/);
+  assert.match(s.page(['config', 'shell.network', 'off']).out, /shell\.network = off/);
   // As a model would, writing the database itself: the session it runs in keeps the sandbox it started with.
   s.sql((db) => setMeta(db, 'config.shell.sandbox', 'off'));
   assert.equal(s.sql((db) => sandboxOn(db)), true);
@@ -361,8 +361,8 @@ test('the editor cannot write git\'s hooks or its config either: what runs on th
 
 test('switching the sandbox or the network says when it takes effect: at the next start, not in what is running', () => {
   const s = throwaway();
-  const out = s.sumo(['config', 'shell.network', 'off']);
+  const out = s.page(['config', 'shell.network', 'off']);
   assert.equal(out.code, 0, out.err);
   assert.match(out.out, /^shell\.network = off\ntakes effect in chats and `sumo job run`s started from now on — a chat already open keeps its setting, for the jobs it starts too, until it is started again$/m);
-  assert.doesNotMatch(s.sumo(['config', 'chat.budget', '3']).out, /takes effect/);
+  assert.doesNotMatch(s.page(['config', 'chat.budget', '3']).out, /takes effect/);
 });

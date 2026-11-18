@@ -102,6 +102,12 @@ export function sandbox() {
     return { code: run.status, out: run.stdout, err: run.stderr };
   };
 
+  /** What the settings page does when a row changes — a setting, a model's switch, Discover — in this home, as `sumo` says it. */
+  const page = (args, { extraEnv } = {}) => {
+    const run = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(REPO_ROOT, 'test', 'fixtures', 'settings-page.mjs'), ...args], { env: { ...env, ...extraEnv }, encoding: 'utf8' });
+    return { code: run.status, out: run.stdout, err: run.stderr };
+  };
+
   /** Runs `sumo` at a terminal and answers its question with `answer` once the prompt ends with `until`; the text the terminal showed comes back. */
   const typed = (args, answer, until) => {
     const run = spawnSync('python3', ['-I', '-c', PTY, process.execPath, '--disable-warning=ExperimentalWarning', ENTRY, ...args], {
@@ -155,5 +161,5 @@ export function sandbox() {
   const modelWasShown = () => JSON.parse(readFileSync(modelSaw, 'utf8'));
   const spawned = () => (existsSync(spawnLog) ? readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean) : []);
 
-  return { root, home, sumo, typed, sql, addProject, hook, modelWillSay, routerWillSay, modelsFound, modelWasShown, spawned };
+  return { root, home, sumo, page, typed, sql, addProject, hook, modelWillSay, routerWillSay, modelsFound, modelWasShown, spawned };
 }

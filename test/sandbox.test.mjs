@@ -70,8 +70,8 @@ test('the sandbox is on unless the user turns it off, and shell.sandbox is on or
   const s = throwaway();
   assert.match(s.sumo(['config', 'shell.sandbox']).out, /shell\.sandbox = on/);
   assert.equal(s.sql((db) => sandboxOn(db)), true);
-  assert.match(s.sumo(['config', 'shell.sandbox', 'maybe']).err, /shell\.sandbox is on or off/);
-  assert.match(s.sumo(['config', 'shell.sandbox', 'off']).out, /shell\.sandbox = off/);
+  assert.match(s.page(['config', 'shell.sandbox', 'maybe']).err, /shell\.sandbox is on or off/);
+  assert.match(s.page(['config', 'shell.sandbox', 'off']).out, /shell\.sandbox = off/);
   // Read once a process: the change takes at the next start (test/shell-hardening.test.mjs).
   assert.equal(s.sql((db) => sandboxOn(db)), true);
   assert.match(s.sumo(['config', 'shell.sandbox', 'on'], { extraEnv: { SUMO_TOOL: '1' } }).err, /Refused: the model's shell does not change/, 'not from the model\'s own shell');
@@ -79,12 +79,12 @@ test('the sandbox is on unless the user turns it off, and shell.sandbox is on or
 
 test('turning the sandbox off says plainly what that means; turning it on says nothing more', () => {
   const s = throwaway();
-  const off = s.sumo(['config', 'shell.sandbox', 'off']);
+  const off = s.page(['config', 'shell.sandbox', 'off']);
   assert.equal(off.code, 0, off.err);
   assert.deepEqual(off.out.split('\n').slice(0, 2), ['shell.sandbox = off', "warning: the model's shell is no longer held to the project — its commands can write anywhere you can"]);
   assert.match(off.out, /takes effect in chats/);
-  assert.doesNotMatch(s.sumo(['config', 'shell.sandbox', 'on']).out, /warning/);
-  assert.doesNotMatch(s.sumo(['config', 'shell.network', 'off']).out, /warning/);
+  assert.doesNotMatch(s.page(['config', 'shell.sandbox', 'on']).out, /warning/);
+  assert.doesNotMatch(s.page(['config', 'shell.network', 'off']).out, /warning/);
 });
 
 // The first command of this file: the note is said once a process, so it is the first result that carries it.

@@ -3,7 +3,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { createInterface } from 'node:readline';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
-import { discoverModels, knownModel, MODEL_IDS, modelLines, setModel } from './catalog.mjs';
+import { knownModel, MODEL_IDS, modelLines } from './catalog.mjs';
 import { openDb } from './db.mjs';
 import { backup, damaged, exportJson, exportMarkdown, liveDatabase, purgeFromBackups, purgeRowFromBackups, restoreCandidate, restoreHint, restoreLines, restoreQuestion } from './export.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
@@ -21,7 +21,6 @@ import { searchAll } from './search.mjs';
 import { findSaved, journalEntry, taskEndedNudge } from './sessions.mjs';
 import { clip, closest, saysAs } from './text.mjs';
 import { heldBy } from './lock.mjs';
-import { redact } from './redact.mjs';
 import { VERSION } from './paths.mjs';
 import { CHAT_EFFORTS, config, doctor, makePrivate, positiveInteger, reportOf, setup, uninstall, uninstallPlan, uninstallQuestion } from './setup.mjs';
 import { colourEnabled, safeForTerminal, styles } from './tty.mjs';
@@ -44,9 +43,9 @@ const HELP = `sumo — one chat across your projects, memory that lasts, and job
         finish <id> --status DONE|FAILED · abandon · retry · list [--all] · stats
   sumo prime · sumo --version                          the block a session starts with · which sumo
   sumo export [--json] · sumo backup [restore [file]] · sumo cost [--days N] [--project S]
-  sumo models [discover | enable <name> | disable <name>]   the API models: which are here and on
-  sumo mcp [add | remove | tools | allow | revoke] <name>   MCP servers, for the chat and every job
-  sumo setup · sumo uninstall · sumo config [key [value]] · sumo doctor [--fix] [--report]
+  sumo config                                          every setting, on one page; /config in a chat
+  sumo models · sumo mcp [tools <name>]                the API models · the MCP servers, as set
+  sumo setup · sumo uninstall · sumo doctor [--fix] [--report]
 
 Scope is global plus --project; other projects stay hidden without --everywhere.
 Exit: 0 done · 1 not done or failed · 2 the command line was wrong · 4 needs an Anthropic credential
@@ -121,21 +120,14 @@ sumo job list [--all] [--json]`,
   apply: 'sumo apply <ops.json> [--source scribe|dream]',
   export: 'sumo export [--json]',
   backup: 'sumo backup [restore [file] [--yes]]    (restore: the newest copy, or the one named, put back, the one there kept aside; over a database that is fine it asks first, or --yes)',
-  models: `sumo models                    every model Sumo knows: on or off, its API id, and why
-sumo models discover           ask the API which of them this credential can use, and set the switches from the answer (one turned off by hand stays off)
-sumo models enable|disable <name>`,
-  mcp: `sumo mcp                        every configured server: where it is, its tools or why it failed, what may run unasked
-sumo mcp add <name> [--env K=V]... -- <command> [args...]     a server run as a process (stdio)
-sumo mcp add <name> --url <url> [--header K=V]...             a server reached over HTTP
-        \${NAME} in a value is filled from the shell when the server starts: the file never holds a token
-sumo mcp add <name> --url <url> --from-claude                 a server Claude Code is logged in to (claude mcp login <name>): its token is borrowed
-sumo mcp remove <name>
+  models: 'sumo models    every model Sumo knows: on or off, its API id, and why — switched on and off, and discovered, on the settings page (sumo config)',
+  mcp: `sumo mcp                        every server: where it is, its tools or why it failed, what may run unasked
 sumo mcp tools <name>           the server's tools, one a line
-sumo mcp allow <name> <tool>|all      let it run without asking      sumo mcp revoke <name> <tool>|all`,
-  setup: 'sumo setup [--bin-dir DIR] [--no-link] [--model-source URL] [--no-model]',
+        added, removed and allowed on the settings page: /config in the chat, or sumo config`,
+  setup: 'sumo setup [--bin-dir DIR] [--no-link] [--no-model]    (the local model comes from Memory › Local model, on the settings page: sumo config)',
   uninstall: 'sumo uninstall [--yes] [--discard-memory]    (removes what setup made — the home\'s own files, its sumo links, the local model\'s server — after copying the memory out beside the home; asks first, or --yes)',
   doctor: 'sumo doctor [--fix] [--report]    (--fix: make the files of the home private · --report: version, checks, settings, MCP server names, the last crash and the logs\' tails — redacted, printed here, sent nowhere)',
-  config: 'sumo config [key [value]]',
+  config: 'sumo config [key] [--json]    every setting on one page, at a terminal — the arrows change one, it is saved as it changes, Esc closes it; with a key, --json or no terminal, the settings printed',
   hook: 'sumo hook session-start|prompt|pre-tool|stop|session-end    (for a harness\'s hook configuration: the event\'s JSON on stdin, what to add to the session on stdout; never fails the session — sumo help hooks prints the lines for Claude Code)',
 };
 
@@ -176,7 +168,9 @@ const fromJob = () => process.env.SUMO_JOB || null;
 const counted = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 /** Typed by the user at a terminal: no model's shell, and a terminal at both ends — another harness's tool runs without one. */
 const byUser = () => (!fromTool() && process.stdin.isTTY && process.stdout.isTTY ? 'user' : undefined);
-const OWNER_ONLY = "Refused: the model's shell does not change what the user controls — the MCP allow list, the models and the configuration. If the user wants it, they run it themselves: `! sumo …`";
+const OWNER_ONLY = "Refused: the model's shell does not change what the user controls — the MCP allow list, the models and the settings. The user changes them on the settings page: /config in the chat, or sumo config at a terminal";
+/** Where a command that set something by name went: the settings page, the one way a setting changes now. */
+const ON_THE_PAGE = (what) => `${what} is set on the settings page now — sumo config at a terminal, or /config in the chat`;
 const jobWrites = () => `Refused: j${fromJob()} runs this command, and a job never writes memory. Put what you learned in your report; the user, or the chat, decides what is kept.`;
 const RECENT_TURNS = 40;
 /**
@@ -217,6 +211,7 @@ const COMMANDS = {
   export: { value: [], bool: ['json', 'md'], max: 0, run: runExport },
   backup: { value: [], bool: ['yes'], run: runBackup },
   models: { value: [], bool: [], run: runModels },
+  // The flags the retired `mcp add` took are still read, so that it is told where adding went rather than that a flag is unknown.
   mcp: { value: ['url'], multi: ['env', 'header'], bool: ['from-claude'], run: runMcp },
 };
 
@@ -895,42 +890,17 @@ async function runMemoryPage(db) {
   return ['stopped'];
 }
 
-/** The models Sumo can run on, their switches, and the two ways the switches are set: by the API's answer, or by hand. */
-async function runModels(db, { args }) {
-  const [sub, name] = args;
-  if (sub === undefined) return modelLines(db);
-  if (sub === 'discover') {
-    const result = await discoverModels(db);
-    if (!result.ok) throw new (/no Anthropic credential/.test(result.error) ? NeedsCredential : Error)(`could not check the models — ${result.error}; nothing was changed`);
-    return modelLines(db);
-  }
-  if ((sub === 'enable' || sub === 'disable') && name !== undefined) {
-    setModel(db, name, sub === 'enable');
-    return modelLines(db, [name]);
-  }
+/** The models Sumo can run on and their switches, as the settings page set them. */
+function runModels(db, { args }) {
+  if (args[0] === undefined) return modelLines(db);
+  if (['enable', 'disable', 'discover'].includes(args[0])) throw new UsageError(ON_THE_PAGE(`which models are on (${args[0]})`));
   throw new UsageError(`usage: ${USAGE.models}`);
 }
 
-/** `NAME=value` pairs from the command line, as an object. The values are stored as typed: `${NAME}` is filled from the shell when the server starts. */
-function pairs(list = [], flag) {
-  return Object.fromEntries(
-    list.map((pair) => {
-      const at = pair.indexOf('=');
-      if (at < 1) throw new UsageError(`${flag} takes NAME=value, not "${pair}"`);
-      const [name, value] = [pair.slice(0, at), pair.slice(at + 1)];
-      // The file never holds a token: one given in the clear is refused, with how to pass it instead — it stays in the shell.
-      if (redact(value).text !== value) {
-        throw new UsageError(`${flag} ${name} holds a token in the clear, and the file never does — export it in your shell and write \${NAME} in its place (${flag} "${name}=${value.startsWith('Bearer ') ? 'Bearer ' : ''}\${MY_TOKEN}"): it is filled in when the server starts`);
-      }
-      return [name, value];
-    }),
-  );
-}
-
-/** MCP servers: configured here, connected by every chat and job; what may run without asking is set here too. */
-async function runMcp(db, { args, flags }) {
-  const { addServer, allowedBy, CLAUDE_CODE_TOKEN, closeMcp, connect, mcpLines, mcpReady, readConfig, removeServer, setAllow } = await import('./mcp.mjs');
-  const [sub = 'list', name, ...rest] = args;
+/** MCP servers, as the settings page set them: each one connected to say how it is, and a server's tools. */
+async function runMcp(db, { args }) {
+  const { allowedBy, closeMcp, connect, mcpLines, mcpReady, readConfig } = await import('./mcp.mjs');
+  const [sub = 'list', name] = args;
   switch (sub) {
     case 'list': {
       // Connecting can take a while — each server is given up to a minute — so a terminal is told what it is waiting for.
@@ -947,29 +917,11 @@ async function runMcp(db, { args, flags }) {
         await closeMcp();
       }
     }
-    case 'add': {
-      if (!name) throw new UsageError(`usage: ${USAGE.mcp}`);
-      let spec;
-      if (flags.url) {
-        if (rest.length > 0) throw new UsageError('a server is a command or a --url, not both');
-        if (!/^https?:\/\/[^\s/]/i.test(flags.url)) throw new UsageError(`--url takes a web address, https://… — not "${flags.url}"`);
-        if (flags['from-claude'] && flags.header) throw new UsageError('a token borrowed from Claude Code or --header, not both');
-        spec = { url: flags.url, ...(flags.header ? { headers: pairs(flags.header, '--header') } : {}), ...(flags['from-claude'] ? { token: CLAUDE_CODE_TOKEN } : {}) };
-      } else if (flags['from-claude']) {
-        throw new UsageError('--from-claude goes with --url: the server Claude Code is logged in to');
-      } else if (rest.length > 0) {
-        spec = { command: rest[0], args: rest.slice(1), ...(flags.env ? { env: pairs(flags.env, '--env') } : {}) };
-      } else {
-        throw new UsageError('a server is a command (after --) or a --url:\nsumo mcp add <name> -- <command> [args...]   |   sumo mcp add <name> --url <url>');
-      }
-      addServer(name, spec);
-      const borrowed = spec.token === CLAUDE_CODE_TOKEN ? `, with Claude Code's login — log in there first: claude mcp add --transport http --scope user ${name} ${spec.url}, then claude mcp login ${name}` : '';
-      return [`added ${name} (${spec.url ? `http: ${spec.url}` : `stdio: ${[spec.command, ...spec.args].join(' ')}`}${borrowed})`, `next: sumo mcp — connects to it and lists its tools; sumo mcp allow ${name} <tool>|all — lets them run without asking`];
-    }
+    case 'add':
     case 'remove':
-      if (!name) throw new UsageError(`usage: ${USAGE.mcp}`);
-      removeServer(name);
-      return [`removed ${name}`];
+    case 'allow':
+    case 'revoke':
+      throw new UsageError(ON_THE_PAGE(`an MCP server (${sub})`));
     case 'tools': {
       if (!name) throw new UsageError(`usage: ${USAGE.mcp}`);
       const spec = readConfig().mcpServers[name];
@@ -982,14 +934,6 @@ async function runMcp(db, { args, flags }) {
       } finally {
         await session.close();
       }
-    }
-    case 'allow':
-    case 'revoke': {
-      const tool = rest[0];
-      if (!name || !tool) throw new UsageError(`usage: ${USAGE.mcp}`);
-      setAllow(name, tool, sub === 'allow');
-      if (tool === 'all') return [sub === 'allow' ? `${name}: every tool may run without asking` : `${name}: every call asks first`];
-      return [sub === 'allow' ? `${name}: ${tool} may run without asking` : `${name}: ${tool} asks first`];
     }
     default:
       throw new UsageError(`usage: ${USAGE.mcp}`);
@@ -1056,8 +1000,9 @@ export async function main(argv) {
       return 0;
     }
     if (command === 'setup') {
-      const { flags } = parse(rest, { value: ['bin-dir', 'model-source'], bool: ['no-link', 'no-model'] });
-      const lines = await setup({ binDir: flags['bin-dir'], link: !flags['no-link'], modelSource: flags['model-source'], noModel: !!flags['no-model'] });
+      if (rest.some((token) => /^--model-source(=|$)/.test(token))) throw new UsageError(ON_THE_PAGE("the local model's address (Memory › Local model), downloaded as it is set,"));
+      const { flags } = parse(rest, { value: ['bin-dir'], bool: ['no-link', 'no-model'] });
+      const lines = await setup({ binDir: flags['bin-dir'], link: !flags['no-link'], noModel: !!flags['no-model'] });
       process.stdout.write(`${lines.join('\n')}\n`);
       return 0;
     }
@@ -1101,9 +1046,21 @@ export async function main(argv) {
       return await runDoctor(flags);
     }
     if (command === 'config') {
-      const { args } = parse(rest, { value: [], bool: [] });
-      if (args[1] !== undefined && fromTool()) throw new Refusal(OWNER_ONLY);
-      process.stdout.write(`${config(args[0], args[1]).join('\n')}\n`);
+      const { args, flags } = parse(rest, { value: [], bool: ['json'] });
+      if (args[1] !== undefined) {
+        if (fromTool()) throw new Refusal(OWNER_ONLY);
+        // A name that is not a setting, or no longer one, is said as that first: what it became, or the one meant.
+        config(args[0]);
+        throw new UsageError(ON_THE_PAGE(args[0]));
+      }
+      // The page takes keys: it opens for a person at a terminal, never for the model's shell, which only reads.
+      if (args.length === 0 && !flags.json && !fromTool() && process.stdin.isTTY && process.stdout.isTTY) {
+        const { runSettings } = await import('./settings.mjs');
+        process.stdout.write(`${(await runSettings({ plain: config('chat.screen')[0].endsWith('= plain') })).join('\n')}\n`);
+        return 0;
+      }
+      const lines = config(args[0]);
+      process.stdout.write(`${flags.json ? asJson({ settings: Object.fromEntries(lines.map((l) => l.split(' = '))) })[0] : lines.join('\n')}\n`);
       return 0;
     }
 

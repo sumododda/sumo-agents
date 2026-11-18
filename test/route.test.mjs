@@ -257,7 +257,7 @@ test('a model that is off is outside the router\'s grammar and prompt; an answer
   });
   await withRouter({ model: 'sonnet', effort: 'low', reason: 'x' }, async (db, project) => {
     for (const model of MODELS) setModel(db, model, false, NOW);
-    await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), (err) => err instanceof memory.UsageError && /^no model is on — sumo models enable <name>/.test(err.message));
+    await assert.rejects(chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' }), (err) => err instanceof memory.UsageError && /^no model is on — turn one on under API models, on the settings page \(sumo config\)$/.test(err.message));
     await assert.rejects(chooseChatRoute(db, { project, text: 'hi' }), (err) => err instanceof memory.UsageError && /^no model is on/.test(err.message));
   });
 });

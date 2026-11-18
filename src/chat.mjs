@@ -99,6 +99,7 @@ function commandList(db, { effortNow = () => null, inUse = () => ({}), saved = (
     { name: 'context', hint: 'how full the context is, and what it has cost' },
     { name: 'export', args: '[path]', hint: 'save the conversation as a Markdown file' },
     { name: 'thinking', args: 'on|off', hint: "show or hide the model's thinking as it works", choices: (given) => (given.length === 0 ? ['on', 'off'] : []) },
+    { name: 'config', hint: 'every setting, on one page' },
     { name: 'help', hint: 'the commands and the keys' },
     { name: 'handoff', hint: 'start fresh from a hand-off the model writes' },
     { name: 'new', hint: 'start a fresh session (/clear does too)' },
@@ -268,7 +269,7 @@ export function contextReport({ contextTokens = 0, rows = [], turns = 0, calls =
 }
 
 /** A session past its budget, in one line: what it has cost, how to start afresh, and how to move the line. */
-const budgetLine = (cost) => `this session has cost $${cost.toFixed(2)} — /new starts a fresh one; sumo config chat.budget changes when this is said`;
+const budgetLine = (cost) => `this session has cost $${cost.toFixed(2)} — /new starts a fresh one; Spend notice, on the settings page (/config), changes when this is said`;
 
 /** Where the context is large enough that quality drops, and where it is time for /handoff: the bands the session is told about. */
 const CONTEXT_LARGE = 60_000;
@@ -320,7 +321,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   // A model the user turned off is not chatted on, however the chat came to be on it; auto reads the switches each turn.
   // A full API id is that model too (claude-opus-5-5 is opus), switched off or on with it.
   const named = MODELS.find((name) => MODEL_IDS[name] === model) ?? model;
-  if (named !== 'auto' && MODELS.includes(named)) assertOn(db, named, 'sumo config chat.model <name>');
+  if (named !== 'auto' && MODELS.includes(named)) assertOn(db, named, 'pick another Model there');
   effort ??= model === 'auto' ? null : configured(db, 'chat.effort');
   /** On auto, the route the last turn ran on; null otherwise. */
   let routed = null;
@@ -1076,7 +1077,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     const [, name, args = ''] = m;
     if (name === 'exit' || name === 'quit') return { control: 'quit' };
     if (name === 'new' || name === 'clear') return { control: 'new' };
-    if (name === 'memory' || name === 'undo' || name === 'context' || name === 'handoff') return { control: name };
+    if (name === 'memory' || name === 'undo' || name === 'context' || name === 'handoff' || name === 'config') return { control: name };
     if (name === 'model' || name === 'resume' || name === 'mcp' || name === 'copy' || name === 'help' || name === 'stop' || name === 'export' || name === 'thinking') return { control: name, args: args.trim() };
     const make = Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
     if (make) return { ...make(args.trim()), said: args.trim() };
@@ -1175,6 +1176,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     saved: () => others().map((s) => sessionLine(s, now())),
     end,
     commands,
+    /** How this chat's MCP servers connected, for the settings page: each one's name, whether it is up, its tools. */
+    mcpServers: () => (registry && !registry.error ? registry.servers() : []),
     get sessionId() {
       return sessionId;
     },

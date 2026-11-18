@@ -6,8 +6,8 @@ import { UsageError } from './memory.mjs';
 /**
  * The models Sumo can run on: the short names the router, `/model` and `sumo config` use, cheapest
  * first, and the API model each one means. Each has a switch. `sumo setup` asks the API once which
- * of them this credential can use and sets the switches from the answer; `sumo models discover` asks
- * again; `sumo models enable|disable <name>` sets one by hand. The chat, the router, the passes and a
+ * of them this credential can use and sets the switches from the answer; the settings page asks again
+ * (API models › Discover) and sets one by hand. The chat, the router, the passes and a
  * job's run all read the switches as they are now.
  */
 export const MODEL_IDS = {
@@ -58,7 +58,7 @@ export function knownModel(name, also = []) {
 /** Why `name` cannot be used right now, with the way out (`orElse` is another one), or null while it is on. */
 export function offLine(db, name, orElse) {
   if (modelStates(db)[name].on) return null;
-  return `${name} is off — sumo models enable ${name}${orElse ? `, or ${orElse}` : ''}`;
+  return `${name} is off — turn it on under API models, on the settings page (sumo config)${orElse ? `, or ${orElse}` : ''}`;
 }
 
 /** `name` is on, or a usage error saying how to turn it on. */

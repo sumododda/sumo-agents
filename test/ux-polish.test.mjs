@@ -139,7 +139,7 @@ test('sumo config lists its settings by section, and a mistyped one is answered 
   const s = sandbox();
   const keys = s.sumo(['config']).out.trim().split('\n').map((line) => line.split(' = ')[0]);
   assert.deepEqual(keys, [...keys].sort(), 'chat.*, guides.*, jobs.*, memory.*, … each together');
-  const typo = s.sumo(['config', 'chat.modle', 'sonnet']);
+  const typo = s.page(['config', 'chat.modle', 'sonnet']);
   assert.equal(typo.code, 2);
   assert.match(typo.err, /unknown setting "chat\.modle" — did you mean chat\.model\? sumo config lists them all/);
   assert.ok(typo.err.trim().length <= 100, typo.err);

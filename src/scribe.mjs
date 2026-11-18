@@ -320,8 +320,10 @@ async function ask(db, { bundle, now, quiet = false, fallback: mayPay = true }) 
   const system = readFileSync(join(REPO_ROOT, 'prompts', 'scribe.md'), 'utf8').trim();
   const schema = opsSchema(db, EXTRACTS);
   // A writer set to a model the user has since turned off is not called: the refusal is the pass's failure, in the ledger like any other.
-  const off = MODELS.includes(model) ? offLine(db, model, 'sumo config memory.model local') : null;
+  const off = MODELS.includes(model) ? offLine(db, model, 'set Memory › Filed by to local there') : null;
   let result = off ? failure(off) : await callModel(db, { system, prompt: bundle.prompt, schema, model, kind: 'scribe' });
+  // A local answer that failed (server down, bundle past its context, answer cut off) is one failed row, then one more try —
+  // when a credential is there to pay for it and a model is on to take it.
   const fallback = mayPay && !result.ok && model === 'local' && resolveAnthropicCredential() ? fallbackModel(db) : null;
   if (fallback) {
     log(result, `${result.error} — retrying on ${fallback}`);

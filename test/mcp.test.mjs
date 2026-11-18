@@ -1,14 +1,16 @@
-// MCP servers: the configuration that names them, the two transports that reach them, what their tools look like to
-// the model, the allow list every call is held to, and the `sumo mcp` commands that manage all of it.
+// MCP servers: where they are kept (a row each in memory.db, and the mcp.json they were kept in before), the two
+// transports that reach them, what their tools look like to the model, the allow list every call is held to, and the
+// `sumo mcp` commands that manage all of it.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { describeCall } from '../src/chat.mjs';
-import { allowedBy, CLAUDE_CODE_TOKEN, closeMcp, connect, DECLINED, gateMcp, isMcpTool, mcpReady, readConfig, setAllow, TOOL_SEARCH, writeConfig } from '../src/mcp.mjs';
+import { getMeta, openDb } from '../src/db.mjs';
+import { addServer, allowedBy, CLAUDE_CODE_TOKEN, closeMcp, connect, DECLINED, gateMcp, isMcpTool, mcpReady, readConfig, removeServer, setAllow, TOOL_SEARCH, writeConfig } from '../src/mcp.mjs';
 import { UsageError } from '../src/memory.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { toolView } from '../src/tty.mjs';
@@ -20,10 +22,29 @@ const FIXTURE = join(REPO_ROOT, 'test', 'fixtures', 'fake-mcp-server.mjs');
 const stdioSpec = (extra = {}) => ({ command: process.execPath, args: [FIXTURE], ...extra });
 const ALL_TOOLS = ['die', 'echo', 'env', 'flood', 'hang', 'leak', 'picture', 'shout', 'structured'];
 
-/** Writes ~/.sumo-agents/mcp.json for the home in hand. */
+/** Keeps these servers, and only these, for the home in hand. */
 function configure(servers) {
-  mkdirSync(paths().home, { recursive: true, mode: 0o700 });
   writeConfig({ mcpServers: servers });
+}
+
+/** A row put straight into the table, as one kept there before anything read the servers. */
+function storedRow(name, spec) {
+  const db = openDb();
+  try {
+    db.prepare('INSERT INTO mcp_servers (name, spec) VALUES (?, ?)').run(name, JSON.stringify(spec));
+  } finally {
+    db.close();
+  }
+}
+
+/** A meta key of the home in hand. */
+function metaOf(key) {
+  const db = openDb();
+  try {
+    return getMeta(db, key);
+  } finally {
+    db.close();
+  }
 }
 
 test('a stdio server: the handshake, every page of its tools, and each shape of answer a call can come back with', async () => {
@@ -241,7 +262,7 @@ test('the registry: every configured server connected at once, a failed one name
   }
 });
 
-test('with nothing configured there are no tools, nothing to describe, and nothing to connect to; a file that is not JSON is a named error, not a crash', async () => {
+test('with nothing configured there are no tools, nothing to describe, and nothing to connect to; an mcp.json that is not JSON is left where it is and named for doctor, not a crash', async () => {
   await withHome(freshHome(), {}, async () => {
     try {
       const registry = await mcpReady();
@@ -259,16 +280,90 @@ test('with nothing configured there are no tools, nothing to describe, and nothi
     writeFileSync(join(paths().home, 'mcp.json'), '{ not json');
     try {
       const registry = await mcpReady();
-      assert.match(registry.error, /mcp\.json/);
+      assert.equal(registry.error, null, 'the chat starts, without the servers the file would have named');
       assert.deepEqual(registry.tools(), []);
-      assert.throws(() => readConfig(), /mcp\.json/);
+      assert.deepEqual(readConfig(), { mcpServers: {} });
+      assert.equal(readFileSync(join(paths().home, 'mcp.json'), 'utf8'), '{ not json', 'the file is left as it was');
+      assert.match(metaOf('mcp.import_failed'), /mcp\.json is not valid JSON/);
     } finally {
       await closeMcp();
     }
   });
 });
 
-test('the allow list: nothing is allowed until the user says so; a tool, or a whole server; it is kept in the file for the next start, and an edit to the file reaches no running process', async () => {
+test('an mcp.json from before is brought in once: its servers keep their allow lists, a server already kept is not overwritten, and the file is renamed aside', async () => {
+  await withHome(freshHome(), { DEMO_SECRET: 'tok' }, async () => {
+    mkdirSync(paths().home, { recursive: true, mode: 0o700 });
+    const file = join(paths().home, 'mcp.json');
+    const old = { mcpServers: { demo: stdioSpec({ env: { DEMO_TOKEN: '${DEMO_SECRET}' }, allow: ['echo'] }), slack: { url: 'https://mcp.slack.com/mcp', token: CLAUDE_CODE_TOKEN, allow: 'all' } } };
+    writeFileSync(file, JSON.stringify(old), { mode: 0o600 });
+    storedRow('slack', { url: 'https://mcp.slack.com/mcp', token: CLAUDE_CODE_TOKEN });
+    assert.deepEqual(readConfig().mcpServers, { slack: { url: 'https://mcp.slack.com/mcp', token: CLAUDE_CODE_TOKEN }, demo: old.mcpServers.demo }, 'the row kept wins over the file');
+    assert.equal(existsSync(file), false);
+    assert.deepEqual(JSON.parse(readFileSync(`${file}.imported`, 'utf8')), old, 'the file is kept, whole, under a name nothing reads');
+    assert.match(metaOf('mcp.imported'), /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(metaOf('mcp.import_failed'), null);
+    try {
+      const registry = await mcpReady();
+      assert.equal(registry.allowed('mcp__demo__echo'), true, 'what the user allowed in the file still runs unasked');
+      assert.equal(registry.allowed('mcp__demo__shout'), false);
+    } finally {
+      await closeMcp();
+    }
+  });
+  // A name taken already, by a copy of an earlier import: the file is put beside it, and the copy is left as it was.
+  await withHome(freshHome(), {}, () => {
+    mkdirSync(paths().home, { recursive: true, mode: 0o700 });
+    writeFileSync(join(paths().home, 'mcp.json.imported'), 'an earlier copy');
+    writeFileSync(join(paths().home, 'mcp.json'), JSON.stringify({ mcpServers: { demo: stdioSpec() } }));
+    assert.deepEqual(Object.keys(readConfig().mcpServers), ['demo']);
+    assert.equal(readFileSync(join(paths().home, 'mcp.json.imported'), 'utf8'), 'an earlier copy');
+    assert.deepEqual(readdirSync(paths().home).filter((n) => n.startsWith('mcp.json')).map((n) => n.replace(/\d+$/, 'N')).sort(), ['mcp.json.imported', 'mcp.json.imported-N']);
+  });
+});
+
+test('an mcp.json made after the import is never read: a file the model\'s shell could make is not servers allowed to run', async () => {
+  await withHome(freshHome(), {}, async () => {
+    configure({ demo: stdioSpec() });
+    const planted = join(paths().home, 'mcp.json');
+    writeFileSync(planted, JSON.stringify({ mcpServers: { x: { command: '/bin/sh', args: ['-c', 'echo pwned'], allow: 'all' }, demo: stdioSpec({ allow: 'all' }) } }));
+    assert.deepEqual(readConfig().mcpServers, { demo: stdioSpec() });
+    setAllow('demo', 'echo', true);
+    assert.deepEqual(readConfig().mcpServers, { demo: stdioSpec({ allow: ['echo'] }) }, 'a write does not bring it in either');
+    try {
+      const registry = await mcpReady();
+      assert.deepEqual(registry.servers().map((s) => s.name), ['demo']);
+      assert.equal(registry.allowed('mcp__demo__shout'), false);
+    } finally {
+      await closeMcp();
+    }
+    assert.equal(existsSync(planted), true, 'left where it was, unread');
+    assert.equal(existsSync(`${planted}.imported`), false);
+  });
+});
+
+test('an mcp.json that does not read is left where it is, its reason kept for sumo doctor, and the servers already kept still come back', async () => {
+  for (const [text, why] of [
+    ['{ "mcpServers": ', /mcp\.json is not valid JSON: /],
+    ['[1, 2]', /mcp\.json should hold an object with "mcpServers" in it/],
+    ['{ "mcpServers": ["demo"] }', /"mcpServers" in .*mcp\.json should be an object: a server per name/],
+  ]) {
+    await withHome(freshHome(), {}, () => {
+      storedRow('demo', stdioSpec({ allow: ['echo'] }));
+      const file = join(paths().home, 'mcp.json');
+      writeFileSync(file, text, { mode: 0o600 });
+      assert.deepEqual(readConfig().mcpServers, { demo: stdioSpec({ allow: ['echo'] }) });
+      assert.equal(readFileSync(file, 'utf8'), text, 'the file is left as it was');
+      const failed = metaOf('mcp.import_failed');
+      assert.match(failed, why);
+      assert.ok(failed.includes(file), 'the reason names the file');
+      assert.equal(failed.includes('\n'), false, 'in one line');
+      assert.notEqual(metaOf('mcp.imported'), null, 'tried once, and not again');
+    });
+  }
+});
+
+test('the allow list: nothing is allowed until the user says so; a tool, or a whole server; it is kept in memory.db for the next start, and a change made elsewhere reaches no running process', async () => {
   await withHome(freshHome(), {}, async () => {
     configure({ demo: stdioSpec() });
     try {
@@ -277,12 +372,12 @@ test('the allow list: nothing is allowed until the user says so; a tool, or a wh
       registry.allow('mcp__demo__echo');
       assert.equal(registry.allowed('mcp__demo__echo'), true);
       assert.equal(registry.allowed('mcp__demo__shout'), false);
-      assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo'], 'written to the file, for the next session');
-      assert.equal(statSync(join(paths().home, 'mcp.json')).mode & 0o777, 0o600);
-      // Edited in the file meanwhile — by the user in another terminal, or by the model's shell: what this process holds is what it read
-      // when it connected, plus what the user allowed at the keyboard. The file is for the next start.
+      assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo'], 'kept in its row, for the next session');
+      assert.equal(existsSync(join(paths().home, 'mcp.json')), false, 'no file is written');
+      // Changed meanwhile — by the user in another terminal: what this process holds is what it read when it connected,
+      // plus what the user allowed at the keyboard. The change is for the next start.
       setAllow('demo', 'all', true);
-      assert.equal(registry.allowed('mcp__demo__shout'), false, 'a file edit does not open a tool in a running process');
+      assert.equal(registry.allowed('mcp__demo__shout'), false, 'a change made elsewhere does not open a tool in a running process');
       assert.equal(registry.servers().find((s) => s.name === 'demo').spec.allow.includes('echo'), true, 'the screen shows what holds here');
       setAllow('demo', 'all', false);
       assert.equal(registry.allowed('mcp__demo__echo'), true, 'nor does one close what the user allowed here');
@@ -307,7 +402,7 @@ test('the gate: an allowed tool passes; one that is not asks the user once, and 
       const call = { type: 'tool_use', id: 't1', name: 'mcp__demo__echo', input: { text: 'hi' } };
       const nobody = await gateMcp(call);
       assert.equal(nobody.isError, true);
-      assert.match(nobody.content, /mcp__demo__echo needs the user's approval[\s\S]*sumo mcp allow demo echo/);
+      assert.match(nobody.content, /mcp__demo__echo needs the user's approval[\s\S]*on the settings page: \/config in the chat, or sumo config \(MCP servers, demo, echo\)/);
 
       const asked = [];
       const approve = (answer) => async (ask) => {
@@ -357,7 +452,26 @@ test('an MCP call on the screen: the server and the tool with what it was given,
   assert.deepEqual(TOOL_SEARCH, { type: 'tool_search_tool_regex_20251119', name: 'tool_search_tool_regex' });
 });
 
-test('sumo mcp: servers are added without their secrets, listed with their tools or why they failed, allowed, and removed', () => {
+test('the list is changed only through its checks: a name, a command or a URL, never plain http over the network, never a server added twice; a placeholder is stored, never its value', async () => {
+  await withHome(freshHome(), {}, () => {
+    assert.deepEqual(addServer('demo', stdioSpec({ env: { DEMO_TOKEN: '${DEMO_SECRET}' } })), stdioSpec({ env: { DEMO_TOKEN: '${DEMO_SECRET}' } }));
+    assert.deepEqual(readConfig().mcpServers.demo.env, { DEMO_TOKEN: '${DEMO_SECRET}' }, 'the placeholder is stored, never the value');
+    assert.equal(existsSync(join(paths().home, 'mcp.json')), false, 'no file: the servers are rows in memory.db');
+    setAllow('demo', 'echo', true);
+    assert.throws(() => addServer('demo', stdioSpec()), /demo is already here — remove it first, on the settings page: \/config in the chat, or sumo config/);
+    assert.deepEqual(readConfig().mcpServers.demo.allow, ['echo'], 'an allow list is never lost to a retyped add');
+    assert.throws(() => addServer('bad name', stdioSpec()), /"bad name" is not a server name/);
+    assert.throws(() => addServer('two__parts', stdioSpec()), /not two underscores together/);
+    assert.throws(() => addServer('nothing', {}), /a server is a command to run or a URL to reach/);
+    assert.throws(() => addServer('clear', { url: 'http://example.test/mcp', headers: { Authorization: 'Bearer ${DEMO_SECRET}' } }), /plain http.*clear text.*https:\/\//, 'a token over plain http to a host on the network is refused');
+    addServer('local', { url: 'http://127.0.0.1:1/mcp' });
+    removeServer('local');
+    assert.throws(() => removeServer('local'), /no MCP server called local — sumo mcp lists them/);
+    assert.deepEqual(Object.keys(readConfig().mcpServers), ['demo']);
+  });
+});
+
+test('sumo mcp lists each server with where it is, what it is given (names, never values) and its tools, or why it failed; adding, removing and allowing are on the settings page', async () => {
   const s = sandbox();
   const run = (args, extra) => {
     const r = s.sumo(['mcp', ...args], extra);
@@ -365,84 +479,47 @@ test('sumo mcp: servers are added without their secrets, listed with their tools
   };
   /** The shell a server starts from, with the token its placeholder names. */
   const secret = { extraEnv: { DEMO_SECRET: 'tok' } };
-  assert.match(run([]).out, /no MCP servers configured/);
-  assert.match(run([]).out, /sumo mcp add/);
+  assert.match(run([]).out, /no MCP servers configured — add one on the settings page: \/config in the chat, or sumo config/);
 
-  const added = run(['add', 'demo', '--env', 'DEMO_TOKEN=${DEMO_SECRET}', '--', process.execPath, FIXTURE]);
-  assert.equal(added.code, 0, added.err);
-  assert.match(added.out, /added demo/);
-  const file = join(s.home, 'mcp.json');
-  assert.equal(statSync(file).mode & 0o777, 0o600);
-  const stored = JSON.parse(readFileSync(file, 'utf8')).mcpServers.demo;
-  assert.deepEqual(stored, { command: process.execPath, args: [FIXTURE], env: { DEMO_TOKEN: '${DEMO_SECRET}' } }, 'the placeholder is stored, never the value');
-
-  const again = run(['add', 'demo', '--', 'x']);
-  assert.equal(again.code, 2);
-  assert.match(again.err, /demo is already configured/);
-  assert.equal(run(['add', 'bad name', '--', 'x']).code, 2);
-  assert.equal(run(['add', 'nothing']).code, 2, 'a server needs a command or a URL');
-  assert.match(run(['add', 'nothing']).err, /--url|command/);
-  const web = run(['add', 'web', '--url', 'http://127.0.0.1:1/mcp', '--header', 'Authorization=Bearer ${DEMO_SECRET}']);
-  assert.equal(web.code, 0, web.err);
-  const clear = run(['add', 'clear', '--url', 'http://example.test/mcp', '--header', 'Authorization=Bearer ${DEMO_SECRET}']);
-  assert.equal(clear.code, 2, 'a token over plain http to a host on the network is refused');
-  assert.match(clear.err, /plain http.*clear text.*https:\/\//);
-  assert.equal(run(['add', 'tls', '--url', 'https://example.test/mcp']).code, 0);
-  assert.equal(run(['remove', 'tls']).code, 0);
-  // A token in the clear would sit in the file: it is refused, with the way to pass it from the shell instead.
-  // Made up, and put together here so no token-shaped string sits in the source for a scanner to stop.
-  const madeUp = ['ghp', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('_');
-  const literal = run(['add', 'leak', '--url', 'https://example.test/mcp', '--header', `Authorization=Bearer ${madeUp}`]);
-  assert.equal(literal.code, 2);
-  assert.match(literal.err, /--header Authorization holds a token in the clear, and the file never does — export it in your shell and write \$\{NAME\} in its place \(--header "Authorization=Bearer \$\{MY_TOKEN\}"\)/);
-  assert.doesNotMatch(readFileSync(file, 'utf8'), /ghp_/);
-  assert.match(run(['add', 'ftp', '--url', 'ftp://example.test/mcp']).err, /--url takes a web address, https:\/\/… — not "ftp:\/\/example\.test\/mcp"/);
-  // A token borrowed from Claude Code: the file says only that, and the listing says whose the token is.
-  const slack = run(['add', 'slack', '--url', 'https://mcp.slack.com/mcp', '--from-claude']);
-  assert.equal(slack.code, 0, slack.err);
-  assert.match(slack.out, /added slack \(http: https:\/\/mcp\.slack\.com\/mcp, with Claude Code's login — log in there first: claude mcp add --transport http --scope user slack https:\/\/mcp\.slack\.com\/mcp, then claude mcp login slack\)/);
-  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).mcpServers.slack, { url: 'https://mcp.slack.com/mcp', token: 'claude-code' });
-  assert.match(run(['add', 'both', '--url', 'https://example.test/mcp', '--from-claude', '--header', 'A=b']).err, /Claude Code or --header, not both/);
-  assert.match(run(['add', 'nourl', '--from-claude', '--', 'x']).err, /--from-claude goes with --url/);
+  await withHome(s.home, {}, () => {
+    addServer('demo', { command: process.execPath, args: [FIXTURE], env: { DEMO_TOKEN: '${DEMO_SECRET}' } });
+    addServer('web', { url: 'http://127.0.0.1:1/mcp', headers: { Authorization: 'Bearer ${DEMO_SECRET}' } });
+    // A token borrowed from Claude Code: its row says only that, and the listing says whose the token is.
+    addServer('slack', { url: 'https://mcp.slack.com/mcp', token: CLAUDE_CODE_TOKEN });
+  });
   /** Claude Code's credentials, with no login for Slack: the listing is told what to run, and the keychain is never asked. */
   const claude = { extraEnv: { ...secret.extraEnv, CLAUDE_CONFIG_DIR: claudeConfigDir({}) } };
-
   const listed = run([], claude);
+  assert.equal(listed.code, 0, listed.err);
   assert.match(listed.out, /slack\s+http: https:\/\/mcp\.slack\.com\/mcp   with Claude Code's login/);
   assert.match(listed.out, /failed: no Claude Code login for https:\/\/mcp\.slack\.com\/mcp — run: claude mcp add --transport http --scope user slack https:\/\/mcp\.slack\.com\/mcp, then: claude mcp login slack/);
-  assert.equal(run(['remove', 'slack']).code, 0);
-  assert.equal(listed.code, 0, listed.err);
   assert.match(listed.out, /demo\s+stdio: .*fake-mcp-server\.mjs/);
   assert.match(listed.out, /env: DEMO_TOKEN/, 'the names the server is given');
   assert.doesNotMatch(listed.text, /tok\b|DEMO_SECRET\}/, 'never a value');
   assert.match(listed.out, /9 tools · allowed: none/);
   assert.match(listed.out, /web\s+http: http:\/\/127\.0\.0\.1:1\/mcp/);
-  assert.match(listed.out, /failed: /);
 
   const tools = run(['tools', 'demo'], secret);
   assert.equal(tools.code, 0, tools.err);
   assert.match(tools.out, /^\s+echo\s+Says the text back\. Use it to test the connection\./m);
   assert.match(run(['tools', 'nowhere']).err, /no MCP server called nowhere/);
-
-  assert.match(run(['allow', 'demo', 'echo']).out, /demo: echo may run without asking/);
-  assert.match(run(['allow', 'demo', 'all']).out, /demo: every tool may run without asking/);
-  assert.match(run([], secret).out, /allowed: all/);
-  assert.match(run(['revoke', 'demo', 'all']).out, /demo: every call asks first/);
-  assert.match(run(['allow', 'demo', 'echo']).out, /echo may run/);
+  await withHome(s.home, {}, () => setAllow('demo', 'echo', true));
   assert.match(run(['tools', 'demo'], secret).out, /^\s+echo\s+\(allowed\)/m);
-  assert.match(run(['revoke', 'demo', 'echo']).out, /demo: echo asks first/);
-  assert.equal(run(['allow', 'demo']).code, 2, 'allow needs a tool, or all');
+  assert.match(run([], secret).out, /allowed: echo/);
 
-  assert.match(run(['remove', 'web']).out, /removed web/);
-  assert.match(run(['remove', 'web']).err, /no MCP server called web/);
-  assert.doesNotMatch(run([]).out, /web/);
+  for (const sub of ['add', 'remove', 'allow', 'revoke']) {
+    const retired = run([sub, 'demo', 'echo']);
+    assert.equal(retired.code, 2, `sumo mcp ${sub}`);
+    assert.match(retired.err, /settings page/);
+  }
+  assert.deepEqual(await withHome(s.home, {}, () => readConfig().mcpServers.demo.allow), ['echo'], 'nothing was changed by them');
   assert.equal(run(['frobnicate']).code, 2);
   assert.match(s.sumo(['help']).out, /sumo mcp/);
 });
 
-test('sumo mcp exits 1 when every configured server failed, so a script can tell', () => {
+test('sumo mcp exits 1 when every configured server failed, so a script can tell', async () => {
   const s = sandbox();
-  s.sumo(['mcp', 'add', 'gone', '--', '/no/such/binary']);
+  await withHome(s.home, {}, () => configure({ gone: { command: '/no/such/binary', args: [] } }));
   const listed = s.sumo(['mcp']);
   assert.equal(listed.code, 1);
   assert.match(listed.out, /gone\s+stdio: \/no\/such\/binary\n\s+failed: /);
@@ -451,7 +528,7 @@ test('sumo mcp exits 1 when every configured server failed, so a script can tell
 test('Ctrl-C while sumo mcp waits on a server ends it as a Ctrl-C does, and the server it started goes with it', async () => {
   const s = sandbox();
   const pidFile = join(s.root, 'server.pid');
-  assert.equal(s.sumo(['mcp', 'add', 'slow', '--', '/bin/sh', '-c', `echo $$ > ${pidFile}; exec sleep 300`]).code, 0);
+  await withHome(s.home, {}, () => configure({ slow: { command: '/bin/sh', args: ['-c', `echo $$ > ${pidFile}; exec sleep 300`] } }));
   const listing = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', ENTRY, 'mcp'], { env: { ...process.env, ...NO_KEY, SUMO_AGENTS_HOME: s.home }, stdio: 'ignore' });
   const ended = new Promise((resolve) => listing.on('close', (code, signal) => resolve({ code, signal })));
   const alive = (pid) => {

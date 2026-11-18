@@ -65,15 +65,16 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 - On macOS the agent's shell runs in a sandbox: it writes only in the project, the temporary folders, Sumo's
   home and the tool caches — never in git's hooks or config, nor Sumo's own memory, settings or MCP servers. A
   plain `sumo …` command it runs is run as Sumo itself, where what only you may change is refused. A write the
-  sandbox blocks is put to you once to run outside it. `sumo config shell.network off` keeps it off the network.
+  sandbox blocks is put to you once to run outside it. Shell › Network, on the settings page, keeps it off the network.
 - An MCP server that takes only a registered app's login, as Slack's official one does, is reached through
   Claude Code's: `claude mcp add --transport http --scope user slack https://mcp.slack.com/mcp`, `claude mcp login slack`,
-  then `sumo mcp add slack --url https://mcp.slack.com/mcp --from-claude`. Sumo borrows the token and never refreshes it.
+  then add it on the settings page with Claude Code's login, or bring it in from Claude Code's list there. Sumo
+  borrows the token and never refreshes it.
   On macOS the token is read from the keychain: when macOS asks, choose Always Allow.
 - The editor reads any file but changes only the project's. A change to one outside it — a config file in
   your home, say — is put to you with the change: once, or that file or its directory for the rest of the
   session, where the shell may then write too. The home itself is never opened that way. A file something
-  else reads later — your shell's rc files, `.envrc`, `.npmrc`, `.vscode`, `.mcp.json`, Sumo's own MCP file —
+  else reads later — your shell's rc files, `.envrc`, `.npmrc`, `.vscode`, `.mcp.json` —
   is changed only when you say so, each time, under any spelling of its name.
 - Any of these questions can be refused with your reason: `r`, type why, Enter. The model reads it as what to
   do instead. Questions from several jobs queue, and the one shown says how many wait behind it.
@@ -106,27 +107,34 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 
 ## Configuration
 
-`sumo config <key> <value>` sets one; `sumo config` lists all fifteen, in this order:
+Every setting is on one page: `/config` in a chat, or `sumo config` at a terminal. The arrows change a setting and
+it is saved as it changes; Esc closes the page and says what changed. There is no config file to edit: the settings,
+the API models' switches and the MCP servers with their allow lists all live in Sumo's database (an `mcp.json` from an
+earlier Sumo is moved in once and renamed `mcp.json.imported`). Turning the sandbox off, and removing a server, ask
+first. Piped, with a key (`sumo config jobs.review`) or `--json`, `sumo config` prints the settings and changes nothing.
 
-| Key | Default | What it does |
+| Setting | Default | What it does |
 |---|---|---|
-| `chat.budget` | `5` | Dollars a chat session costs before the screen says so; `0` never. |
-| `chat.effort` | `medium` | Effort when the chat model is fixed. |
-| `chat.model` | `opus` | What the chat runs on. `auto` lets the local router pick per turn. |
-| `chat.notify` | `on` | `off` stops the bell and the notification when a long turn ends behind another window. |
-| `chat.screen` | `full` | `still` keeps the working line's spinner still. `plain` draws the chat for a screen reader: words, not pictures (no logo), ASCII marks (`x` a failure, `*` at work, `>` your prompt), no rule over the box or bar beside a question, and nothing that moves or ticks. |
-| `jobs.advisor` | `off` | `on` lets a job ask the next model up for advice. |
-| `jobs.budget` | `10` | Dollars one job may spend before it is stopped; `0` for no cap. |
-| `jobs.floor` | `haiku` | The smallest model a job may run on: `sonnet` keeps every job off Haiku, `opus` puts them all on Opus or Fable. |
-| `jobs.minutes` | `60` | Minutes one job may run before it is stopped; `0` for no limit. |
-| `jobs.review` | `risky` | Which verified work gets a reviewer without asking: `risky`, `all` or `off`. |
-| `memory.model` | `local` | What the memory pass runs on: `local`, a model name, or `off` (the chat then saves what lasts itself). |
-| `model.url` | `https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf` | The local model's download address, a `.gguf` file. Run `sumo setup` after changing it; `sumo setup --model-source <base>` puts a mirror in front of the same file. |
-| `projects.home` | `~` | Where new projects are created. |
-| `shell.network` | `on` | `off` keeps the sandboxed shell to this machine. |
-| `shell.sandbox` | `on` | The agent's shell in the macOS sandbox. Read when a chat or job starts. |
+| Chat › Spend notice (`chat.budget`) | `5` | Dollars a chat session costs before the screen says so; `0` never. |
+| Chat › Effort (`chat.effort`) | `medium` | Effort when the chat model is fixed. |
+| Chat › Model (`chat.model`) | `opus` | What the chat runs on. `auto` lets the local router pick per turn. |
+| Chat › Notify (`chat.notify`) | `on` | `off` stops the bell and the notification when a long turn ends behind another window. |
+| Chat › Screen (`chat.screen`) | `full` | `still` keeps the working line's spinner still. `plain` draws the chat for a screen reader: words, not pictures (no logo), ASCII marks (`x` a failure, `*` at work, `>` your prompt), no rule over the box or bar beside a question, and nothing that moves or ticks. |
+| Jobs › Advisor (`jobs.advisor`) | `off` | `on` lets a job ask the next model up for advice. |
+| Jobs › Budget (`jobs.budget`) | `10` | Dollars one job may spend before it is stopped; `0` for no cap. |
+| Jobs › Smallest model (`jobs.floor`) | `haiku` | The smallest model a job may run on: `sonnet` keeps every job off Haiku, `opus` puts them all on Opus or Fable. |
+| Jobs › Time limit (`jobs.minutes`) | `60` | Minutes one job may run before it is stopped; `0` for no limit. |
+| Jobs › Review (`jobs.review`) | `risky` | Which verified work gets a reviewer without asking: `risky`, `all` or `off`. |
+| Memory › Filed by (`memory.model`) | `local` | What the memory pass runs on: `local`, a model name, or `off` (the chat then saves what lasts itself). |
+| Memory › Local model (`model.url`) | `https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf` | The local model's download address, a `.gguf` file — a mirror's too. Downloaded as it is set. |
+| Projects › New ones go in (`projects.home`) | `~` | Where new projects are created. |
+| Shell › Network (`shell.network`) | `on` | `off` keeps the sandboxed shell to this machine. |
+| Shell › Sandbox (`shell.sandbox`) | `on` | The agent's shell in the macOS sandbox. Read when a chat or job starts. |
 
-The API model switches and the environment variables are in
+Under them, **API models** has a switch for each model and **Discover**, which asks the API which this login can use.
+**MCP servers** lists each server: Enter shows its tools, each switched to run without asking or to ask first;
+**+ add a server** takes a pasted command or address, or brings servers in from Claude Code. A token is never typed
+into the page: a header or variable names it as `${NAME}`, filled from your shell. The environment variables are in
 [Install](https://github.com/sumododda/sumo-agents/wiki/Install#configuration).
 
 ## Uninstall

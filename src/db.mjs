@@ -445,6 +445,15 @@ const MIGRATIONS = [
         WHERE was_read = 1 GROUP BY session_id, run ORDER BY MIN(id);
     `);
   },
+  // 18 — MCP servers, a row each: the spec as mcp.json held it (a command with its args and env, or a url with its headers
+  // or token, and the allow list), as JSON. The file is brought in once, the first time the servers are read (mcp.mjs), and
+  // never read again: the model's shell could make a file of that name, never a row here.
+  `
+  CREATE TABLE IF NOT EXISTS mcp_servers (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL
+  ) STRICT;
+  `,
 ];
 
 /**

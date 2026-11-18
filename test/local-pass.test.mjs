@@ -56,7 +56,7 @@ test('without a credential a failed local call is the failure: nothing is filed,
 
 test('a writer set to haiku still goes straight to the API model, as before', () => {
   const s = sandbox();
-  s.sumo(['config', 'memory.model', 'haiku']);
+  s.page(['config', 'memory.model', 'haiku']);
   s.hook('prompt', { session_id: 'one', prompt: 'from now on always squash merge' });
   s.modelWillSay([]);
   assert.match(s.sumo(['memory', 'run']).out, /^read 1 turns/);

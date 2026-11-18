@@ -199,7 +199,7 @@ test('sumo memory eval that could not ask the model exits 1, as text and as --js
   assert.equal(down.code, 1);
   assert.equal(s.sumo(['memory', 'eval', '--json']).code, 1);
 
-  s.sumo(['config', 'memory.model', 'off']);
+  s.page(['config', 'memory.model', 'off']);
   const off = s.sumo(['memory', 'eval']);
   assert.match(off.out, /not replayed — the memory pass is off/);
   assert.equal(off.code, 1);

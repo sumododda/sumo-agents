@@ -741,7 +741,7 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   if (job.status !== 'running' && job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — only a running job can be run`);
   if (!job.model) throw new UsageError(`j${id} has no route — it was created before routing existed; create it again`);
   if (MODELS.includes(job.model) && !usableModels(db).includes(job.model)) {
-    throw new UsageError(`j${id} is routed to ${job.model}, which is off — sumo models enable ${job.model}, or abandon it and create it again`);
+    throw new UsageError(`j${id} is routed to ${job.model}, which is off — turn it on under API models, on the settings page (sumo config), or abandon it and create it again`);
   }
   const project = getProject(db, job.project);
   const tree = treeOf(db, id);
@@ -890,8 +890,8 @@ export function stopReason(stop, detail = null) {
   if (stop === 'model_context_window_exceeded') return 'stopped: the conversation no longer fits in the model\'s context';
   if (stop === 'max_turns') return `stopped: ${MAX_TURNS} turns without an end`;
   if (stop === 'loop') return `stopped: the same call, or the same round of calls, was made ${REPEAT_STOP_AT} times in a row`;
-  if (stop === 'budget') return 'stopped: the job reached its budget — sumo config jobs.budget sets it, 0 for none';
-  if (stop === 'time') return 'stopped: the job reached its time limit — sumo config jobs.minutes sets it, 0 for none';
+  if (stop === 'budget') return 'stopped: the job reached its budget — Jobs › Budget, on the settings page (sumo config), sets it; 0 for none';
+  if (stop === 'time') return 'stopped: the job reached its time limit — Jobs › Time limit, on the settings page (sumo config), sets it; 0 for none';
   if (stop === 'advisor') return `stopped: the advisor was asked ${ADVISOR_STOP_AT} times`;
   if (stop === 'declined') return `stopped: the user declined ${DECLINE_STOP_AT} calls`;
   return null;

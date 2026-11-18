@@ -1185,7 +1185,7 @@ test('the commands of the menu work from inside a project: the guide comes with 
 
       // The guide is named, and comes through the prompt hook as an operator message — not a path the tools cannot reach from the project.
       assert.deepEqual(session.expand('/fix the login bug'), { text: 'Fix this: the login bug', said: 'the login bug', guide: 'fix' });
-      assert.equal(session.expand('/toString').error, 'no command /toString — one of: /fix /feature /review /model /memory /mcp /resume /copy /undo /stop /context /export /thinking /help /handoff /new /exit');
+      assert.equal(session.expand('/toString').error, 'no command /toString — one of: /fix /feature /review /model /memory /mcp /resume /copy /undo /stop /context /export /thinking /config /help /handoff /new /exit');
 
       await session.say('tidy my memory');
       assert.match(seen[1].messages.at(-1).content[0].content, /^(?:tidy: )?(?:nothing to do — |read \d+ sessions)/m, 'the pass ran in this process, and tidied when asked');
@@ -1483,12 +1483,12 @@ test('a model that is off cannot be chatted on: not by configuration, not by /mo
       setModel(db, 'fable', false, NOW);
       assert.throws(
         () => createChat(db, { model: 'fable', effort: 'high', cwd: tmpdir(), send: () => assert.fail('never sent'), now: () => NOW }),
-        (err) => err instanceof UsageError && err.message === 'fable is off — sumo models enable fable, or sumo config chat.model <name>',
+        (err) => err instanceof UsageError && err.message === 'fable is off — turn it on under API models, on the settings page (sumo config), or pick another Model there',
       );
 
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send: () => assert.fail('never sent'), now: () => NOW });
       session.start('startup');
-      assert.throws(() => session.route('fable'), /fable is off — sumo models enable fable/);
+      assert.throws(() => session.route('fable'), /fable is off — turn it on under API models/);
       assert.equal(session.route(''), 'opus/high', 'a refused change changes nothing');
       const model = session.commands.find((c) => c.name === 'model');
       // Each is offered with what it is for, by its name.
@@ -1705,7 +1705,7 @@ test('the chat offers the MCP tools behind tool search, names the servers to the
       await quiet.say('shout');
       const refused = piped.seen[1].messages.at(-1).content[0];
       assert.equal(refused.is_error, true);
-      assert.match(refused.content, /needs the user's approval[\s\S]*sumo mcp allow demo shout/);
+      assert.match(refused.content, /needs the user's approval[\s\S]*on the settings page: \/config in the chat, or sumo config \(MCP servers, demo, shout\)/);
 
       // Piped, /mcp prints the same lines under the mark a command's result gets.
       const printed = [];

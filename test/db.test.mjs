@@ -294,7 +294,7 @@ test('a database at schema 15, with rows in every state, becomes the layered mem
   const before = Date.now();
   const db = openDb(file);
   try {
-    assert.equal(schemaVersion(db), 17);
+    assert.equal(schemaVersion(db), 18);
     const columns = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((c) => `${c.name} ${c.type}`);
     assert.deepEqual(columns('user_turns').slice(-3), ['project TEXT', 'full_len INTEGER', 'sha TEXT']);
     assert.equal(columns('memories').at(-1), 'derived_by TEXT');
@@ -400,7 +400,7 @@ test('a database that ran migration 16 as it first shipped is mended by 17: what
 
   const db = openDb(file);
   try {
-    assert.equal(schemaVersion(db), 17);
+    assert.equal(schemaVersion(db), 18);
     const memories = db.prepare('SELECT id, type, state, held_for, invalid_at FROM memories ORDER BY id').all();
     assert.deepEqual(memories.map((m) => `m${m.id} ${m.state} ${m.held_for}`), [
       'm1 active null',
@@ -439,7 +439,7 @@ test('a new database is made at the current schema, with nothing for migration 1
   await withHome(freshHome(), {}, async () => {
     const db = openDb();
     try {
-      assert.equal(schemaVersion(db), 17);
+      assert.equal(schemaVersion(db), 18);
       assert.deepEqual(['memories', 'memory_events', 'extractions'].map((table) => db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n), [0, 0, 0]);
     } finally {
       db.close();

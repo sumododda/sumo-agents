@@ -128,12 +128,12 @@ test('a limit set with sumo config is a whole number of minutes, 0 or more; anyt
   const s = sandbox();
   assert.match(s.sumo(['config', 'jobs.minutes']).out, /^jobs\.minutes = 60$/m);
   for (const bad of ['soon', '-1', '1.5', '', '10m']) {
-    const run = s.sumo(['config', 'jobs.minutes', bad]);
+    const run = s.page(['config', 'jobs.minutes', bad]);
     assert.equal(run.code, 2, `"${bad}" → ${run.out}`);
     assert.match(run.err, /jobs\.minutes needs a whole number of minutes, 0 or more/);
   }
   assert.match(s.sumo(['config', 'jobs.minutes']).out, /^jobs\.minutes = 60$/m, 'a refused value is not stored');
-  for (const good of ['0', '90']) assert.ok(s.sumo(['config', 'jobs.minutes', good]).out.split('\n').includes(`jobs.minutes = ${good}`), good);
+  for (const good of ['0', '90']) assert.ok(s.page(['config', 'jobs.minutes', good]).out.split('\n').includes(`jobs.minutes = ${good}`), good);
 });
 
 test('a job near its time is told once to close, and at its time it is stopped with its last round answered; the run told to close goes on with the same clock', async () => {
@@ -160,7 +160,7 @@ test('a job near its time is told once to close, and at its time it is stopped w
       const warned = seen.map((m) => m.content.filter((b) => b.type === 'text' && /minutes/.test(b.text)).map((b) => b.text));
       assert.deepEqual(warned.map((w) => w.length), [0, 0, 0, 1]);
       assert.match(warned[3][0], /^This job has run 9 of its 10 minutes, and is stopped when it reaches them\. Close it with `finish` now: DONE only if the work is verified, otherwise FAILED/);
-      assert.equal(stopReason('time'), 'stopped: the job reached its time limit — sumo config jobs.minutes sets it, 0 for none');
+      assert.equal(stopReason('time'), 'stopped: the job reached its time limit — Jobs › Time limit, on the settings page (sumo config), sets it; 0 for none');
       assert.ok(runLines(outcome).includes(stopReason('time')));
 
       // A job that ended its turn past its time is told to close, and that run starts on the same clock: it sends nothing.

@@ -188,7 +188,7 @@ const askRouter = (db, { agent, project, task, title, retryOf }) => askFor(db, a
 
 async function askFor(db, system, prompt, models = usableModels(db)) {
   const usable = models;
-  if (usable.length === 0) throw new UsageError('no model is on — sumo models enable <name>');
+  if (usable.length === 0) throw new UsageError('no model is on — turn one on under API models, on the settings page (sumo config)');
   const result = await callLocalModel(db, { system, prompt, schema: routerSchema(usable) });
   if (!result.ok) return { ok: false, error: result.error };
   const { model, effort, reason, risky } = result.data ?? {};
