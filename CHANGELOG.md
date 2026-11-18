@@ -4,6 +4,8 @@ What each release changed for you. The commit of each version has the full detai
 
 ## Unreleased
 
+## 0.7.0 — 2026-11-18
+
 - **A new effort after a turn that failed no longer breaks the chat.** When a turn ended before the model answered
   (an error, or Esc), and the effort then changed (`/model opus high`, or auto picking a new one), every later
   message was refused: `400 … role 'system' must precede an 'assistant' message`, until `/new`. The note sumo had
