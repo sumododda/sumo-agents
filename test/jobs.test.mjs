@@ -247,6 +247,22 @@ test('sumo job watch shows what a job running in the chat does, from the top, an
   assert.match(s.sumo(['job', 'watch', '1']).out, /^j1 is abandoned — nothing is running/);
 });
 
+test('sumo job watch ends by itself when the chat running the job is gone — its lock free, no end written — instead of waiting for ever', () => {
+  const s = sandbox();
+  s.routerWillSay('haiku', 'low');
+  withSimba(s);
+  s.sumo(['job', 'new', '--project', 'simba', '--title', 'look', '--agent', 'scout'], { input: TASK });
+  // A chat that crashed mid-run: its record stops part way, and the lock names a process that is no longer there.
+  writeFileSync(join(s.home, 'jobs', '1', 'live.log'), '⏺ j1 scout · haiku — look\n  ⏺ $ ls\n');
+  writeFileSync(join(s.home, 'jobs', '1', 'run.lock'), '999999');
+  s.sql((db) => db.prepare(`UPDATE jobs SET status = 'running' WHERE id = 1`).run());
+  const began = Date.now();
+  const watched = s.sumo(['job', 'watch', '1']);
+  assert.equal(watched.code, 0, watched.err);
+  assert.equal(watched.out, '⏺ j1 scout · haiku — look\n  ⏺ $ ls\nj1 stopped without an end: the process running it is gone — sumo job show j1 says where it got to\n');
+  assert.ok(Date.now() - began < 15_000, 'a few seconds of grace, then the end');
+});
+
 test('a job is said as it is: not started until a run takes it, running while one holds it, stopped when a stop left it open', () => {
   const s = sandbox();
   s.routerWillSay('haiku', 'low');

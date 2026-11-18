@@ -24,7 +24,25 @@ describe('the chat terminal rendering', () => {
     assert.equal(renderLine('x'.repeat(25), off, { width: 10 }), 'xxxxxxxxxx\nxxxxxxxxxx\nxxxxx', 'a word longer than the width is cut at the edge');
     assert.equal(renderLine(`- see ${'y'.repeat(20)} now`, off, { width: 14 }), '  • see\n    yyyyyyyyyy\n    yyyyyyyyyy\n    now', 'and goes on under the item it is in');
     assert.equal(wrap(`a ${on.bold('b'.repeat(12))}`, 8), `a\n${on.bold('bbbbbbbb\n\x1b[1mbbbb')}`, 'a colour code takes no room in a cut, and the style goes on in the next row');
-    assert.equal(renderLine('  // a comment that is long', off, { width: 20, fence: true }), '      // a comment\n      that is long', 'a code line goes on at its own indent');
+    assert.equal(renderLine('  // a comment that is long', off, { width: 20, fence: true }), '  // a comment that\n  is long', 'a code line goes on at its own indent');
+    assert.equal(renderLine('  // a comment that is long', off, { width: 20, fence: true, whole: true }), '  // a comment that is long', 'whole, it is left for the terminal to wrap');
+  });
+
+  it('draws code from the first column with nothing around it, whole for the terminal to wrap, and says which lines are code', () => {
+    const out = [];
+    const r = createRenderer((t, how) => out.push([t, how.code]), off, { width: 20, whole: true });
+    r.write('Run this:\n\n```sh\nnpm test -- --reporter=spec --test-name-pattern="release"\n```\n- in a list:\n  ```\n  make\n    install\n  ```\n');
+    r.flush();
+    assert.deepEqual(out, [
+      ['Run this:\n', false],
+      ['\n', false],
+      // One line, however long: a terminal that wrapped it joins it again on a copy; one broken here would paste as two commands.
+      ['npm test -- --reporter=spec --test-name-pattern="release"\n', true],
+      ['  • in a list:\n', false],
+      // A block in a list item loses its fence's indent, as Markdown reads it: what is copied is the code, not the item's indent.
+      ['make\n', true],
+      ['  install\n', true],
+    ]);
   });
 
   it('renders streamed text line by line, keeping a partial line until it ends', () => {
@@ -34,7 +52,7 @@ describe('the chat terminal rendering', () => {
     assert.deepEqual(out, ['  • one\n'], 'a partial line is held back');
     r.write('o\n```\ncode **not bold**\n```\ntail');
     r.flush();
-    assert.equal(out.join(''), '  • one\n  • two\n    ┌─\n    code **not bold**\n    └─\ntail');
+    assert.equal(out.join(''), '  • one\n  • two\ncode **not bold**\ntail');
   });
 
   it('shows the memory block without its tags, in spaced sections, with labels bold and questions yellow', () => {
@@ -203,7 +221,7 @@ describe('the chat terminal rendering', () => {
     const out = [];
     const r = createRenderer((t) => out.push(t), off, { width: 60 });
     r.write('| just | pipes |\nnext\n```\n| a | b |\n|---|---|\n```\n');
-    assert.equal(out.join(''), '| just | pipes |\nnext\n    ┌─\n    | a | b |\n    |---|---|\n    └─\n');
+    assert.equal(out.join(''), '| just | pipes |\nnext\n| a | b |\n|---|---|\n');
 
     const narrow = [];
     const n = createRenderer((t) => narrow.push(t), off, { width: 30 });
@@ -304,15 +322,13 @@ describe('the markdown a model writes', () => {
     assert.equal(rendered('10. tenth\n    more of it'), '  10. tenth\n      more of it');
   });
 
-  it('marks a quote and still reads the marks inside it, and names the language a code block is in', () => {
+  it('marks a quote and still reads the marks inside it, and colours a code block in the language it names', () => {
     assert.equal(rendered('> a **bold** claim'), '  │ a bold claim');
-    assert.equal(rendered('```js\nconst x = 1;\n```'), '    ┌─ js\n    const x = 1;\n    └─');
-    // Code is what is read most closely: its frame is faint, the code itself is not.
+    assert.equal(rendered('```js\nconst x = 1;\n```'), 'const x = 1;\n', 'the code alone: no frame, no indent');
     const lit = [];
     const coloured = createRenderer((t) => lit.push(t), styles(true));
     coloured.write('```js\nconst x = 1;\n```\n');
-    assert.equal(lit[1], '    \x1b[35mconst\x1b[39m x = \x1b[33m1\x1b[39m;\n', 'the code at full weight, in its language\'s colours');
-    assert.match(lit[0], /\x1b\[2m/, 'the frame dim');
+    assert.deepEqual(lit, ['\x1b[35mconst\x1b[39m x = \x1b[33m1\x1b[39m;\n'], 'the code at full weight, in its language\'s colours');
   });
 
   it('sets a heading apart by its level: the top one underlined as well as bold', () => {
@@ -495,7 +511,7 @@ describe('code, links and tables, as a reader wants them', () => {
     const out = [];
     const r = createRenderer((t) => out.push(t), on);
     r.write('```ts\nlet a = 1;\n```\nlet a = 1;\n');
-    assert.match(out.join(''), /\x1b\[35mlet\x1b\[39m a = \x1b\[33m1\x1b\[39m;\n\x1b\[2m {4}└─\x1b\[22m\nlet a = 1;\n$/, 'inside the block only');
+    assert.equal(out.join(''), '\x1b[35mlet\x1b[39m a = \x1b[33m1\x1b[39m;\nlet a = 1;\n', 'inside the block only');
   });
 
   it('makes an address a link the terminal opens, cut in two where it is wrapped and still one link each side; a pager gets none', () => {
@@ -571,8 +587,7 @@ describe('plain mode, drawn for a screen reader', () => {
     r.end?.();
     const text = out.join('\n');
     assert.match(text, /- file: app\.js\n  change: \+3/);
-    assert.match(text, /^ {4}code \(js\):$/m);
-    assert.match(text, /^ {4}end of code$/m);
+    assert.match(text, /^code \(js\):\n+const a = 1;\n+end of code$/m, 'named in words, the code from the first column');
     assert.doesNotMatch(text, /\+-|\+---|\|/, 'no ASCII frame, rule or bar');
   });
 });

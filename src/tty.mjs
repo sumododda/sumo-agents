@@ -23,11 +23,11 @@ const CODES = { bold: ['1', '22'], dim: ['2', '22'], italic: ['3', '23'], underl
  * reader says as itself: no box drawing, no symbol spelled out by its Unicode name.
  */
 const GLYPHS = {
-  tool: '⏺', fail: '✗', pick: '❯', under: '⎿', bar: '┃', quote: '│', rule: '─', fenceOpen: '┌─', fenceClose: '└─', todo: '☐', done: '☑', bullet: '•', warn: '⚠', thought: '✻',
+  tool: '⏺', fail: '✗', pick: '❯', under: '⎿', bar: '┃', quote: '│', rule: '─', todo: '☐', done: '☑', bullet: '•', warn: '⚠', thought: '✻',
   box: { h: '─', v: '│', tl: '┌', tm: '┬', tr: '┐', ml: '├', mm: '┼', mr: '┤', bl: '└', bm: '┴', br: '┘' },
 };
 const PLAIN_GLYPHS = {
-  tool: '*', fail: 'x', pick: '>', under: '|', bar: '>', quote: '|', rule: '-', fenceOpen: '+-', fenceClose: '+-', todo: '[ ]', done: '[x]', bullet: '-', warn: '!', thought: '*',
+  tool: '*', fail: 'x', pick: '>', under: '|', bar: '>', quote: '|', rule: '-', todo: '[ ]', done: '[x]', bullet: '-', warn: '!', thought: '*',
   box: { h: '-', v: '|', tl: '+', tm: '+', tr: '+', ml: '+', mm: '+', mr: '+', bl: '+', bm: '+', br: '+' },
 };
 
@@ -72,7 +72,7 @@ const WIDE = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF
 const columnsOf = (ch) => (WIDE.test(ch) ? 2 : 1);
 
 /** The columns text takes on a terminal, colour codes not counted: a wide character is two, so a table around it lines up. */
-const visible = (t) => {
+export const visible = (t) => {
   const plain = t.replace(/\x1b\[[0-9;]*m|\x1b\]8;[^\x07]*\x07/g, '');
   if (!/[^\x00-\x7e]/.test(plain)) return plain.length;
   let width = 0;
@@ -223,10 +223,11 @@ export function highlight(line, lang, s, code = null) {
  * One line of a reply: block-level marks replaced by weight and indent, then wrapped with a hanging indent.
  * `hang` is the indent of the list item a line may go on with: an indented line that is not an item of its own is drawn there.
  */
-export function renderLine(line, s, { fence = false, width = MAX_WIDTH, hang = null, lang = '', code = null } = {}) {
-  // Code is what is read most closely: the frame around it is faint, the code is not.
-  // A line too long for the window goes on under itself, at its own indent, so the code keeps its shape.
-  if (fence) return wrap(`    ${highlight(line, lang, s, code)}`, width, `    ${/^\s*/.exec(line)[0]}`);
+export function renderLine(line, s, { fence = false, width = MAX_WIDTH, hang = null, lang = '', code = null, whole = false } = {}) {
+  // Code is drawn as it was written, from the first column, with nothing around it: what is selected on the screen is the
+  // code. `whole`, a line too long for the window is left for the terminal to wrap, and a copy joins it again; else it
+  // goes on under itself, at its own indent, so the code keeps its shape.
+  if (fence) return whole ? highlight(line, lang, s, code) : wrap(highlight(line, lang, s, code), width, /^\s*/.exec(line)[0]);
   const heading = /^(#{1,6})\s+(.*)$/.exec(line);
   if (heading) return wrap(heading[1].length === 1 ? s.bold(s.underline(inline(heading[2], s))) : s.bold(inline(heading[2], s)), width);
   const item = LIST_ITEM.exec(line);
@@ -382,7 +383,14 @@ function closedForNow(line) {
   return shown.slice(at + 2).trim() ? `${words}**${shown.slice(words.length)}` : shown.slice(0, at);
 }
 
-export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
+const FENCE = /^(\s*)```\s*(\S*)/;
+
+/**
+ * A reply rendered as it streams, each finished line handed to `write` with `{ code }`: whether it is a line of a code
+ * block. `whole` leaves a code line unbroken for the terminal to wrap (see renderLine); the line still arriving is
+ * always wrapped, for it is drawn and drawn again inside the window.
+ */
+export function createRenderer(write, s, { width = MAX_WIDTH, whole = false } = {}) {
   let tail = '';
   let fence = false;
   let rows = [];
@@ -391,19 +399,30 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
   /** The language the code block in hand is in, and where its colouring has got to: a comment can run over lines. */
   let lang = '';
   let code = { comment: false };
+  /** A code line loses the indent its fence has, as Markdown reads it: a block in a list item is not drawn, or copied, at the item's indent. */
+  let indent = '';
+  const unindented = (raw) => (raw.startsWith(indent) ? raw.slice(indent.length) : raw.trimStart());
+  /** A line rendered, or null for a fence: outside plain mode it draws no row of its own. */
   const line = (raw) => {
-    const marks = /^\s*```\s*(\S*)/.exec(raw);
+    const marks = FENCE.exec(raw);
     if (marks) {
       fence = !fence;
       hang = null;
-      lang = fence ? marks[1].toLowerCase() : '';
+      lang = fence ? marks[2].toLowerCase() : '';
+      indent = fence ? marks[1] : '';
       code = { comment: false };
-      // Plain mode names the block in words, for a reader: no frame corner to spell out.
-      if (s.plain) return s.dim(fence ? `    code${marks[1] ? ` (${marks[1]})` : ''}:` : '    end of code');
-      return s.dim(fence ? `    ${s.g.fenceOpen}${marks[1] ? ` ${marks[1]}` : ''}` : `    ${s.g.fenceClose}`);
+      // Plain mode names the block in words, for a reader.
+      if (s.plain) return s.dim(fence ? `code${marks[2] ? ` (${marks[2]})` : ''}:` : 'end of code');
+      return null;
     }
-    if (!fence) hang = hangOf(raw) ?? (/^\s+\S/.test(raw) || raw.trim() === '' ? hang : null);
-    return renderLine(raw, s, { fence, width, hang: hangOf(raw) === null ? hang : null, lang, code });
+    if (fence) return renderLine(unindented(raw), s, { fence, width, lang, code, whole });
+    hang = hangOf(raw) ?? (/^\s+\S/.test(raw) || raw.trim() === '' ? hang : null);
+    return renderLine(raw, s, { width, hang: hangOf(raw) === null ? hang : null });
+  };
+  const put = (raw, end) => {
+    const isCode = fence && !FENCE.test(raw);
+    const shown = line(raw);
+    if (shown !== null) write(`${shown}${end}`, { code: isCode });
   };
   /** The rows held so far: a table once its rule has come, the lines they were otherwise. */
   const held = () => (rows.length >= 2 && TABLE_RULE.test(rows[1]) ? renderTable(rows, s, width) : rows.map((r) => renderLine(r, s, { width })).join('\n'));
@@ -418,9 +437,9 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
           rows.push(raw);
           continue;
         }
-        if (rows.length > 0) write(`${held()}\n`);
+        if (rows.length > 0) write(`${held()}\n`, { code: false });
         rows = [];
-        write(`${line(raw)}\n`);
+        put(raw, '\n');
       }
     },
     flush() {
@@ -428,19 +447,24 @@ export function createRenderer(write, s, { width = MAX_WIDTH } = {}) {
         rows.push(tail);
         tail = '';
       }
-      if (rows.length > 0) write(`${held()}${tail ? '\n' : ''}`);
-      if (tail) write(line(tail));
+      if (rows.length > 0) write(`${held()}${tail ? '\n' : ''}`, { code: false });
+      if (tail) put(tail, '');
       tail = '';
       rows = [];
       fence = false;
       hang = null;
       lang = '';
+      indent = '';
       code = { comment: false };
+    },
+    /** Whether the line still arriving is a line of code. */
+    get fenced() {
+      return fence;
     },
     /** What has not been written yet, rendered as far as it has got: the rows of a table, and the line still arriving. */
     get tail() {
       const going = /^\s+\S/.test(tail) && hangOf(tail) === null ? hang : null;
-      return [rows.length > 0 ? held() : '', tail && !/^\s*```/.test(tail) ? renderLine(fence ? tail : closedForNow(tail), s, { fence, width, hang: going, lang, code: { ...code } }) : ''].filter(Boolean).join('\n');
+      return [rows.length > 0 ? held() : '', tail && !FENCE.test(tail) ? renderLine(fence ? unindented(tail) : closedForNow(tail), s, { fence, width, hang: going, lang, code: { ...code } }) : ''].filter(Boolean).join('\n');
     },
   };
 }
@@ -847,10 +871,11 @@ export function transcript(log, s, { width = MAX_WIDTH, cwd = null } = {}) {
     if (entry.kind === 'user') out.push('', ...untab(entry.text).split('\n').map((line) => `${s.yellow(g.bar)} ${line}`));
     else if (entry.kind === 'reply') {
       const drawn = [];
-      const reply = createRenderer((text) => drawn.push(text), s, { width: Math.max(MIN_WIDTH, width - 3) });
+      const reply = createRenderer((text, { code }) => drawn.push(...text.replace(/\n$/, '').split('\n').map((row) => ({ row, code }))), s, { width: Math.max(MIN_WIDTH, width - 3) });
       reply.write(entry.raw);
       reply.flush();
-      out.push('', ...drawn.join('').replace(/\n$/, '').split('\n').map((line, i) => `${i === 0 ? `${g.tool} ` : '  '}${line}`));
+      // A line of code stands at the first column, as on the chat screen: what is selected is the code.
+      out.push('', ...drawn.map(({ row, code }, i) => (code ? row : `${i === 0 ? `${g.tool} ` : '  '}${row}`)));
     } else if (entry.kind === 'tool') {
       const view = toolView(entry.call, entry.result, { full: true, cwd });
       const stat = statOf(view.stat, s);

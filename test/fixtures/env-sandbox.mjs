@@ -11,6 +11,10 @@ delete process.env.FORCE_COLOR;
 // Run from inside Claude Code, the suite carries its CLAUDECODE=1, and a memory command would say on stderr that the
 // harness is not being heard: a test about that line sets the variable itself.
 delete process.env.CLAUDECODE;
+// Run inside Herdr, the suite carries the pane's HERDR_ENV and ids, and every job delegated in it would open a real tab
+// in the user's workspace, watching a home that is gone a moment later: hundreds were. A test about Herdr hands the
+// chat its own env and herdr.
+for (const name of Object.keys(process.env)) if (name.startsWith('HERDR_')) delete process.env[name];
 
 /** A fresh SUMO_AGENTS_HOME nothing else has touched. */
 export function freshHome() {

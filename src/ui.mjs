@@ -17,7 +17,7 @@ import { elapsed } from './text.mjs';
 import { cleanPaste, editor, keysOf, matchFiles, menuOf, paste, press, under } from './editor.mjs';
 import { clipboardImage, copyText, droppedImages } from './images.mjs';
 import { ASK_TOOL, BASH_TOOL, DELEGATE_TOOL, EDITOR_TOOL } from './tools.mjs';
-import { colourEnabled, createRenderer, explained, flow, fold, glyphs, inline, linked, logoLines, markdownOf, messageAt, pathFrom, pickMessage, renderBlock, safeForTerminal, spinnerMessages, statOf, styles, sunset, tilde, toolView, transcript, untab, VERSION, withoutColourCodes, withSpan, wrap } from './tty.mjs';
+import { colourEnabled, createRenderer, explained, flow, fold, glyphs, inline, linked, logoLines, markdownOf, messageAt, pathFrom, pickMessage, renderBlock, safeForTerminal, spinnerMessages, statOf, styles, sunset, tilde, toolView, transcript, untab, VERSION, visible, withoutColourCodes, withSpan, wrap } from './tty.mjs';
 
 /**
  * The chat on a real terminal. What is finished scrolls away above — what
@@ -632,8 +632,13 @@ function Question({ ask, columns }) {
   );
 }
 
-/** One line of a reply; the first of a block carries the mark. */
-function Reply({ text, first }) {
+/**
+ * One line of a reply; the first of a block carries the mark. A line of code stands at the first column, no mark or
+ * indent before it, and whole: the terminal wraps one too long for the window, so what is selected and copied is the
+ * line as it was written. Ink cuts nothing a box wider than the window holds.
+ */
+function Reply({ text, first, code = false }) {
+  if (code) return h(Box, { marginTop: first ? 1 : 0, flexShrink: 0, width: Math.max(1, ...String(text).split('\n').map(visible)) }, h(Text, null, text || ' '));
   const g = useMarks();
   // The mark keeps its two columns: a line with a word wider than the window must not squeeze it, or every row after it shifts left.
   return h(Box, { marginTop: first ? 1 : 0 }, h(Box, { flexShrink: 0 }, h(Text, null, first ? `${g.tool} ` : '  ')), h(Text, null, text || ' '));
@@ -1082,7 +1087,11 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
    * An item is drawn apart to be counted, and that sets off a draw of the screen that is waiting, if one is: so an item leaves
    * `unmeasured` only once it is counted, and a draw it sets off keeps the room shut rather than one row too tall.
    */
-  const rowsOf = (item) => renderToString(h(Marks.Provider, { value: s.g }, h(Item, { item, columns: state.columns, s })), { columns: state.columns }).split('\n').length;
+  // A line of code wider than the window is the rows the terminal wraps it to.
+  const rowsOf = (item) =>
+    renderToString(h(Marks.Provider, { value: s.g }, h(Item, { item, columns: state.columns, s })), { columns: state.columns })
+      .split('\n')
+      .reduce((rows, row) => rows + Math.max(1, Math.ceil(visible(row) / state.columns)), 0);
   const measure = () => {
     while (state.unmeasured.length > 0) {
       if (state.used < state.rows) state.used += rowsOf(state.unmeasured[0]);
@@ -1123,15 +1132,15 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     }
     redraw();
   };
-  /** A renderer for a reply: each line it finishes goes on the screen, the first of a block with the mark. */
+  /** A renderer for a reply: each line it finishes goes on the screen, the first of a block with the mark; a line of code whole. */
   const replyTo = (put) =>
     createRenderer(
-      (rendered) => {
-        put({ kind: 'text', text: rendered.replace(/\n$/, ''), first: state.fresh });
+      (rendered, { code }) => {
+        put({ kind: 'text', text: rendered.replace(/\n$/, ''), first: state.fresh, code });
         state.fresh = false;
       },
       s,
-      { width: state.columns - 3 },
+      { width: state.columns - 3, whole: true },
     );
   /** One entry of the log as the lines this window shows for it. */
   function drawn(entry) {
@@ -2203,7 +2212,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
     { flexDirection: 'column', minHeight: room },
     h(Static, { key: state.epoch, items: state.items }, (item) => h(Item, { key: item.id, item, columns, s })),
     ...reads.map((item, i) => h(Item, { key: `reads-${i}`, item, columns, s })),
-    tail ? h(Reply, { text: tail, first: state.fresh }) : null,
+    tail ? h(Reply, { text: tail, first: state.fresh, code: state.reply.fenced }) : null,
     // In one box of their own, so the lines coming and going never move what follows — the working line keeps its clock.
     h(Box, { flexDirection: 'column' }, ...steps.map((step) => h(Tool, step))),
     // The silence that is said is the model's: while a command, a job or a question is in hand, the wait is not on it.

@@ -624,8 +624,11 @@ function tabBegins(db, job, print, herdr) {
 function tabEnds(job, status, herdr) {
   process.stdin.pause();
   herdr.reportAgent(herdr.runHerdr, process.env, { job, state: job.status === 'needs_input' ? 'blocked' : 'idle', message: status });
-  herdr.closeJobTab(herdr.runHerdr, process.env, job);
+  herdr.closeJobTab(herdr.runHerdr, process.env);
 }
+
+/** How long a job's run lock may stand free with no end written before the process running it is taken for gone: a run lets its lock go a moment before its end is written. */
+const GONE_MS = 5000;
 
 /**
  * `sumo job watch <id>`: what a job running in the chat is doing, as it does it — what its Herdr tab shows, and
@@ -646,14 +649,21 @@ async function watchJob(db, id) {
   let at = 0;
   // A character split across two reads is held until its other half arrives.
   const decoder = new StringDecoder('utf8');
+  // The chat running the job holds its run lock: free for a while with no end written, that chat is gone — closed
+  // or crashed — and nothing will write the end, so the watch ends here rather than waiting for ever.
+  let free = 0;
   for (;;) {
     // Looked at before reading, so nothing written before the end is missed.
     const ended = existsSync(jobs.endFile(id));
     at = copyFrom(jobs.liveFile(id), at, decoder);
     if (ended) break;
+    free = heldBy(jobs.runLockFile(id)) === null ? free + 250 : 0;
+    if (free >= GONE_MS) break;
     await new Promise((r) => setTimeout(r, 250));
   }
-  const lines = safeForTerminal(readFileSync(jobs.endFile(id), 'utf8')).trimEnd().split('\n');
+  const lines = existsSync(jobs.endFile(id))
+    ? safeForTerminal(readFileSync(jobs.endFile(id), 'utf8')).trimEnd().split('\n')
+    : [`j${id} stopped without an end: the process running it is gone — sumo job show j${id} says where it got to`];
   tabEnds(jobs.getJob(db, id), lines[0], herdr);
   return lines;
 }

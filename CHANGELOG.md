@@ -4,6 +4,24 @@ What each release changed for you. The commit of each version has the full detai
 
 ## Unreleased
 
+## 0.7.1 — 2026-11-18
+
+- **A job's Herdr tab closes when the job is over, however it ended.** Before, only a job that ended done closed
+  its tab: one that failed, was stopped or had its chat closed left a tab with an empty prompt, and a tab whose
+  watcher never started was never closed at all. The chat that opened the tab now closes it at the end of every
+  run; if the chat crashes, the tab's watcher notices within seconds and closes it itself.
+- **The watcher is typed into its tab once, and checked through Herdr.** It counts as started once Herdr shows its
+  report on the pane. It is typed again only when the shell is back at a bare prompt, never into a watcher that
+  is still starting, where the line would reach the job as a message. A run over before the shell is ready has
+  its tab closed with nothing typed.
+- **Code copies clean.** A code block was drawn six columns in, inside a `┌─`/`└─` frame, and a long line was
+  broken in two to fit the window, so a copied command came with spaces before every line and could paste as two
+  commands. Code is now drawn from the first column with no frame, and a long line is left whole for the terminal
+  to wrap: select it, copy it, and it is the code as written. The model puts commands to run and drafts to send
+  in code blocks. `/copy` still takes a whole reply as written.
+- **The test suite no longer opens tabs in your Herdr.** Run inside Herdr, it opened a real tab for each job it
+  delegated, watching a home deleted a moment later.
+
 ## 0.7.0 — 2026-11-18
 
 - **A new effort after a turn that failed no longer breaks the chat.** When a turn ended before the model answered

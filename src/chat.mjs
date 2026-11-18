@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline/promises';
 import { isAdvisorTool } from './advisor.mjs';
 import { ago } from './card.mjs';
 import { getMeta } from './db.mjs';
-import { openWatchTab, runHerdr } from './herdr.mjs';
+import { closeTab, openWatchTab, runHerdr } from './herdr.mjs';
 import { appendLive, attemptsSettled, endLive, getJob, newJob, parseJobId, reportOf, runFollowed, startLive, tell as tellJob, treeOf } from './jobs.mjs';
 import { handleEvent } from './hooks.mjs';
 import { COMPACT_INSTRUCTIONS, compactionParams, contextFor, converse, describeFailure, networkOn, paramsFor, QUIET_RETRIES, runJob, runLines, sandboxOn, sendToApi, stopReason, TAMPER_REFUSED, tampersMarker, textOf, thinkingFor, withFallback, withMcp, withServers } from './loop.mjs';
@@ -703,6 +703,13 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     // and without its secrets, through the same redaction as what the model sees.
     const record = (t) => appendLive(id, redact(t).text);
     const live = jobPrinter(record, styles(false), { clean: (t) => redact(t).text, cwd: () => getProject(db, getJob(db, id)?.project ?? '')?.path ?? null });
+    // The Herdr tab opened to watch it, closed once the run is over however it ended, or as soon as its watcher never started.
+    let tab = null;
+    const tabStart = new AbortController();
+    const shutTab = () => {
+      if (tab) closeTab(herdr, tab);
+      tab = null;
+    };
     let ended = [];
     try {
       const outcome = await runJob(db, id, {
@@ -713,7 +720,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         onStart: (job) => {
           startLive(id);
           live.onStart(job);
-          watch({ type: 'job', job, call: callId, tab: env.HERDR_ENV ? watchTab(job) : null });
+          const opened = env.HERDR_ENV
+            ? watchTab(job, tabStart.signal, (reason) => {
+                shutTab();
+                watch({ type: 'tab-failed', job: job.id, reason: `${reason}, so it is closed` });
+              })
+            : null;
+          tab = opened?.tab ?? null;
+          watch({ type: 'job', job, call: callId, tab: opened });
           begun();
         },
         onTool: (call) => {
@@ -753,6 +767,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     } finally {
       jobs.delete(id);
       endLive(id, ended.map((l) => redact(l).text));
+      tabStart.abort();
+      shutTab();
       watch({ type: 'job-end', job: id });
     }
   }
@@ -785,10 +801,10 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   /** How many reports wait for a turn of their own: none once MAX_WOKEN automated turns have run in a row — they wait for the user's next message. */
   const waiting = () => (woken >= MAX_WOKEN ? 0 : reports.filter((r) => !r.quiet).length);
 
-  /** The job's tab in Herdr, showing its work: its pane, or why there is none — the job runs here either way. A watcher that never starts in it is said when it gives up. */
-  function watchTab(job) {
+  /** The job's tab in Herdr, showing its work: its pane and tab, or why there is none — the job runs here either way. `onFail` hears why a watcher never started in it. */
+  function watchTab(job, signal, onFail) {
     try {
-      return { pane: openWatchTab(herdr, { job, project: getProject(db, job.project), env, onFail: (reason) => watch({ type: 'tab-failed', job: job.id, reason }) }) };
+      return openWatchTab(herdr, { job, project: getProject(db, job.project), env, signal, onFail });
     } catch (cause) {
       return { error: cause.message };
     }
@@ -1274,7 +1290,8 @@ export async function chat(db, { model, effort, resume = null, send, input = pro
     errors.write(`${e.red(safeForTerminal(text))}\n${detail ? `${e.dim(`  ${safeForTerminal(detail)}`)}\n` : ''}`);
     failed = true;
   };
-  const reply = createRenderer(write, s, { width });
+  // A line of code is written whole: the terminal wraps it, and a copy has it as it was written.
+  const reply = createRenderer(write, s, { width, whole: true });
   const session = createChat(db, {
     model,
     effort,

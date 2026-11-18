@@ -8,7 +8,7 @@ import { describe, it, test } from 'node:test';
 import { chat, createChat, farewell, injection, jobPrinter } from '../src/chat.mjs';
 import { MODEL_IDS, setModel } from '../src/catalog.mjs';
 import { openDb } from '../src/db.mjs';
-import { openWatchTab, reportAgent, startWatcher } from '../src/herdr.mjs';
+import { closeJobTab, openWatchTab, reportAgent, startWatcher } from '../src/herdr.mjs';
 import { finish, takeInbox } from '../src/jobs.mjs';
 import { add, UsageError } from '../src/memory.mjs';
 import { ENTRY, paths, REPO_ROOT, SELF } from '../src/paths.mjs';
@@ -581,7 +581,7 @@ test('a delegated brief becomes a job on the route the router chose, and the rep
   });
 });
 
-test('inside Herdr a delegated job also gets a tab that watches it, while it runs here; a tab Herdr will not open costs the job nothing', async () => {
+test('inside Herdr a delegated job also gets a tab that watches it, while it runs here, closed once the run is over however it ended; a tab Herdr will not open costs the job nothing', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
@@ -591,37 +591,46 @@ test('inside Herdr a delegated job also gets a tab that watches it, while it run
       // The first tab opens and its shell runs the watcher once it is typed; when the second is asked for, Herdr is not there.
       let tabs = 0;
       let typed = false;
+      // The job answers only once its watcher is typed: a run over before then has its tab closed with nothing typed.
+      let typedNow;
+      const typedYet = new Promise((resolve) => (typedNow = resolve));
       const herdr = (args) => {
         calls.push(args);
+        if (args[0] === 'tab' && args[1] === 'close') return { status: 0, stdout: '{"result":{"type":"ok"}}' };
         if (args[0] === 'tab' && tabs++ > 0) return { error: Object.assign(new Error('spawnSync herdr ENOENT'), { code: 'ENOENT' }) };
-        if (args[0] === 'tab') return { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:pJ' } } }) };
-        if (args[1] === 'run') return (typed = true), { status: 0, stdout: '' };
+        if (args[0] === 'tab') return { status: 0, stdout: JSON.stringify({ result: { tab: { tab_id: 'w2:tJ' }, root_pane: { pane_id: 'w2:pJ', tab_id: 'w2:tJ' } } }) };
+        if (args[1] === 'run') return (typed = true), typedNow(), { status: 0, stdout: '' };
         if (args[1] === 'read') return { status: 0, stdout: '~ >' };
         return { status: 0, stdout: JSON.stringify({ result: { process_info: { shell_pid: 7, foreground_processes: typed ? [{ pid: 8, cmdline: `node sumo job watch ${id}` }] : [{ pid: 7, cmdline: '-zsh' }] } } }) };
       };
       const watched = [];
-      const { send, seen } = canned([
-        reply('tool_use', [call('t1', 'delegate', { job: id })]),
-        reply('end_turn', [{ type: 'text', text: 'looked' }]),
-        reply('end_turn', []),
-        reply('tool_use', [call('t2', 'delegate', { job: id })]),
-        reply('end_turn', [{ type: 'text', text: 'looked again; the key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789, then sk-ant-api03-abcdefghijk\x01lmnopqrstuvwxyz0123456789, then sk-ant-api03-abcdefghijk\x1b[0mlmnopqrstuvwxyz0123456789' }]),
-        reply('end_turn', []),
-        reply('end_turn', [{ type: 'text', text: 'fine' }]),
+      const { send, seen } = gated([
+        { reply: reply('tool_use', [call('t1', 'delegate', { job: id })]) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'looked' }]), gate: typedYet },
+        { reply: reply('end_turn', []) },
+        { reply: reply('tool_use', [call('t2', 'delegate', { job: id })]) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'looked again; the key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789, then sk-ant-api03-abcdefghijk\x01lmnopqrstuvwxyz0123456789, then sk-ant-api03-abcdefghijk\x1b[0mlmnopqrstuvwxyz0123456789' }]) },
+        { reply: reply('end_turn', []) },
+        { reply: reply('end_turn', [{ type: 'text', text: 'fine' }]) },
       ]);
       const env = { HERDR_ENV: '1', HERDR_WORKSPACE_ID: 'w2' };
       const session = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, herdr, env, watch: (e) => watched.push(e), now: () => NOW });
       session.start('startup');
       await session.say('have a scout look, twice');
-      await until(() => typed, 'the watcher typed into its tab');
+      assert.ok(typed, 'the watcher typed into its tab');
 
       assert.deepEqual(calls[0], ['tab', 'create', '--workspace', 'w2', '--cwd', project, '--label', `j${id} scout · look`, '--no-focus']);
       // No launcher in this home — setup never ran — so the watcher is this very sumo, by its node and its entry.
       assert.deepEqual(calls.find((c) => c[1] === 'run'), ['pane', 'run', 'w2:pJ', `env SUMO_JOB_TAB=1 SUMO_AGENTS_HOME=${paths().home} ${SELF.join(' ')} job watch ${id}`], 'the tab watches; the job is not run there');
       const [first, second] = watched.filter((e) => e.type === 'job').map((e) => e.tab);
-      assert.deepEqual(first, { pane: 'w2:pJ' });
+      assert.deepEqual(first, { pane: 'w2:pJ', tab: 'w2:tJ' });
       assert.deepEqual(second, { error: '`herdr` is not on PATH' });
       assert.match(seen[3].messages.at(-1).content[0].content, new RegExp(`STATUS: never closed — j${id}[\\s\\S]*looked`), 'the job ran here, tab or not');
+      // The job never closed itself — not done — and its tab is closed all the same, once, after its end is written; the
+      // tab Herdr would not open has nothing to close.
+      const closes = calls.filter((c) => c[0] === 'tab' && c[1] === 'close');
+      assert.deepEqual(closes, [['tab', 'close', 'w2:tJ']]);
+      assert.ok(calls.indexOf(closes[0]) > calls.findIndex((c) => c[1] === 'run'), 'closed after the watcher was typed, not before');
       assert.match(seen[6].messages.at(-1).content[0].content, /looked again/);
       const record = readFileSync(join(paths().jobs, String(id), 'live.log'), 'utf8');
       assert.match(record, /looked again; the key is \[redacted\], then \[redacted\], then \[redacted\]/, 'what a job writes reaches its record without its secrets — also a key broken up by an escape');
@@ -1593,10 +1602,11 @@ describe('the watcher in a job\'s Herdr tab', () => {
     return { herdr, calls };
   };
   const sleep = async () => {};
+  const j32 = { id: 32, agent: 'scout' };
 
   it('waits for the shell to stand at its prompt before typing, and types once when the watcher starts', async () => {
     const { herdr, calls } = pane();
-    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: 32, command: 'sumo job watch 32', sleep }), true);
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: j32, command: 'sumo job watch 32', sleep }), true);
     assert.deepEqual(calls.filter((c) => c === 'pane run'), ['pane run']);
     // The screen shows the shell loading for the first polls, then its prompt twice in a row: only then is the watcher typed.
     assert.equal(calls.slice(0, calls.indexOf('pane run')).filter((c) => c === 'pane read').length, 4, `typed only once the screen had settled: ${calls.join(', ')}`);
@@ -1604,40 +1614,65 @@ describe('the watcher in a job\'s Herdr tab', () => {
 
   it('types the watcher again when the shell threw the first away, and stops once it runs', async () => {
     const { herdr, calls } = pane({ swallow: 1 });
-    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: 32, command: 'sumo job watch 32', sleep }), true);
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: j32, command: 'sumo job watch 32', sleep }), true);
     assert.equal(calls.filter((c) => c === 'pane run').length, 2);
   });
 
   it('gives up after a few tries and says so, instead of claiming a tab that shows nothing', async () => {
     const { herdr, calls } = pane({ starts: false });
-    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: 32, command: 'sumo job watch 32', sleep }), false);
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: j32, command: 'sumo job watch 32', sleep }), false);
     assert.equal(calls.filter((c) => c === 'pane run').length, 3);
   });
 
-  it('is not fooled by another job\'s watcher: j3 is not j32', async () => {
+  it('is not fooled by another job\'s watcher, and never types again while something runs in the tab: j3 is not j32', async () => {
     const { herdr, calls } = pane({ starts: true });
-    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: 3, command: 'sumo job watch 3', sleep }), false);
-    assert.equal(calls.filter((c) => c === 'pane run').length, 3);
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: { id: 3, agent: 'scout' }, command: 'sumo job watch 3', sleep }), false);
+    // A line typed into a watcher at work would reach its job as a message from the user.
+    assert.equal(calls.filter((c) => c === 'pane run').length, 1);
   });
 
-  it('counts the watcher started when its tab shows the record\'s first line — and j3 is not j32 there either', async () => {
-    const written = [];
-    jobPrinter((t) => written.push(t), styles(false)).onStart({ id: 32, agent: 'scout', model: 'sonnet', effort: 'low', title: 'map the parser' });
-    // A Herdr that cannot say what runs in the pane: only the screen tells.
-    const showing = (screen) => (args) => (args[1] === 'read' ? { status: 0, stdout: screen } : args[1] === 'run' ? { status: 0, stdout: '' } : { status: 0, stdout: JSON.stringify({ result: { process_info: { shell_pid: 7, foreground_processes: [{ pid: 7, cmdline: '-zsh' }] } } }) });
-    const screen = `% sumo job watch 32\n${written.join('')}`;
-    assert.equal(await startWatcher(showing(screen), { pane: 'w2:p1', job: 32, command: 'sumo job watch 32', sleep }), true);
-    assert.equal(await startWatcher(showing(screen), { pane: 'w2:p1', job: 3, command: 'sumo job watch 3', sleep }), false);
+  it('counts the watcher started once Herdr shows its report on the pane — and j3 is not j32 there either', async () => {
+    // A Herdr that cannot name what runs in the pane: the watcher's own report to it tells.
+    const reporting = (args) =>
+      args[1] === 'read'
+        ? { status: 0, stdout: '% ' }
+        : args[1] === 'run'
+          ? { status: 0, stdout: '' }
+          : args[1] === 'get'
+            ? { status: 0, stdout: JSON.stringify({ result: { pane: { pane_id: 'w2:p1', agent: 'j32 scout', agent_status: 'working' } } }) }
+            : { status: 0, stdout: JSON.stringify({ result: { process_info: { shell_pid: 7, foreground_processes: [{ pid: 7, cmdline: '-zsh' }] } } }) };
+    assert.equal(await startWatcher(reporting, { pane: 'w2:p1', job: j32, command: 'sumo job watch 32', sleep }), true);
+    assert.equal(await startWatcher(reporting, { pane: 'w2:p1', job: { id: 3, agent: 'scout' }, command: 'sumo job watch 3', sleep }), false);
   });
 
-  it('opens the tab at once and tells the chat later when its watcher never started', async () => {
+  it('stops quietly once the run is over or its tab is gone: nothing typed, nothing said', async () => {
+    const { herdr, calls } = pane();
+    const over = new AbortController();
+    over.abort();
+    assert.equal(await startWatcher(herdr, { pane: 'w2:p1', job: j32, command: 'sumo job watch 32', sleep, signal: over.signal }), null);
+    assert.equal(calls.length, 0);
+    // Herdr answers a closed pane with an error on stderr.
+    const gone = (args) => (args[1] === 'read' ? { status: 1, stdout: '' } : { status: 1, stdout: '', stderr: '{"error":{"code":"pane_not_found","message":"pane w2:p1 not found"}}' });
+    assert.equal(await startWatcher(gone, { pane: 'w2:p1', job: j32, command: 'sumo job watch 32', sleep }), null);
+  });
+
+  it('opens the tab at once, names its pane and tab, and tells the chat later when its watcher never started', async () => {
     const { herdr } = pane({ starts: false });
-    const opening = (args) => (args[0] === 'tab' ? { status: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: 'w2:p1' } } }) } : herdr(args));
+    const opening = (args) => (args[0] === 'tab' ? { status: 0, stdout: JSON.stringify({ result: { tab: { tab_id: 'w2:t1' }, root_pane: { pane_id: 'w2:p1', tab_id: 'w2:t1' } } }) } : herdr(args));
     const failed = [];
     const tab = openWatchTab(opening, { job: { id: 32, agent: 'reviewer', title: 'Review it' }, project: { path: '/p' }, env: {}, sleep, onFail: (why) => failed.push(why) });
-    assert.equal(tab, 'w2:p1', 'the tab is there before its watcher is');
+    assert.deepEqual(tab, { pane: 'w2:p1', tab: 'w2:t1' }, 'the tab is there before its watcher is');
     await until(() => failed.length > 0, 'the chat told the watcher never started');
     assert.deepEqual(failed, ['its Herdr tab never started the watcher']);
+  });
+
+  it('a watcher closes the tab sumo opened for it however the run ended, and never a tab the user opened', () => {
+    const calls = [];
+    const herdr = (args) => calls.push(args) && { status: 0, stdout: '' };
+    closeJobTab(herdr, { SUMO_JOB_TAB: '1', HERDR_TAB_ID: 'w2:t1' });
+    closeJobTab(herdr, { HERDR_TAB_ID: 'w2:t9' });
+    closeJobTab(herdr, { SUMO_JOB_TAB: '1' });
+    assert.deepEqual(calls, [['tab', 'close', 'w2:t1']]);
   });
 });
 

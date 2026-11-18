@@ -754,6 +754,36 @@ test('Up recalls what was typed, across sessions, the last fifty; /model changes
   });
 });
 
+test('a line of code wider than the window is counted as the rows the terminal wraps it to: the box stays at the foot', async () => {
+  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+    const db = openDb();
+    try {
+      const command = `echo ${'x'.repeat(195)}`;
+      const { send } = transport([{ reply: reply('end_turn', [{ type: 'text', text: `Run this:\n\n\`\`\`sh\n${command}\n\`\`\`\n\nDone.` }]) }]);
+      const events = new EventEmitter();
+      const session = createChat(db, { model: 'opus', effort: 'high', cwd: tmpdir(), send, out: (t) => events.emit('text', t), watch: (e) => events.emit(e.type, e), now: () => NOW });
+      const tty = fakeTty({ columns: 80, rows: 30 });
+      const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
+      const latest = () => tty.screen().slice(tty.screen().lastIndexOf(MARK) - 1);
+      try {
+        await tty.type(`go${ENTER}`);
+        for (let i = 0; i < 300 && !/Done\./.test(latest()); i++) await new Promise((r) => setTimeout(r, 10));
+        const lines = latest().split('\n');
+        assert.ok(lines.includes(command), 'the command whole, from the first column');
+        // 200 columns are three rows of an 80-column window: the fake terminal does not wrap, so the frame it holds is two
+        // rows shorter than the window, and a terminal that wraps the line fills them. Counted as one row, the frame would
+        // be two rows too tall, and its top would scroll away.
+        assert.equal(lines.length, 30 - 1 - 2, latest());
+        assert.match(lines.at(-2), /^╰─+╯$/, 'the box at the foot');
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
 test('the logo is the background of the empty window: faint and centred in it, the box to type in at its foot; once something is said the room is the conversation\'s, and a full screen is drawn as before', async () => {
   await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
@@ -1986,8 +2016,10 @@ test('the screen fits every window: at 40, 60, 80 and 120 columns no row runs pa
         const tty = fakeTty({ columns, rows: 50 });
         const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Making the error message regret its choices'], cwd: path, debug: true, progress: false });
         const visible = () => tty.screen().replace(/\x1b\]8;;[^\x07]*\x07/g, '');
+        // A line of code is the one row left whole, from the first column, for the terminal to wrap: a copy joins it again.
+        const codeLine = `export const veryLongName = ${JSON.stringify('x'.repeat(120))}; // and a comment past the edge of any window`;
         const fits = (what) => {
-          const wide = visible().split('\n').filter((row) => [...row].length > columns);
+          const wide = visible().split('\n').filter((row) => [...row].length > columns && row !== codeLine);
           assert.deepEqual(wide, [], `at ${columns} columns, ${what}: no row past the edge`);
           assert.doesNotMatch(visible(), /```|\|-{3}|\*\*|⟨U\+001B⟩|\x1b/, `at ${columns} columns, ${what}: nothing drawn raw`);
           assert.doesNotMatch(visible(), /^⏺\S/m, `at ${columns} columns, ${what}: every mark keeps its space`);
@@ -2005,6 +2037,7 @@ test('the screen fits every window: at 40, 60, 80 and 120 columns no row runs pa
           await tty.type(`show me${ENTER}`);
           await shows(/Done\./, 'the reply');
           fits('a reply of every kind, and a command');
+          assert.ok(visible().split('\n').includes(codeLine), `at ${columns} columns the code is one row, as it was written, with nothing before it`);
           await tty.type(`ask me${ENTER}`);
           await shows(/↑↓ choose/, 'the question');
           fits('a question');
