@@ -84,10 +84,10 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 - A worker's first DONE is answered with its task as a numbered checklist beside its change, one answer per
   item; the second runs your checks.
   A failed first attempt is retried once on the next model up, and risky work is reviewed, without asking.
-  A second worker on a git project works in a worktree of its own.
+  A second worker on a git project works in a worktree of its own. If no check runs, or a failing suite’s results cannot be compared with its baseline, the worker stays open. After inspecting the logs, you can record a manual acceptance with `sumo job finish <id> --status DONE --accept "<reason>"` and the report on stdin.
 - A job's run stops at $10 or 60 minutes (`jobs.budget`, `jobs.minutes`). `sumo cost` shows where the money went,
   and why the cache was written again when it was.
-- `/undo` puts back the files the last chat turn changed with the editor.
+- `/undo` restores the last editor turn. If a file has changed since, Sumo keeps the turn and tells you which file needs inspection.
 - Only your words become memory. Web pages, files and tool output are never filed as yours.
 - The local model, Qwen3-4B through llama.cpp, routes jobs and writes memory for $0 and sleeps when idle.
 - A crash is written, redacted, to `~/.sumo-agents/logs/crash-*.log`. `sumo doctor --report` prints everything a
@@ -178,6 +178,8 @@ npm run build:bin          # optional: a standalone binary in dist/sumo-agents/ 
 
 `node probes/coding-eval.mjs --route sonnet/medium` runs real jobs on small tasks and scores them with hidden
 tests; `--hard` runs the harder set, `--no-guides` and `--advisor` change one thing at a time. It costs money.
+`node probes/paired-eval.mjs --route sonnet/medium --budget-usd 2` runs the same tasks through sumo and Claude Code
+for a side-by-side, within that total.
 
 A release is a commit on `main` that raises the version in `package.json`. The workflow runs the suite on
 macOS, the platform sumo runs on, with Node 24; when it passes, the publish waits in the `release` environment for the

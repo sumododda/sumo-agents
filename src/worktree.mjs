@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, cpSync, lstatSync, mkdirSync, rmSync, statSync, symlinkSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { copyFileSync, cpSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DIFF } from './verify.mjs';
 
 /**
@@ -74,6 +75,83 @@ export function makeTree(root, top) {
   return { top, path, prefix, base: git(top, ['rev-parse', 'HEAD']), linked };
 }
 
+const within = (root, path) => {
+  const rel = relative(root, path);
+  return rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel);
+};
+
+/** Inspect package-manager links, including scoped packages and pnpm's virtual store. */
+function nodeLoadsOriginal(modules, repository, candidate) {
+  const installed = realpathSync(modules);
+  const queue = [modules];
+  const seen = new Set();
+  while (queue.length) {
+    const dir = queue.pop();
+    const real = realpathSync(dir);
+    if (seen.has(real)) continue;
+    seen.add(real);
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.name === '.pnpm' && entry.isDirectory()) {
+        for (const name of readdirSync(path)) if (isDir(join(path, name, 'node_modules'))) queue.push(join(path, name, 'node_modules'));
+      } else if (entry.name.startsWith('@') && entry.isDirectory()) queue.push(path);
+      else if (entry.isSymbolicLink()) {
+        const target = realpathSync(path);
+        if (within(repository, target) && !within(installed, target) && !within(candidate, target)) return true;
+      } else if (entry.isDirectory() && isDir(join(path, 'node_modules'))) queue.push(join(path, 'node_modules'));
+    }
+  }
+  return false;
+}
+
+/** Common editable-install formats: PEP 610/660 metadata, path-based .pth files and legacy egg links. */
+function pythonLoadsOriginal(env, repository, candidate, shared) {
+  function loadsOriginal(path) {
+    const target = realpathSync(path);
+    return within(repository, target) && !within(candidate, target);
+  }
+  const lib = join(env, 'lib');
+  const sites = [join(env, 'Lib', 'site-packages')];
+  if (isDir(lib)) for (const name of readdirSync(lib)) sites.push(join(lib, name, 'site-packages'));
+  for (const site of sites.filter(isDir)) {
+    for (const name of readdirSync(site)) {
+      const file = join(site, name);
+      if (shared && (name.endsWith('.egg-link') || name.startsWith('__editable__'))) return true;
+      if (name.endsWith('.egg-link') || name.endsWith('.pth')) {
+        for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
+          const path = line.trim();
+          if (isAbsolute(path) && taken(path) && loadsOriginal(path)) return true;
+        }
+      }
+      if (name.endsWith('.dist-info') && taken(join(file, 'direct_url.json'))) {
+        const metadata = JSON.parse(readFileSync(join(file, 'direct_url.json'), 'utf8'));
+        if (metadata.dir_info?.editable && (shared || (metadata.url?.startsWith('file:') && loadsOriginal(fileURLToPath(metadata.url))))) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** An isolated job cannot be graded using source reached through the original checkout's installed dependencies. */
+export function sharedSourceDependencies(tree, project) {
+  if (!tree) return [];
+  const shared = [];
+  for (const name of DEPENDENCIES) {
+    const dependency = join(tree.path, name);
+    if (!taken(dependency)) continue;
+    try {
+      const original = join(project, name);
+      const sharedInstall = taken(original) && realpathSync(dependency) === realpathSync(original);
+      const candidate = realpathSync(tree.top);
+      const repository = realpathSync(git(project, ['rev-parse', '--show-toplevel']));
+      if (name === 'node_modules' ? nodeLoadsOriginal(dependency, repository, candidate) : pythonLoadsOriginal(dependency, repository, candidate, sharedInstall)) shared.push(name);
+    } catch {
+      shared.push(name); // Unreadable installation or link: its source cannot be verified.
+    }
+  }
+  return shared;
+}
+
 /** Everything changed in the tree since it was made, new files included, as git itself writes a diff: with `binary`, whole enough to apply. */
 export function treeDiff({ top, prefix, base }, { binary = false } = {}) {
   git(top, ['add', '-A']);
@@ -91,8 +169,7 @@ export function treeDiff({ top, prefix, base }, { binary = false } = {}) {
  * unless a file it touches has edits not staged in the project: git refuses a three-way merge over those, whatever the trial
  * said. `scratch` is a folder of sumo's own for that copy. Not applied, `why` is what git said.
  */
-export function bringBack(root, tree, scratch) {
-  const patch = treeDiff(tree, { binary: true });
+export function bringBack(root, tree, scratch, patch = treeDiff(tree, { binary: true })) {
   if (patch.length === 0) return { applied: false, empty: true };
   const at = git(root, ['rev-parse', '--show-toplevel']);
   const plain = fed(at, ['apply', '--whitespace=nowarn'], patch);

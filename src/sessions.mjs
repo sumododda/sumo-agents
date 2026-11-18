@@ -489,23 +489,29 @@ const redactValues = (value) => {
   return value;
 };
 
-/**
- * One block as it is kept: a picture becomes a line saying there was one; the words — the user's, the model's, a
- * tool's input and what it printed — are redacted, since the user's were sent raw and no secret lands in a file. Ids,
- * types, names and a thinking block's signature are left exactly as they are: the API matches on them.
- */
-function keepBlock(block) {
-  if (block.type === 'image') return { type: 'text', text: NO_PICTURE };
-  const { cache_control: _dropped, ...kept } = block;
-  if (typeof kept.text === 'string') kept.text = redact(kept.text).text;
-  if (kept.type === 'tool_result') kept.content = typeof kept.content === 'string' ? redact(kept.content).text : Array.isArray(kept.content) ? kept.content.map(keepBlock) : kept.content;
-  if (kept.type === 'tool_use') kept.input = redactValues(kept.input);
+// Identifiers pair tool calls and results. The API needs encrypted web results and citation indices byte-for-byte.
+const PROTOCOL_FIELDS = new Set(['type', 'name', 'id', 'tool_use_id', 'encrypted_content', 'encrypted_index', 'encrypted_stdout']);
+
+/** Keep the API block structure for resume while scrubbing its human-readable contents, including nested web results. */
+function keepBlock(value) {
+  if (typeof value === 'string') return redact(value).text;
+  if (Array.isArray(value)) return value.map(keepBlock);
+  if (!value || typeof value !== 'object') return value;
+  if (value.type === 'image') return { type: 'text', text: NO_PICTURE };
+  if (value.type === 'base64') return { type: 'text', media_type: 'text/plain', data: '[binary attachment omitted]' };
+  const kept = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'cache_control') continue;
+    // Tool inputs contain arbitrary user data, even under keys that look like protocol fields.
+    if (key === 'input') kept[key] = redactValues(child);
+    else kept[key] = PROTOCOL_FIELDS.has(key) ? child : keepBlock(child);
+  }
   return kept;
 }
 
-/** The conversation as it is kept on disk: no pictures, no secrets, no cache markers (they are placed again when it is sent). */
+/** What the session can replay after resuming. Thinking signatures cannot survive redaction or a changed prefix. */
 function keepable(messages) {
-  return messages.map((m) => ({ role: m.role, content: typeof m.content === 'string' ? redact(m.content).text : m.content.map(keepBlock) }));
+  return withoutThinking(messages).map((m) => ({ role: m.role, content: keepBlock(m.content) }));
 }
 
 /**
@@ -526,7 +532,7 @@ export function saveState({ id, messages, model, effort, routed, cwd, contextTok
   const file = stateFile(id);
   // The summary first, so a listing can read it without the messages behind it; the route's reason last, since it is prose of any length.
   // `pending` is what jobs reported that the model has not read yet: it goes with the session, to be read when it is picked up again.
-  const state = { version: 1, id, savedAt: now, contextTokens, model, effort, cwd, messages: keepable(messages), routed, pending };
+  const state = { version: 1, id, savedAt: now, contextTokens, model, effort, cwd, messages: keepable(messages), routed: redactValues(routed), pending: redactValues(pending) };
   writeFileSync(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 });
   renameSync(`${file}.tmp`, file);
   return file;

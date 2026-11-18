@@ -155,11 +155,9 @@ export function scoreWork(task, dir, report = '') {
  * brief — routed by the router, or pinned to `route` so that only the harness varies — run in this process, and scored.
  * `send` is the transport, for a stand-in model; without it the job talks to the API.
  */
-export async function runTask(db, task, { send = undefined, route = null, slug = task.id, now = () => new Date().toISOString() } = {}) {
-  const dir = seed(task, mkdtempSync(join(tmpdir(), `sumo-eval-${task.id}-`)));
+export async function runTask(db, task, { send = undefined, route = null, slug = task.id, dir = seed(task, mkdtempSync(join(tmpdir(), `sumo-eval-${task.id}-`))), now = () => new Date().toISOString() } = {}) {
   addProject(db, dir, { slug, now: now() });
-  const { job: made } = await newJob(db, { project: slug, title: task.title, agent: task.agent, task: task.brief, testsMayChange: Boolean(task.testsMayChange), now: now() });
-  if (route) db.prepare(`UPDATE jobs SET model = ?, effort = ?, route_reason = 'eval: pinned' WHERE id = ?`).run(route.model, route.effort, made.id);
+  const { job: made } = await newJob(db, { project: slug, title: task.title, agent: task.agent, task: task.brief, testsMayChange: Boolean(task.testsMayChange), route: route && { ...route, reason: 'eval: pinned', risky: false }, now: now() });
   const began = Date.now();
   let stopped = null;
   try {

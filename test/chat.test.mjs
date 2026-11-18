@@ -1,5 +1,6 @@
 // The chat session: the memory block first, the policy raised in process, delegated jobs run inside the process, the session log.
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1214,7 +1215,11 @@ test('a session is saved after every turn, without its pictures or secrets, and 
       addProject(db, root, { slug: 'simba', now: NOW });
       const { send } = canned([
         reply('tool_use', [{ type: 'thinking', thinking: 'first I look', signature: 'sig1' }, { type: 'text', text: 'looking' }, call('t1', 'bash', { command: 'echo looked' })]),
-        reply('end_turn', [{ type: 'thinking', thinking: 'and now I say', signature: 'sig2' }, { type: 'text', text: 'done' }], { input_tokens: 42_000, output_tokens: 10 }),
+        reply('end_turn', [
+          { type: 'thinking', thinking: 'and now I say', signature: 'sig2' },
+          { type: 'redacted_thinking', data: 'opaque-reasoning' },
+          { type: 'text', text: 'done ghp_abcdefghijklmnopqrstuvwxyz0123456789', citations: [{ type: 'web_search_result_location', cited_text: 'ghp_abcdefghijklmnopqrstuvwxyz0123456789', encrypted_index: 'citation-token' }] },
+        ], { input_tokens: 42_000, output_tokens: 10 }),
       ]);
       const first = createChat(db, { model: 'opus', effort: 'high', cwd: '/', send, now: () => NOW });
       first.start('startup');
@@ -1228,7 +1233,12 @@ test('a session is saved after every turn, without its pictures or secrets, and 
       assert.equal(state.version, 1);
       assert.deepEqual([state.model, state.effort, state.contextTokens, state.cwd], ['opus', 'high', 42_010, '/']);
       assert.equal(state.messages.length, first.params.messages.length, 'the whole conversation: the block, the turn, the card, the calls and their results');
-      assert.equal(state.messages.flatMap((m) => m.content).filter((b) => b.type === 'thinking').length, 2, 'the thinking is kept as it was, signatures and all');
+      const transcript = readFileSync(join(paths().logs, 'sessions', id + '.jsonl'), 'utf8');
+      const assistant = transcript.trim().split('\n').map(JSON.parse).filter((entry) => entry.type === 'assistant');
+      assert.deepEqual(assistant[1].message.content, [{ type: 'text', text: 'done [redacted]' }]);
+      assert.equal(assistant[1].message.usage.input_tokens, 42_000);
+      for (const file of [transcript, JSON.stringify(state)]) assert.doesNotMatch(file, /ghp_abc|first I look|and now I say|opaque-reasoning/);
+      assert.equal(state.messages.at(-1).content[0].citations[0].encrypted_index, 'citation-token');
       assert.equal(JSON.stringify(state).includes('ghp_abc'), false, 'the token the user pasted is not in the file');
       assert.equal(JSON.stringify(state).includes('"image"'), false, 'the picture is not in the file');
       assert.match(state.messages[1].content[1].text, /^\[a picture was here/);
@@ -2107,6 +2117,71 @@ test('a turn that edits and stops before the project\'s check ran is held once a
       assert.match(held(seen[10].messages).at(-1), /a\.txt was edited and nothing has checked it since/);
     } finally {
       db.close();
+    }
+  });
+});
+
+test('chat only clears edited paths after a successful foreground check', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-check-results-')));
+      writeFileSync(join(dir, 'Makefile'), 'test:\n\t@false\n');
+      addProject(db, dir, { slug: 'checked', now: NOW });
+      for (const command of ['make test', 'echo make test', 'make test &', 'true']) {
+        if (command === 'true') rmSync(join(dir, 'Makefile'));
+        const path = join(dir, 'file-' + command.length + '-' + command[0]);
+        const { send, seen } = canned([
+          reply('tool_use', [call('edit', 'str_replace_based_edit_tool', { command: 'create', path, file_text: 'changed' }), call('check', 'bash', { command })]),
+          reply('end_turn', [{ type: 'text', text: 'Done.' }]),
+          reply('end_turn', [{ type: 'text', text: 'Unverified.' }]),
+        ]);
+        const session = createChat(db, { model: 'opus', cwd: dir, send, now: () => NOW });
+        session.start('startup');
+        try {
+          await session.say('change the file in checked');
+          assert.equal(seen.length, 3, command);
+          assert.match(seen[2].messages.at(-1).content[0].text, /<check>/);
+        } finally {
+          session.end();
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test('a shell edit in a git project needs a successful check, excluding changes already present', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-shell-changes-')));
+    try {
+      const git = (...args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'ignore' });
+      git('init', '-q');
+      git('-c', 'user.name=Test', '-c', 'user.email=test@example.org', 'commit', '--allow-empty', '-qm', 'start');
+      writeFileSync(join(dir, 'already-here'), 'user work');
+      addProject(db, dir, { slug: 'shell-edits', now: NOW });
+      const { send, seen } = canned([
+        reply('tool_use', [call('write', 'bash', { command: 'echo changed > changed.txt' })]),
+        reply('end_turn', [{ type: 'text', text: 'Done.' }]),
+        reply('tool_use', [call('check', 'bash', { command: 'test -s changed.txt' })]),
+        reply('end_turn', [{ type: 'text', text: 'Checked.' }]),
+      ]);
+      const session = createChat(db, { model: 'opus', cwd: dir, send, now: () => NOW });
+      session.start('startup');
+      try {
+        await session.say('write the file in shell-edits');
+        assert.equal(seen.length, 4);
+        const held = seen[2].messages.at(-1).content[0].text;
+        assert.match(held, /changed\.txt/);
+        assert.doesNotMatch(held, /already-here/);
+      } finally {
+        session.end();
+      }
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

@@ -472,7 +472,7 @@ test('an image dropped on the box or pasted with Ctrl-V stands in it as a marker
 });
 
 test('Ctrl-O hands the whole conversation to the pager — every line a tool gave back, the command whole — and wipes nothing; a resized window is redrawn at its new width', async () => {
-  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+  await withHome(freshHome(), { TERM: 'xterm-256color', NO_COLOR: '', SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
       const long = 'These words are one line of a reply that a narrow window has to fold and a wide window does not';
@@ -1763,7 +1763,7 @@ test('a long conversation is drawn without a word from Node: no item listens to 
 });
 
 test('the screen as a reader wants it: a long word keeps the margin, the box says what it is for, ? shows the keys, Ctrl-R finds what was sent, and a cleared draft comes back', async () => {
-  await withHome(freshHome(), { SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
+  await withHome(freshHome(), { TERM: 'xterm-256color', NO_COLOR: '', SUMO_AGENTS_SPAWN_LOG: join(mkdtempSync(join(tmpdir(), 'sumo-agents-spawn-')), 'spawned.log') }, async () => {
     const db = openDb();
     try {
       const path = `/Users/someone/${'deeply/nested/'.repeat(5)}file.ts`;

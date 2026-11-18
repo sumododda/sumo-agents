@@ -155,7 +155,7 @@ package-lock.json — removed
   assert.equal(readFileSync(join(s.home, 'jobs', '1', 'report.md'), 'utf8').startsWith('## Summary'), true);
 });
 
-test('a chore in scratch: the brief says how scratch is used, a worker finishes it with nothing to check, nothing is filed under it, and no reviewer is sent in', () => {
+test('a chore in scratch: the brief says how scratch is used, a person accepts it with nothing to check, nothing is filed under it, and no reviewer is sent in', () => {
   const s = sandbox();
   s.routerWillSay('sonnet', 'medium');
   s.hook('session-start', { session_id: 'sess-a', cwd: '/x', transcript_path: null, source: 'startup' });
@@ -167,9 +167,11 @@ test('a chore in scratch: the brief says how scratch is used, a worker finishes 
   assert.match(brief, /one folder per chore/);
 
   pastCheck(s, '1');
-  const done = s.sumo(['job', 'finish', '1', '--status', 'done'], { input: '## Summary\nRenamed 40 scans.\n## Learned\n- the scanner writes names in Latin-1\n' });
+  const report = { input: '## Summary\nRenamed 40 scans.\n## Learned\n- the scanner writes names in Latin-1\n' };
+  assert.match(s.sumo(['job', 'finish', '1', '--status', 'done'], report).err, /nothing was run.*--accept/);
+  const done = s.sumo(['job', 'finish', '1', '--status', 'done', '--accept', 'reviewed the renamed scans'], report);
   assert.equal(done.code, 0, done.err);
-  assert.match(done.out, /^STATUS: DONE — j1/);
+  assert.match(done.out, /^STATUS: DONE \(UNVERIFIED/);
   assert.equal(s.sql((db) => db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE scope = 'project:scratch'`).get().n), 0);
   assert.doesNotMatch(s.sumo(['prime']).out, /Left off: scratch/);
 

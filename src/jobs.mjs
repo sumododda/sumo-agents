@@ -21,7 +21,7 @@ import { addCheckpoint, pendingTurns } from './sessions.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { clip, estimateTokens, head, STOPWORDS } from './text.mjs';
 import { changesSince, diffStat, hasCommit, snapshot, stillThere, takeBaseline, verdictLines, verify, writeChanges } from './verify.mjs';
-import { bringBack, dropTree, makeTree, treeDiff } from './worktree.mjs';
+import { bringBack, dropTree, makeTree, sharedSourceDependencies, treeDiff } from './worktree.mjs';
 
 const AGENTS = ['scout', 'worker', 'reviewer'];
 /** Work with a written way of doing it: guides/<name>.md, carried into the brief on request. */
@@ -440,7 +440,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
       // The project's installed dependencies are linked in (makeTree): outside the job's roots, the sandbox lets it read them, never change them.
       const deps =
         tree.linked?.length > 0
-          ? ` The project's installed dependencies — ${tree.linked.join(', ')} — are its own, linked in: the checks run with them, and they are read-only here; if one must be added or changed, say so in the report. A workspace package or an editable install reached through them is the project's copy, not this tree's: a check that loads one tests the project's code, not your change to it.`
+          ? ` The project's installed dependencies — ${tree.linked.join(', ')} — are its own, linked in: the checks run with them, and they are read-only here; if one must be added or changed, say so in the report. Verification reports shared workspace packages and editable installs that need an independent installation in this worktree.`
           : ' If the checks need installed dependencies, install them there.';
       appendFileSync(fileOf(job.id, 'brief.md'), `\n## Where you work\n${why} Files git ignores — build output and the like — were not copied into it.${deps}\n`, { mode: 0o600 });
     }
@@ -697,9 +697,16 @@ function checkable(db, id, verb) {
   return { job, state, root };
 }
 
+function sharedSourceReason(state, project) {
+  const shared = sharedSourceDependencies(state.tree, project.path);
+  return shared.length ? `shared dependencies (${shared.join(', ')}) may load editable or workspace source from the original checkout. Install those dependencies independently in the worktree and verify again` : null;
+}
+
 /** The project's checks as they stand before the work. Taken once; a second call reports what the first found. */
 export function baseline(db, id) {
-  const { state, root } = checkable(db, id, 'given a baseline');
+  const { job, state, root } = checkable(db, id, 'given a baseline');
+  const shared = sharedSourceReason(state, getProject(db, job.project));
+  if (shared) return [`no baseline taken: ${shared}`];
   if (!state.baseline) {
     const taken = takeBaseline(root, state.snap, dirOf(id));
     if (taken.refused) return [`no baseline taken: ${taken.refused}.`, 'Every check that fails at the end will count as this job\'s.'];
@@ -717,8 +724,13 @@ export function baseline(db, id) {
 
 /** Runs the checks now and records the verdict against the exact tree it judged. */
 export function verifyJob(db, id, now = new Date().toISOString()) {
-  const { state, root } = checkable(db, id, 'verified');
+  const { job, state, root } = checkable(db, id, 'verified');
   const verdict = verify(root, state, dirOf(id), now);
+  const shared = sharedSourceReason(state, getProject(db, job.project));
+  if (shared) {
+    verdict.ok = false;
+    verdict.inconclusive = [...(verdict.inconclusive ?? []), shared];
+  }
   writeState(db, id, { ...state, verdict });
   return verdict;
 }
@@ -742,10 +754,11 @@ export function changes(db, id) {
  * whether the tree moved, so it is always run again.
  */
 function verdictForDone(db, id, state, now) {
-  const root = workdir(state, getProject(db, getJob(db, id).project));
+  const project = getProject(db, getJob(db, id).project);
+  const root = workdir(state, project);
   if (!existsSync(root)) return null;
   const last = state.verdict;
-  if (last?.fingerprint && state.snap && unmoved(root, state.snap, last.fingerprint)) return last;
+  if (last?.version === 2 && !last.inconclusive?.length && !sharedSourceReason(state, project) && last.fingerprint && state.snap && unmoved(root, state.snap, last.fingerprint)) return last;
   return verifyJob(db, id, now);
 }
 
@@ -1022,6 +1035,7 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
   // The checks can take minutes: report a job closed in the meantime before interpreting their verdict.
   requireOpen(getJob(db, id), 'finished');
   if (graded && accept === undefined && !verdict) throw unchecked(`${getProject(db, job.project).path} no longer exists, so its checks cannot be run`);
+  if (verdict?.inconclusive?.length && !verdict.blocking.length) throw unchecked(verdict.inconclusive.join('\n'));
   if (verdict && !verdict.ok) {
     throw new Refusal(
       [
@@ -1153,16 +1167,20 @@ function said(id, heading, lines) {
   return lines;
 }
 
-/** The tree goes; what it changed stays beside the job as changes.diff, for a retry, a review or a person. */
+/* Keep the review text and a complete, applicable patch before removing or merging a tree. */
+function archiveTree(id, state) {
+  writeChanges(state.tree.path, state.snap, fileOf(id, 'changes.diff'));
+  const patch = treeDiff(state.tree, { binary: true });
+  const file = fileOf(id, 'change.patch');
+  writeFileSync(file + '.tmp', patch, { mode: 0o600, flush: true });
+  renameSync(file + '.tmp', file);
+  return patch;
+}
+
 function release(id, project, state) {
-  const kept = fileOf(id, 'changes.diff');
-  try {
-    writeChanges(state.tree.path, state.snap, kept);
-  } catch {
-    // A tree too broken to diff has nothing to keep.
-  }
+  archiveTree(id, state);
   dropTree(project.path, state.tree.top);
-  return kept;
+  return fileOf(id, 'changes.diff');
 }
 
 /** The newest other worker at work in the project itself — not in a worktree of its own — right now, or undefined. */
@@ -1175,25 +1193,27 @@ const inPlace = (db, project, id) => openWorkers(db, project.slug, id).find((o) 
  */
 function applyTree(db, id, project, state) {
   const busy = inPlace(db, project, id);
+  const patch = archiveTree(id, state);
   if (busy) {
-    const patch = treeDiff(state.tree, { binary: true });
-    if (patch.length > 0) writeFileSync(fileOf(id, 'change.patch'), patch, { mode: 0o600 });
-    const kept = release(id, project, state);
+    const kept = fileOf(id, 'changes.diff');
+    dropTree(project.path, state.tree.top);
     if (patch.length === 0) return 'It changed nothing; its worktree is removed.';
     return `The change was NOT applied: j${busy.id} "${busy.title}" is still working in ${project.path}, and the change would land under it — its start, its checks and its review would count it as its own. Its worktree is removed; what it changed is kept in ${kept}, and whole as a patch: once j${busy.id} is done, git -C ${project.path} apply ${fileOf(id, 'change.patch')}`;
   }
-  const back = bringBack(project.path, state.tree, dirOf(id));
+  const back = bringBack(project.path, state.tree, dirOf(id), patch);
   if (!back.applied && !back.empty) {
     return `The change was NOT applied: it does not apply to ${project.path} as that stands now. It is kept in ${state.tree.top} — bring it over by hand, then: git -C ${project.path} worktree remove --force ${state.tree.top}${back.why ? `   (git said: ${back.why})` : ''}`;
   }
-  release(id, project, state);
+  dropTree(project.path, state.tree.top);
   return back.empty ? 'It changed nothing; its worktree is removed.' : `The change was applied to ${project.path}${back.merged ? ' by a three-way merge, and staged' : ''}; its worktree is removed.`;
 }
 
 /** Done, judged by the checks, and its tree still the one they judged: an attempt worth keeping. */
 function verifiedDone(db, id, state) {
   const tree = state?.tree?.path;
-  return getJob(db, id).status === 'done' && state.verdict?.ok === true && existsSync(tree ?? '') && unmoved(tree, state.snap, state.verdict.fingerprint);
+  const job = getJob(db, id);
+  if (/^## Accepted without verification$/m.test(reportOf(id)) || sharedSourceReason(state, getProject(db, job.project))) return false;
+  return job.status === 'done' && state.verdict?.version === 2 && state.verdict.ok === true && existsSync(tree ?? '') && unmoved(tree, state.snap, state.verdict.fingerprint);
 }
 
 /**

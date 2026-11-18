@@ -11,7 +11,7 @@ import { chat, createChat } from '../src/chat.mjs';
 import { openDb } from '../src/db.mjs';
 import { paths } from '../src/paths.mjs';
 import { scratchDir } from '../src/projects.mjs';
-import { runEditor } from '../src/tools.mjs';
+import { runEditor, undoLast } from '../src/tools.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const NOW = '2026-10-25T12:00:00.000Z';
@@ -138,7 +138,7 @@ async function inChat(responses, fn) {
 test('/undo puts back what the editor changed in the last turn that changed files, one turn at a time, and says bash is not tracked', async () => {
   const edit = (id, command, path, extra) => call(id, 'str_replace_based_edit_tool', { command, path, ...extra });
   // Each turn ends on a command, so no edit is left unchecked and the turn ends as the model ended it.
-  const turn = (calls, n) => [reply('tool_use', [...calls, call(`b${n}`, 'bash', { command: 'true' })]), reply('end_turn', [{ type: 'text', text: 'Done.' }])];
+  const turn = (calls, n) => [reply('tool_use', [...calls, call(`b${n}`, 'bash', { command: 'test -f old.txt' })]), reply('end_turn', [{ type: 'text', text: 'Done.' }])];
   const responses = [];
   await inChat(responses, async ({ session, seen, dir }) => {
     const old = join(dir, 'old.txt');
@@ -163,6 +163,12 @@ test('/undo puts back what the editor changed in the last turn that changed file
     assert.equal(turns.length, 2, 'a turn that changed nothing through the editor keeps nothing');
     for (const t of turns) for (const name of readdirSync(join(store, t))) assert.equal(statSync(join(store, t, name)).mode & 0o777, 0o600, `${t}/${name}`);
 
+    writeFileSync(old, 'an edit made after the turn\n');
+    assert.match(session.undo(), /undo stopped.*old\.txt/s);
+    assert.equal(readFileSync(made, 'utf8'), 'fresher\n');
+    assert.equal(readFileSync(old, 'utf8'), 'an edit made after the turn\n');
+    writeFileSync(old, 'later\n');
+
     assert.equal(session.undo(), 'undid the last turn that changed files: restored new.txt and old.txt — changes made through bash are not tracked, so they stay');
     assert.equal(readFileSync(made, 'utf8'), 'fresh\n');
     assert.equal(readFileSync(old, 'utf8'), 'after all\n');
@@ -181,6 +187,71 @@ test('/undo puts back what the editor changed in the last turn that changed file
   });
 });
 
+test('/undo checks the entire turn before restoring or deleting files, and keeps a conflicted turn for retry', () => {
+  const { root, ctx } = project();
+  const session = join(root, 'session');
+  const edit = { ...ctx, undo: join(session, '1') };
+  const original = join(root, 'old.txt');
+  const created = join(root, 'new.txt');
+  writeFileSync(original, 'first');
+  runEditor({ command: 'str_replace', path: original, old_str: 'first', new_str: 'second' }, edit);
+  runEditor({ command: 'create', path: created, file_text: 'made' }, edit);
+  writeFileSync(created, 'mine');
+  assert.match(undoLast(session).blocked, /new\.txt/);
+  assert.equal(readFileSync(original, 'utf8'), 'second');
+  assert.equal(readFileSync(created, 'utf8'), 'mine');
+  writeFileSync(created, 'made');
+  assert.deepEqual(undoLast(session), { restored: [original], deleted: [created] });
+  assert.equal(readFileSync(original, 'utf8'), 'first');
+  assert.equal(existsSync(created), false);
+});
+
+test('/undo preserves an intervening write even when the editor edited the file again in the same turn', () => {
+  const { root, ctx } = project();
+  const session = join(root, 'session');
+  const path = join(root, 'text.txt');
+  const edit = { ...ctx, undo: join(session, '1') };
+  runEditor({ command: 'create', path, file_text: 'initial' }, edit);
+  writeFileSync(path, 'mine and initial');
+  runEditor({ command: 'str_replace', path, old_str: 'initial', new_str: 'edited' }, edit);
+  assert.match(undoLast(session).blocked, /outside the editor during this turn/);
+  assert.equal(readFileSync(path, 'utf8'), 'mine and edited');
+});
+
+test('/undo resumes after an interruption following a restore, without touching paths already completed', () => {
+  const { root, ctx } = project();
+  const session = join(root, 'session');
+  const dir = join(session, '1');
+  const edit = { ...ctx, undo: dir };
+  const [first, second, last] = ['one', 'two', 'three'].map((name) => join(root, name));
+  for (const path of [first, second, last]) {
+    writeFileSync(path, 'old');
+    runEditor({ command: 'str_replace', path, old_str: 'old', new_str: 'new' }, edit);
+  }
+  // The first two writes completed, then the process exited before it could advance past the second.
+  writeFileSync(join(dir, 'restoring'), '1');
+  writeFileSync(first, 'mine after undo');
+  writeFileSync(second, 'old');
+  assert.deepEqual(undoLast(session), { restored: [first, second, last], deleted: [] });
+  assert.equal(readFileSync(first, 'utf8'), 'mine after undo');
+  assert.equal(readFileSync(last, 'utf8'), 'old');
+});
+
+test('/undo keeps old or unreadable records and the current files', () => {
+  const { root, ctx } = project();
+  const session = join(root, 'session');
+  const dir = join(session, '1');
+  const path = join(root, 'new.txt');
+  runEditor({ command: 'create', path, file_text: 'mine' }, { ...ctx, undo: dir });
+  const manifest = join(dir, 'manifest.json');
+  for (const record of ['{', JSON.stringify([{ path, kept: null, mode: null }])]) {
+    writeFileSync(manifest, record);
+    assert.match(undoLast(session).blocked, /undo stopped/i);
+    assert.equal(readFileSync(path, 'utf8'), 'mine');
+    assert.equal(readFileSync(manifest, 'utf8'), record);
+  }
+});
+
 test('/undo walks back twenty turns at most: older ones are let go as new ones are kept', async () => {
   const responses = [];
   await inChat(responses, async ({ session, dir }) => {
@@ -188,7 +259,7 @@ test('/undo walks back twenty turns at most: older ones are let go as new ones a
     writeFileSync(file, '0\n');
     for (let n = 1; n <= 21; n++) {
       responses.push(
-        reply('tool_use', [call(`e${n}`, 'str_replace_based_edit_tool', { command: 'str_replace', path: file, old_str: `${n - 1}\n`, new_str: `${n}\n` }), call(`b${n}`, 'bash', { command: 'true' })]),
+        reply('tool_use', [call(`e${n}`, 'str_replace_based_edit_tool', { command: 'str_replace', path: file, old_str: `${n - 1}\n`, new_str: `${n}\n` }), call(`b${n}`, 'bash', { command: 'test -s count.txt' })]),
         reply('end_turn', [{ type: 'text', text: 'Done.' }]),
       );
       await session.say(`count to ${n}`);

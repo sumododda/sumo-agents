@@ -1,10 +1,12 @@
 // A worker that would share a working tree is given a git worktree of its own; several attempts are each given one, and one is kept.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
+import { sharedSourceDependencies } from '../src/worktree.mjs';
 import { createChat } from '../src/chat.mjs';
 import { openDb } from '../src/db.mjs';
 import { finish, newJob, treeOf } from '../src/jobs.mjs';
@@ -161,6 +163,62 @@ test('a failed or abandoned worker in a worktree leaves its change as changes.di
   assert.match(s.sumo(['job', 'abandon', '3']).out, /^abandoned j3\nIts worktree is removed/);
   assert.equal(existsSync(treeIn(s, 3)), false);
   assert.equal(p.git('worktree', 'list').stdout.trim().split('\n').length, 1, 'only the project itself is left');
+});
+
+test('worktree cleanup archives a recoverable binary patch and keeps the tree if an archive cannot be written', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const p = gitProject(s);
+  newWorker(s);
+  newWorker(s);
+  newWorker(s);
+  const bytes = Buffer.from([0, 1, 255]);
+  writeFileSync(join(treeIn(s, 2), 'asset.bin'), bytes);
+  close(s, 2, 'FAILED');
+  const patch = join(s.home, 'jobs', '2', 'change.patch');
+  assert.equal(p.git('apply', patch).status, 0, 'the saved change can be applied including binary data');
+  assert.deepEqual(readFileSync(join(p.dir, 'asset.bin')), bytes);
+  writeFileSync(join(treeIn(s, 3), 'mine.txt'), 'keep me');
+  mkdirSync(join(s.home, 'jobs', '3', 'change.patch'));
+  const failed = close(s, 3, 'FAILED');
+  assert.match(failed.out, /could not be settled/);
+  assert.equal(readFileSync(join(treeIn(s, 3), 'mine.txt'), 'utf8'), 'keep me');
+});
+
+test('verification refuses shared workspace source and accepts dependencies installed against the candidate', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const p = gitProject(s);
+  mkdirSync(join(p.dir, 'thing'));
+  p.write('thing/index.js', 'module.exports = 1;');
+  mkdirSync(join(p.dir, 'node_modules'));
+  symlinkSync('../thing', join(p.dir, 'node_modules', 'thing'));
+  p.write('Makefile', `.PHONY: test\ntest:\n\t@node -e 'require("thing")'\n`);
+  newWorker(s);
+  newWorker(s);
+  const tree = treeIn(s, 2);
+  writeFileSync(join(tree, 'thing', 'index.js'), 'module.exports = 2;');
+  assert.equal(spawnSync('node', ['-p', 'require("thing")'], { cwd: tree, encoding: 'utf8' }).stdout.trim(), '1');
+  const first = s.sumo(['job', 'verify', '2']);
+  assert.match(first.out, /shared.*node_modules/i);
+  assert.match(first.out, /REFUSED|inconclusive/i);
+  rmSync(join(tree, 'node_modules'));
+  mkdirSync(join(tree, 'node_modules'));
+  symlinkSync('../thing', join(tree, 'node_modules', 'thing'));
+  assert.equal(spawnSync('node', ['-p', 'require("thing")'], { cwd: tree, encoding: 'utf8' }).stdout.trim(), '2');
+  assert.equal(close(s, 2).code, 0);
+});
+
+test('Python editable installs point verification to the worktree they load', () => {
+  const s = sandbox();
+  const project = gitProject(s).dir;
+  const tree = { path: join(s.root, 'candidate'), top: join(s.root, 'candidate') };
+  const metadata = join(tree.path, '.venv', 'lib', 'python3.12', 'site-packages', 'mine.dist-info');
+  mkdirSync(metadata, { recursive: true });
+  for (const [source, expected] of [[project, ['.venv']], [tree.path, []]]) {
+    writeFileSync(join(metadata, 'direct_url.json'), JSON.stringify({ dir_info: { editable: true }, url: pathToFileURL(source).href }));
+    assert.deepEqual(sharedSourceDependencies(tree, project), expected);
+  }
 });
 
 test('outside git a second worker still shares the tree, and is told so', () => {

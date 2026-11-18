@@ -124,8 +124,8 @@ test("a reviewer of a worktree job is handed that job's own change as it was kep
   p.write('notes.txt', 'mine\n');
   newWorker(s);
   newWorker(s);
-  // The brief says what the linked dependencies cannot show: a workspace package through them is the project's.
-  assert.match(s.sumo(['job', 'brief', '2']).out, /linked in: the checks run with them, and they are read-only here; if one must be added or changed, say so in the report\. A workspace package or an editable install reached through them is the project's copy, not this tree's: a check that loads one tests the project's code, not your change to it\./);
+  // The brief explains how to handle a local package reached through the original checkout.
+  assert.match(s.sumo(['job', 'brief', '2']).out, /linked in: the checks run with them, and they are read-only here; if one must be added or changed, say so in the report\. Verification reports shared workspace packages and editable installs that need an independent installation in this worktree\./);
   writeFileSync(join(treeIn(s, 2), 'src.js'), edited(SRC, { 12: 2 }));
   writeFileSync(join(treeIn(s, 2), 'added.js'), 'export const added = true;\n');
   assert.match(close(s, 2).out, /The change was applied to \S+; its worktree is removed\./);

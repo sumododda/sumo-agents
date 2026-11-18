@@ -129,14 +129,15 @@ function timeoutMs() {
 }
 
 /** The last lines of a check's log, read from its end rather than whole. */
-function tailOf(fd) {
+function checkOutput(fd, failed) {
   const size = fstatSync(fd).size;
   const start = Math.max(0, size - OUTPUT_TAIL_BYTES);
   const bytes = Buffer.alloc(size - start);
   const lines = bytes.subarray(0, readSync(fd, bytes, 0, bytes.length, start)).toString('utf8').trimEnd().split('\n');
   // Read from inside a line, the first piece is half of one.
   if (start > 0 && lines.length > 1) lines.shift();
-  return lines.slice(-OUTPUT_TAIL_LINES).join('\n');
+  const failures = failed && start === 0 ? namedFailures(lines) : [];
+  return { output: lines.slice(-OUTPUT_TAIL_LINES).join('\n'), failures };
 }
 
 /** The sandbox a job's process hands down for its checks: the wrap's words, or null — none given, or one that is not a list of words. */
@@ -175,10 +176,10 @@ function runChecks(root, commands, dir, prefix) {
       const timedOut = run.error?.code === 'ETIMEDOUT';
       // Whatever it left running goes with it, so nothing writes to the file once it is read.
       killGroup(run.pid);
-      const output = tailOf(into);
+      const { output, failures } = checkOutput(into, run.status !== 0);
       ftruncateSync(into);
       writeSync(into, `$ ${command}\n${output}\n${timedOut ? '\n(stopped: it ran past the time limit)\n' : ''}`, 0);
-      return { name, command, ok: run.status === 0, status: run.status, timedOut, ms: Date.now() - started, file };
+      return { name, command, ok: run.status === 0, failures, status: run.status, timedOut, ms: Date.now() - started, file };
     } finally {
       closeSync(into);
     }
@@ -189,6 +190,33 @@ function runChecks(root, commands, dir, prefix) {
 const FAILURE_LINE = /\b(?:fail(?:s|ed|ing|ures?)?|errors?|not ok)\b|[✗✕✖]/i;
 /** A time a runner prints, which differs from one run to the next when nothing else does. */
 const TIMING = /\b\d+(?:\.\d+)?\s?m?s\b/g;
+
+/** Named cases printed by common test reporters. A wrapper's exit message or a failure count alone identifies no test. */
+function namedFailures(lines) {
+  const names = [];
+  for (const raw of lines) {
+    const line = raw.replace(/\x1b\[[0-9;]*m/g, '').trim();
+    const match = /^(?:not ok(?: \d+)? - |--- FAIL: |(?:FAIL|FAILED) +|[✗✕✖×●] +)(.+)$/.exec(line)
+      ?? /^test (.+?) \.\.\. FAILED$/.exec(line);
+    if (match) {
+      const name = match[1].replace(/\s*\(\d+(?:\.\d+)?\s?m?s\)$/, '').trim();
+      if (name) names.push(createHash('sha256').update(name).digest('hex'));
+    }
+  }
+  return names;
+}
+
+/** A new failure must not be forgiven just because the same command was red before. Count duplicate case names as well. */
+function explainedBy(current, previous) {
+  if (!previous?.failures?.length || !current.failures.length || current.timedOut || previous.timedOut || previous.status !== current.status) return false;
+  const counts = new Map();
+  for (const name of previous.failures) counts.set(name, (counts.get(name) ?? 0) + 1);
+  for (const name of current.failures) {
+    if (!counts.get(name)) return false;
+    counts.set(name, counts.get(name) - 1);
+  }
+  return true;
+}
 
 /** How a run of a check ended: its exit status and the lines that name a failure, without their times. Two runs that agree on it failed the same way. */
 const endedAs = (run) =>
@@ -224,7 +252,12 @@ export function takeBaseline(root, snap, dir) {
   }
   const checks = runChecks(root, verifyCommands(root), dir, 'baseline');
   const again = runAgain(root, checks.filter((c) => !c.ok), dir);
-  return { checks: checks.map((c) => (again.has(c) && endedAs(again.get(c)) !== endedAs(c) ? { ...c, flaky: true, again: again.get(c).file } : c)) };
+  return { checks: checks.map((check) => {
+    const repeat = again.get(check);
+    if (!repeat || endedAs(repeat) === endedAs(check)) return check;
+    const { status, failures, timedOut } = repeat;
+    return { ...check, flaky: true, again: repeat.file, repeat: { status, failures, timedOut } };
+  }) };
 }
 
 /**
@@ -269,6 +302,7 @@ export function verify(root, { snap, baseline, testsMayChange, declared }, dir, 
   const blocking = [];
   const flags = [];
   const notes = [];
+  const inconclusive = [];
   const beforeChecks = snap && stillThere(root, snap) ? changesSince(root, snap).fingerprint : null;
 
   // The checks that judged the start judge the end: one no longer run, or rewritten, is not part of the change.
@@ -286,11 +320,15 @@ export function verify(root, { snap, baseline, testsMayChange, declared }, dir, 
   const before = new Map((baseline ?? []).map((c) => [c.command, c]));
   const ran = runChecks(root, commands, dir, 'verify');
   // One that passed when the job began and fails now is run once more before it is held against the job: passing then, it is flaky.
-  // One recorded flaky at the start is not run again: whatever it says, it does not refuse DONE on its own.
+  // A baseline failure can explain only failures actually observed in its recorded runs.
   const again = runAgain(root, ran.filter((c) => !c.ok && before.get(c.command)?.ok), dir);
   const checks = ran.map((c) => {
     const was = before.get(c.command);
-    const state = c.ok ? 'pass' : was?.flaky || again.get(c)?.ok ? 'flaky' : was && !was.ok ? 'already-failing' : 'fail';
+    let state = c.ok ? 'pass' : 'fail';
+    if (!c.ok && again.get(c)?.ok) state = 'flaky';
+    if (!c.ok && was && !was.ok && (explainedBy(c, was) || explainedBy(c, was.repeat))) {
+      state = was.flaky ? 'flaky' : 'already-failing';
+    }
     if (state === 'flaky') {
       flags.push(
         was.flaky
@@ -298,10 +336,16 @@ export function verify(root, { snap, baseline, testsMayChange, declared }, dir, 
           : `\`${c.command}\` failed, then passed when run again — flaky, so DONE is not refused on it; read ${c.file}`,
       );
     }
+    if (state === 'fail' && was && !was.ok && !c.timedOut && (!c.failures.length || !was.failures?.length)) {
+      state = 'inconclusive';
+      inconclusive.push(`\`${c.command}\` failed, but its failing cases could not be compared; see ${was.file} and ${c.file}`);
+    }
     if (state === 'fail') {
       const why = c.timedOut ? 'ran past the time limit' : 'fails';
       blocking.push(
-        was
+        was && !was.ok
+          ? `\`${c.command}\` ${why} with a new failure or one the baseline cannot identify; compare ${was.file} with ${c.file}`
+          : was
           ? `\`${c.command}\` ${why}, and it passed when this job began — read ${c.file}`
           : `\`${c.command}\` ${why}, and no baseline was taken before the work, so the failure counts as this job's — read ${c.file}`,
       );
@@ -310,7 +354,7 @@ export function verify(root, { snap, baseline, testsMayChange, declared }, dir, 
     if (state === 'already-failing') flags.push(`\`${c.command}\` was already failing when this job began; compare ${was.file} with ${c.file} to see nothing new broke`);
     return { name: c.name, command: c.command, state, file: c.file };
   });
-  if (checks.length === 0) notes.push('this project declares no check, test, lint or typecheck command — nothing was run');
+  if (checks.length === 0) inconclusive.push('this project declares no check, test, lint or typecheck command — nothing was run');
 
   let fingerprint = null;
   if (snap && !stillThere(root, snap)) {
@@ -338,7 +382,7 @@ export function verify(root, { snap, baseline, testsMayChange, declared }, dir, 
     notes.push('not a git repository — what changed, and whether existing tests were touched, could not be checked');
   }
 
-  return { at: now, ok: blocking.length === 0, fingerprint, checks, blocking, flags, notes };
+  return { version: 2, at: now, ok: blocking.length === 0 && inconclusive.length === 0, fingerprint, checks, blocking, inconclusive, flags, notes };
 }
 
 /** git's own summary of what changed in tracked files since the snapshot: a line a file, at most `count` of them, then its totals. Empty when git cannot say. */
@@ -371,9 +415,10 @@ export function writeChanges(root, snap, file) {
 
 /** One line per check, for a status line or a report. */
 export function verdictLines(verdict) {
-  const words = { pass: 'passed', fail: 'FAILED', 'already-failing': 'was already failing', flaky: 'was flaky' };
+  const words = { pass: 'passed', fail: 'FAILED', 'already-failing': 'was already failing', flaky: 'was flaky', inconclusive: 'was inconclusive' };
   return [
     ...verdict.checks.map((c) => `\`${c.command}\` ${words[c.state]}`),
+    ...(verdict.inconclusive ?? []).map((reason) => `unverified: ${reason}`),
     ...verdict.blocking.map((b) => `blocking: ${b}`),
     ...verdict.flags.map((f) => `look at: ${f}`),
     ...verdict.notes.map((n) => `note: ${n}`),

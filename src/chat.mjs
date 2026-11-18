@@ -28,7 +28,7 @@ import { ASK_TOOL, BASH_TOOL, cap, capRedacted, DELEGATE_TOOL, EDITOR_TOOL, INTE
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { closest, estimateTokens, head } from './text.mjs';
 import { colourEnabled, createRenderer, explained, header, pathFrom, prompt, renderBlock, safeForTerminal, styles, tilde, toolView, widthOf, wrap } from './tty.mjs';
-import { hasCommit } from './verify.mjs';
+import { changesSince, hasCommit, snapshot } from './verify.mjs';
 import { isWebTool, sourcesOf, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WEB_TOOLS } from './web.mjs';
 
 /**
@@ -287,6 +287,11 @@ function logLine(file, entry) {
 
 function configured(db, key) {
   return getMeta(db, `config.${key}`) ?? CONFIG_DEFAULTS[key];
+}
+
+function isCheck(command) {
+  if (/[;&|<>\n`$]/.test(command) || /(?:^|\s)(?:--help|--version|-h|--collect-only)(?:\s|$)/.test(command)) return false;
+  return /^(?:node\s+--test|(?:python3?\s+-m\s+)?pytest|python3?\s+-m\s+unittest|go\s+test|cargo\s+test|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck)|make\s+(?:test|check)|test\s+-[efs]\s+\S+)(?:\s|$)/.test(command);
 }
 
 /** The chat's own tools, in a fixed order so its cached prefix never moves; the MCP servers' come after them. */
@@ -713,7 +718,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     let ended = [];
     try {
       const outcome = await runJob(db, id, {
-        send: (p) => send(p, { signal }),
+        send,
         signal,
         approve,
         inbox: () => inbox.splice(0),
@@ -894,20 +899,32 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
 
   async function turn(text, said, images, automated = false, guide = null) {
     stopper = new AbortController();
-    // Edits nothing has checked: an editor call that wrote adds its file — one refused, or whose old_str was not found,
-    // changed nothing and adds none; one of the project's declared checks running clears them — any command does when
-    // the project declares none. The gate at the end of the turn is told what is left. The shell can edit too (`sed -i`,
-    // a redirect); that is not seen.
     const unchecked = new Set();
-    const declared = () => verifyCommands(workspace().cwd).map((c) => c.command);
-    const noteCall = (call) => {
+    let beforeShell;
+    let shellRoot;
+    const watchShell = (call) => {
       if (call.name !== BASH_TOOL.name) return;
-      const checks = declared();
-      if (checks.length === 0 || checks.some((c) => String(call.input?.command ?? '').includes(c))) unchecked.clear();
+      const { cwd } = workspace();
+      if (beforeShell === undefined || shellRoot !== cwd) {
+        shellRoot = cwd;
+        beforeShell = snapshot(cwd);
+      }
     };
-    // Only the project's own files are the project's check to judge: a file outside it the user let change is theirs.
+    const declared = () => verifyCommands(workspace().cwd).map((c) => c.command);
+    // Only completed, foreground checks can cover prior edits. If the project declares none,
+    // recognise direct invocations of a test runner or file assertion. Compound commands can mask their exit status.
     const noteResult = (call, result) => {
-      if (call.name !== EDITOR_TOOL.name || call.input?.command === 'view' || !call.input?.path || result?.isError) return;
+      if (result?.isError) return;
+      if (call.name === BASH_TOOL.name && (unchecked.size > 0 || beforeShell)) {
+        const command = String(call.input?.command ?? '').trim();
+        const checks = declared();
+        if (checks.includes(command) || (checks.length === 0 && isCheck(command))) {
+          unchecked.clear();
+          beforeShell = undefined;
+        }
+        return;
+      }
+      if (call.name !== EDITOR_TOOL.name || call.input?.command === 'view' || !call.input?.path) return;
       const { cwd: root } = workspace();
       const path = resolve(root, String(call.input.path));
       if (path.startsWith(`${root}${sep}`)) unchecked.add(path);
@@ -940,7 +957,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       if (stopper.signal.aborted) return { stop: 'interrupted', error: null, text: '' };
       routed = chosen;
       apply(routed);
-      logLine(transcript, { type: 'route', ...routed });
+      logLine(transcript, { type: 'route', ...routed, reason: routed.reason && redact(routed.reason).text });
       watch({ type: 'route', ...routed });
     }
     settleTail();
@@ -981,9 +998,9 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
           watch({ type: 'retry', ...r });
         },
         onTool: (call) => {
+          watchShell(call);
           activity(describeCall(call));
           watch({ type: 'tool', call });
-          noteCall(call);
           // A page or an MCP server read here: what this conversation says from now on may be what it was told.
           if (isWebTool(call) || isMcpTool(call.name)) noteSessionOutside(db, sessionId, call.name);
         },
@@ -993,7 +1010,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
         },
         onTurn: (response, totals) => {
           lastContext = totals.contextTokens;
-          logLine(transcript, { type: 'assistant', message: { role: 'assistant', model: response.model ?? params.model, usage: response.usage, content: response.content } });
+          const content = response.content.filter((b) => b.type === 'text').map((b) => ({ type: 'text', text: redact(b.text).text }));
+          logLine(transcript, { type: 'assistant', message: { role: 'assistant', model: response.model ?? params.model, usage: response.usage, content } });
           watch({ type: 'usage', totals });
           overBudget();
           // What the reply rests on, said under it: the pages it cites.
@@ -1014,6 +1032,12 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
       // memory can answer, is told so and continued, once. Only a turn the model ended itself: after an error or a cut-off
       // reply the turn is simply over, and the scribe still hears of it.
       const asked = outcome.stop === 'end_turn';
+      if (asked && beforeShell) {
+        const { tracked, created, fingerprint } = changesSince(shellRoot, beforeShell);
+        if (fingerprint !== beforeShell.fingerprint) {
+          for (const name of [...tracked.map((file) => file.to ?? file.path), ...created]) unchecked.add(resolve(shellRoot, name));
+        }
+      }
       const edited = [...unchecked].map((path) => relative(workspace().cwd, path));
       const checks = declared();
       // The reply goes with the event either way, for the journal: also the one a continued turn ends on, which asks nothing more.
@@ -1034,6 +1058,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   function undo() {
     const done = undoLast(undoDir());
     if (!done) return 'nothing to undo: the editor has changed no file in this session — changes made through bash are not tracked';
+    if (done.blocked) return done.blocked;
     const { cwd: at } = workspace();
     const names = (list) => {
       const shown = list.map((path) => pathFrom(path, at));

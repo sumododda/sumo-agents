@@ -153,8 +153,10 @@ test('a job near its time is told once to close, and at its time it is stopped w
         n++;
         return reply('tool_use', [call(`t${n}`, 'bash', { command: `echo ${n}` })]);
       };
-      const outcome = await runJob(db, id, { send, now });
+      const tools = [];
+      const outcome = await runJob(db, id, { send, now, onTool: (call) => tools.push(call.id) });
       assert.equal(outcome.stop, 'time');
+      assert.deepEqual(tools, ['t1', 't2', 't3'], 'the reply arriving after expiry cannot start another command');
       assert.equal(outcome.turns, 4, 'twelve minutes in after the fourth reply: nothing more is sent');
       // The warning rides with the results of the third reply, the first past eight minutes, and with no other.
       const warned = seen.map((m) => m.content.filter((b) => b.type === 'text' && /minutes/.test(b.text)).map((b) => b.text));
@@ -179,6 +181,30 @@ test('a job near its time is told once to close, and at its time it is stopped w
       const unlimited = await runJob(db, free, { send: async () => ((clock += 60 * 60_000), ++k <= 3 ? reply('tool_use', [call(`f${k}`, 'bash', { command: `echo ${k}` })]) : reply('end_turn', [])), now });
       assert.notEqual(unlimited.stop, 'time');
     } finally {
+      await closeMcp();
+      db.close();
+    }
+  });
+});
+
+test('a job deadline cancels the request already in flight', async (t) => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const { id } = seed(db);
+      setMeta(db, 'config.jobs.minutes', '1');
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      let received;
+      const outcome = await runJob(db, id, { send: async (_params, { signal }) => {
+        received = signal;
+        t.mock.timers.tick(60_000);
+        if (signal?.aborted) throw signal.reason;
+        return reply('refusal', []);
+      } });
+      assert.equal(received?.aborted, true, 'the transport gets a deadline signal');
+      assert.equal(outcome.stop, 'time');
+    } finally {
+      t.mock.timers.reset();
       await closeMcp();
       db.close();
     }

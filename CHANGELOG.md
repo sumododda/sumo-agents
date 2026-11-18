@@ -4,6 +4,42 @@ What each release changed for you. The commit of each version has the full detai
 
 ## Unreleased
 
+## 0.7.2 — 2026-11-18
+
+- **A new failure can no longer hide in a suite that was already red.** A check failing when a worker began, and
+  still failing at the end, was let through whatever else had started failing. Now the failing tests are named
+  from the output at baseline and at the end. A test that fails now but did not then refuses DONE. When the
+  names can't be read from the output, the worker stays open with both logs kept, for you to look at and
+  accept with `sumo job finish <id> --status DONE --accept "<why>"`.
+- **No check run is no longer a pass.** A worker in a project with no check, test, lint or typecheck command
+  could say DONE with nothing run. Now it stays open until you accept it with `--accept`. That includes a
+  chore in scratch. An accepted attempt is never the one picked from several.
+- **`/undo` never throws away an edit you made after it.** It deleted a file the editor had created even after
+  you had written to it. Now every file of the turn is checked against what the editor last wrote before any
+  file is touched. A file changed since keeps the whole turn and names the file. An undo cut off halfway picks
+  up where it stopped.
+- **Secrets the model repeats stay out of files.** A key the model echoed in its reply was written raw to the
+  session's transcript. Replies are now redacted there. A saved session is redacted all the way down, web
+  results and tool results inside other blocks included, and keeps no thinking.
+- **A worker's change is kept whole before its worktree goes.** If `changes.diff` could not be written, the tree
+  was removed anyway, and a binary file came through as "files differ". Now `change.patch` is written beside it,
+  applicable with `git apply`, binary files included. If either can't be written, the worktree stays.
+- **A worker in a worktree is tested on its own code.** A workspace package or editable install linked in from the
+  project loads the project's copy, so a check could pass on code the worker never changed. Such links are now
+  found (npm, pnpm and Python editable installs). Baseline and verify say which to install in the worktree.
+- **Chat's "edited, nothing checked" is cleared only by a check that ran and passed.** Typing the check's name
+  into any command cleared it, before it ran, and in a project with no checks any command did. Now it takes
+  the project's own check, run whole without error. In a project with none, it takes a test runner run on
+  its own. Files changed by the shell in a git project count too.
+- **A job stops at its time limit, even mid-request.** The limit was checked only between requests, so a slow
+  request, retry or tool could run on past it. The request in flight is now cut off at the deadline, and no tool
+  starts after it.
+- **The test suite is green whatever your terminal says.** Two screen tests failed under `NO_COLOR=1`.
+- **`probes/paired-eval.mjs` runs the coding eval through other harnesses.** It runs native sumo, Claude Code and
+  sumo-harness on the same commit with the same brief and the same hidden tests. The route is pinned and the
+  budget split per run. It reports verified DONE, false DONE, time and cost per verified task. Tested offline
+  with stand-in CLIs; no paid run has been made.
+
 ## 0.7.1 — 2026-11-18
 
 - **A job's Herdr tab closes when the job is over, however it ended.** Before, only a job that ended done closed

@@ -99,7 +99,7 @@ test("a worker's DONE rests on what the project's checks say, not on what its re
 test('what already failed is not blamed on the job — and without a baseline, nothing can hide behind "it was already broken"', () => {
   const s = sandbox();
   s.routerWillSay('sonnet', 'medium');
-  gitProject(s, { status: 'broken' });
+  gitProject(s, { status: 'broken', recipe: '@test "$$(cat status)" = ok || { echo "FAIL old case"; exit 1; }' });
   newWorker(s);
   assert.match(s.sumo(['job', 'baseline', '1']).out, /^`make test` ALREADY FAILS — not yours to fix/);
   assert.match(s.sumo(['job', 'brief', '1']).out, /## Already failing before this job began — not yours to fix, and not to be made worse\n- `make test`/);
@@ -114,6 +114,43 @@ test('what already failed is not blamed on the job — and without a baseline, n
   const blamed = finish(s, '2');
   assert.equal(blamed.code, 1);
   assert.match(blamed.err, /no baseline was taken before the work, so the failure counts as this job's/);
+});
+
+test('a worker with no executable check requires explicit acceptance', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const p = gitProject(s);
+  unlinkSync(join(p.dir, 'Makefile'));
+  newWorker(s);
+  const done = finish(s);
+  assert.equal(done.code, 1);
+  assert.match(done.err, /cannot be verified.*nothing was run.*--accept/s);
+  const accepted = finish(s, '1', ['--accept', 'reviewed the exported text manually']);
+  assert.match(accepted.out, /DONE \(UNVERIFIED/);
+});
+
+test('an already-red suite cannot hide a newly failing test at worker finish', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const p = gitProject(s, { status: 'FAIL case A', recipe: '@cat status; exit 1' });
+  newWorker(s);
+  assert.match(s.sumo(['job', 'baseline', '1']).out, /ALREADY FAILS/);
+  p.write('status', 'FAIL case A\nFAIL case B\n');
+  const done = finish(s);
+  assert.equal(done.code, 1, 'a newly failing case must block DONE');
+  assert.match(done.err, /new failure/);
+});
+
+test('unidentifiable failures keep both logs and require explicit acceptance', () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  gitProject(s, { status: 'broken' });
+  newWorker(s);
+  assert.match(s.sumo(['job', 'baseline', '1']).out, /ALREADY FAILS/);
+  const done = finish(s);
+  assert.equal(done.code, 1);
+  assert.match(done.err, /cannot be verified.*baseline-test\.txt.*verify-test\.txt.*--accept/s);
+  for (const file of ['baseline-test.txt', 'verify-test.txt']) assert.ok(existsSync(join(s.home, 'jobs', '1', file)));
 });
 
 test('a baseline taken after the first edit is refused, because it would call the job\'s own breakage "already there"', () => {
@@ -624,7 +661,7 @@ test('a check that is over is not waited on for what it left running: the time l
 test('a baseline taken after an early verdict is what DONE is judged against: the verdict from before it is not reused', () => {
   const s = sandbox();
   s.routerWillSay('sonnet', 'medium');
-  gitProject(s, { status: 'broken' });
+  gitProject(s, { status: 'broken', recipe: '@test "$$(cat status)" = ok || { echo "FAIL old case"; exit 1; }' });
   newWorker(s);
   // Looked before the baseline: with nothing to compare against, the failure counts as the job's.
   assert.match(s.sumo(['job', 'verify', '1']).out, /no baseline was taken before the work/);

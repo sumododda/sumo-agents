@@ -506,6 +506,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
   }
 
   while (turns < MAX_TURNS) {
+    if (signal?.aborted) return interrupted();
     // A job that has spent its budget sends nothing more: the last round it made is answered, and the run ends there.
     if (overBudget()) {
       stop = 'budget';
@@ -521,6 +522,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     let response;
     // The same request, sent again while the API or the connection is the trouble; nothing of a failed try is kept.
     for (let attempt = 0; ; ) {
+      if (overTime()) return { turns, stop: 'time', error: null, text, totals, toldLast };
       try {
         response = await send(params, { onText, onThinking, onBlock, signal });
         break;
@@ -578,6 +580,10 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
     if (!refused) text = textOf(response.content) || text;
     for (const block of response.content) onBlock(block);
     onTurn?.(response, totals);
+    if (overTime()) {
+      stop = 'time';
+      break;
+    }
     // The API paused a long turn of its own accord: the reply so far is kept, and the turn simply goes on.
     if (response.stop_reason === 'pause_turn') continue;
     if (response.stop_reason === 'end_turn') {
@@ -597,6 +603,7 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
 
     totals.toolCalls += calls.length;
     const answer = async (call) => {
+      if (overTime()) return { type: 'tool_result', tool_use_id: call.id, content: 'not run: the job reached its time limit', is_error: true };
       if (signal?.aborted) return { type: 'tool_result', tool_use_id: call.id, content: 'not run: interrupted by the user', is_error: true };
       onTool?.(call);
       let out;
@@ -746,8 +753,6 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   const project = getProject(db, job.project);
   const tree = treeOf(db, id);
   if (tree && !existsSync(tree.path)) throw new UsageError(`j${id}'s worktree, ${tree.path}, no longer exists — abandon it and create it again`);
-  // The MCP servers of this process are the job's too: their tools behind the search tool, their names in its prompt.
-  const registry = await mcpReady();
   // Whom this job may ask, by the setting and the switches as they are now: the next model up that is on, or nobody.
   const advisor = (getMeta(db, 'config.jobs.advisor') ?? CONFIG_DEFAULTS['jobs.advisor']) === 'on' ? advisorOf(job.model, usableModels(db)) : null;
   // What this job may spend, by the setting as it is now; shared by both runs, so the second goes on from what the first spent.
@@ -757,7 +762,6 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   // with an answer, say — counts from its own start, as its budget does: nothing of an earlier `sumo job run` is carried over.
   const minutes = jobMinutes(db);
   const clock = minutes === null ? null : { ms: minutes * 60_000, from: Date.parse(now?.() ?? new Date().toISOString()), warned: false };
-  const params = jobParams({ job, text: brief(db, id), system: withServers(systemPrompt(), registry), mcp: registry.tools(), advisor });
   const lock = tx(db, () => takeRunLock(id));
   const heard = () => [...(inbox?.() ?? []), ...takeInbox(id)];
   // A command the sandbox blocked is put to the user with the job named, as its MCP calls are; its background commands are its own to end.
@@ -773,7 +777,29 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
     const held = handleEvent(db, 'pre-tool', { session_id: job.session_id ?? `job:j${id}`, agent_id: `j${id}`, project: job.project, cwd: ctx.cwd, tool_name: 'bash', tool_input: { command: String(call.input?.command ?? '') } }, now?.());
     return held ? { content: JSON.parse(held).deny, isError: true } : null;
   };
+  const deadline = new AbortController();
+  let timer;
+  // Node timers accept at most a signed 32-bit delay.
+  function arm(ms) {
+    const delay = Math.min(ms, 2_147_483_647);
+    timer = setTimeout(() => ms > delay ? arm(ms - delay) : deadline.abort(), delay);
+    timer.unref?.();
+  }
+  if (clock) {
+    arm(clock.ms);
+    signal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+  }
+  let cancelSetup;
   try {
+    // The registry is shared by other conversations. Stop waiting for it when this job ends.
+    const stopped = new Promise((resolve) => {
+      cancelSetup = () => resolve(null);
+      if (signal?.aborted) cancelSetup();
+      else signal?.addEventListener('abort', cancelSetup, { once: true });
+    });
+    const registry = await Promise.race([mcpReady(), stopped]);
+    signal?.removeEventListener('abort', cancelSetup);
+    const params = jobParams({ job, text: brief(db, id), system: withServers(systemPrompt(), registry), mcp: registry?.tools(), advisor });
     onStart?.(job);
     // A job that outgrows the context is summarized and goes on; its brief is on disk for whatever the summary left out, and what code
     // recorded of its work is said after the summary.
@@ -804,14 +830,17 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
       const totals = Object.fromEntries(Object.keys(more.totals).map((k) => [k, k === 'contextTokens' ? more.totals[k] : outcome.totals[k] + more.totals[k]]));
       outcome = { ...more, turns: outcome.turns + more.turns, text: more.text || outcome.text, totals, toldLast: outcome.toldLast || more.toldLast };
     }
+    if (deadline.signal.aborted && signal.reason === deadline.signal.reason) outcome.stop = 'time';
     // Kept for what follows the job: one told here to close near a limit is not retried past it (`followUp`, src/jobs.mjs).
-    toldToClose(db, id, budget?.warned ? 'budget' : clock?.warned ? 'time' : outcome.toldLast ? 'turns' : null);
+    toldToClose(db, id, budget?.warned ? 'budget' : (clock?.warned || outcome.stop === 'time') ? 'time' : outcome.toldLast ? 'turns' : null);
     // What it left running in the background goes before its worktree is settled: still running, it would write into a tree being
     // brought back and removed, or be there when the change lands in the project.
     for (const group of ctx.background) killGroup(group);
     const settled = await settle(db, id, now?.());
     return { ...outcome, job: getJob(db, id), settled };
   } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', cancelSetup);
     for (const group of ctx.background) killGroup(group);
     rmSync(lock, { force: true });
   }

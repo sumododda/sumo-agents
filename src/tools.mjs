@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { CREDENTIAL_NAMES } from './auth.mjs';
@@ -868,23 +869,12 @@ function undoTurns(sessionDir) {
 /** The folder the coming turn's undo goes in — made only when the editor first changes a file in it. */
 export const nextUndoTurn = (sessionDir) => join(sessionDir, String((undoTurns(sessionDir).at(-1) ?? 0) + 1));
 
-const readManifest = (turnDir) => {
-  try {
-    return JSON.parse(readFileSync(join(turnDir, MANIFEST), 'utf8'));
-  } catch {
-    return null;
-  }
-};
+const digest = (data) => createHash('sha256').update(data).digest('hex');
 
-/**
- * After the editor's first change to a file in a turn: what the file held before it (`before`, its bytes), or that it
- * was not there (null), kept in the turn's folder for /undo, readable by the user alone. A later change to it in the same
- * turn keeps nothing — /undo goes back to before the turn. The turn that starts a folder lets go of the oldest beyond
- * UNDO_TURNS, and of the undo of sessions long untouched.
- */
-function keepForUndo(turnDir, path, before) {
-  const manifest = readManifest(turnDir) ?? [];
-  if (manifest.some((entry) => entry.path === path)) return;
+/** Keep the original bytes once, and the expected file identity and content after the last editor write. */
+function keepForUndo(turnDir, path, before, written) {
+  const file = join(turnDir, MANIFEST);
+  const manifest = existsSync(turnDir) ? JSON.parse(readFileSync(file, 'utf8')) : [];
   if (manifest.length === 0) {
     const sessionDir = dirname(turnDir);
     mkdirSync(turnDir, { recursive: true, mode: 0o700 });
@@ -895,39 +885,78 @@ function keepForUndo(turnDir, path, before) {
       if (other !== sessionDir && Date.now() - statSync(other).mtimeMs > UNDO_KEEP_MS) rmSync(other, { recursive: true, force: true });
     }
   }
-  const kept = before === null ? null : String(manifest.length);
-  if (kept !== null) writeFileSync(join(turnDir, kept), before, { mode: 0o600 });
-  manifest.push({ path, kept, mode: kept === null ? null : statSync(path).mode & 0o777 });
-  writeFileSync(join(turnDir, MANIFEST), JSON.stringify(manifest), { mode: 0o600 });
+  const target = realpathSync.native(path);
+  const stat = statSync(target);
+  let entry = manifest.find((item) => item.path === path || item.target === target);
+  if (!entry) {
+    const kept = before === null ? null : String(manifest.length);
+    if (kept !== null) writeFileSync(join(turnDir, kept), before, { mode: 0o600, flag: 'wx' });
+    entry = { path, target, kept, original: before === null ? null : digest(before), dev: stat.dev, ino: stat.ino, nlink: stat.nlink };
+    manifest.push(entry);
+  } else if (before === null || entry.after !== digest(before) || entry.target !== target || entry.dev !== stat.dev || entry.ino !== stat.ino || entry.nlink !== stat.nlink) {
+    entry.conflict = true; // A later editor write cannot claim an intervening change as its own.
+  }
+  entry.after = digest(written);
+  writeFileSync(file + '.tmp', JSON.stringify(manifest), { mode: 0o600 });
+  renameSync(file + '.tmp', file);
 }
 
-/**
- * /undo: every file the session's last kept turn changed, put back as it was before that turn — a file it created is
- * deleted — and the turn let go, so the next /undo reaches the one before. Null when there is none to undo.
- */
+/** Check every destination and backup before touching the first file. A conflict keeps the whole turn for inspection or retry. */
 export function undoLast(sessionDir) {
-  for (const n of undoTurns(sessionDir).reverse()) {
-    const turnDir = join(sessionDir, String(n));
-    const manifest = readManifest(turnDir);
-    if (!manifest) {
-      rmSync(turnDir, { recursive: true, force: true });
-      continue;
-    }
-    const done = { restored: [], deleted: [] };
-    for (const { path, kept, mode } of manifest) {
-      if (kept === null) {
-        rmSync(path, { force: true });
-        done.deleted.push(path);
-      } else {
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, readFileSync(join(turnDir, kept)), { mode: mode ?? 0o644 });
-        done.restored.push(path);
+  const n = undoTurns(sessionDir).at(-1);
+  if (n === undefined) return null;
+  const turnDir = join(sessionDir, String(n));
+  const cursor = join(turnDir, 'restoring');
+  let manifest, start, plan;
+  try {
+    manifest = JSON.parse(readFileSync(join(turnDir, MANIFEST), 'utf8'));
+    if (!Array.isArray(manifest) || !manifest.length) throw new Error('the undo record is incomplete');
+    // The cursor is written before each mutation. After an interruption, recognise a completed
+    // write or unlink at the cursor, and leave already restored files alone on the next /undo.
+    const resuming = existsSync(cursor);
+    start = resuming ? JSON.parse(readFileSync(cursor, 'utf8')) : 0;
+    if (!Number.isInteger(start) || start < 0 || start >= manifest.length) throw new Error('invalid undo progress');
+    plan = manifest.slice(start).map(({ path, target, kept, original, after, dev, ino, nlink, conflict }, offset) => {
+      if (!after || !target) throw new Error(`the saved record for ${path} has no verifiable after-state`);
+      if (conflict) throw new Error(`${path} was changed outside the editor during this turn`);
+      const atCursor = resuming && offset === 0;
+      const stat = statSync(path, { throwIfNoEntry: false });
+      if (atCursor && kept === null && original === null && !stat && !lstatSync(target, { throwIfNoEntry: false })) return null;
+      if (!stat?.isFile() || realpathSync.native(path) !== target || stat.dev !== dev || stat.ino !== ino || stat.nlink !== nlink) throw new Error(`${path} was removed or replaced`);
+      const content = digest(readFileSync(target));
+      if (atCursor && kept !== null && content === original) return null;
+      if (content !== after) throw new Error(`${path} changed after the editor wrote it`);
+      const remove = kept === null && original === null;
+      if (remove) accessSync(dirname(target), constants.W_OK | constants.X_OK);
+      else if (kept !== String(start + offset)) throw new Error(`invalid backup for ${path}`);
+      else accessSync(target, constants.W_OK);
+      const bytes = remove ? null : readFileSync(join(turnDir, kept));
+      if (bytes !== null && digest(bytes) !== original) throw new Error(`the backup for ${path} has changed`);
+      return { path, target, stat, after, bytes };
+    });
+  } catch (cause) {
+    return { blocked: `undo stopped before changing any files: ${cause.message}. The saved turn is at ${turnDir}.` };
+  }
+  try {
+    for (const [offset, entry] of plan.entries()) {
+      if (!entry) continue;
+      const { path, target, stat, after, bytes } = entry;
+      writeFileSync(cursor + '.tmp', String(start + offset), { mode: 0o600 });
+      renameSync(cursor + '.tmp', cursor);
+      const current = statSync(path);
+      if (realpathSync.native(path) !== target || current.dev !== stat.dev || current.ino !== stat.ino || current.nlink !== stat.nlink || digest(readFileSync(target)) !== after) {
+        throw new Error(`${path} changed while undo was running`);
       }
+      if (bytes === null) rmSync(target);
+      else writeTo(target, bytes);
     }
     rmSync(turnDir, { recursive: true, force: true });
-    return done;
+  } catch (cause) {
+    return { blocked: `undo stopped while restoring files: ${cause.message}. Progress is saved in ${turnDir}. Retry /undo to resume.` };
   }
-  return null;
+  const done = { restored: [], deleted: [] };
+  for (const { path, kept } of manifest) (kept === null ? done.deleted : done.restored).push(path);
+  return done;
 }
 
 /**
@@ -935,16 +964,16 @@ export function undoLast(sessionDir) {
  * chat's turn folder), a change on disk since the model saw it is said first, and a parse the change broke — one that held
  * before it — is said after. `created`: the file was not there, so it parsed before as far as anyone is concerned.
  */
-function change(path, ctx, write, { created = false } = {}) {
+function change(path, ctx, written, { created = false } = {}) {
   const stale = created ? null : changedSince(path, ctx);
   const before = ctx.undo && !created ? readFileSync(path) : null;
   const broken = created ? null : parseError(path, ctx);
-  write();
+  writeTo(path, written, { create: created });
   // Kept once the write has gone through: a change refused — a create of a file already there — has nothing to undo. A keep
   // that fails is said, not thrown: the change is made, and a model told it failed would make it twice.
   let unkept = null;
   try {
-    if (ctx.undo) keepForUndo(ctx.undo, path, before);
+    if (ctx.undo) keepForUndo(ctx.undo, path, before, written);
   } catch (cause) {
     unkept = `(this change could not be kept for /undo: ${cause.message})`;
   }
@@ -1160,7 +1189,7 @@ export function runEditor(input, ctx) {
           return result(`${path} already exists (${lines} line${lines === 1 ? '' : 's'}): change the lines that change with str_replace or insert — a file is never rewritten whole`, true);
         }
         mkdirSync(dirname(path), { recursive: true });
-        const said = change(path, ctx, () => writeTo(path, String(input.file_text ?? ''), { create: true }), { created: true });
+        const said = change(path, ctx, String(input.file_text ?? ''), { created: true });
         return result(said(`created ${path}`));
       }
       case 'str_replace': {
@@ -1178,7 +1207,7 @@ export function runEditor(input, ctx) {
           if (text.includes('\r\n')) replacement = replacement.replace(/\r?\n/g, '\r\n');
           if (where.reindent) replacement = where.reindent(replacement);
         }
-        const said = change(path, ctx, () => writeTo(path, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`));
+        const said = change(path, ctx, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`);
         return { ...result(said(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`)), edit: changeOf(text, where, replacement) };
       }
       case 'insert': {
@@ -1194,7 +1223,7 @@ export function runEditor(input, ctx) {
         // A file ending in a newline splits to a last empty piece, which is not a line to insert after.
         const at = Math.max(0, Math.min(lines.at(-1) === '' ? lines.length - 1 : lines.length, line));
         lines.splice(at, 0, text.replace(/\n$/, ''));
-        const said = change(path, ctx, () => writeTo(path, lines.join('\n')));
+        const said = change(path, ctx, lines.join('\n'));
         return { ...result(said(`inserted into ${path} after line ${at}`)), edit: { line: at + 1, old: '', new: redact(text.replace(/\n$/, '')).text } };
       }
       default:
