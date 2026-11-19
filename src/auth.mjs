@@ -28,8 +28,8 @@ export const effortOnly = (m) => m.role === 'system' && Array.isArray(m.content)
 // Pin the protocol version so authentication does not depend on a local Claude installation.
 const CLAUDE_CODE_VERSION = '2.1.280';
 
-/** The names a credential is read from — and the only names a command run for the model goes without. */
-export const CREDENTIAL_NAMES = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'];
+/** The names Sumo's credentials are read from — Anthropic's, and Cursor's for jobs on its models — and the only names a command run for the model goes without. */
+export const CREDENTIAL_NAMES = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'CURSOR_API_KEY'];
 
 /** Resolve one credential without ever copying it into a child process or output. API keys keep their documented precedence. */
 export function resolveAnthropicCredential(env = process.env) {

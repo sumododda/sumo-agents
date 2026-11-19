@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { closeSync, constants, existsSync, fstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { ownGit } from './sandbox.mjs';
 
 /**
  * Reads what a repository says about itself — deterministically, with no model.
@@ -55,7 +56,7 @@ const readJson = (root, name) => {
 
 export function gitRemote(root) {
   try {
-    return execFileSync('git', ['-C', root, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
+    return execFileSync('git', ['-C', root, ...ownGit(['remote', 'get-url', 'origin'])], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
   } catch {
     return null;
   }
@@ -131,7 +132,8 @@ function projectCommands(root, pkg = readJson(root, 'package.json')) {
   }
   if (found.length === 0) {
     if (existsSync(join(root, 'go.mod'))) found.push({ name: 'test', command: 'go test ./...' });
-    if (existsSync(join(root, 'Cargo.toml'))) found.push({ name: 'test', command: 'cargo test' });
+    // Every test target run, not stopped at the first that fails: what a red one stops is never run, before the work or after it.
+    if (existsSync(join(root, 'Cargo.toml'))) found.push({ name: 'test', command: 'cargo test --no-fail-fast' });
     if (/\bpytest\b/.test(read(root, 'pyproject.toml') ?? '')) found.push({ name: 'test', command: 'pytest' });
   }
   return found;

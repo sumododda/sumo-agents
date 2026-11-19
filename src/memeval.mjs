@@ -1,9 +1,8 @@
 import { getMeta, setMeta } from './db.mjs';
-import { extractorVersion } from './ledger.mjs';
+import { extractorVersion, memoryModel } from './ledger.mjs';
 import { UsageError } from './memory.mjs';
 import { dryExtract } from './rebuild.mjs';
 import { searchAll } from './search.mjs';
-import { CONFIG_DEFAULTS } from './setup.mjs';
 import { clip, saysAs } from './text.mjs';
 
 /**
@@ -91,7 +90,7 @@ const again = (memory, filed) =>
 async function replayExtractor(db, { limit, now, extract }) {
   const { negatives, positives } = cases(db, limit);
   const out = { ran: false, failed: false, error: null, negatives: { cases: negatives.length, kept: 0, refiled: [] }, positives: { cases: positives.length, kept: 0, missed: [] } };
-  if ((getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model']) === 'off') return { ...out, failed: true, error: 'the memory pass is off (memory.model) — Memory › Filed by, on the settings page (sumo config), turns it on' };
+  if (memoryModel(db) === 'off') return { ...out, failed: true, error: 'the memory pass is off (memory.model) — Memory › Filed by, on the settings page (sumo config), turns it on' };
   if (negatives.length + positives.length === 0) return { ...out, error: 'no memory with the turn it came from to replay yet' };
   const read = new Map();
   const filedFrom = async (turn) => {

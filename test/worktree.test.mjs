@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { sharedSourceDependencies } from '../src/worktree.mjs';
+import { makeTree, sharedSourceDependencies } from '../src/worktree.mjs';
 import { createChat } from '../src/chat.mjs';
 import { openDb } from '../src/db.mjs';
 import { finish, newJob, treeOf } from '../src/jobs.mjs';
@@ -219,6 +219,29 @@ test('Python editable installs point verification to the worktree they load', ()
     writeFileSync(join(metadata, 'direct_url.json'), JSON.stringify({ dir_info: { editable: true }, url: pathToFileURL(source).href }));
     assert.deepEqual(sharedSourceDependencies(tree, project), expected);
   }
+});
+
+test("a shared install is judged by where it points: an editable library outside the project, or a link to nothing, is not the project's own source", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-agents-shared-')));
+  const p = gitRepo(join(root, 'proj'));
+  p.write('.gitignore', 'node_modules/\n.venv/\n');
+  const site = join(p.dir, '.venv', 'lib', 'python3.12', 'site-packages');
+  /** An editable install as pip makes it today: a finder the .pth imports, and where it points only in direct_url.json. */
+  const editable = (name, source) => {
+    mkdirSync(join(site, `${name}-0.1.dist-info`), { recursive: true });
+    writeFileSync(join(site, `__editable__.${name}-0.1.pth`), `import __editable___${name}_0_1_finder; __editable___${name}_0_1_finder.install()\n`);
+    writeFileSync(join(site, `${name}-0.1.dist-info`, 'direct_url.json'), JSON.stringify({ dir_info: { editable: true }, url: pathToFileURL(source).href }));
+  };
+  mkdirSync(join(root, 'otherlib'));
+  editable('otherlib', join(root, 'otherlib'));
+  mkdirSync(join(p.dir, 'node_modules'));
+  symlinkSync(join(root, 'nowhere'), join(p.dir, 'node_modules', 'stale'));
+  const tree = makeTree(p.dir, join(root, 'tree'));
+  assert.deepEqual(sharedSourceDependencies(tree, p.dir), []);
+  // The project itself, installed editable into the venv the tree shares, and linked as a workspace package: its source, not the tree's.
+  editable('proj', p.dir);
+  symlinkSync('..', join(p.dir, 'node_modules', 'proj'));
+  assert.deepEqual(sharedSourceDependencies(tree, p.dir), ['node_modules', '.venv']);
 });
 
 test('outside git a second worker still shares the tree, and is told so', () => {

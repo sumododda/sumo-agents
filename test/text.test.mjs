@@ -300,3 +300,17 @@ test('a named value that differs is not what was said: another branch, another v
   assert.equal(sameWayRound('Billing uses Postgres', 'we use postgres for billing'), true);
   assert.equal(sameWayRound('The user uses pnpm', 'we used to use npm but now we use pnpm'), true);
 });
+
+test('a credential Sumo runs on is redacted by its value, whatever its shape — a Cursor key matches no pattern, and is taken out all the same', () => {
+  const key = `grok_${'a1b2c3d4'.repeat(12)}`;
+  const before = process.env.CURSOR_API_KEY;
+  try {
+    delete process.env.CURSOR_API_KEY;
+    assert.match(redact(`it is ${key} here`).text, new RegExp(key), 'no pattern knows its shape');
+    process.env.CURSOR_API_KEY = key;
+    assert.deepEqual(redact(`cat ~/.zshrc\nexport CURSOR_API_KEY=${key}\necho ${key}`), { text: 'cat ~/.zshrc\nexport CURSOR_API_KEY=[redacted]\necho [redacted]', count: 2 });
+  } finally {
+    if (before === undefined) delete process.env.CURSOR_API_KEY;
+    else process.env.CURSOR_API_KEY = before;
+  }
+});

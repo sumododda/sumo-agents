@@ -3,10 +3,9 @@ import { ago, askLines } from './card.mjs';
 import { getMeta, setMeta } from './db.mjs';
 import { paths } from './paths.mjs';
 import { isScratch, listProjects, SCRATCH_DAYS } from './projects.mjs';
-import { filingState } from './ledger.mjs';
+import { filingState, memoryModel } from './ledger.mjs';
 import { lastHeard } from './sessions.mjs';
 import { spoolWaitingSince } from './spool.mjs';
-import { CONFIG_DEFAULTS } from './setup.mjs';
 import { clip, estimateTokens } from './text.mjs';
 
 const LINE_MAX = 120;
@@ -43,7 +42,7 @@ export function prime(db, { budget, project = null, now = new Date().toISOString
 
   // The small, time-sensitive sections are fixed first; preferences get whatever room is left.
   // Preserve the compact layout normally; when it cannot fit, keep time-sensitive lines first.
-  const sections = [workflows(db), projectsLine(db), leftOff(db, now), jobs(db, now), toConfirm(db, { project, now }), warnings(db, now)];
+  const sections = [workflows(db), projectsLine(db, project), leftOff(db, now), jobs(db, now), toConfirm(db, { project, now }), warnings(db, now)];
   // Where the work with no project goes is said every time, and is not something remembered.
   const remembered = sections.flat().length;
   sections.splice(2, 0, scratchLine());
@@ -124,12 +123,15 @@ function workflows(db) {
   return [`Workflows — before doing what one covers, run sumo show <id> and follow it: ${rows.map((m) => `m${m.id} "${clip(m.title, NAME_MAX)}"${m.cue ? ` — when: ${clip(m.cue, NAME_MAX)}` : ''}`).join(' · ')}`];
 }
 
-function projectsLine(db) {
+function projectsLine(db, here = null) {
   const all = listProjects(db).filter((p) => !isScratch(p));
   if (all.length === 0) return [];
   const shown = all.slice(0, MAX_PROJECTS).map((p) => `${p.slug} (${tilde(p.path)})`);
   const more = all.length > MAX_PROJECTS ? ` · +${all.length - MAX_PROJECTS} more: sumo project list` : '';
-  return [`Projects: ${shown.join(' · ')}${more}`];
+  // The project the session started in is said as the one it works in: told only the list and where work with no
+  // project goes, a model once took a turn that named none for scratch's, in a chat started inside the project.
+  const at = here ? all.find((p) => p.slug === here) : null;
+  return [`Projects: ${shown.join(' · ')}${more}`, ...(at ? [`Working in: ${at.slug} (${tilde(at.path)}) — this session started there; the work is there unless the user names another`] : [])];
 }
 
 function scratchLine() {
@@ -210,14 +212,16 @@ export function heartbeat(db, now = new Date().toISOString()) {
 function warnings(db, now) {
   const out = [];
   // AGENTS.md says a background writer files what the user says; with it off, nothing does unless the model is told.
-  if ((getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model']) === 'off') {
+  if (memoryModel(db) === 'off') {
     out.push('The memory pass is off (memory.model): save what the user states that should last, as it is said, with sumo add.');
   }
   // As the ledger counts them, which is what the status says: failures kept under an extractor since changed are not this one's.
-  const filing = filingState(db, now);
+  const filing = filingState(db);
   const failures = filing.failures;
   if (filing.fallbackUsed) out.push('Warning: the memory pass last ran on the hosted fallback — the local model could not answer, and each conversation read that way is paid for. Tell the user; sumo memory status says how the local model is.');
   if (failures >= SCRIBE_FAILURES_TO_WARN) out.push(`Warning: the background memory writer has failed ${failures} times in a row — nothing new is being remembered. Tell the user; sumo memory status shows why.`);
+  // Paused for another reason — most of what it filed thrown out — nothing new is filed either, and it is said as plainly.
+  else if (filing.paused) out.push(`Warning: the memory pass has stopped filing by itself — ${filing.reason}. Tell the user.`);
   // What waits in the spool is replayed by the next event that gets through: still there an hour on, it is not getting through.
   const spool = spoolWaitingSince();
   const waited = spool.since === null ? 0 : Date.parse(now) - spool.since;

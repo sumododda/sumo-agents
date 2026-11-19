@@ -171,3 +171,19 @@ test('a block squeezed to fit counts the lines it left out, in the line that say
     assert.doesNotMatch(prime(db, { now: NOW, budget: 4000 }), /left out for room/);
   });
 });
+
+test('a session started inside a project is told it works there; one started elsewhere is told no project', async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { addProject } = await import('../src/projects.mjs');
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      for (const slug of ['fruit', 'veg']) addProject(db, mkdtempSync(join(tmpdir(), `sumo-agents-${slug}-`)), { slug, now: NOW });
+      assert.match(prime(db, { project: 'fruit', now: NOW }), /^Working in: fruit \(.+\) — this session started there; the work is there unless the user names another$/m);
+      assert.doesNotMatch(prime(db, { now: NOW }), /Working in:/);
+    } finally {
+      db.close();
+    }
+  });
+});

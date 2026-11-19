@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { CREDENTIAL_NAMES } from './auth.mjs';
@@ -8,7 +8,7 @@ import { guardCommand, guardPath } from './guard.mjs';
 import { SELF } from './paths.mjs';
 import { readPlainFile } from './scan.mjs';
 import { redact } from './redact.mjs';
-import { blockedWrite, guardedPlaces, guardedWhy, readOnlyPlaces, sandboxWrap, unsandboxable, writablePlaces } from './sandbox.mjs';
+import { blockedWrite, guardedPlaces, guardedWhy, ownGit, readOnlyPatterns, readOnlyPlaces, sandboxWrap, unsandboxable, writablePlaces } from './sandbox.mjs';
 
 /**
  * The two tools a job gets, and the policy every call passes through before it
@@ -166,7 +166,7 @@ const NO_PROMPTS = { GIT_TERMINAL_PROMPT: '0', GIT_EDITOR: 'true', GIT_PAGER: 'c
 const sshCommands = new Map();
 function hasSshCommand(cwd, env) {
   if (!sshCommands.has(cwd)) {
-    const asked = spawnSync('git', ['config', '--get', 'core.sshCommand'], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PARSE_TIMEOUT_MS });
+    const asked = spawnSync('git', ownGit(['config', '--get', 'core.sshCommand']), { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PARSE_TIMEOUT_MS });
     sshCommands.set(cwd, asked.status === 0 && asked.stdout.trim() !== '');
   }
   return sshCommands.get(cwd);
@@ -437,10 +437,11 @@ function jailOf(ctx) {
     toldUnsandboxed = true;
     return { wrap: null, writable: [], readOnly: [], note };
   }
-  const writable = writablePlaces(ctx.roots, { opened: ctx.opened ?? [] });
+  // Every root can be read; only the project (the first) is written, as the editor writes it — a job's own folder holds what judges it.
+  const writable = writablePlaces(ctx.roots.slice(0, 1), { opened: ctx.opened ?? [] });
   const readOnly = [...new Set([...readOnlyPlaces(ctx.roots), ...guardedPlaces(ctx.roots)])];
   const offline = ctx.network === false;
-  return { wrap: sandboxWrap(writable, { readOnly, network: !offline }), writable, readOnly, offline, note: '' };
+  return { wrap: sandboxWrap(writable, { readOnly, patterns: readOnlyPatterns(ctx.roots), network: !offline }), writable, readOnly, offline, note: '' };
 }
 
 /** What a job's own tools run the project's checks under: the sandbox its shell is in, or nothing where the shell has none. */
@@ -516,7 +517,9 @@ async function runInBackground(command, ctx, { env, jail }) {
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     log = join(dir, `${Date.now()}-${process.pid}-${spilled++}.log`);
-    fd = openSync(log, 'a', 0o600);
+    // Made new, never through a link: the folder may be the temporary one, which the sandboxed shell writes too, and a
+    // link it planted at this name would have sumo — outside the sandbox — append the command's output wherever it leads.
+    fd = openSync(log, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
   } catch (cause) {
     return result(`the command could not be started in the background: there is nowhere to write its log (${cause.message})`, true);
   }
@@ -710,18 +713,20 @@ async function blocked(command, shown, ctx, jail, options) {
 
 /** How much of a file is looked at to tell a binary from text: a NUL byte in its first pages is one. */
 const BINARY_PROBE_BYTES = 8192;
+/** The most a view reads: it shows a few hundred lines, and a file past this is looked at in parts, in the shell. */
+const VIEW_MAX_BYTES = 64 * 1024 * 1024;
 
 function view(path, range) {
-  let bytes;
-  try {
-    bytes = readFileSync(path);
-  } catch (cause) {
-    if (cause.code === 'EISDIR') return result(cap(readdirSync(path).join('\n')));
-    throw cause;
+  // Judged and read through one descriptor that never waits: a FIFO or a device is said to be one, never read.
+  const text = readPlainFile(path, VIEW_MAX_BYTES);
+  if (text === null) {
+    const stat = statSync(path);
+    if (stat.isDirectory()) return result(cap(readdirSync(path).join('\n')));
+    return result(stat.isFile() ? `${path} is ${stat.size} bytes, too big to view whole — look at a part of it in the shell: sed -n '1,200p', tail or grep` : notPlain(path, stat), true);
   }
   // A binary shown as text is pages of nonsense, every page billed: say what it is instead.
-  if (bytes.subarray(0, BINARY_PROBE_BYTES).includes(0)) return result(`${path} is a binary file (${bytes.length} bytes) — not shown; use a tool that reads its kind, or \`file\` and \`xxd | head\` for a look`, true);
-  const lines = bytes.toString('utf8').split('\n');
+  if (text.slice(0, BINARY_PROBE_BYTES).includes('\0')) return result(`${path} is a binary file (${statSync(path).size} bytes) — not shown; use a tool that reads its kind, or \`file\` and \`xxd | head\` for a look`, true);
+  const lines = text.split('\n');
   let [from, to] = Array.isArray(range) && range.length === 2 ? range : [1, lines.length];
   from = Math.max(1, from);
   to = to === -1 ? lines.length : Math.min(lines.length, to);
@@ -828,13 +833,14 @@ const PY_PARSE = 'import ast,sys,traceback\ntry: ast.parse(open(sys.argv[1], "rb
  * or the parser is missing or too slow to say. `.js .mjs .cjs` by `node --check`, `.json` here, `.py` and `.go` by
  * their own tools when they are on the PATH.
  */
-function parseError(path, ctx) {
+function parseError(path, ctx, text) {
   const env = ctx.env ?? childEnv();
   const ext = extname(path);
   let run;
+  // JSON is parsed here, from the text the editor read or wrote: a name looked up again could be anything by now.
   if (ext === '.json') {
     try {
-      JSON.parse(readFileSync(path, 'utf8'));
+      JSON.parse(text);
       return null;
     } catch (cause) {
       return cause.message;
@@ -869,10 +875,14 @@ function undoTurns(sessionDir) {
 /** The folder the coming turn's undo goes in — made only when the editor first changes a file in it. */
 export const nextUndoTurn = (sessionDir) => join(sessionDir, String((undoTurns(sessionDir).at(-1) ?? 0) + 1));
 
-const digest = (data) => createHash('sha256').update(data).digest('hex');
+export const digest = (data) => createHash('sha256').update(data).digest('hex');
 
-/** Keep the original bytes once, and the expected file identity and content after the last editor write. */
-function keepForUndo(turnDir, path, before, written) {
+/**
+ * Keep the original bytes once, and what the file holds after the editor's last write: /undo judges it by that, not by its
+ * inode. `landed` is where the write went — the real path the checks settled on, and the descriptor's own stat after it —
+ * never the name looked up again: a link put there since would be taken for the file, and /undo would write through it.
+ */
+function keepForUndo(turnDir, path, before, written, { target, stat }) {
   const file = join(turnDir, MANIFEST);
   const manifest = existsSync(turnDir) ? JSON.parse(readFileSync(file, 'utf8')) : [];
   if (manifest.length === 0) {
@@ -885,15 +895,13 @@ function keepForUndo(turnDir, path, before, written) {
       if (other !== sessionDir && Date.now() - statSync(other).mtimeMs > UNDO_KEEP_MS) rmSync(other, { recursive: true, force: true });
     }
   }
-  const target = realpathSync.native(path);
-  const stat = statSync(target);
   let entry = manifest.find((item) => item.path === path || item.target === target);
   if (!entry) {
     const kept = before === null ? null : String(manifest.length);
     if (kept !== null) writeFileSync(join(turnDir, kept), before, { mode: 0o600, flag: 'wx' });
-    entry = { path, target, kept, original: before === null ? null : digest(before), dev: stat.dev, ino: stat.ino, nlink: stat.nlink };
+    entry = { path, target, kept, original: before === null ? null : digest(before), nlink: stat.nlink };
     manifest.push(entry);
-  } else if (before === null || entry.after !== digest(before) || entry.target !== target || entry.dev !== stat.dev || entry.ino !== stat.ino || entry.nlink !== stat.nlink) {
+  } else if (before === null || entry.after !== digest(before) || entry.target !== target || entry.nlink !== stat.nlink) {
     entry.conflict = true; // A later editor write cannot claim an intervening change as its own.
   }
   entry.after = digest(written);
@@ -901,12 +909,20 @@ function keepForUndo(turnDir, path, before, written) {
   renameSync(file + '.tmp', file);
 }
 
-/** Check every destination and backup before touching the first file. A conflict keeps the whole turn for inspection or retry. */
+/** A file that no longer holds what the editor left in it: someone's work since, kept as it is. */
+const notAsLeft = (message) => Object.assign(new Error(message), { changed: true });
+
+/**
+ * Check every destination and backup before touching the first file. A file changed since the editor wrote it keeps the
+ * whole turn for the user to put back and retry; asked again over the same file, the turn is let go, the file kept as it
+ * is, so the turns before it can still be undone.
+ */
 export function undoLast(sessionDir) {
   const n = undoTurns(sessionDir).at(-1);
   if (n === undefined) return null;
   const turnDir = join(sessionDir, String(n));
   const cursor = join(turnDir, 'restoring');
+  const refused = join(turnDir, 'refused');
   let manifest, start, plan;
   try {
     manifest = JSON.parse(readFileSync(join(turnDir, MANIFEST), 'utf8'));
@@ -916,16 +932,17 @@ export function undoLast(sessionDir) {
     const resuming = existsSync(cursor);
     start = resuming ? JSON.parse(readFileSync(cursor, 'utf8')) : 0;
     if (!Number.isInteger(start) || start < 0 || start >= manifest.length) throw new Error('invalid undo progress');
-    plan = manifest.slice(start).map(({ path, target, kept, original, after, dev, ino, nlink, conflict }, offset) => {
+    plan = manifest.slice(start).map(({ path, target, kept, original, after, nlink, conflict }, offset) => {
       if (!after || !target) throw new Error(`the saved record for ${path} has no verifiable after-state`);
-      if (conflict) throw new Error(`${path} was changed outside the editor during this turn`);
+      if (conflict) throw notAsLeft(`${path} was changed outside the editor during this turn`);
       const atCursor = resuming && offset === 0;
       const stat = statSync(path, { throwIfNoEntry: false });
-      if (atCursor && kept === null && original === null && !stat && !lstatSync(target, { throwIfNoEntry: false })) return null;
-      if (!stat?.isFile() || realpathSync.native(path) !== target || stat.dev !== dev || stat.ino !== ino || stat.nlink !== nlink) throw new Error(`${path} was removed or replaced`);
+      // A file the turn made that is gone already is as it was before the turn.
+      if (kept === null && original === null && !stat && !lstatSync(target, { throwIfNoEntry: false })) return null;
+      if (!stat?.isFile() || realpathSync.native(path) !== target || stat.nlink !== nlink) throw notAsLeft(`${path} was removed or replaced`);
       const content = digest(readFileSync(target));
       if (atCursor && kept !== null && content === original) return null;
-      if (content !== after) throw new Error(`${path} changed after the editor wrote it`);
+      if (content !== after) throw notAsLeft(`${path} changed after the editor wrote it`);
       const remove = kept === null && original === null;
       if (remove) accessSync(dirname(target), constants.W_OK | constants.X_OK);
       else if (kept !== String(start + offset)) throw new Error(`invalid backup for ${path}`);
@@ -935,7 +952,19 @@ export function undoLast(sessionDir) {
       return { path, target, stat, after, bytes };
     });
   } catch (cause) {
-    return { blocked: `undo stopped before changing any files: ${cause.message}. The saved turn is at ${turnDir}.` };
+    if (!cause.changed) return { blocked: `undo stopped before changing any files: ${cause.message}. The saved turn is at ${turnDir}.` };
+    let refusedBefore = null;
+    try {
+      refusedBefore = readFileSync(refused, 'utf8');
+    } catch {
+      // Not refused before: this is the first time.
+    }
+    if (refusedBefore === cause.message) {
+      rmSync(turnDir, { recursive: true, force: true });
+      return { blocked: `undo let go of the last turn without changing any more files: ${cause.message}, and it is kept as it is. /undo again reaches the turn before.` };
+    }
+    writeFileSync(refused, cause.message, { mode: 0o600 });
+    return { blocked: `undo stopped before changing any files: ${cause.message}. Put it back as the editor left it and /undo again — or /undo again to let that turn go and keep it as it is. The saved turn is at ${turnDir}.` };
   }
   try {
     for (const [offset, entry] of plan.entries()) {
@@ -948,7 +977,7 @@ export function undoLast(sessionDir) {
         throw new Error(`${path} changed while undo was running`);
       }
       if (bytes === null) rmSync(target);
-      else writeTo(target, bytes);
+      else writeTo(target, bytes, current);
     }
     rmSync(turnDir, { recursive: true, force: true });
   } catch (cause) {
@@ -962,23 +991,26 @@ export function undoLast(sessionDir) {
 /**
  * One change to a file by the editor, and what is owed around it: what the file held is kept for /undo (`ctx.undo`, the
  * chat's turn folder), a change on disk since the model saw it is said first, and a parse the change broke — one that held
- * before it — is said after. `created`: the file was not there, so it parsed before as far as anyone is concerned.
+ * before it — is said after. `file`: the descriptor `openChecked` holds, read and written through; with none the file is
+ * made at `target`, where the checks found it lands — it was not there, so it parsed before as far as anyone is concerned.
  */
-function change(path, ctx, written, { created = false } = {}) {
+function change(path, ctx, written, { file = null, target = null } = {}) {
+  const created = file === null;
   const stale = created ? null : changedSince(path, ctx);
-  const before = ctx.undo && !created ? readFileSync(path) : null;
-  const broken = created ? null : parseError(path, ctx);
-  writeTo(path, written, { create: created });
+  const before = ctx.undo && !created ? file.bytes : null;
+  const broken = created ? null : parseError(path, ctx, file.bytes.toString('utf8'));
+  const where = created ? (target ?? path) : file.target;
+  const stat = created ? writeTo(where, written) : writeThrough(path, file, written);
   // Kept once the write has gone through: a change refused — a create of a file already there — has nothing to undo. A keep
   // that fails is said, not thrown: the change is made, and a model told it failed would make it twice.
   let unkept = null;
   try {
-    if (ctx.undo) keepForUndo(ctx.undo, path, before, written);
+    if (ctx.undo) keepForUndo(ctx.undo, path, before, written, { target: where, stat });
   } catch (cause) {
     unkept = `(this change could not be kept for /undo: ${cause.message})`;
   }
   if (created || ctx.seen?.has(path)) seenIn(ctx).set(path, stampOf(path));
-  const now = broken === null ? parseError(path, ctx) : null;
+  const now = broken === null ? parseError(path, ctx, written) : null;
   return (said) => [stale, said, unkept, now && `The file no longer parses:\n${now}`].filter(Boolean).join('\n');
 }
 
@@ -1066,23 +1098,61 @@ function linesOf(text, old) {
 /** Why a file with another name is asked about each time. */
 const HARD_LINK = 'it has another name elsewhere (a hard link), and a change here changes that file too';
 
+/** What the editor says when the file it checked is not the one at that name any more. */
+const replaced = (path) => `${path} was replaced while it was being changed; nothing was written — view it again`;
+/** Why a path that is not a plain file is neither read nor written: a FIFO would wait on a writer for good, a device never ends. */
+const notPlain = (path, stat) => `${path} is ${stat.isDirectory() ? 'a directory' : 'not a plain file (a FIFO, a device or a socket)'} — not opened; look at it in the shell if it is safe to`;
+
+/** Bytes put in place of a file's, from its start, through a descriptor already open on it. */
+function overwrite(fd, data) {
+  const bytes = Buffer.from(data);
+  ftruncateSync(fd, 0);
+  for (let at = 0; at < bytes.length; ) at += writeSync(fd, bytes, at, bytes.length - at, at);
+}
+
 /**
- * A file the editor writes, written where its checks found it lands: through no link swapped in since — the last name
- * is opened without following one — and only when the file opened is the one that was checked. Nothing is truncated
- * before that. (A folder above it swapped for a link between the check and the open is not caught: Node has no openat.)
+ * A file written at its real path, never looked up again: made new (`expected` null, and never through a link), or
+ * written over only when the file opened there — the last name not followed — is the one `expected` names. Nothing is
+ * truncated before that. (A folder above it swapped for a link between the check and the open is not caught: Node has no openat.)
+ * Returns the stat of what was written, from its descriptor.
  */
-function writeTo(path, data, { create = false } = {}) {
-  const target = landsAt(path) ?? path;
-  const before = create ? null : statSync(target);
-  const fd = openSync(target, constants.O_WRONLY | constants.O_NOFOLLOW | (create ? constants.O_CREAT | constants.O_EXCL : 0), 0o666);
+function writeTo(target, data, expected = null) {
+  const fd = openSync(target, constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | (expected ? 0 : constants.O_CREAT | constants.O_EXCL), 0o666);
   try {
     const opened = fstatSync(fd);
-    if (before && (opened.ino !== before.ino || opened.dev !== before.dev)) throw new Error(`${path} was replaced while it was being changed; nothing was written — view it again`);
-    ftruncateSync(fd, 0);
-    writeFileSync(fd, data);
+    if (expected && (!opened.isFile() || opened.ino !== expected.ino || opened.dev !== expected.dev)) throw new Error(replaced(target));
+    overwrite(fd, data);
+    return fstatSync(fd);
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * A file the editor changes, opened once where its checks found it lands (`target`, a real path; `checked`, its lstat
+ * then): read and later written through this one descriptor, so what is written is what was read and judged. The last
+ * name is not followed, nothing but a plain file is opened, and nothing that waits on a writer.
+ */
+function openChecked(path, target, checked) {
+  if (!checked) throw new Error(`${path} does not exist`);
+  if (!checked.isFile()) throw new Error(notPlain(path, checked));
+  const fd = openSync(target, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.dev !== checked.dev || stat.ino !== checked.ino) throw new Error(replaced(path));
+    return { fd, target, stat, bytes: readFileSync(fd) };
+  } catch (cause) {
+    closeSync(fd);
+    throw cause;
+  }
+}
+
+/** The change written through the descriptor `openChecked` holds — and only while the name still leads to that file: a link or another file put there since is neither written through nor said to be changed. Returns the descriptor's stat after it. */
+function writeThrough(path, file, data) {
+  const now = lstatSync(file.target, { throwIfNoEntry: false });
+  if (!now?.isFile() || now.dev !== file.stat.dev || now.ino !== file.stat.ino) throw new Error(replaced(path));
+  overwrite(file.fd, data);
+  return fstatSync(file.fd);
 }
 
 /** The text editor's four commands, each inside the jail; secret files are neither shown nor written. */
@@ -1154,16 +1224,28 @@ export function runEditor(input, ctx) {
         return result(`${path} can be read, not changed — only files in the project (${ctx.roots[0]}) are edited`, true);
       }
     }
+    // Where a write lands, decided here once — its real path, and the file there as it is now — and carried to the write,
+    // which opens that and nothing else: a name swapped for a link while the work goes on cannot move it.
+    const target = input.command === 'view' ? null : landsAt(path);
+    const checked = target === null ? null : (lstatSync(target, { throwIfNoEntry: false }) ?? null);
     // What git runs by itself — a hook on the next commit, a command its config names — runs outside the sandbox: the shell cannot write it, nor can this.
+    // Each check is made of the name given, the deepest folder there, and where the write lands: a link in the project to the
+    // project (`ln -s . sub`) makes `sub/.npmrc` a new `.npmrc` at its top, which neither of the first two names.
     if (input.command !== 'view') {
+      if (target === null) return result(`${path} goes through a link to something not there yet — not written: say in your report what it needs`, true);
       const at = realAncestor(path);
-      const kept = readOnlyPlaces(ctx.roots).find((place) => path === place || path.startsWith(`${place}${sep}`) || at === place || at.startsWith(`${place}${sep}`));
+      const kept = readOnlyPlaces(ctx.roots).find((place) => [path, at, target].some((p) => p === place || p.startsWith(`${place}${sep}`)));
       if (kept) return result(`${path} is git's own hooks or configuration: not changed here — what git runs by itself would run outside the sandbox. Say in your report what it needs.`, true);
+      const hidden = secret ?? guardPath(target);
+      if (hidden) return result(hidden, true);
       // What something else reads later — the shell at its start, a tool before it runs, an editor — is changed only when the user says so, this once.
       const guarded = guardedWhy(path, { roots: ctx.roots }) ?? guardedWhy(at, { roots: ctx.roots });
       if (guarded && ctx.granted !== path) return askFirst(`${path} is changed only when the user says so: ${guarded}`, path, { outside: false, guarded });
+      const lands = guarded ? null : guardedWhy(target, { roots: ctx.roots });
+      if (lands && ctx.granted !== target) return askFirst(`${path} (a link to ${target}) is changed only when the user says so: ${lands}`, target, { outside: false, guarded: lands });
       // A hard link is the same file under another name, perhaps one outside the project or guarded: no path check sees it.
-      if (existsSync(path) && lstatSync(path).isFile() && lstatSync(path).nlink > 1 && ctx.granted !== path) return askFirst(`${path} is changed only when the user says so: ${HARD_LINK}`, path, { outside: false, guarded: HARD_LINK });
+      // Judged on the file the write lands on, so a link to it is no way round.
+      if (checked?.isFile() && checked.nlink > 1 && ctx.granted !== path) return askFirst(`${path} is changed only when the user says so: ${HARD_LINK}`, path, { outside: false, guarded: HARD_LINK });
     }
     switch (input.command) {
       case 'view': {
@@ -1189,45 +1271,56 @@ export function runEditor(input, ctx) {
           return result(`${path} already exists (${lines} line${lines === 1 ? '' : 's'}): change the lines that change with str_replace or insert — a file is never rewritten whole`, true);
         }
         mkdirSync(dirname(path), { recursive: true });
-        const said = change(path, ctx, String(input.file_text ?? ''), { created: true });
+        const said = change(path, ctx, String(input.file_text ?? ''), { target });
         return result(said(`created ${path}`));
       }
       case 'str_replace': {
         if (secret) return result(secret, true);
         if (!input.old_str) return result('str_replace needs old_str', true);
         if (input.new_str !== undefined && input.old_str === input.new_str) return result('old_str and new_str are the same — nothing would change', true);
-        const text = readFileSync(path, 'utf8');
-        const gap = placeholderIn(path, 'new_str', input.new_str, text);
-        if (gap) return result(gap, true);
-        const where = locate(text, input.old_str);
-        if (!where) return result(`old_str was not found in ${path}`, true);
-        if (where.hits !== 1) return result(`old_str appears ${where.hits} times in ${path}${linesOf(text, input.old_str)} — include more context so it is unique`, true);
-        let replacement = String(input.new_str ?? '');
-        if (where.how) {
-          if (text.includes('\r\n')) replacement = replacement.replace(/\r?\n/g, '\r\n');
-          if (where.reindent) replacement = where.reindent(replacement);
+        const file = openChecked(path, target, checked);
+        try {
+          const text = file.bytes.toString('utf8');
+          const gap = placeholderIn(path, 'new_str', input.new_str, text);
+          if (gap) return result(gap, true);
+          const where = locate(text, input.old_str);
+          if (!where) return result(`old_str was not found in ${path}`, true);
+          if (where.hits !== 1) return result(`old_str appears ${where.hits} times in ${path}${linesOf(text, input.old_str)} — include more context so it is unique`, true);
+          let replacement = String(input.new_str ?? '');
+          if (where.how) {
+            if (text.includes('\r\n')) replacement = replacement.replace(/\r?\n/g, '\r\n');
+            if (where.reindent) replacement = where.reindent(replacement);
+          }
+          const said = change(path, ctx, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`, { file });
+          return { ...result(said(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`)), edit: changeOf(text, where, replacement) };
+        } finally {
+          closeSync(file.fd);
         }
-        const said = change(path, ctx, `${text.slice(0, where.start)}${replacement}${text.slice(where.end)}`);
-        return { ...result(said(`edited ${path}${where.how ? ` (old_str matched ${where.how})` : ''}`)), edit: changeOf(text, where, replacement) };
       }
       case 'insert': {
         if (secret) return result(secret, true);
-        const lines = readFileSync(path, 'utf8').split('\n');
-        const line = Number(input.insert_line ?? 0);
-        if (!Number.isInteger(line)) return result('insert needs insert_line: the number of the line to insert after, 0 for the top of the file', true);
-        // The tool sends the text as insert_text, a line with its newline; new_str is what an earlier version of the tool sent.
-        const text = input.insert_text ?? input.new_str;
-        if (typeof text !== 'string') return result('insert needs insert_text: the text to insert', true);
-        const gap = placeholderIn(path, input.insert_text === undefined ? 'new_str' : 'insert_text', text, lines.join('\n'));
-        if (gap) return result(gap, true);
-        // A file ending in a newline splits to a last empty piece, which is not a line to insert after.
-        const at = Math.max(0, Math.min(lines.at(-1) === '' ? lines.length - 1 : lines.length, line));
-        lines.splice(at, 0, text.replace(/\n$/, ''));
-        const said = change(path, ctx, lines.join('\n'));
-        return { ...result(said(`inserted into ${path} after line ${at}`)), edit: { line: at + 1, old: '', new: redact(text.replace(/\n$/, '')).text } };
+        const file = openChecked(path, target, checked);
+        try {
+          const lines = file.bytes.toString('utf8').split('\n');
+          const line = Number(input.insert_line ?? 0);
+          if (!Number.isInteger(line)) return result('insert needs insert_line: the number of the line to insert after, 0 for the top of the file', true);
+          // The tool sends the text as insert_text, a line with its newline; new_str is what an earlier version of the tool sent.
+          const text = input.insert_text ?? input.new_str;
+          if (typeof text !== 'string') return result('insert needs insert_text: the text to insert', true);
+          const gap = placeholderIn(path, input.insert_text === undefined ? 'new_str' : 'insert_text', text, lines.join('\n'));
+          if (gap) return result(gap, true);
+          // A file ending in a newline splits to a last empty piece, which is not a line to insert after.
+          const at = Math.max(0, Math.min(lines.at(-1) === '' ? lines.length - 1 : lines.length, line));
+          lines.splice(at, 0, text.replace(/\n$/, ''));
+          const said = change(path, ctx, lines.join('\n'), { file });
+          return { ...result(said(`inserted into ${path} after line ${at}`)), edit: { line: at + 1, old: '', new: redact(text.replace(/\n$/, '')).text } };
+        } finally {
+          closeSync(file.fd);
+        }
       }
       default:
-        return result(`unknown command ${input.command}`, true);
+        // Said with the way out: a model that never saw this tool's own schema (Cursor's) guesses its shape at first.
+        return result(`${input.command === undefined ? 'no command given' : `unknown command ${input.command}`} — command is one of view, create, str_replace, insert`, true);
     }
   } catch (cause) {
     return result(cause.message, true);

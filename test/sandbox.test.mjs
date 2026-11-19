@@ -1,9 +1,9 @@
 // The model's shell: the OS sandbox around it, the limit on a command gone quiet, and commands left in the background.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { openDb } from '../src/db.mjs';
 import { runJob, sandboxOn } from '../src/loop.mjs';
@@ -23,7 +23,7 @@ const alive = (pid) => {
   }
 };
 const settled = async (check) => {
-  for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 20));
+  for (const end = Date.now() + 10_000; Date.now() < end && !check(); ) await new Promise((r) => setTimeout(r, 20));
   return check();
 };
 const env = childEnv({ PATH: process.env.PATH });
@@ -114,13 +114,22 @@ test('the guarded files — read later by the shell, a tool or an editor — are
   assert.equal(guardedWhy(join(home, 'code', 'other', '.git', 'hooks', 'pre-commit'), { roots: [root], home }), 'git runs what is in it, outside the sandbox');
   assert.equal(guardedWhy(join(home, 'code', 'other', '.GIT', 'config'), { roots: [root], home }), 'git runs what is in it, outside the sandbox');
   assert.equal(guardedWhy(join(home, 'code', 'other', 'src', 'git.js'), { roots: [root], home }), null);
+  const places = guardedPlaces([root], { home: join(scratch, 'nohome'), sumo: join(scratch, 'nosumo'), env: { PATH: '' } });
   assert.deepEqual(
-    guardedPlaces([root], { home: join(scratch, 'nohome'), sumo: join(scratch, 'nosumo'), env: { PATH: '' } }),
-    [realpathSync(join(root, '.envrc')), realpathSync(join(root, '.vscode')), ...['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool'].map((n) => join(scratch, 'nosumo', n))],
-    "the guarded files that are there, and sumo's own by name whether or not they are",
+    places.filter((place) => place.startsWith(`${join(scratch, 'nosumo')}/`)),
+    [...['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool', 'scribe.lock', 'dream.lock', 'logs', 'backups', 'history'].map((n) => join(scratch, 'nosumo', n))],
+    "sumo's own by name, whether or not they are there",
   );
+  // Every guarded name directly under the project, there or not: a file the shell made would be read later all the same.
+  for (const name of ['.envrc', '.vscode', '.npmrc', '.claude', '.mcp.json', 'lefthook.yml']) assert.ok(places.includes(join(root, name)), name);
   // The spool is replayed into the journal as what the user said: a line the shell could add there would be the user's words.
   assert.equal(guardedWhy(join(scratch, 'nosumo', 'spool', 'events.jsonl'), { roots: [root], home, sumo: join(scratch, 'nosumo') }), "it is sumo's own: its memory, settings or program");
+  // A lock naming a live process stops every memory pass; a saved session is picked up again as the conversation itself.
+  assert.equal(guardedWhy(join(scratch, 'nosumo', 'scribe.lock'), { roots: [root], home, sumo: join(scratch, 'nosumo') }), "it is sumo's own: its memory, settings or program");
+  assert.equal(guardedWhy(join(scratch, 'nosumo', 'logs', 'sessions', 'x.state.json'), { roots: [root], home, sumo: join(scratch, 'nosumo') }), "it is sumo's own: its memory, settings or program");
+  // The logs hold each turn's /undo too, which sumo writes back wherever it says: all of them are sumo's.
+  assert.equal(guardedWhy(join(scratch, 'nosumo', 'logs', 'undo', 's', '1', 'manifest.json'), { roots: [root], home, sumo: join(scratch, 'nosumo') }), "it is sumo's own: its memory, settings or program");
+  assert.equal(guardedWhy(join(scratch, 'nosumo', 'scratch', 'notes.txt'), { roots: [root], home, sumo: join(scratch, 'nosumo') }), null, 'a scratch chore is not');
   // Programs' own setup in the home, and anything on the PATH; a project's bin folder is the project's.
   for (const [rel, why] of [
     ['.gitconfig', 'git reads it, and runs what it names'],
@@ -133,13 +142,13 @@ test('the guarded files — read later by the shell, a tool or an editor — are
   assert.equal(guardedWhy(join(root, 'bin', 'run.mjs'), { roots: [root], home, env: { PATH: '' } }), null, "a project's bin is the project's");
   assert.equal(guardedWhy('/opt/tools/bin/deploy', { roots: [root], home, env: { PATH: '/usr/bin:/opt/tools/bin' } }), 'it is on your PATH: a program there runs as a command');
   const ctx = { cwd: root, roots: [root], env, sandbox: true, opened: new Set([opened]) };
-  for (const command of ['echo x >> .envrc', 'echo x > .vscode/settings.json', 'rm -r .vscode']) {
+  for (const command of ['echo x >> .envrc', 'echo x > .vscode/settings.json', 'rm -r .vscode', 'echo x > .npmrc', 'echo x > .NPMRC', 'mkdir -p .claude && echo {} > .claude/settings.json', 'echo {} > .mcp.json', 'echo x > lefthook.yml']) {
     const out = await runBash({ command }, ctx);
     assert.equal(out.isError, true, command);
     assert.match(out.content, /operation not permitted/i, command);
   }
   assert.equal(readFileSync(join(root, '.envrc'), 'utf8'), 'export A=1\n');
-  assert.equal(existsSync(join(root, '.npmrc')), false, 'a guarded name not there yet is still made: only what exists is carved out');
+  assert.deepEqual(['.npmrc', '.claude', '.mcp.json', 'lefthook.yml'].filter((name) => existsSync(join(root, name))), [], 'a guarded name not there yet is not made either');
   assert.deepEqual(await runBash({ command: `echo y > plain.txt && echo z > ${opened}/made.txt && echo ok` }, ctx), { content: 'ok', isError: false });
   assert.equal(readFileSync(join(opened, 'made.txt'), 'utf8'), 'z\n');
 });
@@ -351,6 +360,7 @@ test("sumo's own memory, settings and MCP servers are read-only to the sandboxed
   await withHome(freshHome(), {}, async () => {
     const home = process.env.SUMO_AGENTS_HOME;
     openDb().close();
+    mkdirSync(join(home, 'logs', 'sessions'), { recursive: true });
     const root = join(scratch, 'sumo-own');
     mkdirSync(root);
     const ctx = { cwd: root, roots: [root], env: { ...env, SUMO_AGENTS_HOME: home, SUMO_TOOL: '1' }, sandbox: true };
@@ -360,12 +370,24 @@ test("sumo's own memory, settings and MCP servers are read-only to the sandboxed
       `echo '{"mcpServers":{"x":{"command":"/bin/sh","allow":"all"}}}' > ${home}/mcp.json`,
       `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(process.env.SUMO_AGENTS_HOME + '/memory.db-wal', 'x')"`,
       `mkdir -p ${home}/bin && echo x > ${home}/bin/sumo`,
+      // A lock naming a process that never ends would stop every memory pass, and a saved session is resumed as the
+      // conversation itself: neither is the shell's to write.
+      `echo 1 > ${home}/scribe.lock`,
+      `echo 1 > ${home}/dream.lock`,
+      `echo '{"version":1,"id":"f","savedAt":"2099-01-01T00:00:00Z","messages":[]}' > ${home}/logs/sessions/ffffffff.state.json`,
+      // An /undo turn is written back by sumo, outside the sandbox, wherever it says; a backup or a migration's copy is put back
+      // over the memory; the history is what the user typed.
+      `mkdir -p ${home}/logs/undo/s/999 && echo '[]' > ${home}/logs/undo/s/999/manifest.json`,
+      `mkdir -p ${home}/backups && echo x > ${home}/backups/memory-2099-01-01T00-00-00-000Z.db`,
+      `echo x > ${home}/memory.db.pre-v99.bak`,
+      `echo x > ${home}/history`,
     ]) {
       const out = await runBash({ command }, ctx);
       assert.equal(out.isError, true, command);
       assert.match(out.content, /operation not permitted/i, command);
     }
     assert.equal(existsSync(join(home, 'mcp.json')), false, 'no server list was made');
+    assert.deepEqual(['scribe.lock', 'dream.lock', join('logs', 'sessions', 'ffffffff.state.json'), join('logs', 'undo'), 'memory.db.pre-v99.bak', 'history'].filter((n) => existsSync(join(home, n))), [], 'no lock, no saved session, no undo turn, no copy to restore');
     // Through the CLI it works, as sumo, outside the sandbox — and what only the user may change is still refused.
     const searched = await runBash({ command: 'sumo search "nothing here"' }, ctx);
     assert.equal(searched.isError, false, searched.content);
@@ -375,6 +397,63 @@ test("sumo's own memory, settings and MCP servers are read-only to the sandboxed
     // A sumo command the shell would expand or pipe is not taken for one: it stays in the sandbox, which cannot open the database.
     assert.equal((await runBash({ command: 'sumo search "nothing here" && echo searched' }, ctx)).isError, true);
   });
+});
+
+test("sumo's home is not the sandboxed shell's to write: a job writes its project alone — not its own folder, which holds what judges it, nor another job's inbox, read as the user's words", { skip: noSandbox }, async () => {
+  // A home outside every temporary folder, as ~/.sumo-agents is: the sandbox lets anyone write those.
+  await withHome(join(scratch, 'own-home'), {}, async () => {
+    const home = process.env.SUMO_AGENTS_HOME;
+    openDb().close();
+    for (const dir of [join(home, 'jobs', '7'), join(home, 'jobs', '8', 'inbox')]) mkdirSync(dir, { recursive: true });
+    const root = join(scratch, 'job-project');
+    mkdirSync(root);
+    const ctx = { cwd: root, roots: [root, join(home, 'jobs', '7')], env: { ...env, SUMO_AGENTS_HOME: home, SUMO_TOOL: '1', SUMO_JOB: '7' }, sandbox: true };
+    const project = await runBash({ command: 'echo mine > made.txt' }, ctx);
+    assert.equal(project.isError, false, project.content);
+    for (const file of [join('jobs', '7', 'outside'), join('jobs', '7', 'brief.md'), join('jobs', '8', 'inbox', 'said.json'), 'planted.txt', join('scratch', 'x.txt')]) {
+      const out = await runBash({ command: `mkdir -p ${JSON.stringify(dirname(join(home, file)))} && echo x > ${JSON.stringify(join(home, file))}` }, ctx);
+      assert.equal(out.isError, true, file);
+      assert.match(out.content, /operation not permitted/i, file);
+      assert.equal(existsSync(join(home, file)), false, file);
+    }
+  });
+});
+
+test("a repository's config and hooks below the project are git's to run later, as the project's own are: the shell makes none there, nor a .git that points elsewhere — while the project's own repository works as before; and a project with none is not given one by the shell — `git init`, with a template or a config set after it, would write what git runs later — it is the user's to start", { skip: noSandbox }, async () => {
+  const root = join(scratch, 'nested');
+  mkdirSync(root);
+  const git = (...args) => execFileSync('git', ['-C', root, '-c', 'user.email=t@example.com', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', ...args], { stdio: 'ignore' });
+  git('init', '-q');
+  git('commit', '-q', '--allow-empty', '-m', 'first');
+  const ctx = { cwd: root, roots: [root], env, sandbox: true };
+  for (const command of [
+    'git init -q sub',
+    'mkdir -p deep/er && git -C deep/er init -q',
+    'mkdir -p side/.git && echo "[core]" > side/.git/config',
+    'mkdir -p up && mkdir up/.GIT',
+    'mkdir -p away && printf "gitdir: ../elsewhere\\n" > away/.git',
+    'mkdir -p .git/modules/m && echo "[core]" > .git/modules/m/config',
+    'mkdir -p .git/modules/n/hooks',
+  ]) {
+    const out = await runBash({ command }, ctx);
+    assert.equal(out.isError, true, command);
+    assert.match(out.content, /operation not permitted/i, command);
+  }
+  assert.deepEqual(['sub/.git', 'deep/er/.git', 'side/.git/config', 'up/.GIT', 'away/.git', '.git/modules/m/config', '.git/modules/n/hooks'].filter((p) => existsSync(join(root, p))), []);
+  const commit = await runBash({ command: 'echo one > a.txt && git add a.txt && git -c user.email=t@example.com -c user.name=t -c commit.gpgsign=false commit -q -m one && git log --oneline | wc -l' }, ctx);
+  assert.equal(commit.isError, false, commit.content);
+  const fresh = join(scratch, 'fresh');
+  mkdirSync(fresh);
+  const jail = { cwd: fresh, roots: [fresh], env, sandbox: true };
+  for (const command of [
+    'git init -q',
+    'T=$(mktemp -d) && printf "[core]\\n\\tfsmonitor = touch planted\\n" > $T/config && git init -q --template=$T',
+    'mkdir -p .git/hooks && printf "#!/bin/sh\\n" > .git/hooks/post-checkout',
+  ]) {
+    const out = await runBash({ command }, jail);
+    assert.equal(out.isError, true, command);
+  }
+  assert.deepEqual(['.git/config', '.git/hooks/post-checkout'].filter((p) => existsSync(join(fresh, p))), [], 'no config and no hook were written');
 });
 
 test('a workflow taught with a quoted here-document is filed through sumo itself; one whose steps would end it early and run more stays in the sandbox', { skip: noSandbox }, async () => {
@@ -398,4 +477,24 @@ test('a workflow taught with a quoted here-document is filed through sumo itself
       db.close();
     }
   });
+});
+
+test('the log of a command left in the background is made new and never through a link, so one planted at its name in the temporary folder leads nowhere', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-spill-'));
+  const spill = join(root, 'spill');
+  mkdirSync(spill);
+  const target = join(root, 'rc');
+  writeFileSync(target, 'kept\n');
+  const now = Date.now;
+  Date.now = () => 1_700_000_000_000;
+  try {
+    // Every name the next logs could take, each a link to a file outside.
+    for (let n = 0; n < 200; n++) symlinkSync(target, join(spill, `1700000000000-${process.pid}-${n}.log`));
+    const out = await runBash({ command: 'echo planted-output &' }, { cwd: root, roots: [root], env, spill, sandbox: false });
+    assert.equal(out.isError, true, out.content);
+    assert.match(out.content, /nowhere to write its log/);
+  } finally {
+    Date.now = now;
+  }
+  assert.equal(readFileSync(target, 'utf8'), 'kept\n', 'nothing was appended through the link');
 });

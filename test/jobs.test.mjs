@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { noteOutsideRead } from '../src/jobs.mjs';
 import { systemPrompt } from '../src/loop.mjs';
 import { jobTools } from '../src/jobtools.mjs';
 import { NO_KEY, sandbox } from './helpers.mjs';
@@ -498,8 +499,13 @@ test('what a job that read the web or an MCP server says it learned is held for 
   s.routerWillSay('sonnet', 'medium');
   withSimba(s);
   s.sumo(['job', 'new', '--project', 'simba', '--title', 'check the api limits'], { input: TASK });
-  // The run's record of what it reached outside the machine, as the loop writes it.
-  writeFileSync(join(s.home, 'jobs', '1', 'outside'), 'web_fetch\nmcp__docs__search\n');
+  // The run's record of what it reached outside the machine, as the loop writes it: in the database, which the job's shell
+  // cannot reach. A mark in the job's own folder could be wiped by the job it marks — and here there is none to wipe.
+  s.sql((db) => {
+    noteOutsideRead(db, 1, 'web_fetch');
+    noteOutsideRead(db, 1, 'mcp__docs__search');
+  });
+  rmSync(join(s.home, 'jobs', '1', 'outside'), { force: true });
   pastCheck(s, '1');
   const done = s.sumo(['job', 'finish', '1', '--status', 'done'], { input: '## Summary\nChecked.\n## Learned\n- the vendor api allows only 10 requests a minute per token, so batch the sync\n' });
   assert.equal(done.code, 0, done.err);

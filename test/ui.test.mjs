@@ -11,12 +11,13 @@ import { notePass } from '../src/ledger.mjs';
 import { add } from '../src/memory.mjs';
 import { appendLive, startLive, takeInbox } from '../src/jobs.mjs';
 import { paths } from '../src/paths.mjs';
-import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
+import { closeMcp, readConfig } from '../src/mcp.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { runBash } from '../src/tools.mjs';
 import { contextTone, inView, replayOf, runUi } from '../src/ui.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
+import { writeConfig } from './fixtures/mcp-servers.mjs';
 import { fakeTty } from './fixtures/fake-tty.mjs';
 
 // Where there is no sandbox, the first command of a process says so in its result: said here, so no screen below depends on which test ran a command first.
@@ -380,7 +381,7 @@ test('leaving in the middle of a turn stops the turn, and nothing typed after /q
       const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', debug: true });
       try {
         await tty.type(`a long job${ENTER}`);
-        for (let i = 0; i < 200 && seen.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+        for (const end = Date.now() + 10_000; Date.now() < end && seen.length === 0; ) await new Promise((r) => setTimeout(r, 10));
         await tty.type(`/quit${ENTER}`, `and one more${ENTER}`, '\x04');
         await leaves(ui);
         assert.equal(signals[0].aborted, true, 'the request in flight was dropped, not left running unseen');
@@ -513,7 +514,7 @@ test('Ctrl-O hands the whole conversation to the pager — every line a tool gav
         const before = latest();
         const cleared = written.filter((w) => w.includes('\x1b[3J')).length;
         await tty.type('\x0f');
-        for (let i = 0; i < 200 && paged.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+        for (const end = Date.now() + 10_000; Date.now() < end && paged.length === 0; ) await new Promise((r) => setTimeout(r, 10));
         assert.equal(paged.length, 1, 'the pager was run');
         assert.equal(paged[0].program, process.env.PAGER || 'less -R +G');
         const page = paged[0].text.replace(/\x1b\[[0-9;]*m/g, '');
@@ -767,7 +768,7 @@ test('a line of code wider than the window is counted as the rows the terminal w
       const latest = () => tty.screen().slice(tty.screen().lastIndexOf(MARK) - 1);
       try {
         await tty.type(`go${ENTER}`);
-        for (let i = 0; i < 300 && !/Done\./.test(latest()); i++) await new Promise((r) => setTimeout(r, 10));
+        for (const end = Date.now() + 10_000; Date.now() < end && !/Done\./.test(latest()); ) await new Promise((r) => setTimeout(r, 10));
         const lines = latest().split('\n');
         assert.ok(lines.includes(command), 'the command whole, from the first column');
         // 200 columns are three rows of an 80-column window: the fake terminal does not wrap, so the frame it holds is two
@@ -1266,7 +1267,7 @@ test('a long turn that ends behind another window rings; one in front does not; 
         assert.ok(tty.controls().includes(`\x1b]2;✳ sumo · ${name}\x07`), 'the title says it is at work');
         held.open();
         await shows(/⏺ second/, 'the second reply');
-        for (let i = 0; i < 100 && rings().length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+        for (const end = Date.now() + 10_000; Date.now() < end && rings().length === 0; ) await new Promise((r) => setTimeout(r, 10));
         assert.deepEqual(rings(), [`\x1b]9;sumo — ${name}: done\x07\x07`]);
 
         // Back in front: quiet again.
@@ -1289,7 +1290,7 @@ test('a long turn that ends behind another window rings; one in front does not; 
       const second = runUi({ session: quiet, events, stdin: other.stdin, stdout: other.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true, notifyAfterMs: 0, notify: false, progress: true });
       try {
         await other.type('\x1b[O', `go${ENTER}`);
-        for (let i = 0; i < 300 && !/⏺ done/.test(other.screen()); i++) await new Promise((r) => setTimeout(r, 10));
+        for (const end = Date.now() + 10_000; Date.now() < end && !/⏺ done/.test(other.screen()); ) await new Promise((r) => setTimeout(r, 10));
         await new Promise((r) => setTimeout(r, 50));
         assert.match(other.screen(), /⏺ done/);
         assert.ok(!other.controls().some((c) => c.startsWith('\x1b]9;') && !c.startsWith('\x1b]9;4;')), 'no bell when it is turned off');
@@ -1744,7 +1745,7 @@ test('a long conversation is drawn without a word from Node: no item listens to 
       const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd: '/work/here', logo: [], debug: true });
       try {
         await tty.type(`go${ENTER}`);
-        for (let i = 0; i < 600 && !/⏺ all fourteen ran/.test(tty.screen()); i++) await new Promise((r) => setTimeout(r, 10));
+        for (const end = Date.now() + 10_000; Date.now() < end && !/⏺ all fourteen ran/.test(tty.screen()); ) await new Promise((r) => setTimeout(r, 10));
         assert.match(tty.screen(), /⏺ Bash\(echo line 13\)\n {2}⎿ {2}line 13\n/);
         assert.match(tty.screen(), /\n {2}(?:\d+s · )?14 calls/);
         await new Promise((r) => setImmediate(r));
@@ -1909,7 +1910,7 @@ test('a long working directory beside the name loses its middle, and never runs 
       tty.stdout.write = (frame, ...rest) => frames.push(String(frame).replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')) && write(frame, ...rest);
       const ui = runUi({ session, events, stdin: tty.stdin, stdout: tty.stdout, messages: ['Working'], cwd, logo: [], debug: true, progress: false });
       try {
-        for (let i = 0; i < 300 && !/opus · high/.test(tty.screen()); i++) await new Promise((r) => setTimeout(r, 10));
+        for (const end = Date.now() + 10_000; Date.now() < end && !/opus · high/.test(tty.screen()); ) await new Promise((r) => setTimeout(r, 10));
         const header = tty.screen().split('\n').find((l) => l.startsWith('▄▄█'));
         assert.ok(header.length <= 60, `the path fits beside the name: ${header}`);
         assert.match(header, /█ +the-project · \/\S+….*the-project$/, 'the project by its name, then the folder, its start and its end kept');

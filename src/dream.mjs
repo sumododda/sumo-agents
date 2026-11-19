@@ -2,11 +2,11 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { raiseNotice } from './apply.mjs';
 import { getMeta, setMeta, tx } from './db.mjs';
+import { memoryModel } from './ledger.mjs';
 import { storedKeys } from './memory.mjs';
 import { callModel, logRun } from './model.mjs';
 import { REPO_ROOT } from './paths.mjs';
 import { redact } from './redact.mjs';
-import { CONFIG_DEFAULTS } from './setup.mjs';
 import { clip, stem, words } from './text.mjs';
 
 /**
@@ -144,7 +144,7 @@ const KEYS_SCHEMA = {
 };
 
 /** Whether the tidy steps may run: they call the local model only, never one that is paid for. */
-const tidiesLocally = (db) => (getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model']) === 'local';
+const tidiesLocally = (db) => memoryModel(db) === 'local';
 
 /** One call of the tidy steps to the local model, with the tidy's own instructions, and its ledger row. */
 async function askLocal(db, { prompt, schema, kind, now }) {

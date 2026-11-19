@@ -2,7 +2,7 @@
 // the difference from what was derived before, and — unless asked only to show it — files what is missing and lets go
 // what is no longer found. What the user said to remember, confirmed or pinned is never part of it.
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { openDb } from '../src/db.mjs';
@@ -229,4 +229,63 @@ test("from the model's shell a rebuild only shows its difference: letting memori
   assert.equal(s.sumo(['memory', 'check'], { extraEnv: { SUMO_TOOL: '1' } }).err, '');
   assert.match(s.sumo(['help', 'hooks'], { extraEnv: { SUMO_TOOL: '1' } }).out, /hook session-start/);
   assert.equal(rows(s, `SELECT id FROM memories WHERE state = 'active'`).length, 4);
+});
+
+test('a statement a rebuild let go is filed again when a later reading finds it: only the user letting it go keeps it out', () => {
+  const s = sandbox();
+  s.hook('prompt', { session_id: 'a', prompt: 'from now on always squash merge on github' });
+  s.hook('session-end', { session_id: 'a', reason: 'other' });
+  s.modelWillSay([SQUASH]);
+  assert.match(s.sumo(['memory', 'run', '--auto']).out, /saved m1 /);
+  // An extractor that misses it: the rebuild lets it go — sumo's doing, not the user's.
+  s.modelWillSay([]);
+  assert.match(s.sumo(['memory', 'rebuild']).out, /^ {2}let go m1 /m);
+  // Mended, it finds the statement again.
+  s.modelWillSay([SQUASH]);
+  const again = s.sumo(['memory', 'rebuild']);
+  assert.equal(again.code, 0, again.out + again.err);
+  assert.match(again.out, /^would add: 1$/m);
+  assert.match(again.out, /^rebuilt: 1 statement filed, 0 memories let go$/m);
+  assert.deepEqual(rows(s, `SELECT body FROM memories WHERE state = 'active'`), [{ body: 'from now on always squash merge on github' }]);
+  // The user letting it go is another matter: no reading brings it back.
+  s.sumo(['forget', '2']);
+  s.modelWillSay([SQUASH]);
+  assert.match(s.sumo(['memory', 'rebuild']).out, /^would add: 0$/m);
+  assert.deepEqual(rows(s, `SELECT id FROM memories WHERE state = 'active'`), []);
+});
+
+test("from the model's shell a dry rebuild reads only the newest few conversations, and never on the hosted fallback: a run nobody asked for spends nothing", () => {
+  const s = sandbox();
+  for (let i = 0; i < 7; i++) {
+    s.hook('prompt', { session_id: `c${i}`, prompt: `from now on always squash merge on github in repo ${i}` });
+    s.hook('session-end', { session_id: `c${i}`, reason: 'other' });
+  }
+  s.modelWillSay([]);
+  const shell = { SUMO_TOOL: '1' };
+  const local = s.sumo(['memory', 'rebuild', '--dry-run'], { extraEnv: shell });
+  assert.equal(local.code, 0, local.err);
+  assert.match(local.out, /^read 5 conversations, 5 turns, /, 'the newest five, unless --limit says');
+  assert.match(s.sumo(['memory', 'rebuild', '--dry-run', '--limit', '6'], { extraEnv: shell }).out, /^read 6 conversations/);
+  // The local model down and a key in the shell: the user's own run would pay; the model's does not.
+  const down = s.sumo(['memory', 'rebuild', '--dry-run'], { extraEnv: { ...shell, ANTHROPIC_API_KEY: 'sk-ant-test', STUB_LOCAL_FAILS: '1' } });
+  assert.equal(down.code, 1, 'could not be read, and said');
+  const asked = existsSync(join(s.root, 'model-saw.json.all')) ? readFileSync(join(s.root, 'model-saw.json.all'), 'utf8').trim().split('\n').map((l) => JSON.parse(l).model) : [];
+  assert.deepEqual(asked.filter((m) => m !== 'local'), [], 'the hosted fallback was never asked');
+  assert.equal(rows(s, 'SELECT id FROM model_runs').length, 0);
+});
+
+test('every call the hosted fallback answers is in the ledger of model runs, with what it cost — a dry rebuild\'s too, which files nothing', () => {
+  const s = sandbox();
+  for (const id of ['a', 'b']) {
+    s.hook('prompt', { session_id: id, prompt: `from now on always squash merge on github in ${id}` });
+    s.hook('session-end', { session_id: id, reason: 'other' });
+  }
+  s.modelWillSay([]);
+  const run = s.sumo(['memory', 'rebuild', '--dry-run'], { extraEnv: { ANTHROPIC_API_KEY: 'sk-ant-test', STUB_LOCAL_FAILS: '1' } });
+  assert.equal(run.code, 0, run.err);
+  assert.match(run.out, /\$0\.0080\)/);
+  assert.deepEqual(rows(s, 'SELECT kind, model, ok, cost_usd FROM model_runs ORDER BY id'), [
+    { kind: 'scribe', model: 'haiku', ok: 1, cost_usd: 0.004 },
+    { kind: 'scribe', model: 'haiku', ok: 1, cost_usd: 0.004 },
+  ]);
 });

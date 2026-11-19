@@ -2,9 +2,10 @@
 // heard 35d ago" inside a line marked ok — so going deaf, an index that lost what was said, events left in the spool,
 // a pass that died and a harness that is not heard each fail a check, and each says what to do.
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { startOf } from '../src/scribe.mjs';
 import { hooksHelp, memoryCheck, memoryHealth, memoryHealthLine, memoryStatus, notHeardLine } from '../src/check.mjs';
 import { openDb, setMeta } from '../src/db.mjs';
 import { emptyRun, extractorVersion, notePass } from '../src/ledger.mjs';
@@ -285,6 +286,25 @@ test('a memory pass left running by a process that died fails its check; one tha
     assert.equal(dead.ok, false);
     assert.match(dead.label, /^1 memory pass left running by a process that died \(since 2026-11-17T10:00\)$/);
     assert.equal(dead.fix, 'sumo memory run reads those conversations again');
+  });
+});
+
+test('a memory pass that has held its lock for over half an hour fails the check, naming its process; one at work for minutes does not', async () => {
+  await withDb(async (db) => {
+    heard(db, 'sumo', 1);
+    // This test's own process holds it, as a pass at work would: its pid, and when it started.
+    const lock = join(paths().home, 'scribe.lock');
+    writeFileSync(lock, `${process.pid} ${startOf(process.pid)}`);
+    const heldFor = (minutes) => {
+      const then = new Date(Date.parse(NOW) - minutes * 60_000);
+      utimesSync(lock, then, then);
+      return named(memoryCheck(db, NOW, { filing: FILING }), 'passes');
+    };
+    assert.equal(heldFor(5).ok, true);
+    const stuck = heldFor(45);
+    assert.equal(stuck.ok, false);
+    assert.equal(stuck.label, `the memory pass has been held by process ${process.pid} for 45 minutes`);
+    assert.equal(stuck.fix, `a pass takes minutes: if process ${process.pid} is stuck, end it (kill ${process.pid}) and the next pass takes over`);
   });
 });
 

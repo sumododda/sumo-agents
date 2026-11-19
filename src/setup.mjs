@@ -8,8 +8,9 @@ import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
 import { anthropicClient, authenticatedRequest, FALLBACK_BETA, resolveAnthropicCredential } from './auth.mjs';
-import { assertOn, describeApiError, discoverModels, discoverySummary, knownModel, MODELS, modelsChecked, modelStates } from './catalog.mjs';
+import { ALL_MODELS, assertOn, describeApiError, discoverModels, discoverySummary, JOB_MODELS, knownModel, MODELS, modelsChecked, modelStates } from './catalog.mjs';
 import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mjs';
+import { refreshScorecard, savedScorecard, scorecardSummary } from './scorecard.mjs';
 import { damaged, restoreHint } from './export.mjs';
 import { stopLocalServer } from './local-server.mjs';
 import { latestCrash, crashFiles, logFiles, tailOf } from './logs.mjs';
@@ -149,8 +150,7 @@ function withSource(url, source) {
  * Streams to `<file>.part` then renames, so a run that dies never leaves a file that looks finished.
  * Never throws: a model that could not be fetched is not a reason for `sumo setup` to fail.
  */
-async function ensureModel(db) {
-  const url = modelUrlOf(db);
+async function ensureModel(db, url = modelUrlOf(db)) {
   const dest = join(paths().models, modelFileOfUrl(url));
   const shown = redactUrl(url);
   // Unique per run: two setups at once must not interleave into one file, and a dead run must not leave a
@@ -224,7 +224,7 @@ function sourceOrRefuse(value) {
 }
 
 /** A model's address is a web address of a .gguf file: anything else would fail every later setup. */
-function modelUrlOrRefuse(value) {
+export function modelUrlOrRefuse(value) {
   sourceOrRefuse(value);
   let path;
   try {
@@ -237,15 +237,22 @@ function modelUrlOrRefuse(value) {
 }
 
 /**
- * The local model fetched again for the address the settings page now holds, and the server that ran the old one
- * stopped, so the next local call starts on the new file. Never throws: what happened is the line returned.
+ * A local model set on the settings page: downloaded first, and only once its file is here made the one in use — the
+ * address stored, and the server that ran the old one stopped, so the next local call starts on the new file. One that
+ * does not come, or a download stopped half-way, changes nothing: the model in use stays. `line` says what happened;
+ * only an address that is no model's address throws.
  */
-export async function fetchModel() {
+export async function fetchModel(url) {
+  modelUrlOrRefuse(url);
   const db = openDb();
   try {
-    const line = await ensureModel(db);
-    stopLocalServer(db);
-    return line;
+    const line = await ensureModel(db, url);
+    const ok = existsSync(join(paths().models, modelFileOfUrl(url)));
+    if (ok) {
+      setMeta(db, 'config.model.url', url);
+      stopLocalServer(db);
+    }
+    return { ok, line };
   } finally {
     db.close();
   }
@@ -281,6 +288,7 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
       : await ensureModel(db);
   }
   const modelsLine = await checkModels(db);
+  const scorecardLine = await checkScorecard(db);
   db.close();
 
   // Written aside and renamed in, so a hook running the launcher mid-setup never reads half a script.
@@ -292,7 +300,7 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
   const lines = [`home      ${p.home}`, `database  ${p.db}`, `launcher  ${p.launcher}`];
   // What was skipped is said too: the next step depends on it.
   lines.push(modelLine ?? `model     not fetched (--no-model) — the router needs it: sumo setup`);
-  lines.push(modelsLine);
+  lines.push(modelsLine, scorecardLine);
   if (!llama) lines.push('llama-server not found — brew install llama.cpp');
   if (link) {
     const dir = binDir ?? pickBinDir();
@@ -319,6 +327,16 @@ async function checkModels(db) {
   if (checked) return `models    checked ${checked.slice(0, 10)} — API models › Discover, on the settings page (sumo config), checks again`;
   const result = await discoverModels(db);
   return result.ok ? `models    ${discoverySummary(result)}` : `models    not checked — ${result.error}`;
+}
+
+/**
+ * The benchmarks routing reads, fetched the first time only, as the models are: Discover, on the settings page, fetches them again.
+ * Never throws: a source that cannot be reached is not a reason for `sumo setup` to fail.
+ */
+async function checkScorecard(db) {
+  const card = savedScorecard(db);
+  if (card) return `scorecard fetched ${card.at.slice(0, 10)} — API models › Discover, on the settings page (sumo config), fetches it again`;
+  return scorecardSummary(await refreshScorecard(db));
 }
 
 function commandOnPath(name) {
@@ -438,7 +456,8 @@ export async function doctor() {
       readConfig();
       const db = openDb();
       try {
-        unread = getMeta(db, 'mcp.import_failed');
+        // Said while the file is there: deleted, as the advice says, there is nothing left to bring in.
+        unread = existsSync(join(p.home, 'mcp.json')) ? getMeta(db, 'mcp.import_failed') : null;
       } finally {
         db.close();
       }
@@ -734,7 +753,7 @@ export function config(key, value) {
 
       if (key === 'jobs.advisor' && value !== 'on' && value !== 'off') throw new UsageError('jobs.advisor is on or off: a job asking the next model up for advice, from inside its own request');
 
-      if (key === 'jobs.floor' && !['haiku', 'sonnet', 'opus', 'fable'].includes(value)) throw new UsageError('jobs.floor is haiku, sonnet, opus or fable: the smallest model a job may run on — haiku holds nothing back');
+      if (key === 'jobs.floor' && !JOB_MODELS.includes(value)) throw new UsageError(`jobs.floor is one of ${JOB_MODELS.join(', ')}: the smallest model a job may run on — haiku holds nothing back`);
       if (key === 'jobs.review' && !['risky', 'all', 'off'].includes(value)) {
         throw new UsageError('jobs.review is risky, all or off: which workers that finish DONE, verified, are reviewed without being asked — the ones the router called risky, every one, or none');
       }
@@ -744,7 +763,7 @@ export function config(key, value) {
       if (key === 'model.url') modelUrlOrRefuse(value);
       // A model is one Sumo knows and one that is on; the memory pass also takes `local` and `off`, the chat `auto`.
       if (key === 'chat.model' && value !== 'auto') {
-        knownModel(value, ['auto']);
+        knownModel(value, ['auto'], ALL_MODELS);
         assertOn(db, value);
       }
       if (key === 'memory.model' && value !== 'local' && value !== 'off') {

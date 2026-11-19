@@ -1,53 +1,100 @@
-# Every commit on main is a release candidate: the suite runs, and when package.json names a
-# version npm does not have yet, that version is published — after a person approves it in the
-# `release` environment. No token is stored anywhere: npm trusts this workflow by its identity
-# (OIDC trusted publishing) and signs the provenance itself. A pull request, or a run started by
-# hand, tests the same way and never publishes.
+# A version reaches npm only when you publish a GitHub Release; a push or merge to main only tests (test.yml). The
+# release is refused unless its tag is `v` and package.json's version exactly, the tagged commit is on main, and npm
+# does not have that version yet. The suite then runs again on that commit, and the version is published once a
+# person approves it in the `release` environment. A prerelease is published under npm's `next` dist-tag, never
+# `latest`, and must carry a prerelease version (v0.8.0-rc.1); a full release must carry a plain one, so a prerelease
+# never takes the number the release needs. No token is stored anywhere: npm trusts this workflow by its file name and
+# the `release` environment (OIDC trusted publishing) and signs the provenance itself, so the publish job stays here.
 #
-# Hardening (GitHub's security-hardening guide, OpenSSF Scorecard): every action pinned to a commit;
-# no permissions by default, each job only what it uses; the checkout keeps no credentials; no
-# dependency runs an install script; the registry's signatures are checked; every job has a time
-# limit; one publish at a time; no expression from the event is ever put into a script.
+# Hardening (GitHub's security-hardening guide, OpenSSF Scorecard): every action pinned to a commit; no permissions
+# by default, each job only what it uses; the checkout keeps no credentials; no dependency runs an install script;
+# the registry's signatures are checked; every job has a time limit; one publish at a time; no expression from the
+# event is ever put into a script.
 name: publish
 on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
+  release:
+    types: [published]
 permissions: {}
-# A newer push to a pull request replaces the run in progress; main's runs, which may publish, never cancel.
+# The same tag's release published again replaces the run still going for it, so the newer one is the one approved.
+# Releases of different tags run side by side, and their publishes one at a time (the publish job's own group).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 jobs:
-  # The suite on the Node the package promises (engines: 24.6+), on macOS: sumo runs on macOS only, and there the shell's
-  # sandbox — and every test of what it keeps out — runs. Nothing is published unless it passes.
-  test:
-    name: test
-    runs-on: macos-latest
-    timeout-minutes: 20
+  # A release that could never be published is refused here, before the suite runs or anyone is asked to approve it.
+  check:
+    name: check the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
-      contents: read # to check out the code
+      contents: read # to check out the tagged commit and main's history
+    outputs:
+      dist-tag: ${{ steps.release.outputs.dist-tag }}
     steps:
+      # Every branch's history, so main can be searched for the tagged commit; what is checked out is still the commit
+      # the tag named when the release was published.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-      # Exactly the lockfile, and no package's install script runs: a compromised dependency gets no code run here.
-      - run: npm ci --ignore-scripts
-      # Every installed package as the registry signed it, and its provenance where it has one.
-      - run: npm audit signatures
-      - run: npm test
+          package-manager-cache: false # nothing restored from a cache reaches a release
+      - id: release
+        name: Refuse a release whose tag, branch or version does not fit
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::The release's tag is $TAG, but package.json says $version: its tag must be v$version"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$TAG names a commit that is not on main: only what main has is released"
+            exit 1
+          fi
+          case "$version" in
+            *-*) dist_tag=next ;;
+            *) dist_tag=latest ;;
+          esac
+          if [ "$PRERELEASE" = true ] && [ "$dist_tag" != next ]; then
+            echo "::error::A prerelease needs a prerelease version (v$version-rc.1, say), so $version stays free for the release"
+            exit 1
+          fi
+          if [ "$PRERELEASE" != true ] && [ "$dist_tag" = next ]; then
+            echo "::error::$version is a prerelease version: publish its release as a prerelease, or give it a plain version"
+            exit 1
+          fi
+          if out=$(npm view "$name@$version" version 2>&1); then
+            echo "::error::$name@$version is already on npm, and a published version is never replaced"
+            exit 1
+          fi
+          if ! grep -q E404 <<<"$out"; then
+            printf '%s\n' "$out"
+            echo "::error::npm could not say whether $name@$version is published"
+            exit 1
+          fi
+          echo "dist-tag=$dist_tag" >> "$GITHUB_OUTPUT"
+          echo "$name@$version, from $TAG on main, goes to npm as $dist_tag once approved"
+  # The whole suite again, on the commit the tag names, exactly as test.yml runs it on main.
+  test:
+    name: test
+    needs: check
+    uses: $/.github/workflows/test.yml # this repository at the commit this run is on
+    permissions:
+      contents: read # to check out the code
   publish:
     name: publish to npm
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [check, test]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # A person approves each publish here: the environment's required reviewers are set in the repository's settings,
-    # and npm's trusted publisher is bound to this environment, so no other job can publish.
+    # and npm's trusted publisher is bound to this workflow file and this environment, so no other job can publish.
     environment: release
     concurrency:
       group: publish
@@ -56,6 +103,7 @@ jobs:
       contents: read # to check out the code
       id-token: write # to prove this workflow's identity to npm (trusted publishing) and sign the provenance
     steps:
+      # The same commit the check and the suite saw: the one the tag named when the release was published.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -63,14 +111,10 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false # nothing restored from a cache reaches a release
       - run: npm ci --ignore-scripts
       - run: npm audit signatures
-      - name: Publish when this version is new
-        run: |
-          name=$(node -p "require('./package.json').name")
-          version=$(node -p "require('./package.json').version")
-          if npm view "$name@$version" version >/dev/null 2>&1; then
-            echo "$name@$version is already on npm; nothing to publish"
-            exit 0
-          fi
-          npm publish --access public --provenance --ignore-scripts
+      - name: Publish
+        env:
+          DIST_TAG: ${{ needs.check.outputs.dist-tag }}
+        run: npm publish --access public --provenance --ignore-scripts --tag "$DIST_TAG"

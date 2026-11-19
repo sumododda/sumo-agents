@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { setup } from '../src/setup.mjs';
+import { getMeta, openDb } from '../src/db.mjs';
+import { fetchModel, setup } from '../src/setup.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 import { sandbox } from './helpers.mjs';
 
@@ -54,4 +55,35 @@ test('setup downloads the router model, skips it once present, and survives a do
     const lines = await setup({ modelSource: `http://127.0.0.1:${port}`, link: false });
     assert.equal(lines.some((l) => /could not download the router model/.test(l)), true, lines.join('\n'));
   });
+});
+
+test('a local model set on the page is downloaded first and only then made the one in use; one that does not come leaves the one in use', async () => {
+  const body = Buffer.from('another stand-in gguf');
+  const server = await modelServer(body);
+  const at = `http://127.0.0.1:${server.address().port}`;
+  const home = freshHome();
+  try {
+    await withHome(home, {}, async () => {
+      mkdirSync(join(home, 'models'), { recursive: true });
+      writeFileSync(join(home, 'models', 'Qwen3-4B-Q4_K_M.gguf'), 'the model in use');
+      const stored = () => {
+        const db = openDb();
+        try {
+          return getMeta(db, 'config.model.url');
+        } finally {
+          db.close();
+        }
+      };
+      const missing = await fetchModel(`${at}/elsewhere/Other-8B.gguf`);
+      assert.equal(missing.ok, false);
+      assert.match(missing.line, /could not download the router model/);
+      assert.equal(stored(), null, 'nothing stored: the model in use is still the one in use');
+      const got = await fetchModel(`${at}${MODEL_PATH}`);
+      assert.equal(got.ok, true, got.line);
+      assert.equal(stored(), `${at}${MODEL_PATH}`, 'stored once it is here');
+      await assert.rejects(() => fetchModel('ftp://example.com/x.gguf'), /is not a web address/);
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

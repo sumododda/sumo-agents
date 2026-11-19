@@ -27,7 +27,8 @@ const HELD_ASKS = { outside: 'is this right?', shell: 'they never typed this —
  * conversation they came from read the web or an MCP server, or because the model saved from its shell what the user
  * never typed; nothing else is held: what the memory pass cannot tie to the user's own words is dropped, not queued
  * as a guess — and notices whose two memories both still stand (superseding
- * or forgetting either settles one). The session-start block asks about everything and the session's own project; a
+ * or forgetting either settles one), two that cannot both be true first: a look-alike the user left standing because
+ * both hold must not keep a clash out of view. The session-start block asks about everything and the session's own project; a
  * project's card asks about that project, wherever the session was started.
  */
 export function askLines(db, { scopes, now, held: maxHeld, notices: maxNotices }) {
@@ -40,7 +41,7 @@ export function askLines(db, { scopes, now, held: maxHeld, notices: maxNotices }
       `SELECT n.* FROM notices n
        JOIN memories a ON a.id = n.memory_a AND a.state = 'active' AND a.scope IN (${marks})
        JOIN memories b ON b.id = n.memory_b AND b.state = 'active' AND b.scope IN (${marks})
-       ORDER BY n.id LIMIT ?`,
+       ORDER BY n.kind = 'contradiction' DESC, n.id LIMIT ?`,
     )
     .all(...scopes, ...scopes, maxNotices);
   for (const n of notices) {

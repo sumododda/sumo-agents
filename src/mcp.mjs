@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, renameSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
+import { CREDENTIAL_NAMES } from './auth.mjs';
 import { getMeta, openDb, setMeta, tx } from './db.mjs';
 import { UsageError } from './memory.mjs';
 import { paths } from './paths.mjs';
@@ -162,17 +163,14 @@ export function readConfig() {
   }));
 }
 
-/** The servers replaced whole, in one transaction: a run that dies half-way leaves the list as it was. */
-export function writeConfig(config) {
-  withServers((db) => {
-    db.exec('DELETE FROM mcp_servers');
-    putServers(db, config?.mcpServers ?? {});
-  });
-}
-
-/** `${NAME}` in a configured value, filled from the environment. One nothing fills is refused: a server must not start with a blank where its token should be. */
+/**
+ * `${NAME}` in a configured value, filled from the environment. One nothing fills is refused: a server must not start
+ * with a blank where its token should be. Nor is sumo's own credential filled in: a server never gets it unnamed, and
+ * naming it is no way round.
+ */
 export function expand(value, env = process.env) {
   return String(value).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name) => {
+    if (CREDENTIAL_NAMES.includes(name)) throw new UsageError(`\${${name}} is sumo's own credential: it is never handed to an MCP server — export the server's token under a name of its own`);
     if (env[name] === undefined) throw new UsageError(`\${${name}} is not set in the environment`);
     return env[name];
   });

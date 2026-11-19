@@ -13,13 +13,14 @@ import { CHAT_TOOLS, createChat } from '../src/chat.mjs';
 import { breakdown, noteRewrite, prefixOf, rewriteCause } from '../src/cost.mjs';
 import { openDb, setMeta } from '../src/db.mjs';
 import { jobParams } from '../src/loop.mjs';
-import { closeMcp, mcpReady, writeConfig } from '../src/mcp.mjs';
+import { closeMcp, mcpReady } from '../src/mcp.mjs';
 import { costOf, logRun, usageOf } from '../src/model.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { contextBand } from '../src/sessions.mjs';
 import { toolView } from '../src/tty.mjs';
 import { runUi } from '../src/ui.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
+import { writeConfig } from './fixtures/mcp-servers.mjs';
 import { fakeTty } from './fixtures/fake-tty.mjs';
 import { NO_KEY, sandbox } from './helpers.mjs';
 

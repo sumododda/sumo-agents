@@ -18,7 +18,26 @@ export const MODEL_IDS = {
 };
 export const MODELS = Object.keys(MODEL_IDS);
 
-export const modelId = (model) => MODEL_IDS[model] ?? model;
+/**
+ * The models Sumo runs through the Cursor SDK (src/cursor.mjs), for chat turns and jobs: the memory pass, the advisor,
+ * compaction and hand-offs stay on Claude. Each says what Cursor calls it and the settings it is asked with — the standard variant, never Fast, which
+ * Composer defaults to at six times the price; `effort` names the setting Sumo's effort goes in, where the model takes one.
+ */
+export const CURSOR_MODELS = {
+  composer: { id: 'composer-2.5', params: [{ id: 'fast', value: 'false' }] },
+  grok: { id: 'grok-4.7', params: [{ id: 'context', value: '256k' }, { id: 'fast', value: 'false' }], effort: 'reasoning_effort' },
+};
+/** Every model Sumo knows, Claude's then Cursor's: what the switches, `sumo models` and Discover cover. */
+export const ALL_MODELS = [...MODELS, ...Object.keys(CURSOR_MODELS)];
+/** The models a job may run on, weakest first: the ladder a retry climbs and `jobs.floor` cuts. Cursor's sit above haiku. */
+export const JOB_MODELS = ['haiku', 'composer', 'grok', 'sonnet', 'opus', 'fable'];
+/** How wide a model's name is set in a list, so the columns after it line up: the longest name. */
+export const NAME_WIDTH = Math.max(...ALL_MODELS.map((name) => name.length));
+export const modelId = (model) => MODEL_IDS[model] ?? CURSOR_MODELS[model]?.id ?? model;
+/** A model by the name Sumo calls it, from its name or its API id; one the list does not know, as it was given. */
+export const modelName = (model) => ALL_MODELS.find((name) => name === model || modelId(name) === model) ?? model;
+/** Which way a model is run, by its name or its id: through the Anthropic API, or the Cursor SDK. */
+export const laneOf = (model) => (Object.hasOwn(CURSOR_MODELS, modelName(model)) ? 'cursor' : 'claude');
 
 const STATE_KEY = 'models.state';
 const CHECKED_KEY = 'models.checked';
@@ -28,7 +47,10 @@ const OAUTH_BETA = 'oauth-2025-04-20';
 
 const day = (now) => String(now).slice(0, 10);
 
-/** Every model's switch and the note that explains it — on, and "not checked", until something is recorded. */
+/**
+ * Every model's switch and the note that explains it. A Claude model is on, and "not checked", until something is recorded;
+ * a Cursor model is off until Discover finds it, since without CURSOR_API_KEY it cannot run at all.
+ */
 export function modelStates(db) {
   let stored = {};
   try {
@@ -36,29 +58,41 @@ export function modelStates(db) {
   } catch {
     stored = {};
   }
-  return Object.fromEntries(MODELS.map((name) => [name, { on: stored[name]?.on !== false, note: stored[name]?.note ?? 'not checked' }]));
+  const fresh = (name) => (laneOf(name) === 'cursor' ? { on: false, note: 'not discovered yet' } : { on: true, note: 'not checked' });
+  return Object.fromEntries(ALL_MODELS.map((name) => [name, stored[name] ? { on: stored[name].on !== false, note: stored[name].note ?? fresh(name).note } : fresh(name)]));
 }
 
 const writeStates = (db, states) => setMeta(db, STATE_KEY, JSON.stringify(states));
 
-/** The models the chat, the router and the passes may use, cheapest first. */
+/** The models the chat, the router and the passes may use, cheapest first: Claude's. */
 export function usableModels(db) {
   const states = modelStates(db);
   return MODELS.filter((name) => states[name].on);
+}
+
+/** Whether this shell can run Cursor's models: they need CURSOR_API_KEY, and a switch left on by an earlier Discover does not. */
+export const cursorKeyIn = (env = process.env) => Boolean(env.CURSOR_API_KEY?.trim());
+
+/** The models a job or a chat turn may be routed to, weakest first: Claude's that are on, and Cursor's that are on while this shell has its key. */
+export function usableJobModels(db, env = process.env) {
+  const states = modelStates(db);
+  return JOB_MODELS.filter((name) => states[name].on && (laneOf(name) === 'claude' || cursorKeyIn(env)));
 }
 
 /** When the API was last asked which models it has, or null while it never was. */
 export const modelsChecked = (db) => getMeta(db, CHECKED_KEY);
 
 /** `name` is a model Sumo knows, or a usage error listing them — after `also`, the other values the setting takes. */
-export function knownModel(name, also = []) {
-  if (!MODELS.includes(name)) throw new UsageError(`no such model "${name}" — one of: ${[...also, ...MODELS].join(', ')}`);
+export function knownModel(name, also = [], models = MODELS) {
+  if (!models.includes(name)) throw new UsageError(`no such model "${name}" — one of: ${[...also, ...models].join(', ')}`);
 }
 
-/** Why `name` cannot be used right now, with the way out (`orElse` is another one), or null while it is on. */
-export function offLine(db, name, orElse) {
-  if (modelStates(db)[name].on) return null;
-  return `${name} is off — turn it on under API models, on the settings page (sumo config)${orElse ? `, or ${orElse}` : ''}`;
+/** Why `name` cannot be used right now, with the way out (`orElse` is another one), or null while it can. */
+export function offLine(db, name, orElse, env = process.env) {
+  const or = orElse ? `, or ${orElse}` : '';
+  if (!modelStates(db)[name].on) return `${name} is off — turn it on under API models, on the settings page (sumo config)${or}`;
+  if (laneOf(name) === 'cursor' && !cursorKeyIn(env)) return `${name} runs through Cursor, and this shell has no CURSOR_API_KEY — export it in the shell sumo starts from${or}`;
+  return null;
 }
 
 /** `name` is on, or a usage error saying how to turn it on. */
@@ -69,7 +103,7 @@ export function assertOn(db, name, orElse) {
 
 /** Turns one model on or off by hand. */
 export function setModel(db, name, on, now = new Date().toISOString()) {
-  knownModel(name);
+  knownModel(name, [], ALL_MODELS);
   const states = modelStates(db);
   states[name] = { on, note: `turned ${on ? 'on' : 'off'} ${day(now)}` };
   writeStates(db, states);
@@ -77,9 +111,9 @@ export function setModel(db, name, on, now = new Date().toISOString()) {
 }
 
 /** One line per model: its name, its switch, the API id and the note — what `sumo models` prints. */
-export function modelLines(db, names = MODELS) {
+export function modelLines(db, names = ALL_MODELS) {
   const states = modelStates(db);
-  return names.map((name) => `${name.padEnd(7)} ${states[name].on ? 'on ' : 'off'}  ${MODEL_IDS[name].padEnd(26)} ${states[name].note}`);
+  return names.map((name) => `${name.padEnd(NAME_WIDTH)} ${states[name].on ? 'on ' : 'off'}  ${modelId(name).padEnd(26)} ${states[name].note}${laneOf(name) === 'cursor' ? ' · through Cursor' : ''}`);
 }
 
 /** What went wrong with an API call, in one line a person can act on. */
@@ -166,5 +200,58 @@ export function discoverySummary({ found, missing, errors }) {
   if (missing.length > 0) parts.push(`not found, turned off: ${missing.join(', ')}`);
   const failed = Object.entries(errors);
   if (failed.length > 0) parts.push(`not checked: ${failed.map(([name, error]) => `${name} (${error})`).join(', ')}`);
+  return parts.join(' — ');
+}
+
+/** Which models Cursor has for this key: every id and alias it lists. Loaded only here, so a command that never asks never loads the SDK. */
+async function listCursorModels(apiKey) {
+  const { Cursor } = await import('@cursor/sdk');
+  const models = await Cursor.models.list({ apiKey });
+  return models.flatMap((m) => [m.id, ...(m.aliases ?? [])]);
+}
+
+/** The stand-in's answer to "which models has Cursor": `{ ids: [...] }`; anything else is a failed check. */
+function askStandInCursor(standIn) {
+  const run = spawnSync(standIn, [], { input: JSON.stringify({ kind: 'cursor-models' }), encoding: 'utf8', timeout: TIMEOUT_MS });
+  try {
+    const answer = JSON.parse(run.stdout);
+    if (Array.isArray(answer?.ids)) return answer.ids;
+  } catch {
+    // Said below.
+  }
+  throw new Error((run.stderr || run.stdout || '').trim().slice(0, 200) || `exit ${run.status}`);
+}
+
+/**
+ * Asks Cursor which of Sumo's Cursor models this CURSOR_API_KEY can use, and sets their switches: found → on, unless the user
+ * turned it off by hand; not there → off. Without a key nothing is asked and nothing changes. Never throws. Cursor's list
+ * does not say what the account's plan covers: a model the plan leaves out is found here and refused when a job runs on it.
+ */
+export async function discoverCursor(db, { now = new Date().toISOString(), list = listCursorModels } = {}) {
+  const key = process.env.CURSOR_API_KEY?.trim();
+  if (!key) return { ok: false, error: 'no CURSOR_API_KEY in this shell — export it, then Discover again' };
+  let ids;
+  try {
+    const standIn = process.env.SUMO_AGENTS_MODEL_CMD;
+    ids = new Set(standIn ? askStandInCursor(standIn) : await list(key));
+  } catch (cause) {
+    return { ok: false, error: String(cause?.message ?? cause).replace(/\s+/g, ' ').slice(0, 200) };
+  }
+  const names = Object.keys(CURSOR_MODELS);
+  const found = names.filter((name) => ids.has(CURSOR_MODELS[name].id));
+  const missing = names.filter((name) => !ids.has(CURSOR_MODELS[name].id));
+  const states = modelStates(db);
+  const offByHand = (name) => !states[name].on && /^turned off /.test(states[name].note ?? '');
+  for (const name of found) if (!offByHand(name)) states[name] = { on: true, note: `found ${day(now)}` };
+  for (const name of missing) states[name] = { on: false, note: `not found ${day(now)}` };
+  writeStates(db, states);
+  return { ok: true, found, missing };
+}
+
+/** Cursor's part of a discovery in one line. */
+export function cursorSummary(result) {
+  if (!result.ok) return `Cursor: not checked — ${result.error}`;
+  const parts = [`Cursor: found ${result.found.length > 0 ? result.found.join(', ') : 'none of its models'}`];
+  if (result.missing.length > 0) parts.push(`not found, turned off: ${result.missing.join(', ')}`);
   return parts.join(' — ');
 }

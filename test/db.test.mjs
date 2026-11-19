@@ -115,6 +115,25 @@ test('a database is copied aside before it is migrated, privately, and only the 
   assert.ok(statSync(halfCopy).size > 0, 'an old empty one is made again');
 });
 
+test('a database that cannot be copied aside first is not migrated: it stays at its version, untouched, and the reason is said', async () => {
+  const { mkdtempSync, readdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { DatabaseSync } = await import('node:sqlite');
+  const dir = mkdtempSync(join(tmpdir(), 'sumo-agents-nocopy-'));
+  // A name the file system takes, and the copy's (`.pre-v<N>.bak` added) one it refuses: the copy cannot be made.
+  const file = join(dir, `${'m'.repeat(243)}.db`);
+  openDb(file).close();
+  const raw = new DatabaseSync(file);
+  raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`);
+  raw.close();
+  assert.throws(() => openDb(file), /^Error: the database could not be copied aside before upgrading it .*ENAMETOOLONG.* — nothing was changed: it is still at schema \d+/);
+  const kept = new DatabaseSync(file);
+  assert.equal(kept.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION - 1, 'not migrated without its copy');
+  kept.close();
+  assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith('.bak')), []);
+});
+
 test('a database from a newer sumo is refused, not written over by code that does not know its tables', async () => {
   const { mkdtempSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');

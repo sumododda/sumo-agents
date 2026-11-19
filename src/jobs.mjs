@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
@@ -13,6 +12,7 @@ import { callModel, failure, logRun } from './model.mjs';
 import { paths } from './paths.mjs';
 import { preferences } from './prime.mjs';
 import { getProject, isScratch } from './projects.mjs';
+import { ownGit } from './sandbox.mjs';
 import { chooseRoute, RETRY_IMPORTANT_THRESHOLD, statsLines } from './route.mjs';
 import { verifyCommands } from './scan.mjs';
 import { filingState } from './ledger.mjs';
@@ -20,6 +20,7 @@ import { runScribe } from './scribe.mjs';
 import { addCheckpoint, pendingTurns } from './sessions.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { clip, estimateTokens, head, STOPWORDS } from './text.mjs';
+import { digest } from './tools.mjs';
 import { changesSince, diffStat, hasCommit, snapshot, stillThere, takeBaseline, verdictLines, verify, writeChanges } from './verify.mjs';
 import { bringBack, dropTree, makeTree, sharedSourceDependencies, treeDiff } from './worktree.mjs';
 
@@ -162,7 +163,7 @@ function whereThingsStand(root) {
       return null;
     }
   };
-  const git = (...args) => run('git', ['--no-optional-locks', '-c', 'core.quotePath=false', ...args]);
+  const git = (...args) => run('git', ['--no-optional-locks', '-c', 'core.quotePath=false', ...ownGit(args)]);
   const repo = git('rev-parse', '--is-inside-work-tree')?.trim() === 'true';
   const heading = '## Where things stand as this job begins — no need to look it up again';
   const lines = [];
@@ -229,7 +230,6 @@ ${REPORT[job.agent]}
 `;
 }
 
-const digest = (text) => createHash('sha256').update(text).digest('hex');
 const stateKey = (id) => `job.${id}.verify`;
 
 /**
@@ -380,7 +380,7 @@ export async function newJob(db, { project: nameOrAlias, title, agent = 'worker'
 
   // A rule the user stated a minute ago may not be filed yet, and the brief is built from memory: the conversation
   // still going on is read now. Not while filing is paused — a job starting is not the user asking for it by hand.
-  if (pendingTurns(db, 1).length > 0 && !filingState(db, now).paused) await runScribe(db, { now });
+  if (pendingTurns(db, 1).length > 0 && !filingState(db).paused) await runScribe(db, { now });
 
   const route = routed ?? (await chooseRoute(db, { agent, project, task, title: title.trim(), retryOf, reviews }));
 
@@ -603,6 +603,11 @@ async function followUp(db, id, { now = new Date().toISOString() } = {}) {
     const near = CLOSED_NEAR[getMeta(db, closingKey(id))];
     if (near) {
       const why = `j${id} failed on ${routeOf(job)} after it was told to close near its ${near}: it is not retried one step up, which would start again on a dearer route with a fresh ${near}. To retry it anyway: sumo job retry ${id}`;
+      return { line: said(id, 'Not retried', [why])[0] };
+    }
+    // Its DONE could not be verified here — no check, or none that could be compared: a dearer route would meet the same wall.
+    if (existsSync(unverifiableFile(id))) {
+      const why = `j${id} failed on ${routeOf(job)} after its DONE could not be verified here: it is not retried one step up, which would meet the same wall. To retry it anyway: sumo job retry ${id}`;
       return { line: said(id, 'Not retried', [why])[0] };
     }
     try {
@@ -838,21 +843,26 @@ export const appendLive = (id, text) => appendFileSync(liveFile(id), text, { mod
 export const endLive = (id, lines) => writeFileSync(endFile(id), `${lines.join('\n')}\n`, { mode: 0o600 });
 
 /**
- * The tools a job used that read the world outside the machine — a web search, a fetch, an MCP server — one name a
- * line, each once. What such a run says it learned may be what a page told it, so it is not filed as a fact (see finish).
+ * The tools a job used that read the world outside the machine — a web search, a fetch, an MCP server — each once. What
+ * such a run says it learned may be what a page told it, so it is not filed as a fact (see finish). Kept in the database,
+ * which the job's shell cannot write: a mark in the job's own folder could be wiped by the job it marks. A job from before
+ * wrote a file there, read beside it — a mark only adds.
  */
+const outsideKey = (id) => `job.${id}.outside`;
 const outsideFile = (id) => fileOf(id, 'outside');
-export function noteOutsideRead(id, tool) {
+export function noteOutsideRead(db, id, tool) {
   const name = String(tool).replace(/\s+/g, ' ');
-  if (outsideReads(id).includes(name)) return;
-  appendFileSync(outsideFile(id), `${name}\n`, { mode: 0o600 });
+  const kept = outsideReads(db, id);
+  if (!kept.includes(name)) setMeta(db, outsideKey(id), [...kept, name].join('\n'));
 }
-export function outsideReads(id) {
+export function outsideReads(db, id) {
+  let before = [];
   try {
-    return readFileSync(outsideFile(id), 'utf8').split('\n').filter(Boolean);
+    before = readFileSync(outsideFile(id), 'utf8').split('\n').filter(Boolean);
   } catch {
-    return [];
+    // None: a job of this version keeps its mark in the database alone.
   }
+  return [...new Set([...(getMeta(db, outsideKey(id)) ?? '').split('\n').filter(Boolean), ...before])];
 }
 
 /** What was told to the job since it last looked, taken off the disk so it is read once. A file that is not a message is passed over. */
@@ -924,6 +934,8 @@ function findingsSection(report) {
 }
 
 const checkedFile = (id) => fileOf(id, 'checked');
+/** Written when a DONE was refused as unverifiable: a FAILED the job closes on after it is not the work failing, and is not retried. */
+const unverifiableFile = (id) => fileOf(id, 'unverifiable');
 /** How many changed files, and how many new ones, the check names before it counts the rest. */
 const CHECK_LISTED = 30;
 
@@ -1011,6 +1023,9 @@ function checkAgainstTask(db, job, state) {
  * as gotchas, only in this project, marked as observed, through the same
  * validator as every other model-written memory.
  */
+/** What a job is told when work cannot be checked here: the user takes it or not, and it has not failed. */
+export const ASK_TO_ACCEPT = 'Ask the user to accept it — the ask tool — saying what blocks verification: work that cannot be checked here has not failed, so do not finish FAILED for it.';
+
 export function finish(db, id, { status, report, accept }, now = new Date().toISOString()) {
   const job = getJob(db, id);
   requireOpen(job, 'finished');
@@ -1022,7 +1037,10 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
   // A DONE that cannot be checked is refused, not waved through; --accept is the way to take it anyway, and it is written down.
   const graded = job.agent === 'worker' && status === 'DONE';
   const state = graded ? readState(db, id) : null;
-  const unchecked = (why) => new Refusal(`j${id} cannot be verified — ${why}. To take the work as it stands: sumo job finish ${id} --status DONE --accept "<why>"`);
+  const unchecked = (why) => {
+    writeFileSync(unverifiableFile(id), `${now}\n`, { mode: 0o600 });
+    return new Refusal(`j${id} cannot be verified — ${why}. To take the work as it stands: sumo job finish ${id} --status DONE --accept "<why>" — the user's to run: a job asks the user to accept it — the ask tool — and does not finish FAILED for this`);
+  };
   if (graded && accept === undefined && !state) throw unchecked(`the record of where it began (${fileOf(id, 'verify.json')}) cannot be read, or was changed since sumo wrote it`);
   // Before the checks are run, the author looks once at the task beside its change: the first DONE is answered with that, not taken.
   // Kept in the job's folder, so a run started again goes on to the checks instead of being asked again.
@@ -1072,7 +1090,7 @@ export function finish(db, id, { status, report, accept }, now = new Date().toIS
   // A run that read a page or an MCP server may be passing on what it was told: what it learned waits for the user to
   // confirm (arXiv 2503.03704 — memory written from injected content is read later as trusted). Exactly what this
   // finish wrote is held: another job finishing in the same project at the same moment keeps its own.
-  const outside = outsideReads(id);
+  const outside = outsideReads(db, id);
   if (outside.length > 0 && learned.written.length > 0) {
     const held = db
       .prepare(`UPDATE memories SET state = 'unconfirmed', provenance = 'inferred', held_for = 'outside' WHERE id IN (${learned.written.map(() => '?').join(', ')}) AND type = 'gotcha' AND state = 'active' RETURNING id`)

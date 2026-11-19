@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, closeSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { alive } from './lock.mjs';
 import { paths } from './paths.mjs';
@@ -19,6 +19,8 @@ import { paths } from './paths.mjs';
 const WAITING = 'events.jsonl';
 const BAD = 'events.bad.jsonl';
 const DRAINING = /^events\.(\d+)\.\d+\.draining$/;
+/** What was set aside, in the hand of a process trying it again or purging it: `events.bad.<pid>.<n>.retrying`. */
+const RETRYING = /^events\.bad\.(\d+)\.\d+\.retrying$/;
 /** How many times a line may fail to replay before it is set aside. */
 const TRIES = 3;
 /** Failures of one line closer together than this are one failure: the hooks of one busy minute are not three tries. */
@@ -72,17 +74,22 @@ const names = () => {
   }
 };
 
+/** The two files a process takes into its own hand by a rename before it reads them: what waits, and what was set aside. */
+const WAITS = { file: WAITING, left: DRAINING, taken: () => `events.${process.pid}.${Date.now()}${claims++}.draining` };
+const ASIDE = { file: BAD, left: RETRYING, taken: () => `events.bad.${process.pid}.${Date.now()}${claims++}.retrying` };
+
 /**
- * The files this process may drain now, each taken by a rename only one process can win: what is waiting, and what a
- * drain that died left in its hand (its process is gone) — replaying a line twice inserts nothing twice.
+ * The files of a kind this process may take now, each by a rename only one process can win: the file itself, and what
+ * a process that died left in its hand (its process is gone) — replaying a line twice inserts nothing twice. A file is
+ * never read and written back where a writer may be adding to it: a line added meanwhile would be written over.
  */
-function claim() {
+function claim(kind = WAITS) {
   const dir = paths().spool;
   const mine = [];
   for (const name of names()) {
-    const left = DRAINING.exec(name);
-    if (name !== WAITING && !(left && (Number(left[1]) === process.pid || !alive(Number(left[1])) || olderThan(join(dir, name), LEFT_AFTER_MS)))) continue;
-    const taken = join(dir, `events.${process.pid}.${Date.now()}${claims++}.draining`);
+    const left = kind.left.exec(name);
+    if (name !== kind.file && !(left && (Number(left[1]) === process.pid || !alive(Number(left[1])) || olderThan(join(dir, name), LEFT_AFTER_MS)))) continue;
+    const taken = join(dir, kind.taken());
     try {
       renameSync(join(dir, name), taken);
       mine.push(taken);
@@ -196,32 +203,49 @@ export function drainSpool(replay, { within = (fn) => fn(), now = Date.now() } =
 }
 
 /**
+ * Each line of a file this process took, in order, then the file let go — read again until nothing new comes: a
+ * writer that had it open when it was taken may still add its line. What is left with no line end, when nothing more
+ * comes, is a line cut off as it was written, handed on as it is.
+ */
+function eachLine(file, fn) {
+  for (let read = 0; ; ) {
+    const text = readFileSync(file, 'utf8');
+    const end = text.lastIndexOf('\n') + 1;
+    if (end > read) {
+      for (const raw of text.slice(read, end).split('\n')) if (raw.trim()) fn(raw);
+      read = end;
+      continue;
+    }
+    if (statSync(file).size > Buffer.byteLength(text)) continue;
+    if (text.slice(end).trim()) fn(text.slice(end));
+    rmSync(file, { force: true });
+    return;
+  }
+}
+
+/**
  * `sumo memory check --fix`: every line set aside tried once more, each as its own piece of work — a turn set aside
- * while the database was busy goes in now. What replays leaves `events.bad.jsonl`; what still cannot — a line that
- * was never an event — stays as it was. Returns `{ replayed, left }`.
+ * while the database was busy goes in now. What was set aside is taken by a rename first, so a line a hook sets aside
+ * meanwhile starts a file of its own; what still cannot replay — a line that was never an event — goes back as it was.
+ * Returns `{ replayed, left }`.
  */
 export function retrySetAside(replay, { within = (fn) => fn() } = {}) {
-  const file = join(paths().spool, BAD);
-  let lines;
-  try {
-    lines = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim());
-  } catch (cause) {
-    if (cause.code === 'ENOENT') return { replayed: 0, left: 0 };
-    throw cause;
+  const done = { replayed: 0, left: 0 };
+  for (const file of claim(ASIDE)) {
+    eachLine(file, (raw) => {
+      let entry = null;
+      try {
+        entry = JSON.parse(JSON.parse(raw).line);
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('not an event');
+        within(() => replay(entry));
+        done.replayed++;
+      } catch {
+        addLine(BAD, raw);
+        done.left++;
+      }
+    });
   }
-  const left = lines.filter((raw) => {
-    try {
-      const entry = JSON.parse(JSON.parse(raw).line);
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true;
-      within(() => replay(entry));
-      return false;
-    } catch {
-      return true;
-    }
-  });
-  if (left.length === 0) rmSync(file, { force: true });
-  else if (left.length < lines.length) writeFileSync(file, `${left.join('\n')}\n`, { mode: 0o600 });
-  return { replayed: lines.length - left.length, left: left.length };
+  return done;
 }
 
 /** Every string a line of the spool holds: its own, and those of a line kept inside it (`events.bad.jsonl` keeps the line it set aside). */
@@ -237,20 +261,19 @@ function saidIn(raw) {
 }
 
 /**
- * A purge reaches the spool too: every line — waiting, in a drain's hand, or set aside — whose words `says` holds is
- * taken out, the rest left as they were. Returns how many lines went.
+ * A purge reaches the spool too: every line — waiting, set aside, or left by a process that died — whose words `says`
+ * holds is taken out, the rest put back as they were, each file taken by a rename first so a line a hook adds meanwhile
+ * is never written over. A file in a living process's hand is that process's. Returns how many lines went.
  */
 export function purgeSpool(says) {
   let gone = 0;
-  for (const name of names()) {
-    if (name !== WAITING && name !== BAD && !DRAINING.test(name)) continue;
-    const file = join(paths().spool, name);
-    const lines = readFileSync(file, 'utf8').split('\n');
-    const kept = lines.filter((l) => !l.trim() || !saidIn(l).some(says));
-    if (kept.length === lines.length) continue;
-    gone += lines.length - kept.length;
-    if (kept.some((l) => l.trim())) writeFileSync(file, kept.join('\n'), { mode: 0o600 });
-    else rmSync(file, { force: true });
+  for (const kind of [WAITS, ASIDE]) {
+    for (const file of claim(kind)) {
+      eachLine(file, (raw) => {
+        if (saidIn(raw).some(says)) gone++;
+        else addLine(kind.file, raw);
+      });
+    }
   }
   return gone;
 }
@@ -299,10 +322,12 @@ const linesIn = (name) => {
 
 /**
  * How the spool stands, for whoever checks memory's health: `waiting`, the events not yet in the journal (what waits,
- * and what a drain has in its hand or died holding), and `bad`, the lines set aside in `events.bad.jsonl` because
- * they were not events or failed to replay three times, a minute or more apart. Both are 0 when there has never been a spool.
+ * and what a drain has in its hand or died holding), and `bad`, the lines set aside in `events.bad.jsonl` (or in the
+ * hand of a retry) because they were not events or failed to replay three times, a minute or more apart. Both are 0
+ * when there has never been a spool.
  */
 export function spoolStatus() {
   const all = names();
-  return { waiting: all.filter((n) => n === WAITING || DRAINING.test(n)).reduce((n, name) => n + linesIn(name), 0), bad: all.includes(BAD) ? linesIn(BAD) : 0 };
+  const count = (kind) => all.filter((n) => n === kind.file || kind.left.test(n)).reduce((n, name) => n + linesIn(name), 0);
+  return { waiting: count(WAITS), bad: count(ASIDE) };
 }

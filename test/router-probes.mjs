@@ -4,6 +4,8 @@
 // in a throwaway home, so the real database and ledger are never written.
 // Run after changing the router's prompt, its history or its model:
 //   node --disable-warning=ExperimentalWarning test/router-probes.mjs     (about two minutes)
+// With --scorecard each home fetches today's scorecard first, so the router only sorts and code picks the route:
+//   node --disable-warning=ExperimentalWarning test/router-probes.mjs --scorecard
 import { existsSync, mkdirSync, mkdtempSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,14 +16,15 @@ import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { MODELS } from '../src/catalog.mjs';
 import { chooseRoute, EFFORTS } from '../src/route.mjs';
+import { refreshScorecard } from '../src/scorecard.mjs';
 import { modelFileOfUrl } from '../src/setup.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
-/** Every route on one scale, cheapest first: haiku/none, sonnet/low … fable/max. */
+/** Every route on one scale, cheapest first: haiku/none (from when haiku took no effort), haiku/low … fable/max. */
 const rank = (route) => {
   if (route === 'haiku/none') return 0;
   const [model, effort] = route.split('/');
-  return 1 + (MODELS.indexOf(model) - 1) * EFFORTS.length + EFFORTS.indexOf(effort);
+  return 1 + MODELS.indexOf(model) * EFFORTS.length + EFFORTS.indexOf(effort);
 };
 
 /** [cheapest acceptable route, dearest acceptable route, role, title, task] — the labels are a person's judgment; edit them. */
@@ -83,7 +86,8 @@ realDb.close();
 if (!llama || !existsSync(join(real.models, modelFile))) throw new Error('the router model is not set up — run: sumo setup');
 
 delete process.env.SUMO_AGENTS_MODEL_CMD; // a stand-in would answer instead of the router being measured
-console.log(`router: ${modelFile}`);
+const scored = process.argv.includes('--scorecard');
+console.log(`router: ${modelFile}${scored ? ', routes picked from the scorecard' : ''}`);
 const now = new Date().toISOString();
 // One home per history, so the project keeps the same name and only the history differs between runs.
 for (const [name, jobs] of Object.entries(HISTORIES)) {
@@ -95,17 +99,23 @@ for (const [name, jobs] of Object.entries(HISTORIES)) {
       setMeta(db, 'llama.path', llama);
       // Only the file is needed here: the address goes without any token in it.
       if (modelUrl) setMeta(db, 'config.model.url', `${new URL(modelUrl).origin}${new URL(modelUrl).pathname}`);
+      if (scored) {
+        const card = await refreshScorecard(db);
+        if (!card.ok) throw new Error(`the scorecard could not be fetched: ${card.error}`);
+      }
       const { project } = addProject(db, mkdtempSync(join(tmpdir(), 'sumo-agents-probe-')), { slug: 'probe' });
       const insert = db.prepare(`INSERT INTO jobs (project, title, agent, status, created_at, updated_at, model, effort, important) VALUES (?, 'x', 'worker', ?, ?, ?, ?, ?, ?)`);
       for (const [status, model, effort, important] of jobs) insert.run(project.slug, status, now, now, model, effort, important);
       console.log(`\nhistory: ${name}`);
       const tally = { ok: 0, over: 0, under: 0 };
       for (const [lo, hi, agent, title, task] of PROBES) {
-        const { model, effort } = await chooseRoute(db, { agent, project, title, task });
+        const { model, effort, reason } = await chooseRoute(db, { agent, project, title, task });
         const route = `${model}/${effort}`;
         const verdict = rank(route) > rank(hi) ? 'over' : rank(route) < rank(lo) ? 'under' : 'ok';
         tally[verdict]++;
-        console.log(`  ${verdict.toUpperCase().padEnd(5)} ${route.padEnd(13)} ${title}   (wants ${lo} to ${hi})`);
+        // On the scorecard, how the router sorted the job: what to look at when a route is off.
+        const sorted = scored ? `   [${/scorecard: ([^;]*)/.exec(reason)?.[1] ?? ''}]` : '';
+        console.log(`  ${verdict.toUpperCase().padEnd(5)} ${route.padEnd(13)} ${title}   (wants ${lo} to ${hi})${sorted}`);
       }
       console.log(`  ${PROBES.length} probes: ${tally.ok} ok, ${tally.over} routed too high, ${tally.under} routed too low`);
     } finally {

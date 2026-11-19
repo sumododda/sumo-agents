@@ -12,8 +12,11 @@ test('before anything is checked every model is on, and says it was not checked'
   const s = sandbox();
   const run = s.sumo(['models']);
   assert.equal(run.code, 0, run.err);
-  const lines = run.out.trim().split('\n');
-  assert.equal(lines.length, 4, 'one line per model Sumo knows');
+  const [models, card] = run.out.trim().split('\n\n');
+  const lines = models.split('\n');
+  assert.equal(lines.length, 6, "one line per model Sumo knows: Claude's four, then Cursor's two");
+  assert.match(lines[4], /^composer\s+off\s+composer-2\.5\s+not discovered yet · through Cursor$/, "Cursor's are off until Discover finds them");
+  assert.match(card, /^scorecard: not fetched/, 'then the scorecard, apart');
   assert.match(lines[0], /^haiku\s+on\s+claude-haiku-5-5\s+not checked$/);
   assert.match(lines[2], /^opus\s+on\s+claude-opus-5-5\s+not checked$/);
   assert.match(lines[3], /^fable\s+on\s+claude-fable-5-1\s+not checked$/);
@@ -189,7 +192,7 @@ test('a job routed to a model that has since been turned off is not run', () => 
   s.page(['models', 'disable', 'opus']);
   const run = s.sumo(['job', 'run', id], { extraEnv: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
   assert.notEqual(run.code, 0);
-  assert.match(run.err, new RegExp(`j${id} is routed to opus, which is off — turn it on under API models, on the settings page \\(sumo config\\), or abandon it and create it again`), run.out + run.err);
+  assert.match(run.err, new RegExp(`j${id} cannot run: opus is off — turn it on under API models, on the settings page \\(sumo config\\), or abandon it and create it again`), run.out + run.err);
 });
 
 test('discovery that could not reach the API says so rather than blaming the credential, and an answer that is not a list is a failed check', () => {

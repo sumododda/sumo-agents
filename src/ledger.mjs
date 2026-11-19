@@ -27,8 +27,8 @@ const FAILURES_VERSION = 'scribe.failures_version';
 const LAST_ERROR = 'scribe.last_error';
 const FALLBACK_USED = 'scribe.fallback_used';
 
-/** The model the memory pass is set to: `memory.model`, the one setting. */
-const memoryModel = (db) => getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model'];
+/** The model the memory pass is set to: `memory.model`, the one setting — 'off' when the pass is turned off. */
+export const memoryModel = (db) => getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model'];
 
 /**
  * The extractor's version: a short hash of what decides what gets filed — the prompt the model reads, the model
@@ -43,7 +43,8 @@ export function extractorVersion(db) {
 /**
  * Of the memories this extractor derived, the share the user then threw out within 30 days — forgot, rejected, or
  * replaced by hand — read from `memory_events`; null under ten derived. A memory a rebuild retired is not the user's
- * verdict, and one the pass itself replaced with a newer statement was right when it was filed.
+ * verdict, one the pass itself replaced with a newer statement was right when it was filed, and one the user reworded
+ * on the page (`edited`) they kept.
  */
 function junkRate(db, version) {
   const derived = db

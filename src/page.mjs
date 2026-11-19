@@ -38,6 +38,7 @@ function edit(db, id, body) {
     body: String(body ?? ''),
     writtenBy: 'user',
     supersedes: id,
+    edit: true,
   });
   return { memory: saved, redacted };
 }

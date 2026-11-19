@@ -28,7 +28,8 @@ function staticGraph(entry) {
   return { modules: [...seen].map((f) => f.slice(REPO_ROOT.length + 1)), packages: [...packages] };
 }
 
-const HEAVY_PACKAGES = ['@anthropic-ai/sdk', 'ink', 'react'];
+// The Cursor SDK is 2.5 MB of one file: loaded by the Cursor lane and Discover only, through import().
+const HEAVY_PACKAGES = ['@anthropic-ai/sdk', '@cursor/sdk', 'ink', 'react'];
 // The job commands' own module is light (no SDK, no screen): measured, `--version` and `hook prompt` start in ~60 ms with it.
 const HEAVY_MODULES = ['src/chat.mjs', 'src/loop.mjs', 'src/ui.mjs', 'src/herdr.mjs', 'src/page.mjs'];
 

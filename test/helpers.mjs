@@ -8,7 +8,7 @@ import { ENTRY, REPO_ROOT } from '../src/paths.mjs';
 import './fixtures/env-sandbox.mjs';
 
 /** An empty credential environment: no ambient token decides whether a test pays for a fallback call. */
-export const NO_KEY = { ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '' };
+export const NO_KEY = { ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '', CURSOR_API_KEY: '' };
 
 /** A pseudo-terminal from Python's standard library — Node has none: it types PTY_ANSWER once the output ends with PTY_UNTIL. */
 const PTY = `import os, pty, re, select, sys, time
@@ -80,6 +80,7 @@ export function sandbox() {
   const modelSaw = join(root, 'model-saw.json');
   const routerAnswer = join(root, 'router-answer.json');
   const modelsAnswer = join(root, 'models-answer.json');
+  const scorecardAnswer = join(root, 'scorecard-answer.json');
   const env = {
     ...process.env,
     ...NO_KEY,
@@ -90,6 +91,7 @@ export function sandbox() {
     STUB_CAPTURE: modelSaw,
     STUB_ROUTER_ANSWER: routerAnswer,
     STUB_MODELS: modelsAnswer,
+    STUB_SCORECARD: scorecardAnswer,
   };
 
   /** Runs `sumo` exactly as a user would. Never throws: exit code and streams come back for asserting on. */
@@ -157,9 +159,11 @@ export function sandbox() {
 
   /** Which of Sumo's models the API will say it has, by short name, for every discovery from here on; `errors` names ones whose check fails. */
   const modelsFound = (found, { errors = {} } = {}) => writeFileSync(modelsAnswer, JSON.stringify({ found, errors }));
+  // What the scorecard's sources say, by source id: `{ entries: [{ model, effort, score, cost }] }` or `{ error }`.
+  const scorecardWillBe = (sources) => writeFileSync(scorecardAnswer, JSON.stringify(sources));
 
   const modelWasShown = () => JSON.parse(readFileSync(modelSaw, 'utf8'));
   const spawned = () => (existsSync(spawnLog) ? readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean) : []);
 
-  return { root, home, sumo, page, typed, sql, addProject, hook, modelWillSay, routerWillSay, modelsFound, modelWasShown, spawned };
+  return { root, home, sumo, page, typed, sql, addProject, hook, modelWillSay, routerWillSay, modelsFound, scorecardWillBe, modelWasShown, spawned };
 }

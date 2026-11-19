@@ -7,8 +7,8 @@ import { paths } from './paths.mjs';
 /**
  * The OS sandbox around the model's shell: macOS Seatbelt, the way Codex and Claude Code wrap their commands. Reads and
  * the network stay open — git over ssh reads ~/.ssh, a smoke test calls out, and the user chose to give the shell their
- * environment — while writes are held to the project, its git directory, the temporary folders, Sumo's own home and
- * the tool caches, and never reach git's hooks or config, which run later outside it. The user can close the network
+ * environment — while writes are held to the project, its git directory, the temporary folders and the tool caches —
+ * never Sumo's own home — and never reach git's hooks or config, which run later outside it. The user can close the network
  * past this machine (`shell.network off`). The guard refuses the commands it knows; this stops the ones it does not,
  * whatever they are spelled as.
  * `sandbox-exec` execs into the shell in place, so the shell keeps its pid and its process group, and a stop still reaches it.
@@ -38,6 +38,24 @@ const real = (path) => {
   }
 };
 
+/** git's commands that look into a submodule's working tree — run in it, under its own config — unless told not to. */
+const LOOK_INTO_SUBMODULES = new Set(['status', 'diff', 'diff-index', 'diff-files']);
+
+/**
+ * A git command as sumo runs it for itself, outside the sandbox, in a folder the model's shell can write: nothing the
+ * folder's git files name is run — no fsmonitor, no hook — and no submodule is gone into, whose config the shell could
+ * have planted (a gitlink in the index and a repository beside it are all it takes). `.gitmodules` can set a
+ * submodule's `ignore` over any config, so the commands that would look into one are told on their own command line,
+ * which nothing in the folder overrides; the fsmonitor setting reaches the git a submodule would run all the same.
+ * `git config` runs nothing, and is asked what the folder's config says: it is left to say it, hooks path and all.
+ */
+export function ownGit(args) {
+  const [command, ...rest] = args;
+  if (command === 'config') return args;
+  const blind = LOOK_INTO_SUBMODULES.has(command) && !rest.includes('--no-index') ? ['--ignore-submodules=dirty'] : [];
+  return ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'submodule.recurse=false', '-c', 'diff.ignoreSubmodules=dirty', command, ...blind, ...rest];
+}
+
 /** Each root's git common directory, asked of git once: a root does not turn into a worktree of another repository halfway through. */
 const commonDirs = new Map();
 
@@ -46,7 +64,7 @@ function gitCommonDir(root) {
   if (!commonDirs.has(root)) {
     let dir = null;
     try {
-      const said = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 }).trim();
+      const said = execFileSync('git', ownGit(['rev-parse', '--git-common-dir']), { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 }).trim();
       dir = said ? real(resolve(root, said)) : null;
     } catch {
       // Not in a repository, or no git: there is nothing outside the root to write history to.
@@ -67,7 +85,7 @@ function hooksPathOf(root) {
   if (!hooksPaths.has(root)) {
     let dir = null;
     try {
-      const ask = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 }).trim();
+      const ask = (...args) => execFileSync('git', ownGit(args), { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 }).trim();
       const said = ask('config', '--type=path', '--get', 'core.hooksPath');
       if (said) {
         const path = resolve(ask('rev-parse', '--show-toplevel') || root, said);
@@ -96,14 +114,16 @@ function darwinUserCache() {
 
 /**
  * The places a sandboxed command may write, by their real paths — the sandbox sees through a link — each once: every
- * root and the git directory it commits to, the temporary folders, Sumo's home (the shell runs `sumo job note` and
- * `sumo job finish`, which write there), the per-user cache macOS gives compilers, and the tool caches that exist. A
- * place that does not exist is left out.
+ * root given and the git directory it commits to, the temporary folders, the per-user cache macOS gives compilers, and
+ * the tool caches that exist. A place that does not exist is left out. Never Sumo's home: what is in it is read later by
+ * sumo, outside the sandbox — an /undo turn it restores, a backup it puts back, another job's inbox read as the user's
+ * words — and the sumo commands the shell runs, run as sumo outside it, write there themselves. A root inside the home
+ * (a scratch chore, a job's worktree) is that root's.
  */
-export function writablePlaces(roots, { home = homedir(), tmp = tmpdir(), sumo = paths().home, userCache = darwinUserCache(), opened = [] } = {}) {
+export function writablePlaces(roots, { home = homedir(), tmp = tmpdir(), userCache = darwinUserCache(), opened = [] } = {}) {
   const places = [];
   for (const root of roots.map(real).filter(Boolean)) places.push(root, gitCommonDir(root));
-  places.push(real(tmp), real('/private/tmp'), real(sumo), userCache && real(userCache), ...TOOL_CACHES.map((cache) => real(join(home, cache))));
+  places.push(real(tmp), real('/private/tmp'), userCache && real(userCache), ...TOOL_CACHES.map((cache) => real(join(home, cache))));
   // What the user opened for the session at the editor's question — a file, or a directory with everything under it — the shell may write too.
   places.push(...[...opened].map(real));
   return [...new Set(places.filter(Boolean))];
@@ -117,7 +137,7 @@ export function writablePlaces(roots, { home = homedir(), tmp = tmpdir(), sumo =
 const GUARDED = {
   'your shell reads it when it starts': ['.zshrc', '.zshenv', '.zprofile', '.zlogin', '.bashrc', '.bash_profile', '.bash_login', '.profile', '.envrc'],
   // Husky's hooks are the directory git's config names (`.husky/_`), kept with git's own; the rest of `.husky` is the project's.
-  'a tool reads it before it runs': ['.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml', '.pre-commit-config.yaml', 'lefthook.yml', '.mcp.json', '.claude', '.codex', '.agents'],
+  'a tool reads it before it runs': ['.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml', '.pre-commit-config.yaml', 'lefthook.yml', '.mcp.json', '.claude', '.codex', '.agents', '.cursor'],
   'your editor reads it': ['.vscode', '.idea', '.devcontainer'],
   // Keys and logins other programs trust: a line added to authorized_keys or a profile in .aws outlives every session.
   'it holds credentials other programs trust': ['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.netrc', '.git-credentials', '.pgpass'],
@@ -138,9 +158,13 @@ const HOME_WHY = [...GUARDED_WHY, ...whyOf(HOME_GUARDED)];
 
 /**
  * What sumo keeps for itself, which only sumo writes: its memory and settings, its MCP servers, its own program and model —
- * and the spool, whose lines are replayed into the journal as what the user said.
+ * the spool, whose lines are replayed into the journal as what the user said; the memory pass's locks, by name, there or
+ * not (one naming a process that never ends would stop every pass); its logs, which hold the saved sessions (resumed as
+ * the conversation itself) and each turn's /undo (whose files sumo writes back); the backups a restore puts back; and
+ * the chat's history of what was typed. Nothing sandboxed writes them: the passes and the chat run as sumo. The home is
+ * not the shell's to write at all (`writablePlaces`); these hold where it lies in a place that is — a home under /tmp.
  */
-const SUMO_PRIVATE = ['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool'];
+const SUMO_PRIVATE = ['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool', 'scribe.lock', 'dream.lock', 'logs', 'backups', 'history'];
 
 /** The directories on the PATH, absolute: a program put in one runs whenever its name is typed. */
 const pathDirs = (env = process.env) => [...new Set(String(env.PATH ?? '').split(':').filter((d) => d.startsWith('/')).map((d) => resolve(d)))];
@@ -173,14 +197,23 @@ export function guardedWhy(path, { roots = [], home = homedir(), sumo = paths().
 }
 
 /**
- * What the shell may not write inside the places it may: the guarded files that are there, in each root and the home;
+ * Guarded names directly under a folder, by path there or not — a `.envrc` or `.claude/settings.json` the shell made
+ * would be read later all the same — and, for one that is a link, where it leads too.
+ */
+const guardedUnder = (dir, names) => {
+  const base = real(dir);
+  return base ? names.flatMap((name) => [join(base, name), real(join(base, name))]) : [];
+};
+
+/**
+ * What the shell may not write inside the places it may: the guarded names in each root and the home, there or not;
  * sumo's own files by name, there or not (`mcp.json` made by the shell would be read as servers allowed to run); and
  * the PATH's folders outside the project. Kept read-only as git's hooks are.
  */
 export function guardedPlaces(roots, { home = homedir(), sumo = paths().home, env = process.env } = {}) {
   const places = [];
-  for (const dir of roots) places.push(...Object.values(GUARDED).flat().map((name) => real(join(dir, name))));
-  places.push(...[...Object.values(GUARDED), ...Object.values(HOME_GUARDED)].flat().map((name) => real(join(home, name))));
+  for (const dir of roots) places.push(...guardedUnder(dir, Object.values(GUARDED).flat()));
+  places.push(...guardedUnder(home, [...Object.values(GUARDED), ...Object.values(HOME_GUARDED)].flat()));
   const own = real(sumo) ?? sumo;
   places.push(...SUMO_PRIVATE.map((name) => join(own, name)));
   // A PATH folder in a project is the project's; one above a project would make all of it read-only.
@@ -219,6 +252,35 @@ export function readOnlyPlaces(roots) {
   return [...new Set(places)];
 }
 
+/** A path as a pattern that matches it alone. */
+const literally = (path) => path.replace(/[.*+?^${}()|[\]\\]/g, (c) => `\\${c}`);
+
+/**
+ * What stays read-only by its shape rather than by a path that is there (seatbelt's regex matches case as the disk does):
+ * a repository's config and hooks below each root — one the shell made or cloned is as much git's to run later, by the
+ * user's `git status` going into a submodule or an editor scanning the folder, as the root's own — and the `.git` there
+ * itself, so neither a `.git` file pointing elsewhere nor a whole `.git` moved in brings its own; the config and hooks
+ * of the root repository's submodules and worktrees; and the copies of the database a migration leaves, which a restore
+ * puts back. A root's own `git init` still makes its own. Not caught: a folder moved in whole from a place the shell may
+ * write, with a repository inside it — sumo's own git never runs what such a one names (`ownGit`).
+ */
+export function readOnlyPatterns(roots, { sumo = paths().home } = {}) {
+  const own = '(config|config\\.worktree|hooks(/.*)?)';
+  const patterns = [];
+  for (const root of roots.map(real).filter(Boolean)) {
+    const r = literally(root);
+    // The root's own repository too, made or not: `git init --template` in a root with none writes a config and hooks
+    // git runs later outside the sandbox — your prompt's `git status`, an editor — the same as a planted nested one.
+    patterns.push(`^${r}/.+/\\.git$`, `^${r}/.+/\\.git/(.+/)?${own}$`, `^${r}/\\.git/${own}$`);
+    const gitDir = real(join(root, '.git'));
+    for (const dir of new Set([gitDir && isDirectory(gitDir) ? gitDir : join(root, '.git'), gitCommonDir(root)].filter(Boolean))) {
+      patterns.push(`^${literally(dir)}/(modules|worktrees)/(.+/)?${own}$`);
+    }
+  }
+  patterns.push(`^${literally(real(sumo) ?? sumo)}/memory\\.db\\.pre-v[0-9]+\\.bak$`);
+  return [...new Set(patterns)];
+}
+
 /** Every directory above a path, up to and without the root of the disk. */
 function ancestors(path) {
   const above = [];
@@ -229,25 +291,29 @@ function ancestors(path) {
 /**
  * What a command runs under: sandbox-exec with a profile that allows everything but writing, then writing to each
  * place — given as a parameter, so no path is ever spelled inside the profile — but never to what is kept read-only in
- * them, carved out with require-not as Codex does; and to the devices every shell writes to. No directory above a path
+ * them, carved out with require-not as Codex does, nor to a path of a shape kept read-only (`patterns`, regexes, given as
+ * parameters too); and to the devices every shell writes to. No directory above a path
  * kept read-only can be moved or removed: renamed aside, what is under it would be out of the carve-out, and could be
  * written and moved back. With the network off, nothing past this machine is reached; loopback — a dev server, a
  * test's own — and local sockets stay open. The shell and its command follow it.
  */
-export function sandboxWrap(writable, { readOnly = [], network = true } = {}) {
+export function sandboxWrap(writable, { readOnly = [], patterns = [], network = true } = {}) {
   const places = writable.map((_, i) => `(subpath (param "W${i}"))`).join(' ');
-  const kept = readOnly.map((_, i) => `(require-not (literal (param "R${i}"))) (require-not (subpath (param "R${i}")))`).join(' ');
+  const kept = [
+    ...readOnly.map((_, i) => `(require-not (literal (param "R${i}"))) (require-not (subpath (param "R${i}")))`),
+    ...patterns.map((_, i) => `(require-not (regex (param "P${i}")))`),
+  ].join(' ');
   const above = [...new Set(readOnly.flatMap(ancestors))];
   const rules = [
     '(version 1)',
     '(allow default)',
     '(deny file-write*)',
-    `(allow file-write* ${readOnly.length === 0 ? places : `(require-all (require-any ${places}) ${kept})`} (literal "/dev/null") (regex #"^/dev/(tty|fd/|zero|dtracehelper)"))`,
+    `(allow file-write* ${kept === '' ? places : `(require-all (require-any ${places}) ${kept})`} (literal "/dev/null") (regex #"^/dev/(tty|fd/|zero|dtracehelper)"))`,
   ];
   if (!network) rules.push('(deny network-outbound (remote ip))', '(allow network-outbound (remote ip "localhost:*"))');
   // Last, so no allowance after it opens the unlink a rename is made of.
   if (above.length > 0) rules.push(`(deny file-write-unlink (require-all (vnode-type DIRECTORY) (require-any ${above.map((_, i) => `(literal (param "A${i}"))`).join(' ')})))`);
-  const params = [...writable.map((place, i) => `-DW${i}=${place}`), ...readOnly.map((place, i) => `-DR${i}=${place}`), ...above.map((place, i) => `-DA${i}=${place}`)];
+  const params = [...writable.map((place, i) => `-DW${i}=${place}`), ...readOnly.map((place, i) => `-DR${i}=${place}`), ...patterns.map((pattern, i) => `-DP${i}=${pattern}`), ...above.map((place, i) => `-DA${i}=${place}`)];
   return [SANDBOX_EXEC, '-p', rules.join('\n'), ...params, '--'];
 }
 

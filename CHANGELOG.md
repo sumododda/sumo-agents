@@ -4,6 +4,94 @@ What each release changed for you. The commit of each version has the full detai
 
 ## Unreleased
 
+## 0.8.0 — 2026-11-18
+
+- **Cursor's models, for chats and jobs.** With `CURSOR_API_KEY` exported, Discover asks Cursor too and switches on
+  Composer 2.5 and Grok 4.7 when it lists them. They sit beside Claude's in `/model`, Chat › Model, the jobs' smallest
+  model and auto, and run through the Cursor SDK (`@cursor/sdk`, a new dependency) at their standard variants, never
+  Fast. Cursor runs the loop; Sumo's own tools — the shell, the editor, the job's tools, the MCP servers — answer it
+  through the same approvals, guard and sandbox as on Claude, with `/undo` keeping what the editor changed. Of Cursor's
+  own tools it keeps only web search and fetch, and only where Claude has them — the chat and scouts; its file and shell
+  tools are given no disk, and its agents live in a folder of Sumo's own, so nothing of the SDK runs git or a program
+  from your PATH in your project. A Cursor job gets the same warnings near its budget and time, and the same stops for
+  a repeated call, a loop or declined calls, as one on Claude; what you tell a running job reaches it; and nothing a
+  run started outlives it. Its web search is unseen, so a conversation or scout that has it is taken to have read the
+  web. Each request is priced at Cursor's list rates in the ledger. The key is kept from the model's shell and
+  redacted wherever it would be written, and `.cursor` joins the guarded files.
+- **Claude and Cursor in one conversation.** `/model` and auto move a chat between the two at any turn. What a turn on
+  Cursor did joins the conversation as it would on Claude — each call and what came back, then the reply — so Claude
+  knows what was done and read; a turn back on Cursor is told what was said since, in words, by the same Cursor agent,
+  also after the chat moves into a project; an agent Cursor no longer has is replaced by a new one told the whole
+  conversation. Pictures you paste go to Cursor too. A `/handoff` from Cursor is written by
+  Sonnet. In a shell without `CURSOR_API_KEY` Cursor's models are not offered or routed to, and asking for one says why.
+- **Routing reads published benchmarks, not a rule.** Discover, and the first `sumo setup`, fetch three benchmarks
+  once and save them: CursorBench as Epoch AI collects it, LMArena's agent board and Artificial Analysis's
+  Intelligence Index via modelgrep. No key is needed and no model reads them. Each is turned into a place among
+  Sumo's models before anything is averaged. The local router now only sorts the work; code picks the cheapest model
+  and effort whose score clears the bar for it, at the effort the work's size asks for, over Claude's and Cursor's
+  models alike. Harder, larger or risky work never gets a lower-scoring route than easier work of the same kind, and a
+  retry climbs to a route that scores above the one that failed. `sumo models` shows the scores, and every route says
+  why it was picked. `/scorecard` in the chat fetches them again and shows each step: every request with its status,
+  size and time, the rows kept and left out, and where each source placed the models. Without a scorecard the router
+  chooses Claude's models by the old rule.
+- **A route is priced by what your jobs cost.** Neither API gives a cost back here, so routing reads the ledger: a
+  route's own average over its finished jobs of the same kind, else the benchmarks' cost of a task scaled to the size
+  of your jobs, else your typical job at the model's list prices. A job that failed before anything was billed is not
+  a price, and prices of different kinds are never compared. On today's benchmarks Claude's models win every kind of
+  work on score and price; Cursor's are picked once your own jobs show them cheaper.
+- **The editor cannot be raced into writing elsewhere.** A file swapped for a link while the editor worked on it could
+  have its change written through the link — into `.git/config`, say, which git then runs outside the sandbox — and the
+  record `/undo` keeps could be pointed there the same way. Where a change lands is now decided once, at the checks,
+  the file is read and written through that one descriptor, and `/undo` keeps the file that was written. A hard link
+  reached through a link is asked about as the hard link is, and a FIFO or device is refused at once instead of
+  freezing the chat.
+- **Sumo's home is no longer the sandboxed shell's to write.** The shell could plant what Sumo later trusts there: an
+  `/undo` record that your next `/undo` would write into `.git/config`, a saved session `/resume` would load as your
+  words, a memory-pass lock that stopped filing without a word, a backup, the record that a job read the web. Now the
+  shell writes the project (or scratch) and the temporary folders, never Sumo's home, and its logs, backups and
+  history are kept from it even where the home sits in a writable place. A saved session is picked up only when the
+  journal knows it, and a job's outside reads are kept in the database.
+- **What the sandboxed shell may not write, it may not create either.** A guarded file that did not exist yet —
+  `.envrc`, `.claude/settings.json`, `.npmrc` and the rest — could be created by the shell, also through a link inside
+  the project. Now each is guarded by its path whether it exists or not, and by where it lands. A repository's config
+  and hooks are git's to run later outside the sandbox — your prompt's `git status`, an editor — so the shell makes
+  none: not a nested repository, not one in a project that has none (`git init`, which a template can fill); it is a
+  question for you, or a refusal where nobody can be asked. Sumo's own git never runs an fsmonitor, a hook or a submodule's
+  config, wherever they came from. The log of a command left in the background is made new in the temporary folder,
+  never through a link planted at its name, which would have had Sumo append the command's output wherever it led.
+- **Sumo's own credentials stay out of everything written.** Each is redacted by its value, whatever its shape, and an
+  MCP server's `${NAME}` can no longer name one.
+- **A new failure in an already-red suite is found, whatever the runner.** Failures are now named with their file or
+  package, pytest's `ERROR` lines and go's build failures are read, and the runner's own counts must be accounted for
+  by the names, or the worker stays open for you. `cargo test --no-fail-fast` runs every target, and vitest's timings
+  no longer make a test look new. A DONE that cannot be checked here is asked about, not finished FAILED and retried.
+  A broken link or an editable install pointing outside the project no longer makes a worktree look shared.
+- **`/undo` never gets stuck.** A file rewritten in place by `sed -i`, a formatter or an editor's safe save blocked
+  every undo for good. Files are now compared by what they hold; a turn whose file you changed since is refused once,
+  and the next `/undo` lets it go and keeps your file, so earlier turns can still be undone.
+- **Memory keeps what it should and says when it stops.** A statement a rebuild let go can be filed again; only your
+  letting go keeps it out. Rewording memories on the page no longer pauses filing, and a pause is said in the block.
+  A lock left by a pass that ended is taken over, `sumo memory run` exits 1 when another pass holds it, and the check
+  fails on one held over half an hour. Every call to a hosted model is in the ledger, and a rebuild from the model's
+  shell reads only the newest few conversations, never on a hosted model. A line a hook sets aside while the spool is
+  read is never lost. In a turn of three lines or more only the first and last line are quoted as yours. A database
+  that cannot be copied aside first is not migrated.
+- **The settings page.** A new local model is downloaded before the setting changes, so the old one keeps working
+  meanwhile and a failed download changes nothing; `sumo config` waits for a download and says how it went. A change
+  of effort or model moves only that part of the chat's route. A server's tools changed elsewhere are said, never a
+  crash. A plain variable such as `LOG_LEVEL=info` is taken as it is. The cursor shows under `NO_COLOR`. `sumo doctor`
+  stops failing on an `mcp.json` you have removed.
+- **A release is published by you, not by a merge.** Changes reach `main` only through a pull request, and merging one
+  only runs the suite. A version reaches
+  npm when you publish a GitHub Release tagged `v` and the version in package.json, on a commit on main: the suite runs
+  again on that commit, and the publish waits for your approval in the `release` environment. A prerelease goes to
+  npm's `next` tag, and carries a version like 0.9.0-rc.1.
+- **Smaller.** A session started inside a project is told, in its first block, that it works there: told only the list
+  and where work with no project goes, a model once put a file for the project in scratch. `/context` counts turns and calls on every model, piped too. The editor's answer to a call without a
+  command names the commands it has. Output a check prints in a shape made to make a pattern backtrack is read at once.
+  The suite waits by the clock, not by a count of naps, so it no longer fails on a loaded machine, CI's or across
+  midnight UTC.
+
 ## 0.7.2 — 2026-11-18
 
 - **A new failure can no longer hide in a suite that was already red.** A check failing when a worker began, and

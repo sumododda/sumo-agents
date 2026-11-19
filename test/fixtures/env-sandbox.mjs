@@ -15,6 +15,9 @@ delete process.env.CLAUDECODE;
 // in the user's workspace, watching a home that is gone a moment later: hundreds were. A test about Herdr hands the
 // chat its own env and herdr.
 for (const name of Object.keys(process.env)) if (name.startsWith('HERDR_')) delete process.env[name];
+// Run from a shell with the user's Cursor key, a job on a Cursor model would reach Cursor, and Discover would ask it: a test
+// about Cursor sets the key itself, to a stand-in's.
+delete process.env.CURSOR_API_KEY;
 
 /** A fresh SUMO_AGENTS_HOME nothing else has touched. */
 export function freshHome() {
