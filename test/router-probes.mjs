@@ -6,7 +6,7 @@
 //   node --disable-warning=ExperimentalWarning test/router-probes.mjs     (about two minutes)
 // With --scorecard each home fetches today's scorecard first, so the router only sorts and code picks the route:
 //   node --disable-warning=ExperimentalWarning test/router-probes.mjs --scorecard
-import { existsSync, mkdirSync, mkdtempSync, symlinkSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -16,7 +16,6 @@ import { paths } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { MODELS } from '../src/catalog.mjs';
 import { chooseRoute, EFFORTS } from '../src/route.mjs';
-import { refreshScorecard } from '../src/scorecard.mjs';
 import { modelFileOfUrl } from '../src/setup.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
@@ -99,9 +98,10 @@ for (const [name, jobs] of Object.entries(HISTORIES)) {
       setMeta(db, 'llama.path', llama);
       // Only the file is needed here: the address goes without any token in it.
       if (modelUrl) setMeta(db, 'config.model.url', `${new URL(modelUrl).origin}${new URL(modelUrl).pathname}`);
+      // The scorecard /scorecard wrote in the real home: writing one here would be a model's work, paid for, every probe.
       if (scored) {
-        const card = await refreshScorecard(db);
-        if (!card.ok) throw new Error(`the scorecard could not be fetched: ${card.error}`);
+        if (!existsSync(real.scorecard)) throw new Error(`no scorecard at ${real.scorecard}: run /scorecard in a chat first`);
+        copyFileSync(real.scorecard, paths().scorecard);
       }
       const { project } = addProject(db, mkdtempSync(join(tmpdir(), 'sumo-agents-probe-')), { slug: 'probe' });
       const insert = db.prepare(`INSERT INTO jobs (project, title, agent, status, created_at, updated_at, model, effort, important) VALUES (?, 'x', 'worker', ?, ?, ?, ?, ?, ?)`);

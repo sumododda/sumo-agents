@@ -40,6 +40,7 @@ export function paths() {
     models: join(home, 'models'),
     scratch: join(home, 'scratch'),
     spool: join(home, 'spool'),
+    scorecard: join(home, 'scorecard.json'),
   };
 }
 

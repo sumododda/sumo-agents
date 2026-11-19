@@ -161,10 +161,10 @@ const HOME_WHY = [...GUARDED_WHY, ...whyOf(HOME_GUARDED)];
  * the spool, whose lines are replayed into the journal as what the user said; the memory pass's locks, by name, there or
  * not (one naming a process that never ends would stop every pass); its logs, which hold the saved sessions (resumed as
  * the conversation itself) and each turn's /undo (whose files sumo writes back); the backups a restore puts back; and
- * the chat's history of what was typed. Nothing sandboxed writes them: the passes and the chat run as sumo. The home is
+ * the chat's history of what was typed; and the scorecard routing reads (a file the shell wrote would choose the models). Nothing sandboxed writes them: the passes and the chat run as sumo. The home is
  * not the shell's to write at all (`writablePlaces`); these hold where it lies in a place that is — a home under /tmp.
  */
-const SUMO_PRIVATE = ['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool', 'scribe.lock', 'dream.lock', 'logs', 'backups', 'history'];
+const SUMO_PRIVATE = ['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool', 'scribe.lock', 'dream.lock', 'logs', 'backups', 'history', 'scorecard.json'];
 
 /** The directories on the PATH, absolute: a program put in one runs whenever its name is typed. */
 const pathDirs = (env = process.env) => [...new Set(String(env.PATH ?? '').split(':').filter((d) => d.startsWith('/')).map((d) => resolve(d)))];

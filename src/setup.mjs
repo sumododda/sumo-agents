@@ -10,7 +10,7 @@ import { Readable, Transform } from 'node:stream';
 import { anthropicClient, authenticatedRequest, FALLBACK_BETA, resolveAnthropicCredential } from './auth.mjs';
 import { allModels, assertOn, describeApiError, discoverModels, discoverySummary, knownModel, modelLadder, MODELS, modelsChecked, modelStates } from './catalog.mjs';
 import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mjs';
-import { refreshScorecard, savedScorecard, scorecardSummary } from './scorecard.mjs';
+import { savedScorecard } from './scorecard.mjs';
 import { damaged, restoreHint } from './export.mjs';
 import { stopLocalServer } from './local-server.mjs';
 import { latestCrash, crashFiles, logFiles, tailOf } from './logs.mjs';
@@ -288,7 +288,7 @@ export async function setup({ binDir, link = true, modelSource, noModel = false 
       : await ensureModel(db);
   }
   const modelsLine = await checkModels(db);
-  const scorecardLine = await checkScorecard(db);
+  const scorecardLine = scorecardState();
   db.close();
 
   // Written aside and renamed in, so a hook running the launcher mid-setup never reads half a script.
@@ -329,14 +329,10 @@ async function checkModels(db) {
   return result.ok ? `models    ${discoverySummary(result)}` : `models    not checked — ${result.error}`;
 }
 
-/**
- * The benchmarks routing reads, fetched the first time only, as the models are: Discover, on the settings page, fetches them again.
- * Never throws: a source that cannot be reached is not a reason for `sumo setup` to fail.
- */
-async function checkScorecard(db) {
-  const card = savedScorecard(db);
-  if (card) return `scorecard fetched ${card.at.slice(0, 10)} — API models › Discover, on the settings page (sumo config), fetches it again`;
-  return scorecardSummary(await refreshScorecard(db));
+/** Where the scorecard routing reads stands: setup writes none — it is a model's work, paid for, and only `/scorecard` asks for it. */
+function scorecardState() {
+  const card = savedScorecard();
+  return card ? `scorecard written ${card.at.slice(0, 10)} — /scorecard, in a chat, writes it again` : 'scorecard none written — /scorecard, in a chat, has the strongest Claude model on write it; until then routing goes by its rule';
 }
 
 function commandOnPath(name) {

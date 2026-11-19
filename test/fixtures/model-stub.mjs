@@ -4,7 +4,6 @@
 // while the scribe replays something else; a router answer that is not there is a failed call.
 // A pass on the local model names its kind; STUB_LOCAL_FAILS makes every local call fail.
 // Asked which models the API has (kind `models`), it answers from STUB_MODELS; none recorded is a failed call.
-// Asked for the scorecard (kind `scorecard`), from STUB_SCORECARD.
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const request = readFileSync(0, 'utf8');
@@ -25,15 +24,6 @@ if (asked.kind === 'cursor-models') {
     process.exit(1);
   }
   process.stdout.write(readFileSync(process.env.STUB_CURSOR_MODELS, 'utf8'));
-  process.exit(0);
-}
-// Asked for the scorecard's sources (kind `scorecard`), it answers from STUB_SCORECARD; none recorded is a failed fetch.
-if (asked.kind === 'scorecard') {
-  if (!process.env.STUB_SCORECARD || !existsSync(process.env.STUB_SCORECARD)) {
-    process.stderr.write('no scorecard recorded');
-    process.exit(1);
-  }
-  process.stdout.write(readFileSync(process.env.STUB_SCORECARD, 'utf8'));
   process.exit(0);
 }
 const local = asked.model === 'local';

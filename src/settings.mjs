@@ -3,8 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Box, render, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
 import { createElement as h, useReducer } from 'react';
-import { allModels, cursorSummary, discoverCursor, discoverModels, discoverySummary, labelOf, laneOf, listedPrice, modelId, modelLadder, MODELS, modelStates, setModel } from './catalog.mjs';
-import { refreshScorecard, scorecardSummary } from './scorecard.mjs';
+import { allModels, cursorSummary, discoverCursor, discoverModels, discoverySummary, fetchListedPrices, labelOf, laneOf, listedPrice, modelId, modelLadder, MODELS, modelStates, pricesSummary, setModel } from './catalog.mjs';
 import { getMeta, openDb } from './db.mjs';
 import { addServer, allowedBy, CLAUDE_CODE_TOKEN, connect, readConfig, removeServer, setAllow } from './mcp.mjs';
 import { redact } from './redact.mjs';
@@ -143,7 +142,7 @@ export function keyName(input, key) {
 /**
  * The page. `live` is what the chat lends it: `route(args)` switches the chat's model and effort as the page changes, `current()` is the route it is on,
  * them, `servers()` says how its MCP servers connected, `left()` is the status line's left side. Without it (`sumo
- * config`) a change is for the next chat. `toolsOf`, `download`, `discover`, `cursor`, `score` and `claude` are the slow or outside parts,
+ * config`) a change is for the next chat. `toolsOf`, `download`, `discover`, `cursor`, `prices` and `claude` are the slow or outside parts,
  * passed in so a test can stand in for them.
  */
 /** What a model's row says it is for: one of Claude's four, Composer and Grok by their lane; any other by its maker's name and price. */
@@ -154,7 +153,7 @@ function modelRowHint(m) {
   return `${labelOf(m) ?? m}${price ? ` · $${price.input}/$${price.output} per million tokens` : ' · no price known: run only when picked by name'} — ${use}`;
 }
 
-export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNames, download = fetchModel, discover = discoverModels, cursor = discoverCursor, score = refreshScorecard, claude = () => claudeCodeServers(cwd), onChange = () => {} } = {}) {
+export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNames, download = fetchModel, discover = discoverModels, cursor = discoverCursor, prices = fetchListedPrices, claude = () => claudeCodeServers(cwd), onChange = () => {} } = {}) {
   const db = openDb();
   const values = () => Object.fromEntries(Object.keys(CONFIG_DEFAULTS).map((k) => [k, getMeta(db, `config.${k}`) ?? CONFIG_DEFAULTS[k]]));
   const switches = () => Object.fromEntries(Object.entries(modelStates(db)).map(([m, state]) => [m, state.on]));
@@ -212,7 +211,7 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
     ['Projects', [{ id: 'projects.home', label: 'New ones go in', type: 'path', action: 'enter: change', when: 'at once', hint: 'the folder a new project is made in' }]],
     ['API models', [
       ...allModels(db).map((m) => ({ id: `model:${m}`, label: MODELS.includes(m) || !m.includes('-') ? cap(m) : (labelOf(m) ?? m), type: 'model', m, hint: modelRowHint(m) })),
-      { id: 'discover', label: 'Discover', type: 'action', text: 'ask Anthropic and Cursor which this login can use', action: 'enter', hint: 'sets the switches from the answer — one you turned off stays off — and fetches the scorecard routing reads' },
+      { id: 'discover', label: 'Discover', type: 'action', text: 'ask Anthropic and Cursor which this login can use', action: 'enter', hint: 'sets the switches from the answer — one you turned off stays off — and fetches list prices; /scorecard, in a chat, writes the scorecard' },
     ]],
     ['MCP servers', [
       ...S.servers.map((s, i) => ({ id: `server:${s.name}`, label: s.name, type: 'server', s, i, action: 'enter: tools', hint: `${s.spec.url ?? [s.spec.command, ...(s.spec.args ?? [])].join(' ')} — enter: its tools, and which run without asking` })),
@@ -556,20 +555,20 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
         return openTools(r);
     }
     if (r.id === 'discover') {
-      S.msg = { info: 'asking Anthropic and Cursor which models this login can use, and fetching the scorecard…' };
-      // Each is asked on its own: Cursor needs only its key, and the scorecard no login at all. One that fails is said, never thrown.
+      S.msg = { info: 'asking Anthropic and Cursor which models this login can use, and fetching list prices…' };
+      // Each is asked on its own: Cursor needs only its key, and the prices no login at all. One that fails is said, never thrown.
       const settled = (work) => Promise.resolve().then(work).catch((cause) => ({ ok: false, error: cause.message }));
-      // The scorecard is read for the models just listed, so it is fetched once both have answered.
+      // The prices are read for the models just listed, so they are fetched once both have answered.
       const asked = Promise.all([discover(db), settled(() => cursor(db))]);
-      later(asked.then(async (both) => [...both, await settled(() => score(db))]), (all, cause) => {
+      later(asked.then(async (both) => [...both, await settled(() => prices(db))]), (all, cause) => {
         S.on = switches();
         if (cause) {
           S.msg = { err: cause.message };
           return;
         }
-        const [found, fromCursor, card] = all;
-        const said = `${found.ok ? discoverySummary(found) : found.error} — ${cursorSummary(fromCursor)} — ${scorecardSummary(card)}`;
-        S.msg = found.ok && card.ok ? { ok: said } : { err: said };
+        const [found, fromCursor, priced] = all;
+        const said = `${found.ok ? discoverySummary(found) : found.error} — ${cursorSummary(fromCursor)} — ${pricesSummary(priced)}`;
+        S.msg = found.ok ? { ok: said } : { err: said };
       });
     }
     if (r.id === 'add') {

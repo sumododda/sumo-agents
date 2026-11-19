@@ -105,11 +105,60 @@ function entryOf(name) {
   return seen.listed.claude.find((e) => e.id === modelId(name)) ?? null;
 }
 
-/** Saves the list prices the scorecard's source publishes, by Sumo's name: they price a model Sumo's own list has not. */
+/** Saves the list prices modelgrep publishes, by Sumo's name: they price a model Sumo's own list has not. */
 export function saveListedPrices(db, prices) {
   setMeta(db, LISTED_PRICES_KEY, JSON.stringify(prices));
   readListing(db);
 }
+
+const MODELGREP = 'https://modelgrep.com/api/v1/models';
+
+/** A model's name as a listing and the API spell it, the same way: no maker, no punctuation, lower case — `Claude Haiku 5.5` and `anthropic/claude-haiku-5.5` are both `claude-haiku-5-5`. */
+const plain = (name) => String(name).toLowerCase().replace(/^[^/]*\//, '').replace(/[\s._]+/g, '-').replace(/^-+|-+$/g, '');
+
+/**
+ * modelgrep's list prices for Sumo's models, by name, as the catalog keeps a price: US dollars per million tokens in and out,
+ * and a cache read as a share of input (the input price itself where none is listed — never priced below what it could cost).
+ * A row with no price above zero prices nothing; one id prices every Sumo name that runs it, Claude's own and Cursor's.
+ */
+export function pricesFrom(rows, models) {
+  const prices = {};
+  for (const r of rows) {
+    const p = r.pricing ?? {};
+    if (!(p.input > 0 && p.output > 0)) continue;
+    const price = { input: p.input, output: p.output, cacheRead: p.cache_read > 0 ? Math.min(1, p.cache_read / p.input) : 1 };
+    for (const model of models.filter((m) => plain(modelId(m)) === plain(r.id))) prices[model] ??= price;
+  }
+  return prices;
+}
+
+/**
+ * Discover's list prices: modelgrep's listing read page by page, its prices saved for the models Sumo knows — what orders a
+ * model Sumo's own list does not price, and puts it on the ladder. One that prices nothing leaves the prices saved before.
+ * Never throws; under a stand-in nothing is fetched. `fetchImpl` stands in for fetch in tests.
+ */
+export async function fetchListedPrices(db, { fetchImpl = fetch } = {}) {
+  if (process.env.SUMO_AGENTS_MODEL_CMD && fetchImpl === fetch) return { ok: false, error: 'not fetched under a stand-in' };
+  try {
+    const rows = [];
+    for (let at = 0; at < 2000; at += 200) {
+      const res = await fetchImpl(`${MODELGREP}?offset=${at}&limit=200`, { signal: AbortSignal.timeout(30_000), headers: { 'user-agent': 'sumo-agents' } });
+      if (!res.ok) throw new Error(`modelgrep answered ${res.status}`);
+      const page = await res.json();
+      rows.push(...(page.data ?? []));
+      if (rows.length >= (page.meta?.total ?? 0) || (page.data ?? []).length === 0) break;
+    }
+    const prices = pricesFrom(rows, allModels(db));
+    if (Object.keys(prices).length === 0) return { ok: false, error: "modelgrep lists none of Sumo's models" };
+    saveListedPrices(db, prices);
+    return { ok: true, priced: Object.keys(prices).length };
+  } catch (cause) {
+    return { ok: false, error: String(cause?.message ?? cause).slice(0, 200) };
+  }
+}
+
+/** Discover's list prices in a few words. */
+export const pricesSummary = (result) => (result.ok ? `list prices for ${result.priced} models` : `list prices not fetched — ${result.error}`);
 
 /** A model's price per million tokens: Sumo's own list first, then the scorecard's list price; null when neither has it. */
 export function listedPrice(model) {

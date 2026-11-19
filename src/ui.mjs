@@ -1496,14 +1496,16 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
         state.settings = settingsPage({ live: { route: (to) => session.route(to), current: () => ({ model: session.model, effort: session.effort }), servers: () => session.mcpServers(), left }, cwd: state.where.cwd, onChange: redraw });
         return;
       }
-      // Each source as a step of its own, said as it is read; then what was saved, as a table.
+      // The writer's searches, pages and writes, each a step as a turn's calls are; Esc stops it; then what was saved, as a table.
       if (control === 'scorecard') {
         record({ kind: 'user', text: line });
         state.working = pickMessage(messages);
         redraw();
-        const report = await session.scorecard((source) =>
-          record({ kind: 'tool', call: { id: `scorecard-${source.id}`, name: 'Fetch', input: { text: source.name } }, result: { content: source.steps.join('\n'), isError: !source.ok }, took: source.ms }),
-        );
+        const since = new Map();
+        const report = await session.scorecard({
+          onTool: (call) => since.set(call.id, Date.now()),
+          onResult: (call, result) => record({ kind: 'tool', call, result, took: Date.now() - (since.get(call.id) ?? Date.now()) }),
+        });
         return record({ kind: 'reply', raw: report, own: true });
       }
       if (control === 'memory' || control === 'mcp' || control === 'undo') {
