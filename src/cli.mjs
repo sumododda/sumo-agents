@@ -3,7 +3,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { createInterface } from 'node:readline';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
-import { ALL_MODELS, cursorKeyIn, knownModel, laneOf, modelId, modelLines } from './catalog.mjs';
+import { allModels, cursorKeyIn, knownModel, laneOf, modelId, modelLines } from './catalog.mjs';
 import { openDb } from './db.mjs';
 import { backup, damaged, exportJson, exportMarkdown, liveDatabase, purgeFromBackups, purgeRowFromBackups, restoreCandidate, restoreHint, restoreLines, restoreQuestion } from './export.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
@@ -1048,7 +1048,16 @@ export async function main(argv) {
       const resume = flags.resume ? (given[0] ?? 'last') : null;
       // Said once, before the screen: past here every turn would fail the same way.
       // A full API id is taken too (claude-opus-5-5), as the chat itself takes one.
-      if (flags.model !== undefined && flags.model !== 'auto' && !ALL_MODELS.map(modelId).includes(flags.model)) knownModel(flags.model, ['auto'], ALL_MODELS);
+      if (flags.model !== undefined && flags.model !== 'auto') {
+        const listing = openDb();
+        let known;
+        try {
+          known = allModels(listing);
+        } finally {
+          listing.close();
+        }
+        if (!known.map(modelId).includes(flags.model)) knownModel(flags.model, ['auto'], known);
+      }
       if (flags.effort !== undefined && !CHAT_EFFORTS.includes(flags.effort)) throw new UsageError(`no such effort "${flags.effort}" — one of: ${CHAT_EFFORTS.join(', ')}`);
       if (!resolveAnthropicCredential()) throw new NeedsCredential('the chat needs an Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this shell, then: sumo chat');
       const db = openDb();

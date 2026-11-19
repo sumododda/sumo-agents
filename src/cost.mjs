@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { modelName } from './catalog.mjs';
+import { modelName, readListing } from './catalog.mjs';
 import { CACHE_WRITE, priceOf } from './model.mjs';
 import { getProject } from './projects.mjs';
 
@@ -154,6 +154,8 @@ function split(sum, of = null) {
  * on two projects is counted under each.
  */
 export function costLines(db, { days, project } = {}) {
+  // The list prices of the models Discover found, read before any row is split by them.
+  readListing(db);
   const slug = project === undefined ? null : getProject(db, project).slug;
   const since = days === undefined ? null : new Date(Date.now() - days * 86_400_000).toISOString();
   const rows = db

@@ -1,12 +1,12 @@
-import { CURSOR_MODELS, JOB_MODELS, modelId, usableJobModels, usableModels } from './catalog.mjs';
+import { EFFORTS, effortOn, effortsOf, ladderRank, modelId, MODELS, sameModel, splitRoute, usableJobModels, usableModels } from './catalog.mjs';
 import { getMeta } from './db.mjs';
-import { routeScore, savedScorecard } from './scorecard.mjs';
+import { activeScorecard, routeScore } from './scorecard.mjs';
 import { CONFIG_DEFAULTS } from './setup.mjs';
 import { callLocalModel, costOf } from './model.mjs';
 import { UsageError } from './memory.mjs';
 import { elapsed } from './text.mjs';
 
-export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+export { EFFORTS };
 /** A failed job can always be retried; a done one only once review found enough wrong with it — and either retry goes up. */
 export const RETRY_IMPORTANT_THRESHOLD = 3;
 
@@ -24,10 +24,31 @@ const JOB_KINDS =
   'kind: mechanical (typos, renames, comments, constants, tests for a pure function), routine (an ordinary feature or fix with a clear spec), ' +
   'hard (design, a bug whose cause is unknown, or reviewing risky code), novel (new algorithms, subtle concurrency, deep security review). ' +
   'surface: how much code the job touches. risky: true when it touches security, credentials, money, migrations or concurrency.';
-const ROUTER_SYSTEM =
+/** Each kind's model in the router's rule, Claude's four from the cheapest. */
+const RULE = [['mechanical', 'haiku'], ['routine', 'sonnet'], ['hard', 'opus'], ['novel', 'fable']];
+
+/**
+ * The rule's model sentence for the models the router may answer: each kind's own model where it may, else the nearest one up
+ * that may, else the nearest down — so the router is never told to pick a model that is switched off, or below the jobs'
+ * smallest. With all four, the rule as it always read; with none of them, no sentence.
+ */
+function modelRule(models) {
+  const may = MODELS.filter((m) => models.includes(m));
+  if (may.length === 0) return '';
+  const nearest = (m) => {
+    const at = MODELS.indexOf(m);
+    return MODELS.slice(at).find((x) => may.includes(x)) ?? MODELS.slice(0, at).reverse().find((x) => may.includes(x));
+  };
+  const kinds = new Map();
+  for (const [kind, model] of RULE) kinds.set(nearest(model), [...(kinds.get(nearest(model)) ?? []), kind]);
+  return ` Model follows kind: ${[...kinds].map(([model, of]) => `${model} for ${of.join(' and ')}`).join(', ')}.`;
+}
+
+const ROUTER_SYSTEM = (models) =>
   'You assign a coding job to a model and an effort level. Answer with JSON only. First classify the job, then choose. ' +
   JOB_KINDS +
-  ' Model follows kind: haiku for mechanical, sonnet for routine, opus for hard, fable for novel. Effort follows surface: low for one spot, ' +
+  modelRule(models) +
+  ' Effort follows surface: low for one spot, ' +
   'medium for a few files, high for many interacting parts. risky raises the effort one step (low, medium, high, xhigh, max) and makes a ' +
   'routine job hard. History lists only the routes that failed or drew Important review findings on this project: for work like that, go above them.';
 
@@ -43,10 +64,11 @@ const SCOUT_KINDS =
   '(almost never: only reasoning nobody has written down, such as proving a concurrent algorithm correct). surface: how much code must be ' +
   'read. risky: true when what is judged is security, credentials, money, migrations or concurrency.';
 const SCOUT = 'The job is done by a scout: it reads code and reports, and changes nothing.';
-const SCOUT_ROUTER_SYSTEM =
+const SCOUT_ROUTER_SYSTEM = (models) =>
   `You assign a reading job to a model and an effort level. ${SCOUT} Answer with JSON only. First classify the job, then choose. ` +
   SCOUT_KINDS +
-  ' Model follows kind: haiku for mechanical, sonnet for routine, opus for hard, fable for novel. Effort follows surface: low for one spot, ' +
+  modelRule(models) +
+  ' Effort follows surface: low for one spot, ' +
   'medium for a few files or a whole project read for a summary, high when many interacting parts must be judged together. risky raises the ' +
   'effort one step (low, medium, high, xhigh, max). History lists only the routes that failed or drew Important review findings on this ' +
   'project: for work like that, go above them.';
@@ -96,23 +118,34 @@ const BARS = { mechanical: 0, routine: 0.3, hard: 0.55, novel: 0.75 };
 const SURFACE_EFFORT = { 'one spot': 'low', 'a few files': 'medium', 'many interacting parts': 'high' };
 
 /**
- * A route as the run it is: a model that takes no effort (Composer) runs the same at every one, and one on Cursor that takes
- * an effort is sent its xhigh for max (`cursorModel`, src/cursor.mjs). What the ledger knows of a run, and what this project's
- * record holds against it, is known of each route that is that run.
+ * A route as the run it is: a model that takes no effort (Composer) runs the same at every one, and one that does not take an
+ * effort is asked at the nearest it takes below it (`effortOn`: Grok's xhigh for max). What the ledger knows of a run, and what
+ * this project's record holds against it, is known of each route that is that run.
  */
 function runOf(model, effort) {
-  const cursor = CURSOR_MODELS[model];
-  if (!cursor) return `${model}/${effort}`;
-  return cursor.effort ? `${model}/${effort === 'max' ? 'xhigh' : effort}` : `${model}/*`;
+  return effortsOf(model) ? `${model}/${effortOn(model, effort)}` : `${model}/*`;
 }
 
 /**
- * The cheapest of `routes` by one measure: their prices, when every one of them has one — never some priced and some not —
- * and on equal prices, or with none, the lower rung: the model lower on the job ladder, then the lower effort.
+ * Each route with no price, priced at most as the nearest effort above it on the same model that has one: more thought never
+ * costs less. A board that prices only a model's high effort so never makes its low one look dearer — nor any route cheaper.
+ */
+function boundedFromAbove(routes) {
+  return routes.map((r) => {
+    if (r.price) return r;
+    const above = routes.filter((o) => o.model === r.model && o.price && effortRank(o.effort) > effortRank(r.effort)).sort((a, b) => effortRank(a.effort) - effortRank(b.effort))[0];
+    return above ? { ...r, price: { cost: above.price.cost, per: `${above.price.per} at most (what ${above.effort} costs)` } } : r;
+  });
+}
+
+/**
+ * The cheapest of `routes` by one measure: their prices, all in one unit (`priceRoutes`); a route with no price ranks after every
+ * one that has one — an unknown cost is never taken for a low one, nor does it make the others' prices count for nothing — and
+ * on equal prices, or with none, the lower rung: the model lower on the job ladder, then the lower effort.
  */
 function cheapest(routes) {
-  const priced = routes.every((r) => r.price);
-  return [...routes].sort((a, b) => (priced && a.price.cost !== b.price.cost ? a.price.cost - b.price.cost : 0) || compareRoutes(a, b))[0];
+  const byPrice = (a, b) => (a.price && b.price ? a.price.cost - b.price.cost : a.price ? -1 : b.price ? 1 : 0);
+  return [...routes].sort((a, b) => byPrice(a, b) || compareRoutes(a, b))[0];
 }
 
 /**
@@ -129,15 +162,15 @@ export function pickRoute({ card, usable, kind, surface, risky = false, hardens 
   const asked = risky && hardens && kind === 'routine' ? 'hard' : kind;
   const top = highest ? EFFORTS.indexOf(highest) : EFFORTS.length - 1;
   const floor = Math.min(EFFORTS.indexOf(SURFACE_EFFORT[surface] ?? 'low') + (risky ? 1 : 0), top);
-  // One route per run (`runOf`): Composer at the floor's effort, and no max on Cursor — either would be the same job said again.
+  // One route per run (`runOf`): Composer at the floor's effort, and only the efforts a model takes — Grok's max would be its xhigh said again.
   const efforts = (model, at) => {
-    const cursor = CURSOR_MODELS[model];
-    if (cursor && !cursor.effort) return [EFFORTS[at]];
-    return EFFORTS.slice(at, top + 1).filter((effort) => !cursor || effort !== 'max');
+    const takes = effortsOf(model);
+    if (!takes) return [EFFORTS[at]];
+    return EFFORTS.slice(at, top + 1).filter((effort) => takes.includes(effort));
   };
-  const avoided = new Set(avoid.map((route) => runOf(...route.split('/'))));
+  const avoided = new Set(avoid.map((route) => runOf(...splitRoute(route))));
   const poolAt = (at) => {
-    const scored = priceRoutes(usable.flatMap((model) => efforts(model, at).map((effort) => ({ model, effort, on: routeScore(card, model, effort, EFFORTS) }))).filter((r) => r.on), ledger, card);
+    const scored = boundedFromAbove(priceRoutes(usable.flatMap((model) => efforts(model, at).map((effort) => ({ model, effort, on: routeScore(card, model, effort, EFFORTS) }))).filter((r) => r.on), ledger, card));
     const open = scored.filter((r) => !avoided.has(runOf(r.model, r.effort)));
     return open.length > 0 ? open : scored;
   };
@@ -154,7 +187,7 @@ export function pickRoute({ card, usable, kind, surface, risky = false, hardens 
   }
   const two = (n) => Number(n.toFixed(2));
   const needs = `${asked}${risky ? ', risky' : ''}, ${surface} needs ${two(bar)}${raisedBy ? `, what ${raisedBy.model}/${raisedBy.effort} scores a step smaller` : ''}${above === null ? '' : ` and more than ${two(above)}, what the attempt retried scores`}`;
-  const price = clear.length > 0 && clear.every((r) => r.price) ? `$${pick.price.cost.toFixed(2)} ${pick.price.per}, the cheapest` : 'an unknown cost, the lowest';
+  const price = clear.length > 0 && pick.price ? `$${pick.price.cost.toFixed(2)} ${pick.price.per}, the cheapest${clear.every((r) => r.price) ? '' : ' priced'}` : 'an unknown cost, the lowest';
   const why = clear.length > 0
     ? `${needs}; ${pick.model}/${pick.effort} scores ${pick.on.score.toFixed(2)} at ${price} of ${clear.length} that do`
     : `${needs}; none does, and ${pick.model}/${pick.effort} scores best at ${pick.on.score.toFixed(2)}`;
@@ -203,7 +236,7 @@ function priceRoutes(routes, ledger, card) {
   const priced = (cost, per) => (cost > 0 ? { cost, per } : null);
   if (!ledger) return routes.map((r) => ({ ...r, price: priced(r.on.cost, 'a task on the benchmarks') }));
   const ratios = [...ledger.own]
-    .map(([route, mine]) => [mine, routeScore(card, ...route.split('/'), EFFORTS)?.cost])
+    .map(([route, mine]) => [mine, routeScore(card, ...splitRoute(route), EFFORTS)?.cost])
     .filter(([, cost]) => cost > 0)
     .map(([mine, cost]) => mine.cost / cost)
     .filter((ratio) => ratio > 0)
@@ -222,12 +255,12 @@ function priceRoutes(routes, ledger, card) {
 }
 
 /**
- * The saved scorecard, when it lists any of `usable` and scores no other version of one of them: what decides whether the router
+ * The scorecard of the models switched on (`activeScorecard`), when it lists any of `usable` and scores no other version of one of them: what decides whether the router
  * sorts or chooses. One fetched before the catalog moved a model on is set aside until Discover fetches it again — read, it would
  * leave that model out of routing for want of a score.
  */
 function scorecardFor(db, usable) {
-  const card = savedScorecard(db);
+  const card = activeScorecard(db);
   const stale = Object.values(card?.sources ?? {}).some((s) => s.entries.some((e) => usable.includes(e.model) && e.id !== modelId(e.model)));
   return card && !stale && usable.some((m) => EFFORTS.some((e) => routeScore(card, m, e, EFFORTS))) ? card : null;
 }
@@ -344,10 +377,11 @@ const CHAT_KINDS =
   'codebase), novel (new algorithms, subtle concurrency, deep security review). surface: how much code the turn touches. risky: true when ' +
   'it touches security, credentials, money, migrations or concurrency.';
 const CHAT = 'The chat is a coding assistant with a shell and an editor; the turn is what the user just typed.';
-const CHAT_ROUTER_SYSTEM =
+const CHAT_ROUTER_SYSTEM = (models) =>
   `You assign one chat turn to a model and an effort level. ${CHAT} Answer with JSON only. First classify the turn, then choose. ` +
   CHAT_KINDS +
-  ' Model follows kind: haiku for mechanical, sonnet for routine, opus for hard, fable for novel. Effort follows surface: low for one spot, ' +
+  modelRule(models) +
+  ' Effort follows surface: low for one spot, ' +
   'medium for a few files, high for many interacting parts. risky raises the effort one step (low, medium, high, xhigh, max) and makes a ' +
   'routine turn hard.';
 
@@ -367,12 +401,12 @@ const jobFloor = (db) => getMeta(db, 'config.jobs.floor') ?? CONFIG_DEFAULTS['jo
  */
 export function jobModels(db, { claude = false } = {}) {
   const usable = claude ? usableModels(db) : usableJobModels(db);
-  const above = usable.filter((m) => JOB_MODELS.indexOf(m) >= JOB_MODELS.indexOf(jobFloor(db)));
+  const above = usable.filter((m) => ladderRank(m) >= ladderRank(jobFloor(db)));
   return above.length > 0 ? above : usable;
 }
 
 const askRouter = (db, { agent, project, task, title, retryOf }, { classify = false } = {}) =>
-  askFor(db, agent === 'scout' ? SCOUT_ROUTER_SYSTEM : ROUTER_SYSTEM, routerPrompt(db, { agent, project, task, title, retryOf }, { classify }), jobModels(db, { claude: !classify }), { classify });
+  askFor(db, (agent === 'scout' ? SCOUT_ROUTER_SYSTEM : ROUTER_SYSTEM)(jobModels(db, { claude: true })), routerPrompt(db, { agent, project, task, title, retryOf }, { classify }), jobModels(db, { claude: !classify }), { classify });
 
 async function askFor(db, system, prompt, models = usableModels(db), { classify = false } = {}) {
   const usable = models;
@@ -387,9 +421,9 @@ async function askFor(db, system, prompt, models = usableModels(db), { classify 
   return { ok: true, kind, surface, model, effort, reason: reason.replace(/\s+/g, ' ').trim(), risky: risky === true };
 }
 
-// Routes compared on one scale: by model first, weakest to strongest as the job ladder lists them (JOB_MODELS), then by effort.
+// Routes compared on one scale: by model first, weakest to strongest as the job ladder lists them (`modelLadder`), then by effort.
 // The 'none' an old job ran at, from when haiku took no effort, sits below every effort.
-const modelRank = (model) => JOB_MODELS.indexOf(model);
+const modelRank = ladderRank;
 const effortRank = (effort) => EFFORTS.indexOf(effort);
 const compareRoutes = (a, b) => modelRank(a.model) - modelRank(b.model) || effortRank(a.effort) - effortRank(b.effort);
 
@@ -398,7 +432,8 @@ const goesAbove = (prev) => Boolean(prev) && modelRank(prev.model) >= 0 && (prev
 
 /** One step above a route: the next model up that is on, keeping the effort (medium, off an old 'none'); on the top one, one effort up, max at most. */
 function stepAbove({ model, effort }, usable) {
-  const next = usable.find((m) => modelRank(m) > modelRank(model));
+  // The same model through the other lane is no step: past it.
+  const next = usable.find((m) => modelRank(m) > modelRank(model) && !sameModel(m, model));
   if (next) return { model: next, effort: EFFORTS.includes(effort) ? effort : 'medium' };
   const top = usable.at(-1);
   return { model: top, effort: EFFORTS[Math.min(effortRank(effort) + 1, EFFORTS.length - 1)] };
@@ -430,11 +465,11 @@ export function routePolicy({ agent, routed, retryOf: prev, reviews: target, usa
     }
   }
   if (!prev) {
-    if (agent === 'worker' && route.model === 'fable' && usable.includes('opus')) {
+    if (agent === 'worker' && sameModel(route.model, 'fable') && usable.includes('opus')) {
       route.model = 'opus';
       why.push('a first attempt starts on opus, not fable');
     }
-    if (agent === 'scout' && route.model === 'haiku' && usable.includes('sonnet')) {
+    if (agent === 'scout' && sameModel(route.model, 'haiku') && usable.includes('sonnet')) {
       route = { model: 'sonnet', effort: 'low' };
       why.push("a scout's first attempt starts on sonnet at low effort, not haiku");
     }
@@ -500,7 +535,7 @@ export async function chooseChatRoute(db, { project, text }) {
   // The chat runs on Cursor's models too: with a scorecard they are weighed with Claude's; with none, the rule names Claude's alone.
   const card = scorecardFor(db, usableJobModels(db));
   const classify = card !== null;
-  const routed = await askFor(db, CHAT_ROUTER_SYSTEM, chatRouterPrompt(db, { project, text }, { classify }), usableModels(db), { classify });
+  const routed = await askFor(db, CHAT_ROUTER_SYSTEM(usableModels(db)), chatRouterPrompt(db, { project, text }, { classify }), usableModels(db), { classify });
   if (!routed.ok) throw new UsageError(`the router failed: ${routed.error}`);
   // A turn edits and runs commands as a worker does: its routes are priced by workers' jobs.
   const scored = card && pickRoute({ card, usable: usableJobModels(db), kind: routed.kind, surface: routed.surface, risky: routed.risky, ledger: ledgerCost(db, 'worker') });

@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ALL_MODELS, modelId, NAME_WIDTH } from './catalog.mjs';
+import { allModels, modelId, modelStates, NAMED, nameWidth, saveListedPrices } from './catalog.mjs';
 import { getMeta, setMeta } from './db.mjs';
 
 /**
@@ -33,10 +33,10 @@ const ANY = '*';
 /** A model's name as the sources and the API spell it, the same way: no maker, no punctuation, lower case — `Claude Haiku 5.5` and `anthropic/claude-haiku-5.5` are both `claude-haiku-5-5`. */
 const plain = (name) => String(name).toLowerCase().replace(/^[^/]*\//, '').replace(/[\s._]+/g, '-').replace(/^-+|-+$/g, '');
 
-/** The Sumo model a source's name means, or null for one Sumo does not run. */
-function sumoModel(name, models) {
+/** The Sumo models a source's name means — Claude's own and the same model through Cursor are both it — none for one Sumo does not run. */
+function sumoModels(name, models) {
   const wanted = plain(name);
-  return models.find((m) => plain(modelId(m)) === wanted) ?? null;
+  return models.filter((m) => plain(modelId(m)) === wanted);
 }
 
 /** The effort a source's word means: a level Sumo has, `*` for none named, null for one Sumo has no word for. */
@@ -53,15 +53,17 @@ function entriesOf(rows, models, tally = null) {
   const kept = new Map();
   const count = (why) => tally && (tally[why] = (tally[why] ?? 0) + 1);
   for (const { name, effort: word, score, cost } of rows) {
-    const model = sumoModel(name, models);
+    const named = sumoModels(name, models);
     const effort = effortOf(word);
-    if (!model) count('model');
+    if (named.length === 0) count('model');
     else if (effort === null) count('effort');
     else if (!Number.isFinite(score)) count('score');
     else {
-      const key = `${model}/${effort}`;
-      if (kept.has(key)) count('twice');
-      if (!kept.has(key) || kept.get(key).score < score) kept.set(key, { model, effort, score, cost: Number.isFinite(cost) ? cost : null });
+      for (const model of named) {
+        const key = `${model}/${effort}`;
+        if (kept.has(key)) count('twice');
+        if (!kept.has(key) || kept.get(key).score < score) kept.set(key, { model, effort, score, cost: Number.isFinite(cost) ? cost : null });
+      }
     }
   }
   if (tally) tally.rows = rows.length;
@@ -100,7 +102,7 @@ export function parseCsv(text) {
 }
 
 /** CursorBench's rows: `claude-opus-5-5_high` is a model and its effort; a name with no effort after it scores the model. */
-export function fromCursorBench(csv, models = ALL_MODELS, tally = null) {
+export function fromCursorBench(csv, models = allModels(), tally = null) {
   const rows = parseCsv(csv).map((r) => {
     const version = r['Model version'] ?? '';
     const cut = version.lastIndexOf('_');
@@ -111,7 +113,7 @@ export function fromCursorBench(csv, models = ALL_MODELS, tally = null) {
 }
 
 /** LMArena's rows: `Claude Opus 5.5 (High)` is a model and its effort; only the overall board counts. */
-export function fromArena(rows, models = ALL_MODELS, tally = null) {
+export function fromArena(rows, models = allModels(), tally = null) {
   const read = rows
     .filter((r) => (r.category ?? 'overall') === 'overall')
     .map((r) => {
@@ -121,8 +123,24 @@ export function fromArena(rows, models = ALL_MODELS, tally = null) {
   return entriesOf(read, models, tally);
 }
 
+/**
+ * modelgrep's list prices for Sumo's models, by name, as the catalog keeps a price: US dollars per million tokens in and out,
+ * and a cache read as a share of input (the input price itself where none is listed — never priced below what it could cost).
+ * A row with no price above zero prices nothing.
+ */
+export function pricesFrom(rows, models = allModels()) {
+  const prices = {};
+  for (const r of rows) {
+    const p = r.pricing ?? {};
+    if (!(p.input > 0 && p.output > 0)) continue;
+    const price = { input: p.input, output: p.output, cacheRead: p.cache_read > 0 ? Math.min(1, p.cache_read / p.input) : 1 };
+    for (const model of sumoModels(r.id, models)) prices[model] ??= price;
+  }
+  return prices;
+}
+
 /** modelgrep's rows: one Intelligence Index per model, at no effort in particular. */
-export function fromIntelligence(rows, models = ALL_MODELS, tally = null) {
+export function fromIntelligence(rows, models = allModels(), tally = null) {
   return entriesOf(rows.map((r) => ({ name: r.id, score: r.benchmarks?.artificial_analysis?.intelligence })), models, tally);
 }
 
@@ -130,17 +148,25 @@ export function fromIntelligence(rows, models = ALL_MODELS, tally = null) {
 const modelsIn = (entries) => [...new Set(entries.map((e) => e.model))];
 
 /**
- * Each entry's place among the others in its source: 0 the lowest score, 1 the highest, ties sharing a place. A source that
- * scores fewer than two of Sumo's models says nothing: one model's efforts placed against each other would put its lower one at
- * the bottom of Sumo's models, below models the source never ranked.
+ * Each entry's place in its source, read on one ruler: the scores of the six models Sumo names (`NAMED`), 0 the lowest of
+ * them, 1 the highest, ties sharing a place — the scale the routing bars were set on. Any other model is placed where its
+ * score falls between theirs (0 below all of them, 1 above), so the dozens more Discover finds, older and weaker ones among
+ * them, never push a model's place up or down. A source that scores fewer than two of the six says nothing: one model's
+ * efforts placed against each other would put its lower one at the bottom, below models the source never ranked.
  */
 function placed(entries) {
-  if (modelsIn(entries).length < 2) return [];
-  const sorted = entries.map((e) => e.score).sort((a, b) => a - b);
+  const ruler = entries.filter((e) => NAMED.includes(e.model));
+  if (modelsIn(ruler).length < 2) return [];
+  const sorted = ruler.map((e) => e.score).sort((a, b) => a - b);
+  const last = sorted.length - 1;
   const rank = (score) => {
-    const first = sorted.indexOf(score);
-    const last = sorted.lastIndexOf(score);
-    return (first + last) / 2 / (sorted.length - 1);
+    const below = sorted.filter((s) => s < score).length;
+    const same = sorted.filter((s) => s === score).length;
+    if (same > 0) return (below + (same - 1) / 2) / last;
+    if (below === 0) return 0;
+    if (below === sorted.length) return 1;
+    // Between two of the ruler's scores: as far between their places as the score is between them.
+    return (below - 1 + (score - sorted[below - 1]) / (sorted[below] - sorted[below - 1])) / last;
   };
   return entries.map((e) => ({ ...e, place: rank(e.score) }));
 }
@@ -215,20 +241,24 @@ function cursorBenchCsv(bytes) {
 
 /** How each source is read: its requests, said as they go and held to `limits`, then its rows read for Sumo's models. */
 const READERS = {
-  cursorbench: async (fetchImpl, say, tally, limits) => {
+  cursorbench: async (fetchImpl, say, tally, limits, models) => {
     const csv = cursorBenchCsv(await get(fetchImpl, SOURCES[0].url, say, limits));
     say('  unzipped cursorbench_external.csv');
-    return fromCursorBench(csv, ALL_MODELS, tally);
+    return fromCursorBench(csv, models, tally);
   },
-  arena: async (fetchImpl, say, tally, limits) =>
-    fromArena(await allPages(fetchImpl, ARENA_ROWS, say, limits, { limit: 100, rowsOf: (p) => (p.rows ?? []).map((r) => r.row), totalOf: (p) => p.num_rows_total ?? 0 }), ALL_MODELS, tally),
-  intelligence: async (fetchImpl, say, tally, limits) =>
-    fromIntelligence(await allPages(fetchImpl, MODELGREP, say, limits, { limit: 200, size: 'limit', rowsOf: (p) => p.data ?? [], totalOf: (p) => p.meta?.total ?? 0 }), ALL_MODELS, tally),
+  arena: async (fetchImpl, say, tally, limits, models) =>
+    fromArena(await allPages(fetchImpl, ARENA_ROWS, say, limits, { limit: 100, rowsOf: (p) => (p.rows ?? []).map((r) => r.row), totalOf: (p) => p.num_rows_total ?? 0 }), models, tally),
+  // The same rows carry each model's list price: kept beside the entries (`tally.prices`), for the catalog to price what Sumo's own list does not.
+  intelligence: async (fetchImpl, say, tally, limits, models) => {
+    const rows = await allPages(fetchImpl, MODELGREP, say, limits, { limit: 200, size: 'limit', rowsOf: (p) => p.data ?? [], totalOf: (p) => p.meta?.total ?? 0 });
+    tally.prices = pricesFrom(rows, models);
+    return fromIntelligence(rows, models, tally);
+  },
 };
 
 /** What a source's rows came to: how many were kept, for which models, and what was left out and why. */
 function keptLines(entries, tally) {
-  const per = ALL_MODELS.map((m) => [m, entries.filter((e) => e.model === m).length]).filter(([, n]) => n > 0);
+  const per = allModels().map((m) => [m, entries.filter((e) => e.model === m).length]).filter(([, n]) => n > 0);
   const lines = [`kept ${entries.length} of ${tally.rows} rows${per.length > 0 ? `: ${per.map(([m, n]) => `${m} ${n}`).join(', ')}` : ''}`];
   const why = { model: "of models Sumo doesn't run", effort: 'at an effort Sumo has no word for', score: 'with no score', twice: 'listed twice (the better kept)' };
   const left = Object.entries(why).filter(([k]) => tally[k] > 0).map(([k, said]) => `${tally[k]} ${said}`);
@@ -240,7 +270,8 @@ function keptLines(entries, tally) {
 function unplaced(entries) {
   const models = modelsIn(entries);
   if (models.length === 0) return "none of Sumo's models is listed";
-  return models.length === 1 ? `only ${models[0]} of Sumo's models is listed: nothing to rank it against` : null;
+  if (models.length === 1) return `only ${models[0]} of Sumo's models is listed: nothing to rank it against`;
+  return modelsIn(entries.filter((e) => NAMED.includes(e.model))).length < 2 ? `fewer than two of ${NAMED.join(', ')} are listed: nothing to place the others on` : null;
 }
 
 /** Where a source placed Sumo's routes: its best and its worst, by score. */
@@ -258,7 +289,7 @@ function placeLine(entries) {
  * One source read, its steps said as they happen, tried once more when it fails. What it came to is told to `onSource` as soon
  * as it is known — `{ id, name, url, ok, steps, ms }` — so a slow source never holds the others back from the screen.
  */
-async function readSource(source, fetchImpl, onSource, { retryMs = RETRY_MS, maxBytes = MAX_BYTES, sourceMs = SOURCE_MS } = {}) {
+async function readSource(source, fetchImpl, onSource, { retryMs = RETRY_MS, maxBytes = MAX_BYTES, sourceMs = SOURCE_MS, models = allModels() } = {}) {
   const steps = [];
   const say = (line) => steps.push(line);
   const started = Date.now();
@@ -267,10 +298,10 @@ async function readSource(source, fetchImpl, onSource, { retryMs = RETRY_MS, max
     const tally = {};
     const limits = { maxBytes, sourceMs, deadline: AbortSignal.timeout(sourceMs) };
     try {
-      const entries = await READERS[source.id](fetchImpl, say, tally, limits);
+      const entries = await READERS[source.id](fetchImpl, say, tally, limits, models);
       steps.push(...keptLines(entries, tally));
       const none = unplaced(entries);
-      got = none ? { error: none } : { entries: placed(entries) };
+      got = none ? { error: none } : { entries: placed(entries), ...(tally.prices ? { prices: tally.prices } : {}) };
       say(placeLine(entries));
     } catch (cause) {
       say(`failed: ${failedBecause(cause, limits)}${attempt === 1 ? ` — trying once more in ${retryMs / 1000} s` : ''}`);
@@ -304,7 +335,7 @@ function askStandIn(standIn, onSource) {
       const none = got.error ? null : unplaced(got.entries ?? []);
       const steps = [`asked the stand-in (${standIn})`, ...(got.error ? [`failed: ${got.error}`] : [`kept ${got.entries?.length ?? 0} rows`, placeLine(got.entries ?? [])])];
       onSource?.({ id: source.id, name: source.name, url: source.url, ok: !got.error && !none, steps, ms: 0 });
-      return [source.id, got.error ? got : none ? { error: none } : { entries: placed(got.entries) }];
+      return [source.id, got.error ? got : none ? { error: none } : { entries: placed(got.entries), ...(got.prices ? { prices: got.prices } : {}) }];
     }),
   );
 }
@@ -320,6 +351,29 @@ export function savedScorecard(db) {
 }
 
 /**
+ * The saved scorecard as routing and `sumo models` read it: the models switched on, and nothing of the ones switched off.
+ * Places are read on a fixed ruler (`placed`), so one turned off moves no other's place, and one turned on again is back
+ * without a fetch. Null while none was fetched.
+ */
+export function activeScorecard(db) {
+  const card = savedScorecard(db);
+  if (!card) return null;
+  const states = modelStates(db);
+  const sources = {};
+  for (const [id, source] of Object.entries(card.sources)) {
+    const entries = source.entries.filter((e) => states[e.model]?.on);
+    if (entries.length > 0) sources[id] = { ...source, entries };
+  }
+  return { ...card, sources };
+}
+
+/** The models switched on, in the catalog's order: what the scorecard shows. */
+const switchedOn = (db) => {
+  const states = modelStates(db);
+  return allModels(db).filter((m) => states[m].on);
+};
+
+/**
  * Fetches the sources and saves the scorecard: each source's entries for Sumo's models, placed among themselves. A source
  * that cannot be read now keeps what was saved from it last, with the day it was read; one never read is left out. Each source
  * is told to `onSource` as it is read (see `readSource`). Never
@@ -327,7 +381,7 @@ export function savedScorecard(db) {
  */
 export async function refreshScorecard(db, { fetchImpl = fetch, now = new Date().toISOString(), onSource = null, retryMs = RETRY_MS, maxBytes = MAX_BYTES, sourceMs = SOURCE_MS } = {}) {
   const standIn = process.env.SUMO_AGENTS_MODEL_CMD;
-  const fetched = standIn ? askStandIn(standIn, onSource) : await fetchSources(fetchImpl, onSource, { retryMs, maxBytes, sourceMs });
+  const fetched = standIn ? askStandIn(standIn, onSource) : await fetchSources(fetchImpl, onSource, { retryMs, maxBytes, sourceMs, models: allModels(db) });
   const before = savedScorecard(db)?.sources ?? {};
   const sources = {};
   const failed = {};
@@ -343,6 +397,9 @@ export async function refreshScorecard(db, { fetchImpl = fetch, now = new Date()
   }
   if (Object.keys(sources).length === 0) return { ok: false, error: Object.values(failed)[0] ?? 'nothing fetched', failed };
   setMeta(db, KEY, JSON.stringify({ at: now, sources }));
+  // List prices come with a source read now; one that failed leaves the ones saved before.
+  const prices = SOURCES.map((s) => fetched[s.id]?.prices).find(Boolean);
+  if (prices) saveListedPrices(db, prices);
   return { ok: true, read: SOURCES.filter((s) => !failed[s.id]).map((s) => s.id), failed, kept: Object.keys(failed).filter((id) => sources[id]) };
 }
 
@@ -395,25 +452,27 @@ function fromLine(card) {
   const from = SOURCES.filter((s) => card.sources[s.id]).map((s) => (card.sources[s.id].at.slice(0, 10) === day ? s.name : `${s.name} (${card.sources[s.id].at.slice(0, 10)})`));
   return `fetched ${day} from ${from.join('; ')}`;
 }
-const READING = "a score is a model's place among Sumo's models, 0 to 1, averaged over the sources; a cost is one task's";
+const READING = `a score is where a model falls among ${NAMED.join(', ')}, 0 to 1, averaged over the sources; a cost is one task's`;
 
 /** What `sumo models` adds: when the scorecard was fetched and from what, then each model's score and cost per task at each effort. */
-export function scorecardLines(db, efforts, models = ALL_MODELS) {
-  const card = savedScorecard(db);
-  if (!card) return ['scorecard: not fetched — API models › Discover, on the settings page (sumo config), fetches it'];
-  const lines = [`scorecard: ${fromLine(card)}`, `  ${READING}`];
+export function scorecardLines(db, efforts, models = switchedOn(db)) {
+  const saved = savedScorecard(db);
+  if (!saved) return ['scorecard: not fetched — API models › Discover, on the settings page (sumo config), fetches it'];
+  const card = activeScorecard(db);
+  const lines = [`scorecard: ${fromLine(saved)}`, `  ${READING}`];
   for (const model of models) {
     const cells = efforts.map((effort) => [effort, cellOf(card, model, effort, efforts)]).filter(([, cell]) => cell).map(([effort, cell]) => `${effort} ${cell}`);
-    lines.push(`  ${model.padEnd(NAME_WIDTH)} ${cells.length > 0 ? cells.join(' · ') : 'not listed by any source'}`);
+    lines.push(`  ${model.padEnd(nameWidth(models))} ${cells.length > 0 ? cells.join(' · ') : 'not listed by any source'}`);
   }
   return lines;
 }
 
 /** What `/scorecard` ends on, in Markdown for the chat to draw: how the refresh went, then the saved scorecard as a table. */
-export function scorecardReport(db, result, efforts, models = ALL_MODELS) {
-  const card = savedScorecard(db);
-  if (!card) return scorecardSummary(result);
+export function scorecardReport(db, result, efforts, models = switchedOn(db)) {
+  const saved = savedScorecard(db);
+  if (!saved) return scorecardSummary(result);
+  const card = activeScorecard(db);
   const rows = models.map((m) => `| ${m} | ${efforts.map((e) => cellOf(card, m, e, efforts) ?? '—').join(' | ')} |`);
   const table = [`| | ${efforts.join(' | ')} |`, `|---|${efforts.map(() => '---').join('|')}|`, ...rows];
-  return [scorecardSummary(result), '', `Saved: ${fromLine(card)}.`, '', ...table, '', `${READING[0].toUpperCase()}${READING.slice(1)}.`].join('\n');
+  return [scorecardSummary(result), '', `Saved: ${fromLine(saved)}.`, '', ...table, '', `${READING[0].toUpperCase()}${READING.slice(1)}.`].join('\n');
 }

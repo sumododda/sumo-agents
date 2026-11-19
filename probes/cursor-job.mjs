@@ -2,8 +2,9 @@
 // A live job on a Cursor model, start to finish, run with `sumo job run` as a person runs one — what it does is shown as it
 // happens. It works in a throwaway home and a throwaway project, so the real database and ledger are never written, and
 // leaves nothing behind. It needs CURSOR_API_KEY, and spends a few cents of the key's Cursor usage.
-//   node probes/cursor-job.mjs            → on composer
-//   node probes/cursor-job.mjs grok       → on grok, at medium effort
+//   node probes/cursor-job.mjs                  → on composer
+//   node probes/cursor-job.mjs grok             → on grok, at medium effort
+//   node probes/cursor-job.mjs cursor/grok-4.6  → on any model Cursor lists for the key: Discover asks Cursor first (a cent or so)
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,7 +12,7 @@ import { join } from 'node:path';
 import { leaveNothing } from './throwaway.mjs';
 
 const model = process.argv[2] ?? 'composer';
-if (!['composer', 'grok'].includes(model)) throw new Error(`a Cursor model: composer or grok, not ${model}`);
+if (!['composer', 'grok'].includes(model) && !model.startsWith('cursor/')) throw new Error(`a Cursor model: composer, grok or cursor/<Cursor's id>, not ${model}`);
 if (!process.env.CURSOR_API_KEY?.trim()) throw new Error('export CURSOR_API_KEY first: the job runs on Cursor');
 
 const root = mkdtempSync(join(tmpdir(), 'sumo-agents-cursor-job-'));
@@ -31,11 +32,16 @@ try {
   // given — its brief, its rules and its recorded start as any job's — on the model asked for, switched on as Discover would.
   process.env.SUMO_AGENTS_HOME = home;
   const { openDb } = await import('../src/db.mjs');
-  const { setModel } = await import('../src/catalog.mjs');
+  const { discoverCursor, setModel } = await import('../src/catalog.mjs');
   const { newJob } = await import('../src/jobs.mjs');
   const db = openDb();
   let id;
   try {
+    // Any other model is one Discover lists: asked of Cursor here, in the throwaway home, as the settings page asks.
+    if (model.startsWith('cursor/')) {
+      const found = await discoverCursor(db);
+      if (!found.ok || !found.found.includes(model)) throw new Error(`${model} does not run on this key: ${found.ok ? 'Discover did not find it running' : found.error}`);
+    }
     setModel(db, model, true);
     const task = '## Goal\nCreate greet.mjs exporting greet(name), which returns `hello, <name>`, and greet.test.mjs testing it with node:test.\n\n## Check\n`npm test` passes.';
     const made = await newJob(db, { project: 'greet', title: 'greet(name)', task, route: { model, effort: 'medium', reason: 'probes/cursor-job.mjs', risky: false } });

@@ -7,13 +7,13 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { modelId } from '../src/catalog.mjs';
+import { modelId, setModel } from '../src/catalog.mjs';
 import { createChat } from '../src/chat.mjs';
 import { openDb, setMeta } from '../src/db.mjs';
 import { REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
-import { chooseChatRoute, chooseRoute, EFFORTS, ledgerCost, pickRoute } from '../src/route.mjs';
-import { fromArena, fromCursorBench, fromIntelligence, parseCsv, refreshScorecard, routeScore, savedScorecard, scorecardSummary } from '../src/scorecard.mjs';
+import { chooseChatRoute, chooseRoute, EFFORTS, ledgerCost, pickRoute, routePolicy } from '../src/route.mjs';
+import { activeScorecard, fromArena, fromCursorBench, fromIntelligence, parseCsv, pricesFrom, refreshScorecard, routeScore, savedScorecard, scorecardLines, scorecardReport, scorecardSummary } from '../src/scorecard.mjs';
 import { settingsPage } from '../src/settings.mjs';
 import { runUi } from '../src/ui.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
@@ -199,10 +199,10 @@ test('with a scorecard saved the router only sorts the job, is not shown the mod
     assert.doesNotMatch(saw.prompt, /^models:|^history:/m);
 
     const chat = await chooseChatRoute(db, { project, text: 'why does the retry ignore the limit?' });
-    // The chat may run at xhigh and max, which this cut-down CursorBench does not price: with some routes unpriced, none is compared
-    // by price, and the lowest rung that clears the bar is taken.
-    assert.deepEqual({ model: chat.model, effort: chat.effort }, { model: 'sonnet', effort: 'high' });
-    assert.match(chat.reason, /^a bug whose cause is unknown; scorecard: hard, a few files needs 0\.58, what sonnet\/high scores a step smaller; sonnet\/high scores 0\.58 at an unknown cost, the lowest of 7 that do$/);
+    // The chat may run at xhigh and max, which this cut-down CursorBench does not price: those rank after the routes it does price,
+    // which are still compared by price — the same route as the job's.
+    assert.deepEqual({ model: chat.model, effort: chat.effort }, { model: 'opus', effort: 'medium' });
+    assert.match(chat.reason, /^a bug whose cause is unknown; scorecard: hard, a few files needs 0\.88, what opus\/low scores a step smaller; opus\/medium scores 0\.96 at \$2\.91 a task on the benchmarks, the cheapest priced of 4 that do$/);
     assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(root, 'router-saw.json'), 'utf8')).schema.properties), ['kind', 'surface', 'risky', 'reason']);
 
     // An answer outside the sorting grammar is the router failing, as before.
@@ -455,25 +455,35 @@ test('setup fetches the scorecard the first time only, and sumo models shows it 
   assert.match(first.out, /^scorecard from CursorBench, via Epoch AI; LMArena agent leaderboard; Artificial Analysis Intelligence Index, via modelgrep$/m, first.out);
   const listed = s.sumo(['models']).out;
   assert.match(listed, /^scorecard: fetched \d{4}-\d{2}-\d{2} from CursorBench, via Epoch AI; LMArena agent leaderboard; Artificial Analysis Intelligence Index, via modelgrep$/m, listed);
-  assert.match(listed, /^ {2}a score is a model's place among Sumo's models, 0 to 1, averaged over the sources; a cost is one task's$/m);
-  assert.match(listed, /^ {2}opus {5}low \d\.\d\d \$1\.17 · medium \d\.\d\d \$2\.91 · high 1\.00 \$3\.97 · xhigh 1\.00 · max 1\.00$/m, 'an effort no source prices has no cost');
-  assert.match(listed, /^ {2}fable {4}not listed by any source$/m);
-  assert.match(listed, /^ {2}composer not listed by any source$/m, "Cursor's models are on it too");
+  assert.match(listed, /^ {2}a score is where a model falls among haiku, sonnet, opus, fable, composer, grok, 0 to 1, averaged over the sources; a cost is one task's$/m);
+  assert.match(listed, /^ {2}opus {3}low \d\.\d\d \$1\.17 · medium \d\.\d\d \$2\.91 · high 1\.00 \$3\.97 · xhigh 1\.00 · max 1\.00$/m, 'an effort no source prices has no cost');
+  assert.match(listed, /^ {2}fable {2}not listed by any source$/m);
+  assert.doesNotMatch(listed, /^ {2}composer /m, 'a model switched off — Cursor\'s, before Discover — is not on it');
 
   const again = s.sumo(['setup', '--bin-dir', binDir, '--no-model']);
   assert.match(again.out, /^scorecard fetched \d{4}-\d{2}-\d{2} — API models › Discover, on the settings page \(sumo config\), fetches it again$/m, again.out);
 });
 
-test('Discover on the settings page asks Anthropic and Cursor and fetches the scorecard, and says all three', async () => {
+test('Discover on the settings page asks Anthropic and Cursor, then fetches the scorecard for the models they listed, and says all three', async () => {
   await withHome(freshHome(), {}, async () => {
-    const found = { ok: true, found: ['haiku', 'sonnet', 'opus', 'fable'], missing: [], errors: {} };
-    const page = settingsPage({ claude: () => [], discover: async () => found, cursor: async () => ({ ok: true, found: ['composer'], missing: ['grok'] }), score: async () => ({ ok: true, read: ['cursorbench'], failed: { arena: 'answered 503' }, kept: [] }) });
-    const screen = () => page.lines({ columns: 220, rows: 60 }).map((l) => l.map(([t]) => t).join('')).join('\n');
+    const found = { ok: true, found: ['haiku', 'sonnet', 'opus', 'fable'], missing: [], errors: {}, more: ['claude-opus-4-8'], cannot: ['claude-haiku-4-5-20251001'] };
+    const order = [];
+    const answered = (what, value) => async () => {
+      order.push(`${what} asked`);
+      await new Promise((r) => setTimeout(r, 5));
+      order.push(`${what} answered`);
+      return value;
+    };
+    const fromCursor = { ok: true, found: ['composer', 'cursor/gpt-5.5'], refused: ['cursor/gpt-5.6-sol', 'cursor/gemini-3.1-pro'], cannot: [], errors: {}, missing: ['grok'] };
+    const page = settingsPage({ claude: () => [], discover: answered('anthropic', found), cursor: answered('cursor', fromCursor), score: answered('scorecard', { ok: true, read: ['cursorbench'], failed: { arena: 'answered 503' }, kept: [] }) });
+    const screen = () => page.lines({ columns: 400, rows: 60 }).map((l) => l.map(([t]) => t).join('')).join('\n');
     page.key('up');
     for (let i = 0; i < 60 && !/› Discover\s/.test(screen()); i++) page.key('down');
     page.key('enter');
-    await new Promise((r) => setTimeout(r, 20));
-    assert.match(screen(), /found: haiku, sonnet, opus, fable — Cursor: found composer — not found, turned off: grok — scorecard from CursorBench, via Epoch AI — not read: LMArena agent leaderboard \(answered 503\)/);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.match(screen(), /found: haiku, sonnet, opus, fable, claude-opus-4-8 — listed, but Sumo cannot run them, off: claude-haiku-4-5-20251001 — Cursor: runs composer, cursor\/gpt-5\.5 — 2 refused for this key, off — not found, turned off: grok — scorecard from CursorBench, via Epoch AI — not read: LMArena agent leaderboard \(answered 503\)/);
+    assert.deepEqual(order.slice(-2), ['scorecard asked', 'scorecard answered'], 'the scorecard is read once both lists are in');
+    assert.deepEqual(order.slice(0, 2).sort(), ['anthropic asked', 'cursor asked'], 'Anthropic and Cursor are asked together');
     page.key('escape');
   });
 });
@@ -566,4 +576,92 @@ test('when no route clears the bar and the best scored has no price, the pick is
   const picked = pickRoute({ card, usable: ['haiku', 'sonnet'], kind: 'novel', surface: 'one spot' });
   assert.equal(picked.model, 'sonnet');
   assert.match(picked.why, /none does, and sonnet\/\w+ scores best/);
+});
+
+test('a source scores a model under every name Sumo runs it by, and its list prices price the models Sumo\'s own list does not', () => {
+  const models = ['haiku', 'opus', 'cursor/claude-opus-5-5', 'cursor/gpt-5.5'];
+  const rows = [
+    { id: 'anthropic/claude-opus-5.5', benchmarks: { artificial_analysis: { intelligence: 60 } }, pricing: { input: 4, output: 20, cache_read: 0.2 } },
+    { id: 'openai/gpt-5.5', benchmarks: { artificial_analysis: { intelligence: 55 } }, pricing: { input: 1.25, output: 10 } },
+    { id: 'anthropic/claude-haiku-5.5', benchmarks: { artificial_analysis: { intelligence: 40 } }, pricing: { input: 0, output: 0 } },
+  ];
+  const entries = fromIntelligence(rows, models);
+  assert.deepEqual(entries.map((e) => e.model).sort(), ['cursor/claude-opus-5-5', 'cursor/gpt-5.5', 'haiku', 'opus'], 'Claude Opus 5.5 is opus, and the same model through Cursor');
+  assert.deepEqual(pricesFrom(rows, models), {
+    opus: { input: 4, output: 20, cacheRead: 0.05 },
+    'cursor/claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.05 },
+    'cursor/gpt-5.5': { input: 1.25, output: 10, cacheRead: 1 },
+  }, 'a cache read as a share of input, the whole input where none is listed; no price at zero');
+});
+
+test('a route the benchmarks do not price ranks after every one they do: an unknown cost is not taken for a low one, nor does it switch the prices off', async () => {
+  // Grok is the lower rung (cheaper by the token) and dearer by the task; Fable's low effort has no cost listed.
+  const sources = { cursorbench: { entries: [entry('haiku', 'low', 0.5, 0.08), entry('grok', 'low', 0.6, 3.49), entry('sonnet', 'low', 0.7, 0.37), entry('fable', 'low', 0.8), entry('fable', 'high', 0.9, 9.08)] } };
+  await withCard(sources, async (db) => {
+    await refreshScorecard(db);
+    const card = savedScorecard(db);
+    const pick = pickRoute({ card, usable: ['grok', 'sonnet', 'fable'], kind: 'mechanical', surface: 'one spot', highest: 'high' });
+    assert.equal(`${pick.model}/${pick.effort}`, 'sonnet/low', 'the cheapest priced route, not the lowest rung of all');
+    assert.match(pick.why, /sonnet\/low scores [\d.]+ at \$0\.37 a task on the benchmarks, the cheapest priced of 9 that do$/, 'the efforts the board lists no cost for are said to be unpriced');
+    const unpricedOnly = pickRoute({ card, usable: ['fable'], kind: 'mechanical', surface: 'one spot', highest: 'low' });
+    assert.match(unpricedOnly.why, /fable\/low scores [\d.]+ at an unknown cost, the lowest of 1 that do$/, 'with nothing priced, the lowest rung, said so');
+  });
+});
+
+test('a model switched off leaves the scorecard: it is not shown or weighed, no other model\'s place moves, and it is back when switched on — with no fetch', async () => {
+  await withCard(SOURCES, async (db) => {
+    await refreshScorecard(db);
+    const score = (model, effort) => routeScore(activeScorecard(db), model, effort, EFFORTS)?.score;
+    const sonnetWithAll = score('sonnet', 'low');
+    setModel(db, 'haiku', false, '2026-11-18T12:00:00.000Z');
+    assert.equal(score('haiku', 'low'), undefined, 'haiku is not on the scorecard while it is off');
+    assert.equal(score('sonnet', 'low'), sonnetWithAll, 'sonnet keeps its place');
+    const lines = scorecardLines(db, EFFORTS);
+    assert.equal(lines.some((l) => /^ {2}haiku /.test(l)), false, 'sumo models leaves it out');
+    assert.ok(lines.some((l) => /^ {2}sonnet /.test(l)));
+    const report = scorecardReport(db, { ok: true, read: ['cursorbench'], failed: {}, kept: [] }, EFFORTS);
+    assert.match(report, /^\| sonnet \|/m);
+    assert.doesNotMatch(report, /^\| haiku \|/m, '/scorecard leaves it out too');
+    const pick = pickRoute({ card: activeScorecard(db), usable: ['haiku', 'sonnet', 'opus'], kind: 'mechanical', surface: 'one spot', highest: 'high' });
+    assert.notEqual(pick.model, 'haiku', 'not weighed even when asked for');
+    setModel(db, 'haiku', true, '2026-11-18T12:00:00.000Z');
+    assert.equal(typeof score('haiku', 'low'), 'number', 'switched on again, it is back');
+    assert.equal(savedScorecard(db).sources.cursorbench.entries.some((e) => e.model === 'haiku'), true, 'what was fetched is kept whole');
+  });
+});
+
+test('every model is placed on the ruler of the six Sumo names: dozens more listed move none of their places, and one between two of them falls between their places', async () => {
+  const six = [entry('haiku', 'low', 0.3, 0.08), entry('sonnet', 'low', 0.4, 0.37), entry('opus', 'low', 0.5, 1.17)];
+  const older = Array.from({ length: 20 }, (_, i) => entry(`claude-old-${i}`, 'low', 0.1 + i * 0.005, 0.5));
+  const placesOf = async (entries) => {
+    let card;
+    await withCard({ cursorbench: { entries } }, async (db) => {
+      await refreshScorecard(db);
+      card = savedScorecard(db);
+    });
+    return (model) => routeScore(card, model, 'low', EFFORTS).score;
+  };
+  const alone = await placesOf(six);
+  const among = await placesOf([...six, entry('claude-between', 'low', 0.45, 0.9), ...older]);
+  assert.equal(among('sonnet'), alone('sonnet'), 'twenty weaker models do not lift sonnet');
+  assert.equal(among('sonnet'), 0.5);
+  assert.equal(among('claude-between'), 0.75, 'halfway between sonnet and opus');
+  assert.equal(among('claude-old-0'), 0, 'below the ruler is its bottom');
+});
+
+test('a route of a Cursor model is avoided by its whole name, and a retry steps past the same model through the other lane', async () => {
+  const sources = { cursorbench: { entries: [entry('haiku', 'low', 0.3, 0.08), entry('sonnet', 'low', 0.5, 0.37), entry('cursor/gpt-5.5', 'low', 0.45, 0.2), entry('opus', 'low', 0.6, 1.17)] } };
+  await withCard(sources, async (db) => {
+    await refreshScorecard(db);
+    const card = savedScorecard(db);
+    const usable = ['haiku', 'sonnet', 'cursor/gpt-5.5', 'opus'];
+    const first = pickRoute({ card, usable, kind: 'routine', surface: 'one spot', highest: 'low' });
+    assert.equal(`${first.model}/${first.effort}`, 'cursor/gpt-5.5/low');
+    const avoided = pickRoute({ card, usable, kind: 'routine', surface: 'one spot', highest: 'low', avoid: ['cursor/gpt-5.5/low'] });
+    assert.equal(`${avoided.model}/${avoided.effort}`, 'sonnet/low', 'avoided by its whole name, slash and all');
+  });
+  const retried = routePolicy({ agent: 'worker', routed: { model: 'sonnet', effort: 'medium' }, retryOf: { id: 3, model: 'sonnet', effort: 'medium', status: 'failed' }, usable: ['haiku', 'sonnet', 'cursor/claude-sonnet-5-5', 'opus'] });
+  assert.equal(retried.model, 'opus', 'the same model through Cursor is no step above it');
+  const scout = routePolicy({ agent: 'scout', routed: { model: 'cursor/claude-haiku-5-5', effort: 'low' }, usable: ['cursor/claude-haiku-5-5', 'sonnet'] });
+  assert.deepEqual([scout.model, scout.effort], ['sonnet', 'low'], 'the rules for a model hold for it through Cursor');
 });

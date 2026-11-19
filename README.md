@@ -98,18 +98,21 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
 - Routing reads a scorecard of published benchmarks, fetched once by Discover and the first `sumo setup`, and saved: [CursorBench](https://cursor.com/cursorbench)
   as [Epoch AI](https://epoch.ai/benchmarks) collects it, [LMArena](https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset)'s
   agent board and [Artificial Analysis](https://artificialanalysis.ai)'s Intelligence Index via [modelgrep](https://modelgrep.com/api).
+  A model switched off is left off the scorecard and out of the local router's rule.
   The local model sorts the work; code picks the cheapest model and effort, Claude's or Cursor's, that scores high enough, at the
   effort the work's size asks for. Harder, larger or risky work never gets a lower-scoring route than easier work of its kind, and a
   retry climbs above the route that failed. A route is priced by what your own jobs of that kind cost, from the ledger, else by the
   benchmarks. `sumo models` shows the scores and every route says why; `/scorecard` in the chat fetches them again and shows each
   step: every request, what was kept, where each source placed the models. Without a scorecard the router picks Claude's models by its old rule.
-- With `CURSOR_API_KEY` exported, Discover (on the settings page) switches on Cursor's Composer 2.5 and Grok 4.7: `/model composer`,
-  Chat › Model, the jobs' smallest model and auto offer them beside Claude's. They run through the Cursor SDK at their standard
+- With `CURSOR_API_KEY` exported, Discover (on the settings page) lists every model Cursor has for the key and tries each once:
+  the ones your plan runs are switched on, the ones it refuses stay off with Cursor's reason. Composer 2.5 and Grok 4.7 are
+  `composer` and `grok`; every other is `cursor/` and Cursor's id (`/model cursor/grok-4.6`). Chat › Model, the jobs'
+  smallest model and auto offer them beside Claude's. They run through the Cursor SDK at their standard
   variants, never Fast, on Sumo's own shell, editor, job tools and MCP servers, behind the same approvals and sandbox. Of Cursor's
   own tools only web search and fetch are kept, and only where Claude has them, in the chat and scouts; Sumo cannot see them, so
   a conversation or scout on Cursor counts as having read the web. Its agents live in a folder of Sumo's own, so nothing of the
   SDK runs git or a program from your PATH in your project. `/model` and auto move a chat between Claude and Cursor at any turn, each told what the other did. Each request
-  is priced at Cursor's list rates. Without the key they are not offered, and asking for one says why.
+  is priced at list rates: Sumo's own for Composer and Grok, the scorecard's for the others. Without the key they are not offered, and asking for one says why.
 - A crash is written, redacted, to `~/.sumo-agents/logs/crash-*.log`. `sumo doctor --report` prints everything a
   bug report needs, redacted, and sends nothing; the logs that hold what you said are counted there, not quoted.
   `sumo doctor --fix` makes the home's files private again.
@@ -137,12 +140,12 @@ first. Piped, with a key (`sumo config jobs.review`) or `--json`, `sumo config` 
 |---|---|---|
 | Chat › Spend notice (`chat.budget`) | `5` | Dollars a chat session costs before the screen says so; `0` never. |
 | Chat › Effort (`chat.effort`) | `medium` | Effort when the chat model is fixed. |
-| Chat › Model (`chat.model`) | `opus` | What the chat runs on. `auto` picks per turn, over Claude's and Cursor's models. Cursor's (`composer`, `grok`) need `CURSOR_API_KEY`. |
+| Chat › Model (`chat.model`) | `opus` | What the chat runs on: any model that is on. `auto` picks per turn, over Claude's and Cursor's models. Cursor's (`composer`, `grok`, `cursor/…`) need `CURSOR_API_KEY`. |
 | Chat › Notify (`chat.notify`) | `on` | `off` stops the bell and the notification when a long turn ends behind another window. |
 | Chat › Screen (`chat.screen`) | `full` | `still` keeps the working line's spinner still. `plain` draws the chat for a screen reader: words, not pictures (no logo), ASCII marks (`x` a failure, `*` at work, `>` your prompt), no rule over the box or bar beside a question, and nothing that moves or ticks. |
 | Jobs › Advisor (`jobs.advisor`) | `off` | `on` lets a job ask the next model up for advice. |
 | Jobs › Budget (`jobs.budget`) | `10` | Dollars one job may spend before it is stopped; `0` for no cap. |
-| Jobs › Smallest model (`jobs.floor`) | `haiku` | The smallest model a job may run on, up the ladder `haiku`, `composer`, `grok`, `sonnet`, `opus`, `fable`: `sonnet` keeps every job off Haiku and Cursor's models, `opus` puts them all on Opus or Fable. |
+| Jobs › Smallest model (`jobs.floor`) | `haiku` | The smallest model a job may run on, up the ladder: every model that has a price, cheapest first, as `sumo models` lists them. `sonnet` keeps every job off the models cheaper than Sonnet, `opus` off all but Opus and dearer. |
 | Jobs › Time limit (`jobs.minutes`) | `60` | Minutes one job may run before it is stopped; `0` for no limit. |
 | Jobs › Review (`jobs.review`) | `risky` | Which verified work gets a reviewer without asking: `risky`, `all` or `off`. |
 | Memory › Filed by (`memory.model`) | `local` | What the memory pass runs on: `local`, a model name, or `off` (the chat then saves what lasts itself). |
@@ -151,9 +154,13 @@ first. Piped, with a key (`sumo config jobs.review`) or `--json`, `sumo config` 
 | Shell › Network (`shell.network`) | `on` | `off` keeps the sandboxed shell to this machine. |
 | Shell › Sandbox (`shell.sandbox`) | `on` | The agent's shell in the macOS sandbox. Read when a chat or job starts. |
 
-Under them, **API models** has a switch for each model and **Discover**, which asks the API which this login can use,
-asks Cursor too when `CURSOR_API_KEY` is set, and fetches the scorecard routing reads. Cursor's models start off;
-Discover turns on the ones Cursor lists for the key.
+Under them, **API models** has a switch for each model, cheapest first, and **Discover**. Discover asks Anthropic for
+every model your login can see, and Cursor too when `CURSOR_API_KEY` is set, tries each with a one-word question, and
+then fetches the scorecard routing reads. A model that answers is switched on; one your login or plan is refused stays
+off with the reason (a Claude Code login is refused models that need a newer Claude Code), as does one Sumo cannot
+drive (Claude's before Opus 4.6 lack adaptive thinking). Claude's four keep their short names, `haiku`, `sonnet`,
+`opus` and `fable`; any other model is its id (`claude-opus-4-8`). A model with no price known is run only when you
+pick it by name: routing cannot weigh it, nor a budget hold it. Trying them all costs a few cents.
 **MCP servers** lists each server: Enter shows its tools, each switched to run without asking or to ask first;
 **+ add a server** takes a pasted command or address, or brings servers in from Claude Code. A token is never typed
 into the page: a header or variable names it as `${NAME}`, filled from your shell. The environment variables are in

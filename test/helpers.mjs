@@ -157,8 +157,11 @@ export function sandbox() {
   const routerWillSay = (model, effort, reason = 'stand-in route') =>
     model === null ? rmSync(routerAnswer, { force: true }) : writeFileSync(routerAnswer, JSON.stringify({ is_error: false, result: '', structured_output: { model, effort, reason }, usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 }));
 
-  /** Which of Sumo's models the API will say it has, by short name, for every discovery from here on; `errors` names ones whose check fails. */
-  const modelsFound = (found, { errors = {} } = {}) => writeFileSync(modelsAnswer, JSON.stringify({ found, errors }));
+  /**
+   * Which of Sumo's models the API will say it has, by short name, for every discovery from here on; `errors` names ones whose
+   * check fails; `listed` is every model the API lists, as it lists them (`/v1/models`); `refused`, by id, what trying one answers.
+   */
+  const modelsFound = (found, { errors = {}, listed = [], refused = {} } = {}) => writeFileSync(modelsAnswer, JSON.stringify({ found, errors, listed, refused }));
   // What the scorecard's sources say, by source id: `{ entries: [{ model, effort, score, cost }] }` or `{ error }`.
   const scorecardWillBe = (sources) => writeFileSync(scorecardAnswer, JSON.stringify(sources));
 

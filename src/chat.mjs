@@ -13,7 +13,7 @@ import { COMPACT_INSTRUCTIONS, compactionParams, contextFor, converse, describeF
 import { logRun, usageOf } from './model.mjs';
 import { closeMcp, compactInput, gateMcp, isMcpTool, mcpLines, mcpReady, splitMcpName } from './mcp.mjs';
 import { EFFORT_MESSAGE_BETA, effortOnly } from './auth.mjs';
-import { ALL_MODELS, assertOn, laneOf, MODEL_IDS, modelId, modelName, usableJobModels, usableModels } from './catalog.mjs';
+import { allModels, assertOn, effortOn, labelOf, laneOf, listedPrice, MODEL_IDS, modelId, modelName, onModels, switched, usableModels } from './catalog.mjs';
 import { converseCursor } from './cursor.mjs';
 import { takeLock } from './lock.mjs';
 import { paths, REPO_ROOT } from './paths.mjs';
@@ -68,6 +68,12 @@ const MODEL_HINTS = {
   composer: "Cursor's own coding model, from your plan's pool",
   grok: "xAI's Grok through Cursor, from your plan's pool",
 };
+/** What `/model`'s menu says of a model: what it is for, or — for one Discover listed — its maker's name for it, the lane, and its price. */
+function modelHint(name) {
+  if (MODEL_HINTS[name]) return MODEL_HINTS[name];
+  const price = listedPrice(name);
+  return [labelOf(name) ?? name, laneOf(name) === 'cursor' ? 'through Cursor' : null, price ? `$${price.input}/$${price.output} per million tokens` : 'no price known: never routed to'].filter(Boolean).join(' · ');
+}
 /** And each effort: how much the model thinks before it acts. */
 const EFFORT_HINTS = { low: 'quickest: one spot', medium: 'a few files', high: 'many parts that work together', xhigh: 'more thought still, slower', max: 'the most thought, the slowest' };
 
@@ -84,9 +90,9 @@ function commandList(db, { effortNow = () => null, inUse = () => ({}), saved = (
   };
   const marked = (name, hint, current) => ({ name, hint: `${hint}${name === current ? ' (current)' : ''}` });
   const modelChoices = (given) => {
-    const usable = usableJobModels(db);
+    const usable = onModels(db);
     const { model, effort } = inUse();
-    if (given.length === 0) return ['auto', ...usable].map((name) => marked(name, MODEL_HINTS[name] ?? '', model));
+    if (given.length === 0) return ['auto', ...usable].map((name) => marked(name, modelHint(name), model));
     return given.length === 1 && usable.includes(given[0]) ? efforts().map((name) => marked(name, EFFORT_HINTS[name] ?? '', model === 'auto' ? null : effort)) : [];
   };
   return [
@@ -212,7 +218,7 @@ function parseRoute(args, current, db) {
     if (effort) throw new UsageError('auto takes no effort — the router picks it each turn');
     return { model: 'auto', effort: null };
   }
-  if (!ALL_MODELS.includes(model)) throw new UsageError(`no such model "${model}" — one of: auto, ${usableJobModels(db).join(', ')}`);
+  if (!allModels(db).includes(model)) throw new UsageError(`no such model "${model}" — one of: auto, ${onModels(db).join(', ')}`);
   assertOn(db, model);
   if (rest.length > 0) throw new UsageError(`/model takes a model and an effort, not "${args}"`);
   if (effort !== undefined && !EFFORTS.includes(effort)) throw new UsageError(`no such effort "${effort}" — one of: ${EFFORTS.join(', ')}`);
@@ -336,7 +342,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   // A model the user turned off is not chatted on, however the chat came to be on it; auto reads the switches each turn.
   // A full API id is that model too (claude-opus-5-5 is opus), switched off or on with it.
   const named = modelName(model);
-  if (named !== 'auto' && ALL_MODELS.includes(named)) assertOn(db, named, 'pick another Model there');
+  if (named !== 'auto' && switched(db, named)) assertOn(db, named, 'pick another Model there');
   effort ??= model === 'auto' ? null : configured(db, 'chat.effort');
   /** On auto, the route the last turn ran on; null otherwise. */
   let routed = null;
@@ -454,7 +460,7 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
     if (!saved) throw new UsageError(`the saved session ${shortId(found.id)} is gone`);
     // Its model is checked as the chat's own was: a full API id is that model too, and one turned off since is not chatted on.
     const named = modelName(saved.model);
-    if (!given.model && named !== 'auto' && ALL_MODELS.includes(named)) assertOn(db, named, '/model <name>');
+    if (!given.model && named !== 'auto' && switched(db, named)) assertOn(db, named, '/model <name>');
     const held = takeLock(lockFile(found.id), busy(found.id));
     if (sessionId) end();
     start('resume', saved, held);
@@ -489,7 +495,8 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
    */
   function apply({ model: m, effort: e }) {
     const id = modelId(m);
-    const wanted = e && e !== 'none' ? e : null;
+    // A Claude model that does not take this effort is asked at the nearest it takes below it; Cursor's runner does its own.
+    const wanted = e && e !== 'none' ? (laneOf(m) === 'claude' ? effortOn(m, e) : e) : null;
     const switched = params.model !== id;
     const spoken = params.messages.some(effortOnly);
     // Cursor is never sent the conversation's effort messages: on its models the effort in force is the request's own.
