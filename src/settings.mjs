@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Box, render, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
 import { createElement as h, useReducer } from 'react';
-import { ALL_MODELS, cursorSummary, discoverCursor, discoverModels, discoverySummary, JOB_MODELS, laneOf, modelId, MODELS, modelStates, setModel } from './catalog.mjs';
+import { allModels, cursorSummary, discoverCursor, discoverModels, discoverySummary, labelOf, laneOf, listedPrice, modelId, modelLadder, MODELS, modelStates, setModel } from './catalog.mjs';
 import { refreshScorecard, scorecardSummary } from './scorecard.mjs';
 import { getMeta, openDb } from './db.mjs';
 import { addServer, allowedBy, CLAUDE_CODE_TOKEN, connect, readConfig, removeServer, setAllow } from './mcp.mjs';
@@ -146,10 +146,18 @@ export function keyName(input, key) {
  * config`) a change is for the next chat. `toolsOf`, `download`, `discover`, `cursor`, `score` and `claude` are the slow or outside parts,
  * passed in so a test can stand in for them.
  */
+/** What a model's row says it is for: one of Claude's four, Composer and Grok by their lane; any other by its maker's name and price. */
+function modelRowHint(m) {
+  const use = laneOf(m) === 'cursor' ? 'on: offered for chats and jobs, run through Cursor with CURSOR_API_KEY · off: never used' : 'on: offered for chats, jobs and memory · off: never used';
+  if (MODELS.includes(m) || !m.includes('-')) return use;
+  const price = listedPrice(m);
+  return `${labelOf(m) ?? m}${price ? ` · $${price.input}/$${price.output} per million tokens` : ' · no price known: run only when picked by name'} — ${use}`;
+}
+
 export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNames, download = fetchModel, discover = discoverModels, cursor = discoverCursor, score = refreshScorecard, claude = () => claudeCodeServers(cwd), onChange = () => {} } = {}) {
   const db = openDb();
   const values = () => Object.fromEntries(Object.keys(CONFIG_DEFAULTS).map((k) => [k, getMeta(db, `config.${k}`) ?? CONFIG_DEFAULTS[k]]));
-  const switches = () => Object.fromEntries(ALL_MODELS.map((m) => [m, modelStates(db)[m].on]));
+  const switches = () => Object.fromEntries(Object.entries(modelStates(db)).map(([m, state]) => [m, state.on]));
   const serversNow = () => Object.entries(readConfig().mcpServers).map(([name, spec]) => ({ name, spec }));
   const S = { v: values(), on: switches(), servers: [], view: 'page', f: 0, tf: 0, sv: 0, edit: null, msg: null, ask: null, add: null, tools: null, busy: 0, scroll: {}, log: [], closed: false, fetching: null };
   try {
@@ -180,14 +188,14 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
 
   const sections = () => [
     ['Chat', [
-      { id: 'chat.model', label: 'Model', type: 'choice', opts: () => ['auto', ...ALL_MODELS], disabled: (o) => o !== 'auto' && !S.on[o], when: live.route ? 'this chat too' : 'from the next chat', hint: 'the model chats run on — auto: the router picks one each turn' },
+      { id: 'chat.model', label: 'Model', type: 'choice', opts: () => ['auto', ...allModels(db).filter((m) => S.on[m] || m === S.v['chat.model'])], disabled: (o) => o !== 'auto' && !S.on[o], when: live.route ? 'this chat too' : 'from the next chat', hint: 'the model chats run on — auto: the router picks one each turn' },
       { id: 'chat.effort', label: 'Effort', type: 'choice', opts: () => CHAT_EFFORTS, when: live.route ? 'this chat too' : 'from the next chat', hint: 'how much the model thinks before it acts' },
       { id: 'chat.budget', label: 'Spend notice', type: 'money', step: 1, unit: 'a session', zero: 'never', when: live.route ? 'this chat too' : '', hint: 'what a chat may cost before the screen says so, once — ←→ by $1 or type it, 0 for never' },
       { id: 'chat.notify', label: 'Notify', type: 'toggle', when: 'from the next chat', hint: 'the bell and a notification when a long turn ends behind another window' },
       { id: 'chat.screen', label: 'Screen', type: 'choice', opts: () => ['full', 'still', 'plain'], when: 'from the next chat', hint: 'full: colours flow through the working line · still: nothing moves · plain: for a screen reader' },
     ]],
     ['Jobs', [
-      { id: 'jobs.floor', label: 'Smallest model', type: 'choice', opts: () => JOB_MODELS, disabled: (o) => !S.on[o], when: 'jobs from now on', hint: 'the smallest model a job may run on — haiku holds nothing back' },
+      { id: 'jobs.floor', label: 'Smallest model', type: 'choice', opts: () => modelLadder(db).filter((m) => S.on[m] || m === S.v['jobs.floor']), disabled: (o) => !S.on[o], when: 'jobs from now on', hint: 'the smallest model a job may run on — haiku holds nothing back' },
       { id: 'jobs.budget', label: 'Budget', type: 'money', step: 1, unit: 'a job', zero: 'no cap', when: 'jobs from now on', hint: 'what one job may spend before it is stopped — 0 for no cap' },
       { id: 'jobs.minutes', label: 'Time limit', type: 'minutes', step: 15, zero: 'no limit', when: 'jobs from now on', hint: 'how long one job may run before it is stopped — ←→ by 15 or type it, 0 for no limit' },
       { id: 'jobs.review', label: 'Review', type: 'choice', opts: () => ['risky', 'all', 'off'], when: 'jobs from now on', hint: 'which workers that finish DONE are reviewed unasked: the risky ones, every one, or none' },
@@ -203,7 +211,7 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
     ]],
     ['Projects', [{ id: 'projects.home', label: 'New ones go in', type: 'path', action: 'enter: change', when: 'at once', hint: 'the folder a new project is made in' }]],
     ['API models', [
-      ...ALL_MODELS.map((m) => ({ id: `model:${m}`, label: cap(m), type: 'model', m, hint: laneOf(m) === 'cursor' ? 'on: offered for chats and jobs, run through Cursor with CURSOR_API_KEY · off: never used' : 'on: offered for chats, jobs and memory · off: never used' })),
+      ...allModels(db).map((m) => ({ id: `model:${m}`, label: MODELS.includes(m) || !m.includes('-') ? cap(m) : (labelOf(m) ?? m), type: 'model', m, hint: modelRowHint(m) })),
       { id: 'discover', label: 'Discover', type: 'action', text: 'ask Anthropic and Cursor which this login can use', action: 'enter', hint: 'sets the switches from the answer — one you turned off stays off — and fetches the scorecard routing reads' },
     ]],
     ['MCP servers', [
@@ -291,6 +299,7 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
       case 'model': {
         const t = tog(S.on[r.m]);
         t[0][0] = t[0][0].padEnd(plain ? 3 : 5);
+        // The id after the switch: for a model known by its id, the name `/model` takes, whole, where the label is its maker's name for it.
         return [...t, [`   ${modelId(r.m)}`, 'd']];
       }
       case 'action':
@@ -506,7 +515,7 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
       const users = [['chat.model', "the chat's model"], ['jobs.floor', "the jobs' smallest model"], ['memory.model', 'the model that files memory']].filter(([k]) => S.v[k] === m);
       if (users.length > 0) return err(`${m} is ${users[0][1]} — pick another there first`);
       // A Claude model stays on: the chat and the memory pass run on nothing else. Cursor's are for jobs, and may all be off.
-      if (laneOf(m) === 'claude' && MODELS.filter((x) => S.on[x]).length === 1) return err('one model stays on: chats and jobs need one');
+      if (MODELS.includes(m) && MODELS.filter((x) => S.on[x]).length === 1) return err('one model stays on: chats and jobs need one');
     }
     setModel(db, m, !S.on[m]);
     S.on = switches();
@@ -550,7 +559,9 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
       S.msg = { info: 'asking Anthropic and Cursor which models this login can use, and fetching the scorecard…' };
       // Each is asked on its own: Cursor needs only its key, and the scorecard no login at all. One that fails is said, never thrown.
       const settled = (work) => Promise.resolve().then(work).catch((cause) => ({ ok: false, error: cause.message }));
-      later(Promise.all([discover(db), settled(() => cursor(db)), settled(() => score(db))]), (all, cause) => {
+      // The scorecard is read for the models just listed, so it is fetched once both have answered.
+      const asked = Promise.all([discover(db), settled(() => cursor(db))]);
+      later(asked.then(async (both) => [...both, await settled(() => score(db))]), (all, cause) => {
         S.on = switches();
         if (cause) {
           S.msg = { err: cause.message };
@@ -883,7 +894,7 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
       for (const [, rows] of sections()) {
         for (const r of rows) if (r.id in snap.v && snap.v[r.id] !== S.v[r.id]) out.push(`${r.label.toLowerCase()} ${show(r, snap.v[r.id])} → ${show(r, S.v[r.id])}`);
       }
-      for (const m of ALL_MODELS) if (snap.on[m] !== S.on[m]) out.push(`${m} ${S.on[m] ? 'on' : 'off'}`);
+      for (const m of Object.keys(S.on)) if (snap.on[m] !== S.on[m]) out.push(`${m} ${S.on[m] ? 'on' : 'off'}`);
       if (S.fetching) out.push(`local model ${S.fetching.from} → ${S.fetching.to} once it has downloaded — the one in use stays until then`);
       return [...out, ...S.log];
     },

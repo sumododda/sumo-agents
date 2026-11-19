@@ -8,7 +8,7 @@ import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
 import { anthropicClient, authenticatedRequest, FALLBACK_BETA, resolveAnthropicCredential } from './auth.mjs';
-import { ALL_MODELS, assertOn, describeApiError, discoverModels, discoverySummary, JOB_MODELS, knownModel, MODELS, modelsChecked, modelStates } from './catalog.mjs';
+import { allModels, assertOn, describeApiError, discoverModels, discoverySummary, knownModel, modelLadder, MODELS, modelsChecked, modelStates } from './catalog.mjs';
 import { getMeta, openDb, SCHEMA_VERSION, schemaVersion, setMeta } from './db.mjs';
 import { refreshScorecard, savedScorecard, scorecardSummary } from './scorecard.mjs';
 import { damaged, restoreHint } from './export.mjs';
@@ -753,7 +753,7 @@ export function config(key, value) {
 
       if (key === 'jobs.advisor' && value !== 'on' && value !== 'off') throw new UsageError('jobs.advisor is on or off: a job asking the next model up for advice, from inside its own request');
 
-      if (key === 'jobs.floor' && !JOB_MODELS.includes(value)) throw new UsageError(`jobs.floor is one of ${JOB_MODELS.join(', ')}: the smallest model a job may run on — haiku holds nothing back`);
+      if (key === 'jobs.floor' && !modelLadder(db).includes(value)) throw new UsageError(`jobs.floor is one of ${modelLadder(db).join(', ')}: the smallest model a job may run on — haiku holds nothing back`);
       if (key === 'jobs.review' && !['risky', 'all', 'off'].includes(value)) {
         throw new UsageError('jobs.review is risky, all or off: which workers that finish DONE, verified, are reviewed without being asked — the ones the router called risky, every one, or none');
       }
@@ -763,7 +763,7 @@ export function config(key, value) {
       if (key === 'model.url') modelUrlOrRefuse(value);
       // A model is one Sumo knows and one that is on; the memory pass also takes `local` and `off`, the chat `auto`.
       if (key === 'chat.model' && value !== 'auto') {
-        knownModel(value, ['auto'], ALL_MODELS);
+        knownModel(value, ['auto'], allModels(db));
         assertOn(db, value);
       }
       if (key === 'memory.model' && value !== 'local' && value !== 'off') {

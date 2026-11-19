@@ -31,7 +31,7 @@ import { closeMcp } from '../src/mcp.mjs';
 import { paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { EFFORTS } from '../src/route.mjs';
-import { JOB_MODELS, setModel } from '../src/catalog.mjs';
+import { NAMED, setModel } from '../src/catalog.mjs';
 import { modelFileOfUrl } from '../src/setup.mjs';
 import { elapsed } from '../src/text.mjs';
 import { HARD_TASKS } from './coding-eval-hard.mjs';
@@ -207,8 +207,9 @@ export function summary(results) {
 function parseArgs(argv) {
   const value = (name) => (argv.includes(`--${name}`) ? argv[argv.indexOf(`--${name}`) + 1] : undefined);
   const route = value('route');
+  // One of the six Sumo names: the eval's throwaway home has run no Discover, so knows no other.
   const [model, effort] = route ? route.split('/') : [];
-  if (route && (!JOB_MODELS.includes(model) || !EFFORTS.includes(effort))) throw new Error(`--route is a model and an effort, like sonnet/medium, haiku/low or composer/medium — not "${route}"`);
+  if (route && (!NAMED.includes(model) || !EFFORTS.includes(effort))) throw new Error(`--route is a model and an effort, like sonnet/medium, haiku/low or composer/medium — not "${route}"`);
   const wanted = value('task')?.split(',');
   const every = [...TASKS, ...HARD_TASKS];
   const unknown = (wanted ?? []).filter((id) => !every.some((t) => t.id === id));

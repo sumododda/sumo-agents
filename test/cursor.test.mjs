@@ -6,9 +6,9 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } fro
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { discoverCursor, modelStates, setModel, usableJobModels } from '../src/catalog.mjs';
+import { allModels, cursorSummary, discoverCursor, effortsOf, modelStates, offLine, onModels, saveListedPrices, setModel, usableJobModels } from '../src/catalog.mjs';
 import { createChat } from '../src/chat.mjs';
-import { converseCursor, cursorModel } from '../src/cursor.mjs';
+import { converseCursor, cursorModel, tryCursorModel } from '../src/cursor.mjs';
 import { openDb } from '../src/db.mjs';
 import { outsideReads, tell } from '../src/jobs.mjs';
 import { runJob } from '../src/loop.mjs';
@@ -249,10 +249,35 @@ test('without CURSOR_API_KEY, or when Cursor refuses, the job ends with the reas
   });
 });
 
-test('Discover turns on the Cursor models Cursor lists for the key, and none without one; they join the job ladder above haiku', async () => {
+/**
+ * A model as Cursor lists it (`Cursor.models.list`): a variant for every combination of `settings`, the default where
+ * `isDefault` says, Max mode where `isMax` does — the shape measured on @cursor/sdk 1.4.1.
+ */
+function listedModel(id, displayName, settings = {}, { isDefault = () => false, isMax = () => false } = {}) {
+  const combos = Object.entries(settings).reduce((all, [setting, values]) => all.flatMap((c) => values.map((value) => [...c, { id: setting, value }])), [[]]);
+  return {
+    id,
+    displayName,
+    parameters: Object.entries(settings).map(([setting, values]) => ({ id: setting, values: values.map((value) => ({ value })) })),
+    variants: combos.map((params) => ({ params, displayName, isDefault: isDefault(params), isMaxMode: isMax(params) })),
+  };
+}
+const valueOf = (params, setting) => params.find((p) => p.id === setting)?.value;
+/** What Cursor listed for a key on Nov 18 2026, cut down: its Auto, Composer, GPT, Claude, GLM, and a model only Max mode runs. */
+const CURSOR_LISTED = [
+  listedModel('default', 'Auto', {}, { isDefault: () => true }),
+  listedModel('composer-2.5', 'Composer 2.5', { fast: ['true', 'false'] }, { isDefault: (p) => valueOf(p, 'fast') === 'true' }),
+  listedModel('gpt-5.5', 'GPT-5.5', { context: ['272k', '1m'], reasoning: ['none', 'low', 'medium', 'high', 'extra-high'], fast: ['false', 'true'] }, { isDefault: (p) => valueOf(p, 'context') === '272k' && valueOf(p, 'reasoning') === 'medium' && valueOf(p, 'fast') === 'true', isMax: (p) => valueOf(p, 'context') === '1m' }),
+  listedModel('claude-opus-5-5', 'Claude Opus 5.5', { context: ['300k', '1m'], effort: ['low', 'medium', 'high', 'xhigh', 'max'], fast: ['false', 'true'] }, { isDefault: (p) => valueOf(p, 'context') === '300k' && valueOf(p, 'effort') === 'high' && valueOf(p, 'fast') === 'false', isMax: (p) => valueOf(p, 'context') === '1m' || valueOf(p, 'fast') === 'true' }),
+  listedModel('glm-5.2', 'GLM 5.2', { reasoning: ['high', 'max'] }, { isDefault: (p) => valueOf(p, 'reasoning') === 'high' }),
+  listedModel('big-max', 'Big Max', { context: ['1m'] }, { isMax: () => true }),
+];
+const PLAN_REFUSAL = 'GPT-5.5 is not included in your weekly usage Buy credits or switch to a Grok model to continue.';
+
+test('Discover lists every model Cursor has for the key, tries each, and turns on the ones the key runs: a model its plan leaves out, or only Max mode runs, is listed and off, saying why', async () => {
   const root = mkdtempSync(join(tmpdir(), 'sumo-agents-cursor-models-'));
   const answer = join(root, 'cursor-models.json');
-  writeFileSync(answer, JSON.stringify({ ids: ['composer-2.5', 'composer', 'gpt-5.5'] }));
+  writeFileSync(answer, JSON.stringify({ models: CURSOR_LISTED, refused: { 'gpt-5.5': PLAN_REFUSAL } }));
   const stub = join(REPO_ROOT, 'test', 'fixtures', 'model-stub.mjs');
   await withHome(freshHome(), { SUMO_AGENTS_MODEL_CMD: stub, STUB_CURSOR_MODELS: answer }, async () => {
     const db = openDb();
@@ -262,12 +287,100 @@ test('Discover turns on the Cursor models Cursor lists for the key, and none wit
       assert.deepEqual(without, { ok: false, error: 'no CURSOR_API_KEY in this shell — export it, then Discover again' });
       process.env.CURSOR_API_KEY = 'test-cursor-key';
       const found = await discoverCursor(db, { now: NOW });
-      assert.deepEqual(found, { ok: true, found: ['composer'], missing: ['grok'] });
-      assert.deepEqual(modelStates(db).composer, { on: true, note: 'found 2026-11-18' });
-      assert.deepEqual(modelStates(db).grok, { on: false, note: 'not found 2026-11-18' });
-      assert.deepEqual(usableJobModels(db), ['haiku', 'composer', 'sonnet', 'opus', 'fable'], 'on the job ladder, above haiku');
+      assert.deepEqual(found, { ok: true, found: ['cursor/default', 'composer', 'cursor/claude-opus-5-5', 'cursor/glm-5.2'], refused: ['cursor/gpt-5.5'], cannot: ['cursor/big-max'], errors: {}, missing: ['grok'] });
+      assert.equal(cursorSummary(found), 'Cursor: runs cursor/default, composer, cursor/claude-opus-5-5, cursor/glm-5.2 — 1 refused for this key, off — 1 Sumo cannot run, off — not found, turned off: grok');
+      const states = modelStates(db);
+      assert.deepEqual(states.composer, { on: true, note: 'found 2026-11-18' });
+      assert.deepEqual(states['cursor/claude-opus-5-5'], { on: true, note: 'found 2026-11-18' });
+      assert.deepEqual(states['cursor/gpt-5.5'], { on: false, note: `found 2026-11-18 — Cursor refused it for this key: ${PLAN_REFUSAL}` });
+      assert.deepEqual(states['cursor/big-max'], { on: false, note: 'found 2026-11-18 — Sumo cannot run it: no a standard variant' });
+      assert.deepEqual(states.grok, { on: false, note: 'not found 2026-11-18' });
+
+      // Each is asked for by its standard variant: never Fast, never Max mode, the model's own default where it has one, and
+      // Sumo's effort in the setting the model names for it, at the nearest level it takes.
+      assert.deepEqual(cursorModel('cursor/claude-opus-5-5', 'max'), { id: 'claude-opus-5-5', params: [{ id: 'context', value: '300k' }, { id: 'effort', value: 'max' }, { id: 'fast', value: 'false' }] });
+      assert.deepEqual(cursorModel('cursor/gpt-5.5', 'xhigh'), { id: 'gpt-5.5', params: [{ id: 'context', value: '272k' }, { id: 'reasoning', value: 'extra-high' }, { id: 'fast', value: 'false' }] }, "GPT's extra-high is Sumo's xhigh");
+      assert.deepEqual(cursorModel('cursor/gpt-5.5', 'max'), cursorModel('cursor/gpt-5.5', 'xhigh'), 'a level it lacks is the nearest below');
+      assert.deepEqual(cursorModel('cursor/glm-5.2', 'low'), { id: 'glm-5.2', params: [{ id: 'reasoning', value: 'high' }] }, 'below its lowest, its lowest');
+      assert.deepEqual(cursorModel('cursor/default', 'high'), { id: 'default', params: [] }, 'one that takes no effort is asked as it is');
+      assert.deepEqual(cursorModel('composer', 'high'), { id: 'composer-2.5', params: [{ id: 'fast', value: 'false' }] }, 'Composer keeps its own settings');
+      assert.deepEqual(effortsOf('cursor/gpt-5.5'), ['low', 'medium', 'high', 'xhigh']);
+
+      // Every model that is on is offered by name; only the ones with a price are routed to — Cursor's other models get theirs from the scorecard.
+      assert.deepEqual(usableJobModels(db), ['haiku', 'composer', 'sonnet', 'opus', 'fable'], 'the ladder: a model with no price is not weighed');
+      assert.deepEqual(onModels(db), ['haiku', 'composer', 'sonnet', 'opus', 'fable', 'cursor/claude-opus-5-5', 'cursor/default', 'cursor/glm-5.2'], 'cheapest first, the unpriced after');
+      saveListedPrices(db, { 'cursor/glm-5.2': { input: 0.6, output: 2.2, cacheRead: 0.2 }, 'cursor/claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.05 } });
+      assert.deepEqual(usableJobModels(db), ['haiku', 'cursor/glm-5.2', 'composer', 'sonnet', 'opus', 'cursor/claude-opus-5-5', 'fable'], 'priced, they join the ladder by their price; on a tie Claude\'s own comes before the same through Cursor');
+      assert.deepEqual(allModels(db).slice(0, 3), ['haiku', 'cursor/glm-5.2', 'composer']);
+
+      // A model turned off by hand stays off whatever Cursor answers, now and after it leaves the list and comes back.
+      setModel(db, 'cursor/glm-5.2', false, NOW);
+      writeFileSync(answer, JSON.stringify({ models: CURSOR_LISTED, refused: { 'glm-5.2': 'GLM 5.2 is not included in your weekly usage' } }));
+      await discoverCursor(db, { now: NOW });
+      assert.deepEqual(modelStates(db)['cursor/glm-5.2'], { on: false, note: 'turned off 2026-11-18' }, 'a refusal does not write over it');
+
+      // Cursor listing a model no more takes it out of the list; Composer not listed is turned off.
+      writeFileSync(answer, JSON.stringify({ models: [CURSOR_LISTED[3]] }));
+      const later = await discoverCursor(db, { now: NOW });
+      assert.deepEqual(later.found, ['cursor/claude-opus-5-5']);
+      assert.deepEqual(later.missing, ['composer', 'grok']);
+      assert.equal(allModels(db).includes('cursor/glm-5.2'), false);
+      assert.match(offLine(db, 'cursor/glm-5.2'), /^cursor\/glm-5\.2 is not among the models Sumo knows now — API models › Discover/, 'one no longer listed is refused, saying why');
+      writeFileSync(answer, JSON.stringify({ models: CURSOR_LISTED, refused: { 'gpt-5.5': PLAN_REFUSAL } }));
+      await discoverCursor(db, { now: NOW });
+      assert.deepEqual(modelStates(db)['cursor/glm-5.2'], { on: false, note: 'turned off 2026-11-18' }, 'listed again, it is as the user left it');
     } finally {
       delete process.env.CURSOR_API_KEY;
+      db.close();
+    }
+  });
+});
+
+test('Discover tries a model on Cursor with a one-word question, none of Cursor\'s tools and an empty tree; a refusal is the reason, an answer a ledger row', async () => {
+  await withHome(freshHome(), { ...KEY, SUMO_AGENTS_MODEL_CMD: '' }, async () => {
+    const db = openDb();
+    try {
+      const made = [];
+      let closed = 0;
+      const fake = (ended) => ({
+        emptyFs: () => EMPTY_FS,
+        Agent: {
+          create: async (options) => {
+            made.push(options);
+            return {
+              close: () => closed++,
+              send: async (message) => ({ message, stream: async function* () {}, wait: async () => ended }),
+            };
+          },
+        },
+      });
+      // The real path: the list from Cursor, each model tried through the SDK.
+      const tried = [];
+      const result = await discoverCursor(db, {
+        now: NOW,
+        list: async () => CURSOR_LISTED.slice(1, 3),
+        tryModel: async (_db, name) => {
+          tried.push(name);
+          return tryCursorModel(db, name, { sdk: fake(name === 'composer' ? { status: 'finished', result: 'ok', usage: { inputTokens: 3479, outputTokens: 33, cacheReadTokens: 384, cacheWriteTokens: 0 } } : { status: 'error', error: { message: PLAN_REFUSAL } }), now: () => NOW });
+        },
+      });
+      assert.deepEqual(tried, ['composer', 'cursor/gpt-5.5']);
+      assert.deepEqual([result.found, result.refused], [['composer'], ['cursor/gpt-5.5']]);
+      assert.equal(made.length, 2);
+      for (const options of made) {
+        assert.deepEqual(options.tools, [], "none of Cursor's tools");
+        assert.equal(options.local.fs, EMPTY_FS, 'an empty tree, never the disk');
+        assert.equal(options.apiKey, 'test-cursor-key');
+      }
+      assert.deepEqual(made[1].model, { id: 'gpt-5.5', params: [{ id: 'context', value: '272k' }, { id: 'reasoning', value: 'none' }, { id: 'fast', value: 'false' }] }, 'asked at its standard variant');
+      assert.equal(closed, 2, 'every agent made is closed');
+      const rows = db.prepare("SELECT model, ok, input_tokens, cost_usd FROM model_runs WHERE kind = 'discover' ORDER BY id").all();
+      assert.deepEqual(rows.map((r) => [r.model, r.ok]), [['composer-2.5', 1], ['cursor/gpt-5.5', 0]], 'each under the name its jobs are kept by');
+      assert.ok(rows[0].cost_usd > 0, 'what the answer cost is priced');
+
+      const thrown = await tryCursorModel(db, 'composer', { sdk: { emptyFs: () => EMPTY_FS, Agent: { create: async () => { throw Object.assign(new Error('bad key'), { name: 'AuthenticationError' }); } } } });
+      assert.deepEqual(thrown, { ok: false, error: 'Cursor refused CURSOR_API_KEY: bad key' }, 'a key Cursor refuses is not a model refused');
+    } finally {
       db.close();
     }
   });

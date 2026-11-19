@@ -2,7 +2,7 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { ADVISOR_BETA, ADVISOR_SPENT, ADVISOR_SPENT_AT, ADVISOR_STOP_AT, advisorIn, advisorLine, advisorOf, advisorResult, advisorRuns, advisorTool, isAdvisorCall, isAdvisorResult } from './advisor.mjs';
 import { anthropicClient, authenticatedRequest, FALLBACK_BETA, loadSdk, resolveAnthropicCredential } from './auth.mjs';
-import { JOB_MODELS, laneOf, MODEL_IDS, modelId, offLine, usableModels } from './catalog.mjs';
+import { describeApiError, effortOn, laneOf, MODEL_IDS, modelId, modelName, offLine, switched, usableModels } from './catalog.mjs';
 import { converseCursor } from './cursor.mjs';
 import { getMeta, tx } from './db.mjs';
 import { handleEvent } from './hooks.mjs';
@@ -166,11 +166,12 @@ export const systemPrompt = () => [promptFile('agent.md'), `## How the user want
 export const thinkingFor = (_model) => ({ type: 'adaptive', display: 'summarized' });
 
 /**
- * Whether a model's declined replies are run again on another, server-side: every model but haiku, whose refusals have no
- * fallback. A request that goes on from one answered that way carries the `fallback` block as it came, and is priced on
- * the model that answered.
+ * Whether a model's declined replies are run again on another, server-side: sonnet, opus and fable — haiku's refusals have no
+ * fallback, and no other model has been checked to take one. A request that goes on from one answered that way carries the
+ * `fallback` block as it came, and is priced on the model that answered.
  */
-const fallsBack = (model) => laneOf(model) === 'claude' && modelId(model) !== MODEL_IDS.haiku;
+const FALLS_BACK = new Set([MODEL_IDS.sonnet, MODEL_IDS.opus, MODEL_IDS.fable]);
+const fallsBack = (model) => FALLS_BACK.has(modelId(model));
 
 /** A request's fallback set as its model takes it: on, with its beta, or off. The request itself is changed. */
 export function withFallback(params, model) {
@@ -199,10 +200,30 @@ export function paramsFor({ model, effort, tools, text, system }) {
     betas: BETAS,
     context_management: { edits: CONTEXT_EDITS },
   };
-  if (effort && effort !== 'none') params.output_config = { effort };
+  // A Claude model that does not take this effort is asked at the nearest it takes below it (`effortOn`); Cursor's runner does its own.
+  if (effort && effort !== 'none') params.output_config = { effort: laneOf(model) === 'claude' ? effortOn(model, effort) : effort };
   const thinking = thinkingFor(model);
   if (thinking) params.thinking = thinking;
   return withFallback(params, model);
+}
+
+/**
+ * Tries a model once, as Discover does each model the API lists: the request a chat's first turn is — adaptive thinking, an
+ * effort, the context edits — asking for one word. `{ ok: true }` when it answers; `{ ok: false, refused }` with the API's
+ * reason when this credential may not use it (a 400, 403 or 404 — a Claude Code login is refused a model that needs a newer
+ * Claude Code); `{ ok: false, error }` when the API could not be asked. What it cost is a ledger row. `send` stands in for
+ * the API in tests.
+ */
+export async function tryClaudeModel(db, name, { send = sendToApi, now = () => new Date().toISOString() } = {}) {
+  const params = { ...paramsFor({ model: name, effort: 'low', tools: [], system: 'Answer with one word.', text: 'Say ok.' }), max_tokens: 256 };
+  try {
+    const response = await send(params, {});
+    logRun(db, { kind: 'discover', model: response.model ?? modelId(name), result: { ok: true, usage: usageOf(response.model ?? modelId(name), response.usage) }, note: 'tried by Discover', now: now() });
+    return { ok: true };
+  } catch (cause) {
+    if ([400, 403, 404].includes(cause?.status)) return { ok: false, refused: String(cause.error?.error?.message ?? describeApiError(cause)).replace(/\s+/g, ' ').slice(0, 200) };
+    return { ok: false, error: describeApiError(cause) };
+  }
 }
 
 /**
@@ -786,7 +807,8 @@ export async function runJob(db, id, { send = sendToApi, cursorSdk = null, now, 
   const job = getJob(db, id);
   if (job.status !== 'running' && job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — only a running job can be run`);
   if (!job.model) throw new UsageError(`j${id} has no route — it was created before routing existed; create it again`);
-  const off = JOB_MODELS.includes(job.model) ? offLine(db, job.model, 'abandon it and create it again') : null;
+  // A model a later Discover no longer lists is refused as one switched off is, with the way out.
+  const off = job.model && switched(db, modelName(job.model)) ? offLine(db, modelName(job.model), 'abandon it and create it again') : null;
   if (off) throw new UsageError(`j${id} cannot run: ${off}`);
   const project = getProject(db, job.project);
   const tree = treeOf(db, id);

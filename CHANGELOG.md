@@ -4,6 +4,34 @@ What each release changed for you. The commit of each version has the full detai
 
 ## Unreleased
 
+## 0.8.1 — 2026-11-18
+
+- **Every model your login and key can run, not two of Cursor's and four of Claude's.** Discover asks Anthropic for
+  every model it lists (all pages) and Cursor for every model it has for `CURSOR_API_KEY`, and tries each once with a
+  one-word question — eight at a time, a few seconds, a few cents — since neither list says what you may run: a Claude
+  Code login is refused models that need a newer Claude Code, and a Cursor plan leaves most of its models out. A model
+  that answers is switched on; one refused stays off with the reason the API gave. Claude's four keep their names; any
+  other is its id (`claude-opus-4-8`), and Cursor's beyond `composer` and `grok` are `cursor/` and Cursor's id
+  (`cursor/grok-4.6`). Each Cursor model is asked at its standard variant — never Fast or Max mode — with your effort in
+  the setting it names; a Claude model that lacks an effort is asked at the nearest below. Models Sumo cannot drive
+  (Claude's before Opus 4.6, a Cursor model only Max mode runs) are listed and off, saying why.
+- **Sorted cheapest first, everywhere.** `sumo models`, the settings page, `/model` and the job ladder list models by
+  their price per token: Sumo's own list, else the list price modelgrep publishes, now kept when the scorecard is
+  fetched. A model with no price known runs only when picked by name — routing cannot weigh it, nor a budget hold it.
+  `jobs.floor` takes any model on the ladder.
+- **A model switched off leaves the scorecard and the router's rule.** `sumo models` and `/scorecard` show only the
+  models that are on, routing weighs only them, and one switched on again is back from what was fetched. The local
+  router is told a rule naming only models it may pick — with Fable off, "opus for hard and novel" — where it named all
+  four whatever was off, and a backend without grammar support could answer one and fail the job.
+- **Routing over the larger pool.** Places are read on one ruler, the six models Sumo names: any other model is placed
+  where its score falls between theirs, so the dozens Discover adds — older and weaker ones among them — move no place
+  and the bars stay where they were set. A benchmark source now scores a model under every name Sumo runs it by (Claude
+  Opus 5.5 is `opus` and `cursor/claude-opus-5-5`). An effort the benchmarks give no cost for costs at most what the
+  same model's next effort up does, and a route still without a price ranks after the priced ones — before, one
+  unpriced route among the candidates switched every price off, and with more models that sent routine work to the
+  lowest rung instead of the cheapest route. With every model one login ran on switched on, each kind and size of work
+  gets the same route as with the six alone. The server-side fallback is asked only on Sonnet, Opus and Fable.
+
 ## 0.8.0 — 2026-11-18
 
 - **Cursor's models, for chats and jobs.** With `CURSOR_API_KEY` exported, Discover asks Cursor too and switches on

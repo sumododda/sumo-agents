@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CURSOR_MODELS, cursorKeyIn } from './catalog.mjs';
+import { cursorKeyIn, cursorSelection, modelId } from './catalog.mjs';
 import { isMcpTool, runMcpTool } from './mcp.mjs';
 import { costOf, logRun, usageOf } from './model.mjs';
 import { paths } from './paths.mjs';
@@ -78,14 +78,14 @@ function toolsOf(params) {
   return wanted;
 }
 
-/** The model as Cursor takes it: its id, the standard variant, and the effort where the model takes one (Grok's top is xhigh). */
+/**
+ * The model as Cursor takes it: its id, the standard variant, and the effort where the model takes one — the nearest it has at
+ * or below the one asked (Grok's top is xhigh), as `cursorSelection` (src/catalog.mjs) reads Discover's listing.
+ */
 export function cursorModel(model, effort) {
-  const name = Object.keys(CURSOR_MODELS).find((n) => CURSOR_MODELS[n].id === model || n === model);
-  const known = CURSOR_MODELS[name];
-  if (!known) throw new Error(`${model} is not a Cursor model Sumo knows`);
-  const params = [...known.params];
-  if (known.effort && effort && effort !== 'none') params.push({ id: known.effort, value: effort === 'max' ? 'xhigh' : effort });
-  return { id: known.id, params };
+  const selection = cursorSelection(model, effort);
+  if (!selection) throw new Error(`${model} is not a Cursor model Sumo knows — API models › Discover, on the settings page (sumo config), lists them again`);
+  return selection;
 }
 
 /** A message's words: its text blocks, without the tool calls, results and pictures beside them. */
@@ -173,6 +173,32 @@ const picturesIn = (messages) =>
     .slice(messages.findLastIndex((m) => m.role === 'assistant') + 1)
     .filter((m) => m.role === 'user' && Array.isArray(m.content))
     .flatMap((m) => m.content.filter((b) => b.type === 'image' && b.source?.type === 'base64').map((b) => ({ data: b.source.data, mimeType: b.source.media_type })));
+
+/**
+ * Tries a model once, as Discover does each model Cursor lists: a one-word question to an agent with none of Cursor's tools
+ * and an empty tree. `{ ok: true }` when it answers; `{ ok: false, refused }` with Cursor's reason when the run is refused (a
+ * model the key's plan leaves out is, at no cost); `{ ok: false, error }` when Cursor could not be asked. What it cost is a
+ * ledger row. `sdk` stands in for @cursor/sdk in tests.
+ */
+export async function tryCursorModel(db, name, { sdk = null, now = () => new Date().toISOString() } = {}) {
+  const { Agent, emptyFs } = sdk ?? (await import('@cursor/sdk'));
+  const apiKey = cursorKeyIn() ? process.env.CURSOR_API_KEY.trim() : null;
+  if (!apiKey) return { ok: false, error: 'no CURSOR_API_KEY in this shell' };
+  let agent;
+  try {
+    agent = await Agent.create({ apiKey, model: cursorModel(name, null), tools: [], local: { cwd: cursorFolder(), fs: emptyFs(), settingSources: [] } });
+    const run = await agent.send('Reply with the single word: ok');
+    for await (const _ of run.stream());
+    const result = await run.wait();
+    const ok = result.status !== 'error';
+    logRun(db, { kind: 'discover', model: modelId(name), result: { ok, usage: usageOf(modelId(name), result.usage ? anthropicUsage(result.usage) : null) }, note: 'tried by Discover', now: now() });
+    return ok ? { ok: true } : { ok: false, refused: describeCursorError(result.error ?? 'the run failed') };
+  } catch (cause) {
+    return { ok: false, error: describeCursorError(cause) };
+  } finally {
+    agent?.close?.();
+  }
+}
 
 /**
  * Runs the job's conversation on Cursor until the model stops, the budget or the clock runs out, or `signal` aborts — and

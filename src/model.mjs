@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { accessSync, constants, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { anthropicClient, authenticatedRequest, loadSdk, resolveAnthropicCredential } from './auth.mjs';
-import { describeApiError, modelId } from './catalog.mjs';
+import { describeApiError, listedPrice, modelId } from './catalog.mjs';
 import { getMeta } from './db.mjs';
 import { ensureLocalServer, LOCAL_REASONING_BUDGET, modelIdOf } from './local-server.mjs';
 import { appendLog } from './logs.mjs';
@@ -23,30 +23,12 @@ const MAX_LOCAL_PASS_TOKENS = LOCAL_REASONING_BUDGET + 3072;
 // streaming. An answer longer than this is the model rambling, not remembering.
 const MAX_API_ANSWER_TOKENS = 8192;
 
-/**
- * US dollars per million tokens: input, output, and what a cache read costs relative to input. Haiku has two rate cards,
- * by the size of the prompt — everything read, from the cache or not — `over` is the dearer one past that many tokens.
- */
-const PRICES = {
-  'claude-haiku-5-5': { input: 0.1, output: 0.5, cacheRead: 0.1, over: { tokens: 100_000, input: 0.5, output: 2.5, cacheRead: 0.1 } },
-  'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.05 },
-  'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.05 },
-  'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.025 },
-  // Where a declined reply is run again (`fallbacks`): the API names the model by the category; the ledger must price what it answered on.
-  'claude-opus-4-8': { input: 5, output: 25, cacheRead: 0.1 },
-  'claude-sonnet-5': { input: 2, output: 10, cacheRead: 0.1 },
-  // Cursor's own models, at the standard variants Sumo asks for (cursor.com/docs/models, Nov 18 2026). Paid plans draw them from
-  // a weekly pool first: these are what the same tokens cost past it, so a job on them is never priced below what it could cost.
-  // Cursor lists no cache-write rate; a write is priced as the others are.
-  'composer-2.5': { input: 0.5, output: 2.5, cacheRead: 0.4 },
-  'grok-4.7': { input: 2, output: 6, cacheRead: 0.25 },
-};
 /** What writing to the cache costs relative to input: the five-minute cache every request here writes. */
 export const CACHE_WRITE = 1.25;
 
 /** The rate card a response is priced on: the model's, or its dearer one when the prompt was over that size; null for a model the list does not know. */
 export function priceOf(model, usage = {}) {
-  const price = PRICES[modelId(model)];
+  const price = listedPrice(model);
   if (!price) return null;
   const prompt = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
   return price.over && prompt > price.over.tokens ? price.over : price;

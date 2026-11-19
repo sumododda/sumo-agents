@@ -262,6 +262,32 @@ test('a model that is off is outside the router\'s grammar and prompt; an answer
   });
 });
 
+test('the local router is never told to pick a model that is off: its rule names, for each kind, the nearest model that is on — for jobs, scouts and chat turns', async () => {
+  const capture = join(mkdtempSync(join(tmpdir(), 'sumo-agents-route-rule-')), 'saw.json');
+  const seen = () => JSON.parse(readFileSync(capture, 'utf8')).system;
+  await withRouter({ model: 'sonnet', effort: 'low', reason: 'x' }, async (db, project) => {
+    process.env.STUB_CAPTURE = capture;
+    try {
+      await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
+      assert.match(seen(), / Model follows kind: haiku for mechanical, sonnet for routine, opus for hard, fable for novel\. Effort follows surface/, 'all four on: the rule as it always read');
+      setModel(db, 'fable', false, NOW);
+      setModel(db, 'haiku', false, NOW);
+      await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
+      assert.match(seen(), / Model follows kind: sonnet for mechanical and routine, opus for hard and novel\. /);
+      assert.doesNotMatch(seen(), /haiku|fable/, 'no model that is off is named');
+      await chooseRoute(db, { agent: 'scout', project, title: 'x', task: 'y' });
+      assert.match(seen(), /^You assign a reading job.* Model follows kind: sonnet for mechanical and routine, opus for hard and novel\. /);
+      await chooseChatRoute(db, { project, text: 'hi' });
+      assert.match(seen(), /^You assign one chat turn.* Model follows kind: sonnet for mechanical and routine, opus for hard and novel\. /);
+      setModel(db, 'opus', false, NOW);
+      await chooseRoute(db, { agent: 'worker', project, title: 'x', task: 'y' });
+      assert.match(seen(), / Model follows kind: sonnet for mechanical and routine and hard and novel\. /, 'with one model on, every kind is it');
+    } finally {
+      delete process.env.STUB_CAPTURE;
+    }
+  });
+});
+
 test('a model that is off is never a job\'s route: the router is not offered it, and an answer naming it is refused', async () => {
   await withRouter({ model: 'haiku', effort: 'low', reason: 'a quick look' }, async (db, project) => {
     setModel(db, 'haiku', false, NOW);
