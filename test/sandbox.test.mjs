@@ -117,7 +117,7 @@ test('the guarded files — read later by the shell, a tool or an editor — are
   const places = guardedPlaces([root], { home: join(scratch, 'nohome'), sumo: join(scratch, 'nosumo'), env: { PATH: '' } });
   assert.deepEqual(
     places.filter((place) => place.startsWith(`${join(scratch, 'nosumo')}/`)),
-    [...['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool', 'scribe.lock', 'dream.lock', 'logs', 'backups', 'history'].map((n) => join(scratch, 'nosumo', n))],
+    [...['memory.db', 'memory.db-wal', 'memory.db-shm', 'mcp.json', 'bin', 'models', 'eval.env', 'spool', 'scribe.lock', 'dream.lock', 'logs', 'backups', 'history', 'scorecard.json'].map((n) => join(scratch, 'nosumo', n))],
     "sumo's own by name, whether or not they are there",
   );
   // Every guarded name directly under the project, there or not: a file the shell made would be read later all the same.

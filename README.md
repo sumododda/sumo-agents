@@ -95,15 +95,17 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
   turn kept; `/undo` again lets that turn go, keeps your file, and goes on to the turn before.
 - Only your words become memory. Web pages, files and tool output are never filed as yours.
 - The local model, Qwen3-4B through llama.cpp, sorts jobs for routing and writes memory for $0 and sleeps when idle.
-- Routing reads a scorecard of published benchmarks, fetched once by Discover and the first `sumo setup`, and saved: [CursorBench](https://cursor.com/cursorbench)
-  as [Epoch AI](https://epoch.ai/benchmarks) collects it, [LMArena](https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset)'s
-  agent board and [Artificial Analysis](https://artificialanalysis.ai)'s Intelligence Index via [modelgrep](https://modelgrep.com/api).
+- Routing reads a scorecard of published benchmarks, written by a model: `/scorecard` in the chat has the strongest Claude model
+  you have on, at its highest effort, search the web — [CursorBench](https://cursor.com/cursorbench) as [Epoch AI](https://epoch.ai/benchmarks)
+  collects it, [LMArena](https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset)'s agent board and [Artificial Analysis](https://artificialanalysis.ai)'s
+  Intelligence Index first — and write each source's numbers for your models to `~/.sumo-agents/scorecard.json`. Which of a
+  vendor's names is which of your models is the model's to judge; Sumo checks every entry and refuses what it cannot use.
   A model switched off is left off the scorecard and out of the local router's rule.
   The local model sorts the work; code picks the cheapest model and effort, Claude's or Cursor's, that scores high enough, at the
   effort the work's size asks for. Harder, larger or risky work never gets a lower-scoring route than easier work of its kind, and a
   retry climbs above the route that failed. A route is priced by what your own jobs of that kind cost, from the ledger, else by the
-  benchmarks. `sumo models` shows the scores and every route says why; `/scorecard` in the chat fetches them again and shows each
-  step: every request, what was kept, where each source placed the models. Without a scorecard the router picks Claude's models by its old rule.
+  benchmarks. `sumo models` shows the scores and every route says why; `/scorecard` shows each search, page and write as it
+  happens, then the table. Without a scorecard the router picks Claude's models by its old rule.
 - With `CURSOR_API_KEY` exported, Discover (on the settings page) lists every model Cursor has for the key and tries each once:
   the ones your plan runs are switched on, the ones it refuses stay off with Cursor's reason. Composer 2.5 and Grok 4.7 are
   `composer` and `grok`; every other is `cursor/` and Cursor's id (`/model cursor/grok-4.6`). Chat › Model, the jobs'
@@ -112,7 +114,7 @@ are covered in [Install](https://github.com/sumododda/sumo-agents/wiki/Install).
   own tools only web search and fetch are kept, and only where Claude has them, in the chat and scouts; Sumo cannot see them, so
   a conversation or scout on Cursor counts as having read the web. Its agents live in a folder of Sumo's own, so nothing of the
   SDK runs git or a program from your PATH in your project. `/model` and auto move a chat between Claude and Cursor at any turn, each told what the other did. Each request
-  is priced at list rates: Sumo's own for Composer and Grok, the scorecard's for the others. Without the key they are not offered, and asking for one says why.
+  is priced at list rates: Sumo's own for Composer and Grok, modelgrep's for the others. Without the key they are not offered, and asking for one says why.
 - A crash is written, redacted, to `~/.sumo-agents/logs/crash-*.log`. `sumo doctor --report` prints everything a
   bug report needs, redacted, and sends nothing; the logs that hold what you said are counted there, not quoted.
   `sumo doctor --fix` makes the home's files private again.
@@ -156,7 +158,7 @@ first. Piped, with a key (`sumo config jobs.review`) or `--json`, `sumo config` 
 
 Under them, **API models** has a switch for each model, cheapest first, and **Discover**. Discover asks Anthropic for
 every model your login can see, and Cursor too when `CURSOR_API_KEY` is set, tries each with a one-word question, and
-then fetches the scorecard routing reads. A model that answers is switched on; one your login or plan is refused stays
+then fetches list prices from modelgrep. A model that answers is switched on; one your login or plan is refused stays
 off with the reason (a Claude Code login is refused models that need a newer Claude Code), as does one Sumo cannot
 drive (Claude's before Opus 4.6 lack adaptive thinking). Claude's four keep their short names, `haiku`, `sonnet`,
 `opus` and `fable`; any other model is its id (`claude-opus-4-8`). A model with no price known is run only when you

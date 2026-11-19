@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { allModels, cursorSummary, discoverCursor, effortsOf, modelStates, offLine, onModels, saveListedPrices, setModel, usableJobModels } from '../src/catalog.mjs';
 import { createChat } from '../src/chat.mjs';
-import { converseCursor, cursorModel, tryCursorModel } from '../src/cursor.mjs';
+import { converseCursor, cursorModel, loadCursorSdk, tryCursorModel } from '../src/cursor.mjs';
 import { openDb } from '../src/db.mjs';
 import { outsideReads, tell } from '../src/jobs.mjs';
 import { runJob } from '../src/loop.mjs';
@@ -334,6 +334,16 @@ test('Discover lists every model Cursor has for the key, tries each, and turns o
       db.close();
     }
   });
+});
+
+test('Cursor\'s agents stream over HTTP/1.1, which a network that drops HTTP/2 in the handshake still lets through, and the SDK installed takes the setting', async () => {
+  const configured = [];
+  const fake = { Agent: {}, configureCursorSdk: (options) => configured.push(options) };
+  assert.equal(await loadCursorSdk(async () => fake), fake);
+  assert.deepEqual(configured, [{ local: { useHttp1ForAgent: true } }]);
+  // The real one: an SDK that dropped the setting, or refused it, fails here rather than in a chat.
+  const sdk = await loadCursorSdk();
+  assert.equal(typeof sdk.Agent.create, 'function');
 });
 
 test('Discover tries a model on Cursor with a one-word question, none of Cursor\'s tools and an empty tree; a refusal is the reason, an answer a ledger row', async () => {

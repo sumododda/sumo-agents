@@ -1180,12 +1180,14 @@ export function createChat(db, { model, effort, cwd = process.cwd(), send = send
   }
 
   /**
-   * `/scorecard`: the benchmarks routing reads, fetched again and saved, as Discover fetches them. Each source is told to
-   * `onSource` as it is read — its requests, what it kept and left out, where it placed Sumo's routes — and what was saved
-   * comes back as a table. The model is told nothing: what to route by is not the conversation's.
+   * `/scorecard`: the scorecard routing reads, written again by the strongest Claude model on from the benchmarks it reads on
+   * the web (src/scorecard.mjs). Its searches, its pages and its calls to write the file go to `onTool` and `onResult` as a
+   * turn's calls do, and `interrupt()` stops it; what was saved comes back as a table. The conversation is told nothing: what
+   * to route by is not the conversation's.
    */
-  async function scorecard(onSource) {
-    const result = await refreshScorecard(db, { onSource, now: now() });
+  async function scorecard({ onTool = null, onResult = null } = {}) {
+    stopper = new AbortController();
+    const result = await refreshScorecard(db, { send: sendAs, signal: stopper.signal, onTool, onResult, now });
     return scorecardReport(db, result, EFFORTS);
   }
 

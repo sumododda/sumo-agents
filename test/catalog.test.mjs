@@ -17,7 +17,7 @@ test('before anything is checked every Claude model is on and says it was not ch
   assert.equal(lines.length, 6, "one line per model Sumo knows before Discover: Claude's four and Cursor's two");
   assert.deepEqual(lines.map((l) => l.split(' ')[0]), ['haiku', 'composer', 'grok', 'sonnet', 'opus', 'fable'], 'cheapest first, by output price');
   assert.match(lines[1], /^composer\s+off\s+composer-2\.5\s+not discovered yet · through Cursor$/, "Cursor's are off until Discover finds them");
-  assert.match(card, /^scorecard: not fetched/, 'then the scorecard, apart');
+  assert.match(card, /^scorecard: none written/, 'then the scorecard, apart');
   assert.match(lines[0], /^haiku\s+on\s+claude-haiku-5-5\s+not checked$/);
   assert.match(lines[4], /^opus\s+on\s+claude-opus-5-5\s+not checked$/);
   assert.match(lines[5], /^fable\s+on\s+claude-fable-5-1\s+not checked$/);

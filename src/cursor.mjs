@@ -167,6 +167,19 @@ function cursorFolder() {
   return realFolder(dir);
 }
 
+/**
+ * @cursor/sdk, set to run its agents' streams over HTTP/1.1 with server-sent events. Left to itself the SDK opens them over
+ * HTTP/2, and a network that will not agree to HTTP/2 — a VPN or proxy that drops it in the TLS handshake (ALPN) — ends
+ * every Cursor chat, job and Discover try on a session error; HTTP/1.1 goes through. Its other requests (the model list,
+ * the key exchange) are HTTP/1.1 already. Loaded only where a model runs or Discover asks, as before. `load` stands in for
+ * the import in tests.
+ */
+export async function loadCursorSdk(load = () => import('@cursor/sdk')) {
+  const sdk = await load();
+  sdk.configureCursorSdk({ local: { useHttp1ForAgent: true } });
+  return sdk;
+}
+
 /** The pictures the user put in the messages Cursor is about to be told — those after its last answer — as the SDK takes them on a send. */
 const picturesIn = (messages) =>
   messages
@@ -181,7 +194,7 @@ const picturesIn = (messages) =>
  * ledger row. `sdk` stands in for @cursor/sdk in tests.
  */
 export async function tryCursorModel(db, name, { sdk = null, now = () => new Date().toISOString() } = {}) {
-  const { Agent, emptyFs } = sdk ?? (await import('@cursor/sdk'));
+  const { Agent, emptyFs } = sdk ?? (await loadCursorSdk());
   const apiKey = cursorKeyIn() ? process.env.CURSOR_API_KEY.trim() : null;
   if (!apiKey) return { ok: false, error: 'no CURSOR_API_KEY in this shell' };
   let agent;
@@ -210,7 +223,7 @@ export async function tryCursorModel(db, name, { sdk = null, now = () => new Dat
  * @cursor/sdk in tests.
  */
 export async function converseCursor(db, params, { ctx, ledger, beforeTool = null, concurrent = null, onText = null, onTool = null, onResult = null, onOutput = null, onUsage = null, inbox = null, signal = null, budget = null, clock = null, circling = null, remind = null, now = () => new Date().toISOString(), sdk = null } = {}) {
-  const { Agent, emptyFs } = sdk ?? (await import('@cursor/sdk'));
+  const { Agent, emptyFs } = sdk ?? (await loadCursorSdk());
   const apiKey = cursorKeyIn() ? process.env.CURSOR_API_KEY.trim() : null;
   const totals = { inputTokens: 0, outputTokens: 0, costUsd: 0, toolCalls: 0, contextTokens: 0 };
   const log = (result, note) => logRun(db, { kind: ledger.kind, model: params.model, result, note, now: now(), jobId: ledger.jobId ?? null, sessionId: ledger.sessionId ?? null });

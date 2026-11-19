@@ -4,6 +4,19 @@ What each release changed for you. The commit of each version has the full detai
 
 ## Unreleased
 
+- **The scorecard is written by a model, not by code that knows each vendor's spelling.** `/scorecard` has the
+  strongest Claude model you have on, at its highest effort, search the web — CursorBench via Epoch AI, LMArena's
+  agent board and the Artificial Analysis Intelligence Index first — and write each source's numbers for your models
+  to `~/.sumo-agents/scorecard.json`. It decides which of a vendor's names is which of your models, so a model the
+  old name matching missed (`claude-opus-4-6`, `cursor/glm-5p3`) is scored where a source lists it. Sumo checks every
+  entry and refuses what it can't use, places the numbers on the same six-model ruler, and keeps the file saved before
+  when a writing is stopped or fails. One writing may spend $5; Discover and `sumo setup` no longer touch the
+  scorecard (Discover still fetches list prices). Run `/scorecard` once after upgrading: until then routing goes by
+  its rule.
+- **Cursor's models on a network that drops HTTP/2.** Cursor's agents now stream over HTTP/1.1 with server-sent events,
+  not HTTP/2: on a VPN or proxy that refuses HTTP/2 in the TLS handshake, every Cursor chat, job and Discover try ended
+  on a session error. The model list and the key exchange were HTTP/1.1 already.
+
 ## 0.8.1 — 2026-11-18
 
 - **Every model your login and key can run, not two of Cursor's and four of Claude's.** Discover asks Anthropic for
