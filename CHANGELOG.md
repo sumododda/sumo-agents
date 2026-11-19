@@ -4,6 +4,8 @@ What each release changed for you. The commit of each version has the full detai
 
 ## Unreleased
 
+## 0.8.2 — 2026-11-19
+
 - **The scorecard is written by a model, not by code that knows each vendor's spelling.** `/scorecard` has the
   strongest Claude model you have on, at its highest effort, search the web — CursorBench via Epoch AI, LMArena's
   agent board and the Artificial Analysis Intelligence Index first — and write each source's numbers for your models
