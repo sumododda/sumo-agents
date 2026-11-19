@@ -52,6 +52,8 @@ function unsupported(db, turnIds, supported) {
 }
 
 const count = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+/** The conversations a rebuild from the model's shell reads unless `--limit` says: each is a model call nobody asked for. */
+const SHELL_LIMIT = 5;
 
 /**
  * `sumo memory rebuild`: the journal read again with the extractor as it is now, and the difference from the memories
@@ -60,10 +62,13 @@ const count = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
  * as read) and the unsupported derived memories are let go the way `sumo forget` does, history kept — except one that
  * replaced another memory, which is shown as kept; each change is written to the memory's history with the reason `rebuilt`. A change wider than a pass may make (`tooWide`) is
  * refused whole unless `yes`. `since` (an ISO time) and `limit` (the newest N conversations) bound what is read: every
- * batch is a model call. Returns the lines to print; `exitCode` 1 when something could not be read or was refused.
+ * batch is a model call. `fromShell`, a run the model's shell started (only ever a dry one): the newest five unless
+ * `limit` says, and never on the hosted fallback. Returns the lines to print; `exitCode` 1 when something could not be
+ * read or was refused.
  */
-export async function rebuild(db, { dryRun = false, since, limit, yes = false, now = new Date().toISOString() } = {}) {
+export async function rebuild(db, { dryRun = false, since, limit: asked, yes = false, fromShell = false, now = new Date().toISOString() } = {}) {
   const version = extractorVersion(db);
+  const limit = asked ?? (fromShell ? SHELL_LIMIT : undefined);
   const sessions = db
     .prepare(
       `SELECT s.id FROM sessions s
@@ -77,7 +82,7 @@ export async function rebuild(db, { dryRun = false, since, limit, yes = false, n
   const turnIds = sessions.flatMap((id) => turns.all(id, since ?? null).map((t) => t.id));
 
   const go = async () => {
-    const read = await extract(db, { turnIds, now });
+    const read = await extract(db, { turnIds, now, fallback: !fromShell });
     const readTurns = read.batches.flatMap((b) => b.turnIds);
     const adds = read.wouldFile.filter((f) => f.existing === null);
     // What an addition does to a memory it looks like, as far as can be said before the pair judge is asked — which a

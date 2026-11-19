@@ -179,3 +179,19 @@ test('sumo memory serves the page, asks for it to be opened, and stops cleanly o
   child.stdin.write('\x03');
   assert.equal(await exited, 0);
 });
+
+test('an edit on the page is the user keeping a memory in their own words: it never counts as thrown out, and filing does not pause over it', async () => {
+  const { extractorVersion, filingState } = await import('../src/ledger.mjs');
+  await withPage(async ({ db, page }) => {
+    // Ten statements a pass filed, as the ledger and the history hold them.
+    const version = extractorVersion(db);
+    db.prepare(`INSERT INTO sessions (id, harness, started_at) VALUES ('s', 'claude', '2026-11-01T00:00:00.000Z')`).run();
+    const run = Number(db.prepare(`INSERT INTO extractions (session_id, extractor_version, status, attempts, started_at) VALUES ('s', ?, 'ok', 1, '2026-11-01T00:00:00.000Z')`).run(version).lastInsertRowid);
+    const filed = Array.from({ length: 10 }, (_, i) => add(db, { type: 'preference', body: `ok so / from now on always use tool${i} for builds`, provenance: 'stated', writtenBy: 'scribe', derivedBy: version, runId: run }).memory);
+    // The user tidies the wording of six of them, and keeps every one.
+    for (const m of filed.slice(0, 6)) assert.equal((await post(`${page.url}memories/${m.id}/edit`, { body: m.body.replace('ok so / from now on a', 'A') })).status, 200);
+    const filing = filingState(db);
+    assert.equal(filing.junkRate, 0);
+    assert.equal(filing.paused, false, filing.reason);
+  });
+});

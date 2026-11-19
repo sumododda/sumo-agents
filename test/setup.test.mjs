@@ -385,7 +385,7 @@ test('config refuses an effort the API does not take and a model address that is
     [['config', 'model.url', 'http://mirror.example/x.gguf'], /plain http/],
     [['config', 'chat.notify', 'maybe'], /chat\.notify is on or off/],
     [['config', 'chat.screen', 'slow'], /chat\.screen is full, still or plain/],
-    [['config', 'jobs.floor', 'gpt'], /jobs\.floor is haiku, sonnet, opus or fable/],
+    [['config', 'jobs.floor', 'gpt'], /jobs\.floor is one of haiku, composer, grok, sonnet, opus, fable: the smallest model a job may run on/],
   ]) {
     const run = s.page(args);
     assert.equal(run.code, 2, `${args.join(' ')} → ${run.out}`);

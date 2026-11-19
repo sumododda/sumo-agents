@@ -1,16 +1,19 @@
 // The settings page: every setting on one page, changed with the keys and saved as it changes — no file to edit, and no
 // setting typed by name.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { modelStates } from '../src/catalog.mjs';
+import { pathToFileURL } from 'node:url';
+import { modelStates, setModel } from '../src/catalog.mjs';
 import { createChat } from '../src/chat.mjs';
 import { getMeta, openDb } from '../src/db.mjs';
-import { addServer, readConfig } from '../src/mcp.mjs';
-import { claudeCodeServers, nameFrom, settingsPage } from '../src/settings.mjs';
+import { addServer, readConfig, removeServer } from '../src/mcp.mjs';
+import { REPO_ROOT } from '../src/paths.mjs';
+import { claudeCodeServers, nameFrom, runSettings, settingsPage } from '../src/settings.mjs';
 import { runUi } from '../src/ui.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 import { fakeTty } from './fixtures/fake-tty.mjs';
@@ -43,7 +46,7 @@ const setting = (key) => {
 };
 /** What the page waits on — a server's tools, a download — answered. */
 const settle = () => new Promise((r) => setTimeout(r, 20));
-const page = (options = {}) => settingsPage({ toolsOf: async () => ['search', 'get_issue'], download: async () => 'model     downloaded', claude: () => [], ...options });
+const page = (options = {}) => settingsPage({ toolsOf: async () => ['search', 'get_issue'], download: async () => ({ ok: true, line: 'model     downloaded' }), claude: () => [], ...options });
 
 test('every setting is on one page, and a change made with the arrow keys is saved at once, what it was and is now said under the frame', async () => {
   await withHome(freshHome(), {}, async () => {
@@ -149,13 +152,14 @@ test('⌫ puts a setting back to its default, and a model something uses cannot 
 test('in the chat the page switches the chat it was opened in too, and says so', async () => {
   await withHome(freshHome(), {}, async () => {
     const routed = [];
-    const p = page({ live: { route: (to) => routed.push(to), servers: () => [], left: () => 'opus · medium   shop (main)' } });
+    // As a chat's route answers: with nothing, the route it is on.
+    const p = page({ live: { route: (to) => routed.push(to), current: () => ({ model: 'opus', effort: 'medium' }), servers: () => [], left: () => 'opus · medium   shop (main)' } });
     assert.match(shown(p), /^ {2}opus · medium {3}shop \(main\) +↑↓ move/m, 'the chat\'s status beside the keys');
     onRow(p, 'Effort');
     p.key('right');
     onRow(p, 'Model');
     p.key('left');
-    assert.deepEqual(routed, ['opus high', 'sonnet high']);
+    assert.deepEqual(routed, ['opus high', 'sonnet'], 'the effort with the model the chat is on; the model alone, which keeps the effort');
     assert.match(shown(p), /✓ saved · model: opus → sonnet · this chat too/);
   });
 });
@@ -339,4 +343,174 @@ test('sumo config without a terminal prints the settings, --json as one object; 
   assert.equal(s.sumo(['config']).out, listed.out, 'nothing was changed by any of them');
   const fromShell = s.sumo(['config', 'jobs.review', 'all'], { extraEnv: { SUMO_TOOL: '1' } });
   assert.match(fromShell.err, /the model's shell does not change what the user controls/);
+});
+
+test('a change on the page moves only what it changes in the chat it was opened in: a model picked there with /model stays when the effort changes', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    try {
+      const session = createChat(db, { model: 'opus', effort: 'medium', cwd: tmpdir(), send: async () => assert.fail('no model is asked'), out: () => {}, watch: () => {}, now: () => NOW });
+      session.start('startup');
+      session.route('sonnet low');
+      const p = page({ live: { route: (to) => session.route(to), current: () => ({ model: session.model, effort: session.effort }), servers: () => [], left: () => '' } });
+      onRow(p, 'Effort');
+      p.key('right');
+      assert.equal(session.route(''), 'sonnet/high', 'the effort changed; the model picked with /model stayed');
+      assert.equal(setting('chat.effort'), 'high');
+      onRow(p, 'Model');
+      p.key('right');
+      assert.equal(session.route(''), 'fable/high', 'the model changed; the effort stayed');
+      session.route('auto');
+      onRow(p, 'Effort');
+      p.key('right');
+      assert.equal(session.route(''), 'auto', 'a chat on auto stays there: the router picks its effort each turn');
+      assert.match(shown(p), /✓ saved · effort: high → xhigh · this chat is on auto, which picks the effort each turn/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("a server's allow list changed elsewhere while its tools are open is said, never a crash", async () => {
+  await withHome(freshHome(), {}, async () => {
+    addServer('demo', { command: 'demo-server', args: [] });
+    const p = page({ toolsOf: async () => ['echo'] });
+    onRow(p, 'demo');
+    p.key('enter');
+    await settle();
+    // Another sumo, or the page in another terminal, takes it away.
+    removeServer('demo');
+    p.key('right');
+    assert.match(shown(p), /✗ no MCP server called demo/);
+    p.key('a');
+    assert.match(shown(p), /✗ no MCP server called demo/);
+    assert.equal(p.closed, false, 'the page is still there to go back from');
+  });
+});
+
+test('a variable that is no token is taken as it is, from the page and from Claude Code; one that is a token is refused', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const p = page();
+    p.paste('npx -y some-server');
+    press(p, 'down', 'down', 'right', 'down');
+    p.paste('LOG_LEVEL=info');
+    press(p, 'down', 'enter');
+    assert.deepEqual(readConfig().mcpServers.some, { command: 'npx', args: ['-y', 'some-server'], env: { LOG_LEVEL: 'info' } });
+    const q = page();
+    q.paste('npx -y other-server');
+    press(q, 'down', 'down', 'right', 'down');
+    q.paste(`GITHUB_TOKEN=ghp_${'a'.repeat(36)}`);
+    press(q, 'down', 'enter');
+    assert.match(shown(q), /✗ a token typed here would be stored/);
+    assert.equal(readConfig().mcpServers.other, undefined);
+    const dir = mkdtempSync(join(tmpdir(), 'sumo-claude-'));
+    writeFileSync(join(dir, '.claude.json'), JSON.stringify({ mcpServers: { plain: { command: 'node', args: ['s.js'], env: { LOG_LEVEL: 'info' } }, leaky: { command: 'node', args: ['s.js'], env: { GITHUB_TOKEN: `ghp_${'a'.repeat(36)}` } } } }));
+    const [plain, leaky] = claudeCodeServers('/work/here', { CLAUDE_CONFIG_DIR: dir });
+    assert.equal(plain.why, null, 'a log level is no token');
+    assert.match(leaky.why, /its environment holds a token/);
+  });
+});
+
+test('under NO_COLOR the cursor in a field is still drawn: reverse video is not colour', () => {
+  const home = freshHome();
+  const script = `import { render } from 'ink';
+import { createElement as h } from 'react';
+import { EventEmitter } from 'node:events';
+import { settingsPage, SettingsView } from ${JSON.stringify(pathToFileURL(join(REPO_ROOT, 'src', 'settings.mjs')).href)};
+const p = settingsPage({ claude: () => [] });
+p.paste('npx -y thing');
+let out = '';
+const stdout = Object.assign(new EventEmitter(), { columns: 80, rows: 30, isTTY: true, write: (s, cb) => { out += s; if (typeof cb === 'function') cb(); return true; } });
+render(h(SettingsView, { page: p, columns: 80, rows: 30 }), { stdout, interactive: false, patchConsole: false }).unmount();
+process.stdout.write(JSON.stringify(out));`;
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { cwd: REPO_ROOT, encoding: 'utf8', env: { ...process.env, SUMO_AGENTS_HOME: home, NO_COLOR: '1', FORCE_COLOR: '0' } });
+  const drawn = JSON.parse(run.stdout || '""');
+  assert.match(drawn, /npx -y thing/, run.stderr);
+  assert.ok(drawn.includes('\x1b[7m \x1b[27m'), 'the cursor after what was typed, in reverse video');
+  assert.doesNotMatch(drawn, /\x1b\[3\dm/, 'and no colour');
+});
+
+test('tab completes a folder even when a link that leads nowhere starts the same way', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'sumo-complete-')));
+    mkdirSync(join(dir, 'projects'));
+    symlinkSync(join(dir, 'nowhere'), join(dir, 'proj-old'));
+    const p = page();
+    onRow(p, 'New ones go in');
+    p.key('enter');
+    p.key('backspace');
+    p.paste(`${dir}/pro`);
+    p.key('tab');
+    assert.match(shown(p, { columns: 200 }), new RegExp(`New ones go in\\s+${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/projects/`));
+  });
+});
+
+test('the smallest model a job may run on is any model a job runs on: → reaches composer when it is on', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const db = openDb();
+    setModel(db, 'composer', true);
+    db.close();
+    const p = page();
+    onRow(p, 'Smallest model');
+    p.key('right');
+    assert.equal(setting('jobs.floor'), 'composer');
+    assert.match(shown(p), /✓ saved · smallest model: haiku → composer/);
+  });
+});
+
+test('a new local model is downloaded first: the one in use stays until it is here, and one that never comes changes nothing', async () => {
+  await withHome(freshHome(), {}, async () => {
+    let finish;
+    const asked = [];
+    const p = page({ download: (url) => (asked.push(url), new Promise((r) => (finish = r))) });
+    onRow(p, 'Local model');
+    p.key('enter');
+    p.paste('https://example.com/org/repo/resolve/main/Other-8B.gguf');
+    p.key('enter');
+    assert.deepEqual(asked, ['https://example.com/org/repo/resolve/main/Other-8B.gguf']);
+    assert.equal(setting('model.url'), null, 'not stored while it downloads');
+    assert.match(shown(p), /downloading Other-8B… — the model in use stays until it is here/);
+    finish({ ok: false, line: 'could not download the router model from https://example.com/…: GET → HTTP 404' });
+    await settle();
+    assert.equal(setting('model.url'), null, 'nor after a download that failed');
+    assert.match(shown(p), /✗ could not download the router model/);
+    assert.match(shown(p), /Local model\s+Qwen3-4B-Q4_K_M/, 'the row says the one in use');
+    assert.deepEqual(p.summary(), [], 'nothing changed');
+  });
+});
+
+test('sumo config closed while a model downloads says so, and waits for it rather than leaving the terminal silent', async () => {
+  await withHome(freshHome(), {}, async () => {
+    const tty = fakeTty({ columns: 100, rows: 40 });
+    const said = [];
+    const write = tty.stdout.write.bind(tty.stdout);
+    tty.stdout.write = (frame, ...rest) => (said.push(String(frame)), write(frame, ...rest));
+    let finish;
+    const ran = runSettings({ stdin: tty.stdin, stdout: tty.stdout, download: () => new Promise((r) => (finish = r)), claude: () => [] });
+    // Each key waits for the screen it leads to, by the clock: on CI's slower machine a frame came later than the next key,
+    // which went past the row or pasted before the field was open, and no download ever began.
+    const until = async (seen, ms = 10_000) => {
+      for (const end = Date.now() + ms; Date.now() < end && !seen(); ) await new Promise((r) => setTimeout(r, 10));
+      return seen();
+    };
+    await until(() => /Local model/.test(tty.screen()));
+    for (let i = 0; i < 30 && !/› Local model/.test(tty.screen()); i++) {
+      const before = tty.screen();
+      await tty.type(DOWN);
+      await until(() => tty.screen() !== before, 2000);
+    }
+    assert.match(tty.screen(), /› Local model/);
+    const row = tty.screen();
+    await tty.type('\r');
+    await until(() => tty.screen() !== row);
+    await tty.type('\x1b[200~https://example.com/m/Other-8B.gguf\x1b[201~');
+    await until(() => /Other-8B\.gguf/.test(tty.screen()));
+    await tty.type('\r');
+    assert.ok(await until(() => /downloading Other-8B/.test(tty.screen())), tty.screen());
+    await tty.type(ESC);
+    await until(() => said.some((s) => /still downloading/.test(s)));
+    assert.ok(said.some((s) => /still downloading Other-8B — the model in use stays until it is here; Ctrl-C stops it and changes nothing/.test(s)), said.join(''));
+    finish({ ok: true, line: 'model     /m/Other-8B.gguf (8 B, downloaded)' });
+    assert.deepEqual(await ran, ['saved: local model Qwen3-4B-Q4_K_M → Other-8B'], 'said once it is here');
+  });
 });

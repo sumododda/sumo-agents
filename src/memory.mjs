@@ -150,7 +150,7 @@ function noteEvent(db, id, op, { actor = 'sumo', runId = null, reason = null, no
  * Stores one memory. Returns it with any active memories that look like the
  * same statement, so the caller can supersede instead of piling up duplicates.
  * `derivedBy` is the extractor version that drew it from the journal (absent: primary, the user's to keep);
- * `runId` is the extractions row of the pass that filed it.
+ * `runId` is the extractions row of the pass that filed it; `edit` says the memory it supersedes is this one reworded.
  */
 export function add(db, input) {
   if (!TYPES.includes(input.type)) {
@@ -210,7 +210,8 @@ export function add(db, input) {
       );
     const id = Number(lastInsertRowid);
     noteEvent(db, id, 'added', { actor: writer, runId, now });
-    if (replaced) markSuperseded(db, replaced.id, id, now, { actor: writer, runId });
+    // An edit is the user keeping the memory in other words: its history says so, and it is never counted as thrown out.
+    if (replaced) markSuperseded(db, replaced.id, id, now, { actor: writer, runId, op: input.edit ? 'edited' : 'superseded' });
 
     return { memory: get(db, id), similar, redacted };
   });
@@ -230,14 +231,14 @@ function noteRetired(db, id) {
 /** Whether a scanned fact with this text was let go by someone other than the scanner. */
 export const scanRetired = (db, scope, scanKey, body) => getMeta(db, retiredKey(scope, scanKey)) === digestOf(body);
 
-function markSuperseded(db, oldId, newId, now, { actor, runId } = {}) {
+function markSuperseded(db, oldId, newId, now, { actor, runId, op = 'superseded' } = {}) {
   noteRetired(db, oldId);
   db.prepare(`UPDATE memories SET state = 'superseded', superseded_by = ?, invalid_at = ? WHERE id = ?`).run(
     newId,
     now,
     oldId,
   );
-  noteEvent(db, oldId, 'superseded', { actor, runId, reason: `by m${newId}`, now });
+  noteEvent(db, oldId, op, { actor, runId, reason: `by m${newId}`, now });
 }
 
 /** Links two memories that already exist: `oldId` stops being true because of `newId`. `actor` and `runId` say who asked, and in which pass. */

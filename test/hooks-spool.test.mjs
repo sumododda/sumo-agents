@@ -325,3 +325,49 @@ test('hooks draining the same spool at the same moment replay every line once: n
   });
   assert.deepEqual(status(s), { waiting: 0, bad: 0 });
 });
+
+test('a line a hook sets aside while sumo memory check --fix is trying the others again is kept: the file is taken by a rename, never written over under a writer', async () => {
+  const { retrySetAside } = await import('../src/spool.mjs');
+  await withHome(freshHome(), {}, () => {
+    const event = (session, text) => ({ v: 1, at: '2026-11-17T10:00:00.000Z', event: 'prompt', harness: 'claude', session_id: session, cwd: null, transcript_path: null, text });
+    spoolEvent(event('old', 'set aside an hour ago'));
+    drainSpool(() => {
+      throw Object.assign(new Error('not an event this version replays'), { bad: true });
+    });
+    assert.deepEqual(spoolStatus(), { waiting: 0, bad: 1 });
+    // While the old line replays, another process's hook sets one of its own aside.
+    spoolEvent(event('new', 'set aside just now'));
+    const out = retrySetAside((entry) => {
+      if (entry.session_id === 'old') {
+        drainSpool(() => {
+          throw Object.assign(new Error('not an event this version replays'), { bad: true });
+        });
+      }
+    });
+    assert.deepEqual(out, { replayed: 1, left: 0 });
+    assert.deepEqual(spoolStatus(), { waiting: 0, bad: 1 }, 'the line set aside meanwhile is still there, and counted');
+    assert.deepEqual(linesOf(join(process.env.SUMO_AGENTS_HOME, 'spool', 'events.bad.jsonl')).map((b) => JSON.parse(b.line).text), ['set aside just now']);
+  });
+});
+
+test('a purge never drops an event a hook adds while it reads the spool: what is waiting is taken by a rename, and what it keeps goes back as lines', async () => {
+  const { purgeSpool } = await import('../src/spool.mjs');
+  await withHome(freshHome(), {}, () => {
+    const event = (text) => ({ v: 1, at: '2026-11-17T10:00:00.000Z', event: 'prompt', harness: 'claude', session_id: 's', cwd: null, transcript_path: null, text });
+    spoolEvent(event('we use bun for every install in slate'));
+    spoolEvent(event('keep this one'));
+    let added = false;
+    const gone = purgeSpool((text) => {
+      // A hook, mid-purge, keeps a turn of its own.
+      if (!added) {
+        added = true;
+        spoolEvent(event('said while the purge was reading'));
+      }
+      return text === 'we use bun for every install in slate';
+    });
+    assert.equal(gone, 1);
+    const dir = join(process.env.SUMO_AGENTS_HOME, 'spool');
+    assert.deepEqual(readdirSync(dir).flatMap((name) => linesOf(join(dir, name))).map((e) => e.text).sort(), ['keep this one', 'said while the purge was reading']);
+    assert.deepEqual(readdirSync(dir), ['events.jsonl'], 'all of it waiting where a hook looks');
+  });
+});

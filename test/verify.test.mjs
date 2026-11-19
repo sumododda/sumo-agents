@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { ENTRY } from '../src/paths.mjs';
 import { verifyCommands } from '../src/scan.mjs';
+import { diffStat, snapshot } from '../src/verify.mjs';
 import { sandbox } from './helpers.mjs';
 
 const TASK = `## Goal
@@ -151,6 +152,58 @@ test('unidentifiable failures keep both logs and require explicit acceptance', (
   assert.equal(done.code, 1);
   assert.match(done.err, /cannot be verified.*baseline-test\.txt.*verify-test\.txt.*--accept/s);
   for (const file of ['baseline-test.txt', 'verify-test.txt']) assert.ok(existsSync(join(s.home, 'jobs', '1', file)));
+});
+
+/** A suite already red when the job began, its runner's output standing in `status`; the job leaves the runner saying `after`. */
+function redThen(before, after) {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const p = gitProject(s, { status: before, recipe: '@cat status; exit 1' });
+  newWorker(s);
+  assert.match(s.sumo(['job', 'baseline', '1']).out, /ALREADY FAILS/);
+  p.write('status', `${after}\n`);
+  return finish(s);
+}
+
+test('a new failure in a suite already red is seen however its runner names it: a pytest error, a Go package that no longer builds, a unittest case under the same count, a node test of the same name in another file', () => {
+  const cases = [
+    ['pytest', 'FAILED tests/test_a.py::test_x - assert 1 == 2\n==== 1 failed, 1 passed in 0.01s ====', 'FAILED tests/test_a.py::test_x - assert 1 == 2\nERROR tests/test_a.py::test_y - RuntimeError: broken by the job\n==== 1 failed, 1 error in 0.02s ===='],
+    ['go', '--- FAIL: TestRed (0.00s)\nFAIL\nFAIL\texample/a\t0.185s\nok  \texample/b\t0.197s\nFAIL', '# example/b [example/b.test]\nb/b.go:2:25: cannot use "two" as int value\n--- FAIL: TestRed (0.00s)\nFAIL\nFAIL\texample/a\t0.191s\nFAIL\texample/b [build failed]\nFAIL'],
+    ['unittest', 'FAIL: test_f (test_app.A.test_f)\nRan 2 tests in 0.000s\nFAILED (failures=1)', 'FAIL: test_g (test_app.A.test_g)\nRan 2 tests in 0.000s\nFAILED (failures=1)'],
+    ['node', '✖ works (0.84ms)\nℹ fail 1\n✖ failing tests:\n\ntest at a.test.mjs:4:1\n✖ works (0.84ms)', '✖ works (0.51ms)\nℹ fail 1\n✖ failing tests:\n\ntest at b.test.mjs:4:1\n✖ works (0.51ms)'],
+  ];
+  for (const [runner, before, after] of cases) {
+    const done = redThen(before, after);
+    assert.equal(done.code, 1, `${runner}: ${done.out}`);
+    assert.match(done.err, /fails with a new failure/, runner);
+  }
+});
+
+test('a suite already red whose failures its names do not account for, or whose runner stopped at the first failing target, leaves DONE open for the user', () => {
+  const cases = [
+    ['a count over the names', 'FAILED tests/test_a.py::test_x - assert 1 == 2\n==== 1 failed in 0.01s ====', 'FAILED tests/test_a.py::test_x - assert 1 == 2\n==== 2 failed in 0.02s ===='],
+    ['a count line, which names no test', 'Ran 2 tests in 0.000s\nFAILED (failures=1)', 'Ran 2 tests in 0.000s\nFAILED (failures=1)'],
+    ['cargo stopped at the first failing target', ...Array(2).fill('     Running unittests src/lib.rs (target/debug/deps/demo-1)\ntest tests::already_red ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\nerror: test failed, to rerun pass `--lib`')],
+  ];
+  for (const [why, before, after] of cases) {
+    const done = redThen(before, after);
+    assert.equal(done.code, 1, `${why}: ${done.out}`);
+    assert.match(done.err, /cannot be verified — `make test` failed, but its failing cases could not be compared/, why);
+  }
+});
+
+test('a runner that prints how long a failing test took, as vitest does, is judged by the test and not by its time', () => {
+  const done = redThen(' FAIL  a.test.js > adds\n   × adds 50ms\n      Tests  1 failed | 1 passed (2)', ' FAIL  a.test.js > adds\n   × adds 17ms\n      Tests  1 failed | 1 passed (2)');
+  assert.equal(done.code, 0, done.err);
+  assert.match(done.out, /`make test` was already failing/);
+});
+
+test('a Rust crate is checked with every test target run, not stopped at the first one that fails', () => {
+  const s = sandbox();
+  const dir = join(s.root, 'crate');
+  mkdirSync(dir);
+  writeFileSync(join(dir, 'Cargo.toml'), '[package]\nname = "demo"\n');
+  assert.deepEqual(verifyCommands(dir).map((c) => c.command), ['cargo test --no-fail-fast']);
 });
 
 test('a baseline taken after the first edit is refused, because it would call the job\'s own breakage "already there"', () => {
@@ -539,18 +592,18 @@ test('two checks of one name are told apart: each is judged against its own base
   const withBin = { extraEnv: { PATH: `${bin}:${process.env.PATH}` } };
 
   s.sumo(['job', 'new', '--project', 'mixed', '--title', 'x'], { input: TASK });
-  assert.match(s.sumo(['job', 'baseline', '1'], withBin).out, /^`cargo test` passes\n`pytest` ALREADY FAILS/);
+  assert.match(s.sumo(['job', 'baseline', '1'], withBin).out, /^`cargo test --no-fail-fast` passes\n`pytest` ALREADY FAILS/);
   writeFileSync(join(dir, 'rust-status'), 'broken\n');
   pastCheck(s);
   const refused = s.sumo(['job', 'finish', '1', '--status', 'DONE'], { input: REPORT, ...withBin });
   assert.equal(refused.code, 1, refused.out);
-  assert.match(refused.err, /blocking: `cargo test` fails, and it passed when this job began/);
+  assert.match(refused.err, /blocking: `cargo test --no-fail-fast` fails, and it passed when this job began/);
   const logs = readdirSync(join(s.home, 'jobs', '1')).filter((f) => f.endsWith('.txt')).sort();
   // A failing check is run once more — at the baseline the one already failing, at the end the one that passed then — and that run's log sits beside its first.
   assert.deepEqual(logs, ['baseline-test-2-again.txt', 'baseline-test-2.txt', 'baseline-test.txt', 'verify-test-2.txt', 'verify-test-again.txt', 'verify-test.txt']);
   assert.match(readFileSync(join(s.home, 'jobs', '1', 'baseline-test-2-again.txt'), 'utf8'), /^\$ pytest\npytest ran/);
-  assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test-again.txt'), 'utf8'), /^\$ cargo test\ncargo ran/);
-  assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test.txt'), 'utf8'), /^\$ cargo test\ncargo ran/);
+  assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test-again.txt'), 'utf8'), /^\$ cargo test --no-fail-fast\ncargo ran/);
+  assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test.txt'), 'utf8'), /^\$ cargo test --no-fail-fast\ncargo ran/);
   assert.match(readFileSync(join(s.home, 'jobs', '1', 'verify-test-2.txt'), 'utf8'), /^\$ pytest\npytest ran/);
 });
 
@@ -745,4 +798,37 @@ test("a checker's own settings changed by the job are put in front of a person",
   const done = finish(s);
   assert.equal(done.code, 0, done.err);
   assert.match(done.out, /^ {2}look at: a checker's settings were changed: tsconfig\.json — see that nothing it checked was loosened$/m);
+});
+
+test("sumo's own git never runs what a repository planted in the project names: a gitlink with an fsmonitor in its config, `.gitmodules` asking git to look into it, and sumo making a job and taking where it starts — while the submodule's commit moving is still seen", () => {
+  const s = sandbox();
+  s.routerWillSay('sonnet', 'medium');
+  const { dir, git } = gitProject(s);
+  const ran = join(s.root, 'fsmonitor-ran');
+  // What the model's shell could leave: a repository of its own, its commit in the project's index, and its config naming a command.
+  const own = (...args) => spawnSync('git', ['-C', join(dir, 'm'), '-c', 'core.fsmonitor=false', '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { encoding: 'utf8' });
+  spawnSync('git', ['init', '-q', join(dir, 'm')]);
+  own('commit', '-q', '--allow-empty', '-m', 'one');
+  git('update-index', '--add', '--cacheinfo', `160000,${own('rev-parse', 'HEAD').stdout.trim()},m`);
+  git('commit', '-q', '-m', 'the submodule');
+  writeFileSync(join(dir, '.gitmodules'), '[submodule "m"]\n\tpath = m\n\turl = ./m\n\tignore = none\n');
+  own('config', 'core.fsmonitor', `touch ${ran}`);
+  // The planted command does run for a git that looks into the submodule: the test would prove nothing otherwise.
+  spawnSync('git', ['-C', dir, 'status', '--porcelain'], { encoding: 'utf8' });
+  assert.equal(existsSync(ran), true, 'a plain git status runs it');
+  unlinkSync(ran);
+
+  const snap = snapshot(dir);
+  assert.equal(newWorker(s).code, 0, 'a job is made — its brief takes where things stand, and its start is snapshotted');
+  own('commit', '-q', '--allow-empty', '-m', 'two');
+  assert.match(diffStat(dir, snap, 10), /\bm\b/, 'the submodule moving to another commit is still a change');
+  assert.equal(existsSync(ran), false, "nothing the planted repository names ran in sumo's own git");
+});
+
+
+test('output shaped to make a pattern backtrack — a unittest count line or a failure name of key=value runs thousands long — is read at once', () => {
+  const started = Date.now();
+  const done = redThen(`FAILED (0=${'9'.repeat(20_000)}x\nFAIL 0=${'900'.repeat(20_000)}!`, `FAILED (0=${'9'.repeat(20_000)}x\nFAIL 0=${'900'.repeat(20_000)}!`);
+  assert.ok(Date.now() - started < 5000, `read in ${Date.now() - started} ms`);
+  assert.equal(typeof done.out, 'string');
 });

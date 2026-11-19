@@ -402,17 +402,19 @@ const MIGRATIONS = [
                CASE state WHEN 'superseded' THEN 'superseded' WHEN 'invalid' THEN 'forgotten' ELSE 'rejected' END, 'unknown', 'backfilled'
         FROM memories WHERE state IN ('superseded', 'invalid', 'rejected') ORDER BY id;
 
-      -- The guesses still waiting, rejected once. The event first: it names the rows while they are still waiting.
-      INSERT INTO memory_events (ts, memory_id, op, actor, reason)
-        SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), id, 'rejected', 'migration', 'a guess still waiting when guesses stopped being kept'
-        FROM memories WHERE state = 'unconfirmed' AND held_for IS NULL ORDER BY id;
-      UPDATE memories SET state = 'rejected', invalid_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        WHERE state = 'unconfirmed' AND held_for IS NULL;
-
       -- A conversation the old writer had read to its end is not read again as if new.
       INSERT INTO extractions (session_id, extractor_version, status, attempts, first_turn, last_turn, started_at, ended_at)
         SELECT session_id, 'v0', 'ok', 1, MIN(id), MAX(id), MIN(ts), MAX(ts) FROM user_turns GROUP BY session_id HAVING MIN(scribed) = 1;
     `);
+    // The guesses still waiting, rejected once, at one moment: the history's line and the row say the same time. The
+    // event first: it names the rows while they are still waiting.
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO memory_events (ts, memory_id, op, actor, reason)
+         SELECT ?, id, 'rejected', 'migration', 'a guess still waiting when guesses stopped being kept'
+         FROM memories WHERE state = 'unconfirmed' AND held_for IS NULL ORDER BY id`,
+    ).run(now);
+    db.prepare("UPDATE memories SET state = 'rejected', invalid_at = ? WHERE state = 'unconfirmed' AND held_for IS NULL").run(now);
   },
   // 17: two things migration 16 got wrong, mended for a database that has had it — 16 itself stays as it ran.
   (db) => {
@@ -516,7 +518,12 @@ function opened(file) {
     db.close();
     throw new Error(`the database is from a newer sumo (schema ${found}; this one knows ${MIGRATIONS.length}) — upgrade: npm update -g sumo-agents`);
   }
-  if (found > 0 && found < MIGRATIONS.length) copyAside(db, file, found);
+  try {
+    if (found > 0 && found < MIGRATIONS.length) copyAside(db, file, found);
+  } catch (cause) {
+    db.close();
+    throw cause;
+  }
   migrate(db);
   return db;
 }
@@ -530,7 +537,8 @@ const HALF_MADE_MS = 60_000;
  * The database as it is, copied beside it before it is migrated — `<db>.pre-v<N>.bak`, N the version it was at — so an
  * upgrade that goes wrong can be undone by hand. VACUUM INTO writes a consistent copy while others read; it writes into
  * a file made empty and private first, so the copy is never readable by others for a moment. A copy already there was
- * made by a process that got here first. One that cannot be made is let go: the migrations only add.
+ * made by a process that got here first. One that cannot be made stops the upgrade, said with why: a migration also
+ * changes rows (16 rejected the guesses still waiting), and none runs without the copy that would undo it.
  */
 function copyAside(db, file, version) {
   const copy = `${file}.pre-v${version}.bak`;
@@ -542,16 +550,19 @@ function copyAside(db, file, version) {
   } catch {
     // Not there: the usual case.
   }
+  const refused = (cause) =>
+    new Error(`the database could not be copied aside before upgrading it (${cause.code ?? cause.message}) — nothing was changed: it is still at schema ${version}, and sumo runs again once a copy can be written beside it (free some disk space): ${file}`, { cause });
   try {
     closeSync(openSync(copy, 'wx', 0o600));
-  } catch {
-    return;
+  } catch (cause) {
+    if (cause.code === 'EEXIST') return;
+    throw refused(cause);
   }
   try {
     db.exec(`VACUUM INTO '${copy.replaceAll("'", "''")}'`);
-  } catch {
+  } catch (cause) {
     rmSync(copy, { force: true });
-    return;
+    throw refused(cause);
   }
   const mine = `${basename(file)}.pre-v`;
   const copies = readdirSync(dirname(file))

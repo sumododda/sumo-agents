@@ -177,6 +177,30 @@ test("a first attempt sumo told to close — near its budget or its time — and
   });
 });
 
+test('a worker whose DONE cannot be verified here is told to ask the user to accept it, and the FAILED it may close on instead is not retried one step up', async () => {
+  await inProcess(async ({ db, root }) => {
+    // Nothing here declares a check, so no DONE can be verified: a retry on a dearer route would meet the same wall.
+    const dir = join(root, 'unchecked');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'src.js'), SRC);
+    addProject(db, dir, { slug: 'unchecked', now: NOW });
+    const { job } = await newJob(db, { project: 'unchecked', title: 'return 2', task: TASK, now: NOW });
+    const ran = await runFollowed(
+      db,
+      job.id,
+      async (id) => {
+        assert.throws(() => done(db, id), /cannot be verified — this project declares no check.*a job asks the user to accept it — the ask tool — and does not finish FAILED for this/s);
+        finish(db, id, { status: 'FAILED', report: '## Summary\nIt could not be verified here.\n' }, NOW);
+        return 'closed';
+      },
+      { now: () => NOW },
+    );
+    assert.deepEqual(ran.map((step) => step.id), [job.id, null]);
+    assert.match(ran[1].line, new RegExp(`^j${job.id} failed on sonnet/medium after its DONE could not be verified here: it is not retried one step up, which would meet the same wall\\.`));
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM jobs WHERE retry_of IS NOT NULL').get().n, 0, 'no retry was made');
+  });
+});
+
 test('what a job left running in the background is stopped before its worktree is settled: nothing of it is there when the change lands', async () => {
   await inProcess(async ({ db, p, root }) => {
     await newJob(db, { project: 'proj', title: 'first', task: TASK, now: NOW });

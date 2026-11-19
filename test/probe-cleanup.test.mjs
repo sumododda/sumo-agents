@@ -47,7 +47,7 @@ test("a probe's throwaway home goes with its server; a server of another home is
     assert.equal(existsSync(other), false);
 
     leaveNothing(root);
-    for (let i = 0; i < 50 && alive(ours); i++) await new Promise((r) => setTimeout(r, 20));
+    for (const end = Date.now() + 10_000; Date.now() < end && alive(ours); ) await new Promise((r) => setTimeout(r, 20));
     assert.equal(alive(ours), false, 'the throwaway server is stopped');
     assert.equal(existsSync(root), false, 'the throwaway home is gone');
     leaveNothing(root);

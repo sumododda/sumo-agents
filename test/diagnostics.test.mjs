@@ -2,7 +2,7 @@
 // crash leaves behind, the report doctor bundles, and the home kept private — logs that never grow without end.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { appendLog, LOG_ROTATE_BYTES, rotate, trimLog } from '../src/logs.mjs';
@@ -43,7 +43,7 @@ test('help opens on what sumo is now, and a mistyped command is answered with th
   const s = sandbox();
   const help = s.sumo(['help']);
   assert.match(help.out, /^sumo — one chat across your projects, memory that lasts/);
-  assert.match(help.out, /sumo --version/);
+  assert.match(help.out, /sumo version/);
   assert.match(help.out, /sumo doctor \[--fix\] \[--report\]/);
   const typo = s.sumo(['serch', 'tabs']);
   assert.equal(typo.code, 2);
@@ -191,6 +191,9 @@ test('doctor checks the shell sandbox, git, and says when an old mcp.json could 
   if (process.platform === 'darwin') assert.match(ok.out, /^ok {4}shell sandbox \(\/usr\/bin\/sandbox-exec\)$/m);
   assert.match(ok.out, /^ok {4}git on PATH$/m);
   assert.match(ok.out, /^FAIL {2}MCP servers moved from mcp\.json — .*mcp\.json.* — add them on the settings page \(sumo config\), then delete the file$/m);
+  // Done as it says: the file deleted, there is nothing left to fail on.
+  rmSync(join(s.home, 'mcp.json'));
+  assert.doesNotMatch(s.sumo(['doctor']).out, /MCP servers moved/, 'the advice taken, the failure goes');
   const noGit = s.sumo(['doctor'], { extraEnv: { PATH: '/nonexistent' } });
   assert.match(noGit.out, /^warn {2}git on PATH — /m);
 });

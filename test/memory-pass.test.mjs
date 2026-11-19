@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { startOf } from '../src/scribe.mjs';
 import { sandbox } from './helpers.mjs';
 
 /** A memory from before the week began: with it, and no tidy yet, the weekly tidy is due. */
@@ -68,4 +69,47 @@ test('the memory page is the user\'s: from the model\'s shell it is refused, not
   const tool = s.sumo(['memory'], { extraEnv: { SUMO_TOOL: '1' } });
   assert.equal(tool.code, 1);
   assert.match(tool.err, /the memory page is the user's: they open it with \/memory in the chat, or sumo memory/);
+});
+
+test('a pass asked for by hand while another pass holds the lock reads nothing, says so and exits 1: a script can tell it did not run', () => {
+  const s = sandbox();
+  s.hook('prompt', { session_id: 'a', prompt: 'from now on always squash merge on github' });
+  s.hook('session-end', { session_id: 'a', reason: 'other' });
+  s.modelWillSay([]);
+  // This test's own process holds it, as a pass at work would: its pid, and when it started.
+  const started = startOf(process.pid);
+  writeFileSync(join(s.home, 'scribe.lock'), `${process.pid} ${started}`);
+  const run = s.sumo(['memory', 'run']);
+  assert.equal(run.code, 1, run.out + run.err);
+  assert.match(run.out, /^nothing to do — another run is in progress/m);
+  assert.equal(s.sql((db) => db.prepare('SELECT COUNT(*) AS n FROM extractions').get().n), 0, 'nothing was read');
+});
+
+test('a pass left running by a process that died is closed as failed by the next pass, also one that finds the pass turned off: the check does not fail for ever over a pass that cannot run', () => {
+  const s = sandbox();
+  s.hook('prompt', { session_id: 'a', prompt: 'from now on always squash merge on github' });
+  s.sql((db) => {
+    db.prepare(`INSERT INTO extractions (session_id, extractor_version, status, attempts, first_turn, last_turn, started_at) VALUES ('a', 'abc12345', 'running', 1, 1, 1, '2026-01-01T00:00:00.000Z')`).run();
+    db.prepare(`INSERT INTO meta (key, value) VALUES ('config.memory.model', 'off')`).run();
+  });
+  assert.match(s.sumo(['memory', 'check']).out, /left running by a process that died/);
+  assert.match(s.sumo(['memory', 'run']).out, /memory\.model is off/);
+  assert.deepEqual(s.sql((db) => db.prepare('SELECT status, error FROM extractions').all().map((r) => ({ ...r }))), [{ status: 'failed', error: 'the pass that started it died before it finished' }]);
+  assert.match(s.sumo(['memory', 'check']).out, /^ok +no memory pass was left unfinished$/m);
+});
+
+test('each batch of a pass is stamped when it started and when it ended, not when the pass began: a pass long at work never looks to the check like one that died', () => {
+  const s = sandbox();
+  for (const id of ['a', 'b', 'c']) {
+    s.hook('prompt', { session_id: id, prompt: `from now on always squash merge on github in ${id}` });
+    s.hook('session-end', { session_id: id, reason: 'other' });
+  }
+  s.modelWillSay([]);
+  assert.equal(s.sumo(['memory', 'run']).code, 0);
+  const rows = s.sql((db) => db.prepare('SELECT started_at, ended_at FROM extractions ORDER BY id').all().map((r) => ({ ...r })));
+  assert.equal(rows.length, 3);
+  for (const [i, row] of rows.entries()) {
+    assert.ok(row.ended_at >= row.started_at, `batch ${i} ended after it started`);
+    if (i > 0) assert.ok(row.started_at >= rows[i - 1].ended_at && row.started_at > rows[i - 1].started_at, `batch ${i} started after the one before it ended: ${JSON.stringify(rows)}`);
+  }
 });

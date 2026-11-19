@@ -1,0 +1,43 @@
+# The suite, on every push or merge to main, every pull request, and by hand. Nothing is published from here: a
+# version reaches npm only when a GitHub Release is published (publish.yml), and publish.yml calls this workflow to
+# run the suite again on the exact commit the release names.
+#
+# Hardening (GitHub's security-hardening guide, OpenSSF Scorecard): every action pinned to a commit; no permissions
+# by default, each job only what it uses; the checkout keeps no credentials; no dependency runs an install script;
+# the registry's signatures are checked; every job has a time limit; no expression from the event is ever put into a
+# script.
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+permissions: {}
+# A newer push to a pull request replaces the run in progress; every other run (main's, one started by hand, or a
+# release's) is in a group of its own, so it is never cancelled, nor replaced while it waits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  # The suite on the Node the package promises (engines: 24.6+), on macOS: sumo runs on macOS only, and there the
+  # shell's sandbox — and every test of what it keeps out — runs.
+  test:
+    name: test
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # to check out the code
+    steps:
+      # The commit the event names: main's new head, a pull request's merge, or the commit a release's tag points at.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      # Exactly the lockfile, and no package's install script runs: a compromised dependency gets no code run here.
+      - run: npm ci --ignore-scripts
+      # Every installed package as the registry signed it, and its provenance where it has one.
+      - run: npm audit signatures
+      - run: npm test

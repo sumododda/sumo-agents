@@ -24,7 +24,7 @@ import { asksForWork, coverage, overlap, saysAs, sharedStems, standsAlone, words
  * The rules below as a version: part of the extractor's version (ledger.mjs), so memories derived under other rules
  * can be told apart and rebuilt. Bump it whenever what is accepted, dropped or replaced here changes.
  */
-export const APPLY_RULES = '2026-11-18.6';
+export const APPLY_RULES = '2026-11-18.7';
 
 const STATED_TYPES = ['preference', 'fact', 'decision'];
 const BODY_MAX = 300;
@@ -46,8 +46,8 @@ const SAME_MATTER = 0.75;
 const QUOTE_MAX_WORDS = 40;
 /** A memory the chat saved from a turn is in what is filed from that turn when this share of its words is. */
 const SAID_HERE = 0.8;
-/** A turn of this many paragraphs or more holds something pasted: only its first and last are taken as the user's own. */
-const PASTED_PARAGRAPHS = 3;
+/** A turn of this many lines or more holds something pasted: only its first and last line are taken as the user's own. */
+const PASTED_LINES = 3;
 /** What stands for a line break in a memory's one line: a paragraph of several lines is kept as it was typed, on one. */
 const LINE_BREAK = ' / ';
 /** A turn past this length is mostly something pasted: only what opens or closes it is taken as the user's own. */
@@ -135,17 +135,19 @@ function standsApart(paragraphs, i) {
 
 /**
  * What of a turn a quote stands for, as the user's own words: `{ paragraph }`, the body to store — or `{ why }` it
- * cannot be taken. A quote sits on one line, in a paragraph that holds nothing pasted. A turn that fits in one
- * memory, and holds nothing pasted, is taken whole, whichever paragraph the quote is in: a blank line between what
- * negates and what is negated cuts nothing off. Of a longer turn the quote's paragraph is taken — the first or the
- * last of three or more (a page pasted between what the user typed is a paragraph like any other), opening or closing
- * a turn long enough to be mostly a paste, and only one that stands apart from the paragraph before it.
+ * cannot be taken. A quote sits on one line, in a paragraph that holds nothing pasted, and in a turn of three lines or
+ * more on the first or the last: a page pasted between what the user typed is lines like any other, however short
+ * ("the README says:", the page's line, "thoughts"). A turn that fits in one memory, and holds nothing pasted, is
+ * taken whole: a line break between what negates and what is negated cuts nothing off. Of a longer turn the quote's
+ * paragraph is taken — opening or closing a turn long enough to be mostly a paste, and only one that stands apart
+ * from the paragraph before it.
  */
 function placeOf(text, quote) {
   const sought = folded(quote);
   const paragraphs = paragraphsOf(text);
   const whole = paragraphs.map((p) => p.body).join(LINE_BREAK);
   const fits = whole.length <= BODY_MAX && !paragraphs.some((p) => p.pasted);
+  const lines = paragraphs.flatMap((p) => p.lines);
   const why = { pasted: false, inner: false, middle: false, leaning: false };
   for (const [i, p] of paragraphs.entries()) {
     for (const line of p.lines) {
@@ -153,8 +155,8 @@ function placeOf(text, quote) {
       if (from === -1) continue;
       const [starts, ends] = [line.start + from, line.start + from + sought.length];
       if (p.pasted) why.pasted = true;
+      else if (lines.length >= PASTED_LINES && line !== lines[0] && line !== lines.at(-1)) why.inner = true;
       else if (fits) return { paragraph: whole };
-      else if (paragraphs.length >= PASTED_PARAGRAPHS && i !== 0 && i !== paragraphs.length - 1) why.inner = true;
       else if (text.length > LONG_TURN_CHARS && ends > LONG_TURN_OWN && starts < text.length - LONG_TURN_OWN) why.middle = true;
       // One too long to keep is said to be that, below: the reason that needs no reading of its first letter.
       else if (p.body.length <= BODY_MAX && !standsApart(paragraphs, i)) why.leaning = true;
@@ -162,7 +164,7 @@ function placeOf(text, quote) {
     }
   }
   if (why.middle) return { why: `the quote is from the middle of a long turn: past ${LONG_TURN_CHARS.toLocaleString('en-US')} characters only its first and last ${LONG_TURN_OWN} are taken as the user's own` };
-  if (why.inner) return { why: "the quote is from a paragraph in the middle of a turn of several: only its first and last paragraph are taken as the user's own" };
+  if (why.inner) return { why: "the quote is from a line in the middle of a turn of three lines or more: only its first and last line are taken as the user's own" };
   if (why.leaning) return { why: 'the paragraph does not stand by itself (it follows one that leads into it, is a list, or opens as a continuation), and the turn is too long to keep whole' };
   if (why.pasted) return { why: 'the quote is from a pasted block — code, or a quoted line — or the paragraph it sits in holds one' };
   return { why: 'the quote runs across a line break: a statement is on one line' };
@@ -249,11 +251,13 @@ function lookalike(db, scope, body, exclude) {
 /**
  * The same sentence is often proposed twice from one turn — once by a retry, once by the chat model saving it
  * directly, once by an extractor from before memories were the user's own sentences. A repeat is the same statement,
- * or one drawn from the same words: its quote holds this one's, or this one's holds its.
+ * or one drawn from the same words: its quote holds this one's, or this one's holds its. Only a memory that still
+ * holds it, or one a later statement replaced, is a repeat: one let go is the user's (`letGo` keeps that out) or else
+ * a rebuild's or a migration's, which must not keep the user's own words out for ever.
  */
 function savedFromTurn(db, turnId, scope, body, exclude, quote) {
   if (turnId === null) return null;
-  const fromTurn = db.prepare(`SELECT * FROM memories WHERE source_turn = ? AND scope = ? AND state != 'unconfirmed' AND id IS NOT ?`).all(turnId, scope, exclude ?? null);
+  const fromTurn = db.prepare(`SELECT * FROM memories WHERE source_turn = ? AND scope = ? AND state IN ('active', 'superseded') AND id IS NOT ?`).all(turnId, scope, exclude ?? null);
   const said = typeof quote === 'string' ? normalize(quote) : '';
   const sameWords = (m) => {
     const theirs = m.source_quote ? normalize(m.source_quote) : '';

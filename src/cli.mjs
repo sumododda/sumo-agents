@@ -3,7 +3,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { createInterface } from 'node:readline';
 import { applyOps } from './apply.mjs';
 import { card } from './card.mjs';
-import { knownModel, MODEL_IDS, modelLines } from './catalog.mjs';
+import { ALL_MODELS, cursorKeyIn, knownModel, laneOf, modelId, modelLines } from './catalog.mjs';
 import { openDb } from './db.mjs';
 import { backup, damaged, exportJson, exportMarkdown, liveDatabase, purgeFromBackups, purgeRowFromBackups, restoreCandidate, restoreHint, restoreLines, restoreQuestion } from './export.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
@@ -41,7 +41,7 @@ const HELP = `sumo — one chat across your projects, memory that lasts, and job
   sumo job new --project S --title T [--agent A]       a job, its task on stdin
         by id: run · watch · tell · note · ask · answer · show · brief · baseline · verify · changes
         finish <id> --status DONE|FAILED · abandon · retry · list [--all] · stats
-  sumo prime · sumo --version                          the block a session starts with · which sumo
+  sumo prime · sumo version                            the block a session starts with · which sumo
   sumo export [--json] · sumo backup [restore [file]] · sumo cost [--days N] [--project S]
   sumo config                                          every setting, on one page; /config in a chat
   sumo models · sumo mcp [tools <name>]                the API models · the MCP servers, as set
@@ -120,7 +120,7 @@ sumo job list [--all] [--json]`,
   apply: 'sumo apply <ops.json> [--source scribe|dream]',
   export: 'sumo export [--json]',
   backup: 'sumo backup [restore [file] [--yes]]    (restore: the newest copy, or the one named, put back, the one there kept aside; over a database that is fine it asks first, or --yes)',
-  models: 'sumo models    every model Sumo knows: on or off, its API id, and why — switched on and off, and discovered, on the settings page (sumo config)',
+  models: 'sumo models    every model Sumo knows: on or off, its API id, and why, then the scorecard routing reads — switched on and off, discovered and scored, on the settings page (sumo config)',
   mcp: `sumo mcp                        every server: where it is, its tools or why it failed, what may run unasked
 sumo mcp tools <name>           the server's tools, one a line
         added, removed and allowed on the settings page: /config in the chat, or sumo config`,
@@ -740,7 +740,10 @@ async function runJob(db, { args, flags }) {
     case 'run': {
       // The job runs here, in Sumo's own loop, on the route the router chose; it closes itself the way its brief says.
       // On a terminal the work is shown as it happens — the lines a Herdr pane shows; piped, only how it ended.
-      if (!resolveAnthropicCredential()) {
+      // A job on a Cursor model is run with Cursor's key, and needs no other; one on Claude, with an Anthropic credential.
+      if (laneOf(jobs.getJob(db, id).model ?? '') === 'cursor') {
+        if (!cursorKeyIn()) throw new NeedsCredential(`j${id} not started — it is routed to a Cursor model and this shell has no CURSOR_API_KEY: export it first`);
+      } else if (!resolveAnthropicCredential()) {
         throw new NeedsCredential(`j${id} not started — this shell has no Anthropic credential. Inside the chat, the delegate tool runs it; in a terminal, export CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY first`);
       }
       // The run's own machinery, loaded only for a run: the loop brings the SDK, and no other command needs any of it.
@@ -805,7 +808,7 @@ async function runJob(db, { args, flags }) {
     default: {
       // Taking work unverified is the user's call: never granted from inside a job's own shell, whatever the command looked like.
       if (flags.accept !== undefined && process.env.SUMO_JOB) {
-        throw new Refusal(`Refused: j${process.env.SUMO_JOB} runs this command, and work is never taken unverified on its author's word. Finish FAILED with what blocks verification, or ask.`);
+        throw new Refusal(`Refused: j${process.env.SUMO_JOB} runs this command, and work is never taken unverified on its author's word. ${jobs.ASK_TO_ACCEPT}`);
       }
       const { job, learned, verdict, unverified } = jobs.finish(db, id, { status: String(flags.status ?? '').toUpperCase(), report: stdinText(flags), accept: flags.accept });
       // A worker's plain DONE means the checks agreed; the verdict is in the report. Only the exceptions are said here.
@@ -837,13 +840,17 @@ async function runMemoryCommand(db, { args, flags }) {
   // Nor with no terminal: piped or in a script, nobody is there to look at it, or to press Ctrl-C.
   if (args[0] === undefined && (!process.stdin.isTTY || !process.stdout.isTTY)) throw new UsageError('the memory page runs until Ctrl-C, so it needs a terminal — run sumo memory in one; sumo memory status and sumo search work anywhere');
   if (args[0] === undefined) return runMemoryPage(db);
-  if (args[0] === 'run') return memoryPassLines(await runMemoryPass(db, { tidy: flags.tidy === true, auto: flags.auto === true }), { asked: flags.tidy === true });
+  if (args[0] === 'run') {
+    const pass = await runMemoryPass(db, { tidy: flags.tidy === true, auto: flags.auto === true });
+    // Turned away by another pass holding the lock, it read nothing: a script must not take that for done.
+    return pass.filed.locked ? Object.assign(memoryPassLines(pass), { exitCode: 1 }) : memoryPassLines(pass, { asked: flags.tidy === true });
+  }
   if (args[0] === 'rebuild') {
     // It lets memories go, past the bound with --yes: from the model's shell — this command runs outside the sandbox — only the difference is shown.
     if (fromTool() && flags['dry-run'] !== true) throw new Refusal("rebuilding memory is the user's to do: they run sumo memory rebuild themselves. sumo memory rebuild --dry-run shows what it would change");
     const { rebuild } = await import('./rebuild.mjs');
     const limit = flags.limit === undefined ? undefined : positiveInteger(flags.limit, '--limit needs a positive number');
-    return rebuild(db, { dryRun: flags['dry-run'] === true, since: dayFlag(flags.since, '--since', { back: true }), limit, yes: flags.yes === true });
+    return rebuild(db, { dryRun: flags['dry-run'] === true, since: dayFlag(flags.since, '--since', { back: true }), limit, yes: flags.yes === true, fromShell: fromTool() });
   }
   // The checks load with the commands that report them: a hook reaches this file on every prompt.
   if (args[0] === 'status') return (await import('./check.mjs')).memoryStatus(db);
@@ -900,9 +907,12 @@ async function runMemoryPage(db) {
   return ['stopped'];
 }
 
-/** The models Sumo can run on and their switches, as the settings page set them. */
-function runModels(db, { args }) {
-  if (args[0] === undefined) return modelLines(db);
+/** The models Sumo can run on and their switches, as the settings page set them, then how the saved scorecard scores each. */
+async function runModels(db, { args }) {
+  if (args[0] === undefined) {
+    const [{ EFFORTS }, { scorecardLines }] = await Promise.all([import('./route.mjs'), import('./scorecard.mjs')]);
+    return [...modelLines(db), '', ...scorecardLines(db, EFFORTS)];
+  }
   if (['enable', 'disable', 'discover'].includes(args[0])) throw new UsageError(ON_THE_PAGE(`which models are on (${args[0]})`));
   throw new UsageError(`usage: ${USAGE.models}`);
 }
@@ -1038,7 +1048,7 @@ export async function main(argv) {
       const resume = flags.resume ? (given[0] ?? 'last') : null;
       // Said once, before the screen: past here every turn would fail the same way.
       // A full API id is taken too (claude-opus-5-5), as the chat itself takes one.
-      if (flags.model !== undefined && flags.model !== 'auto' && !Object.values(MODEL_IDS).includes(flags.model)) knownModel(flags.model, ['auto']);
+      if (flags.model !== undefined && flags.model !== 'auto' && !ALL_MODELS.map(modelId).includes(flags.model)) knownModel(flags.model, ['auto'], ALL_MODELS);
       if (flags.effort !== undefined && !CHAT_EFFORTS.includes(flags.effort)) throw new UsageError(`no such effort "${flags.effort}" — one of: ${CHAT_EFFORTS.join(', ')}`);
       if (!resolveAnthropicCredential()) throw new NeedsCredential('the chat needs an Anthropic credential — export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this shell, then: sumo chat');
       const db = openDb();

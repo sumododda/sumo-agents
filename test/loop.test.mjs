@@ -14,13 +14,14 @@ import { getJob, takeInbox, tell } from '../src/jobs.mjs';
 import Anthropic from '@anthropic-ai/sdk';
 import { writablePlaces } from '../src/sandbox.mjs';
 import { contextFor, converse, grantsItself, jobParams, markTail, RETRY, retryable, retryDelay, runJob, runLines, stopReason, tampersMarker } from '../src/loop.mjs';
-import { closeMcp, DECLINED, readConfig, writeConfig } from '../src/mcp.mjs';
+import { closeMcp, DECLINED, readConfig } from '../src/mcp.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { addProject } from '../src/projects.mjs';
 import { cap, capRedacted, childEnv, EDITOR_TOOL, jailed, runBash, runEditor, runTool } from '../src/tools.mjs';
 import { styles, toolView } from '../src/tty.mjs';
 import { sourcesOf, WEB_TOOLS } from '../src/web.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
+import { writeConfig } from './fixtures/mcp-servers.mjs';
 
 const NOW = '2026-09-30T12:00:00.000Z';
 
@@ -339,8 +340,10 @@ const alive = (pid) => {
     return false;
   }
 };
-const settled = async (test) => {
-  for (let i = 0; i < 100 && !test(); i++) await new Promise((r) => setTimeout(r, 20));
+// Waited for by the clock, not by a count of naps: under a loaded machine (the whole suite at once) a nap of 20 ms runs
+// long, and a killed process is reaped late, so two seconds of naps came to less than the work took.
+const settled = async (test, ms = 5000) => {
+  for (const end = Date.now() + ms; !test() && Date.now() < end; ) await new Promise((r) => setTimeout(r, 20));
   return test();
 };
 
@@ -1294,7 +1297,7 @@ test('a job routed to a model that is off is refused before anything is sent', a
       setModel(db, 'fable', false, NOW);
       await assert.rejects(
         runJob(db, id, { send: () => assert.fail('nothing is sent'), now: () => NOW }),
-        (err) => err instanceof UsageError && err.message === `j${id} is routed to fable, which is off — turn it on under API models, on the settings page (sumo config), or abandon it and create it again`,
+        (err) => err instanceof UsageError && err.message === `j${id} cannot run: fable is off — turn it on under API models, on the settings page (sumo config), or abandon it and create it again`,
       );
     } finally {
       db.close();
@@ -1598,7 +1601,7 @@ test('a job that searches or fetches the web is written down as having read outs
         reply('end_turn', [{ type: 'text', text: 'done' }]),
       ]);
       await runJob(db, id, { send, now: () => NOW });
-      assert.deepEqual(outsideReads(id), ['web_search']);
+      assert.deepEqual(outsideReads(db, id), ['web_search']);
 
       // A second job on the same project, made as seed makes one.
       const other = { id: Number(db.prepare(`INSERT INTO jobs (project, title, agent, status, session_id, created_at, updated_at, model, effort, route_reason) VALUES ('demo', 'quiet job', 'worker', 'running', 's1', ?, ?, 'sonnet', 'medium', 'test')`).run(NOW, NOW).lastInsertRowid) };
@@ -1606,7 +1609,7 @@ test('a job that searches or fetches the web is written down as having read outs
       writeFileSync(join(paths().jobs, String(other.id), 'brief.md'), `# Job j${other.id} — quiet job\n\n## The task\nsay hello\n`);
       const { send: quiet } = canned([reply('tool_use', [call('t1', 'bash', { command: 'echo here' })]), reply('end_turn', [{ type: 'text', text: 'done' }]), reply('end_turn', [{ type: 'text', text: 'done' }])]);
       await runJob(db, other.id, { send: quiet, now: () => NOW });
-      assert.deepEqual(outsideReads(other.id), []);
+      assert.deepEqual(outsideReads(db, other.id), []);
     } finally {
       db.close();
     }
@@ -1642,4 +1645,12 @@ test('a file under macOS\'s own /var or /tmp is not called a link: those folders
   const out = await runTool({ name: EDITOR_TOOL.name, input: { command: 'str_replace', path: join(outside, 'cfg.toml'), old_str: 'a = 1', new_str: 'a = 2' } }, { cwd: root, roots: [root], env: childEnv({}), opened: new Set(), approve: async () => 'no' });
   assert.match(out.content, /is outside the project/);
   if (realpathSync(outside) !== outside) assert.doesNotMatch(out.content, /a link to/, 'the system\'s own link is not named');
+});
+
+test('an editor call without a command, or with one it does not have, is answered with the commands it has', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sumo-agents-editor-'));
+  const ctx = { cwd: root, roots: [root], env: childEnv({ PATH: process.env.PATH }) };
+  const call = (input) => runTool({ name: EDITOR_TOOL.name, input: { path: join(root, 'a.txt'), ...input } }, ctx);
+  assert.deepEqual(await call({ file_text: 'x' }), { content: 'no command given — command is one of view, create, str_replace, insert', isError: true });
+  assert.deepEqual(await call({ command: 'write', content: 'x' }), { content: 'unknown command write — command is one of view, create, str_replace, insert', isError: true });
 });

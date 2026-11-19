@@ -91,3 +91,12 @@ test('a changed extractor starts with a clean record: the failures, the junk and
     assert.deepEqual(filingState(db), { paused: false, reason: null, failures: 0, quarantined: 0, junkRate: null, fallbackUsed: false, lastOkAt: at(0) });
   });
 });
+
+test('a filing that paused itself is said in the block every session starts with, and why: nothing new is filed until the user acts', async () => {
+  const { prime } = await import('../src/prime.mjs');
+  await withDb((db) => {
+    const ids = derive(db, extractorVersion(db), 10);
+    for (const id of ids.slice(0, 6)) event(db, id, 'forgotten');
+    assert.match(prime(db, { now: at(2) }), /^Warning: the memory pass has stopped filing by itself — 60% of what this extractor filed was forgotten or rejected within 30 days — sumo memory run reads again by hand, and a changed prompt or model starts afresh\. Tell the user\.$/m);
+  });
+});

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { MODEL_IDS, MODELS } from './catalog.mjs';
+import { modelName } from './catalog.mjs';
 import { CACHE_WRITE, priceOf } from './model.mjs';
 import { getProject } from './projects.mjs';
 
@@ -136,8 +136,6 @@ export function breakdown(rows) {
 const dollars = (usd) => `$${usd.toFixed(2)}`;
 const count = (n, word) => `${n.toLocaleString('en-US')} ${word}${n === 1 ? '' : 's'}`;
 const percent = (part, whole) => (whole > 0 ? ` (${Math.round((part / whole) * 100)}%)` : '');
-/** A model by the name Sumo calls it; a local model or one the list does not know, as the ledger has it. */
-const nameOf = (model) => MODELS.find((name) => MODEL_IDS[name] === model) ?? model;
 /** Who made a request, in the words the user knows: the ledger keeps its own short kinds. */
 const KIND_NAMES = { scribe: 'memory pass, filing', dream: 'memory pass, tidying', local: 'router' };
 const kindOf = (kind) => KIND_NAMES[kind] ?? kind;
@@ -179,7 +177,7 @@ export function costLines(db, { days, project } = {}) {
   return [
     `${scope}: ${count(total.requests, 'request')}, ${dollars(total.usd)} — ${split(total, total.usd)}`,
     // A group that cost nothing — the local model's — has nothing to split.
-    ...groups.map((g) => `  ${kindOf(g.kind)} · ${nameOf(g.model)}: ${count(g.requests, 'request')}, ${dollars(g.usd)}${g.usd >= 0.005 ? ` — ${split(g)}` : ''}`),
+    ...groups.map((g) => `  ${kindOf(g.kind)} · ${modelName(g.model)}: ${count(g.requests, 'request')}, ${dollars(g.usd)}${g.usd >= 0.005 ? ` — ${split(g)}` : ''}`),
     `cache rewrites: ${count(rewrites.requests, 'request')} read under ${REWRITE_READ_UNDER / 1000}k from the cache and wrote most of their context again, under ${CACHE_LIVES_MS / 60_000} minutes after the request before — ${dollars(rewrites.usd)} of cache writes${share}`,
     // Told apart at the time, whatever the gap: the ones a longer cache would have kept are the gap ones.
     ...(told.length > 0 ? [`  why: ${told.map(([cause, sum]) => `${cause} ${count(sum.requests, 'request')}, ${dollars(sum.usd)}`).join(' · ')}`, ...told.map(([cause]) => `    ${cause}: ${CAUSES[cause]}`)] : []),

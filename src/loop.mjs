@@ -2,10 +2,11 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { ADVISOR_BETA, ADVISOR_SPENT, ADVISOR_SPENT_AT, ADVISOR_STOP_AT, advisorIn, advisorLine, advisorOf, advisorResult, advisorRuns, advisorTool, isAdvisorCall, isAdvisorResult } from './advisor.mjs';
 import { anthropicClient, authenticatedRequest, FALLBACK_BETA, loadSdk, resolveAnthropicCredential } from './auth.mjs';
-import { MODEL_IDS, modelId, MODELS, usableModels } from './catalog.mjs';
+import { JOB_MODELS, laneOf, MODEL_IDS, modelId, offLine, usableModels } from './catalog.mjs';
+import { converseCursor } from './cursor.mjs';
 import { getMeta, tx } from './db.mjs';
 import { handleEvent } from './hooks.mjs';
-import { brief, getJob, noteOutsideRead, planOf, readState, runLockFile, settle, takeInbox, toldToClose, treeOf } from './jobs.mjs';
+import { ASK_TO_ACCEPT, brief, getJob, noteOutsideRead, planOf, readState, runLockFile, settle, takeInbox, toldToClose, treeOf } from './jobs.mjs';
 import { isJobTool, jobTools, runJobTool } from './jobtools.mjs';
 import { takeLock } from './lock.mjs';
 import { DECLINED, gateMcp, isMcpTool, mcpReady, runMcpTool, TOOL_SEARCH } from './mcp.mjs';
@@ -169,7 +170,7 @@ export const thinkingFor = (_model) => ({ type: 'adaptive', display: 'summarized
  * fallback. A request that goes on from one answered that way carries the `fallback` block as it came, and is priced on
  * the model that answered.
  */
-const fallsBack = (model) => modelId(model) !== MODEL_IDS.haiku;
+const fallsBack = (model) => laneOf(model) === 'claude' && modelId(model) !== MODEL_IDS.haiku;
 
 /** A request's fallback set as its model takes it: on, with its beta, or off. The request itself is changed. */
 export function withFallback(params, model) {
@@ -249,7 +250,7 @@ export const grantsItself = (command) => SELF_GRANT.test(command.replace(/\\\n/g
 /** Whether a command, as written, clears or sets the marker that says it is the model's. */
 export const tampersMarker = (command) => TAMPERS.test(command.replace(/\\\n/g, ' '));
 export const TAMPER_REFUSED = 'Refused: the marker that says this shell is the model\'s is not yours to clear or set. What it holds back, the user does themselves.';
-const SELF_GRANT_REFUSED = "Refused: work is never taken unverified on its author's word. Finish FAILED with what blocks verification, or ask.";
+const SELF_GRANT_REFUSED = `Refused: work is never taken unverified on its author's word. ${ASK_TO_ACCEPT}`;
 
 /** How many requests apart a job is shown its own plan again, and how. */
 const PLAN_EVERY = 10;
@@ -395,6 +396,94 @@ function within(promise, ms, signal) {
   });
 }
 
+/** What an inbox hands over, as blocks: the user's words — or, as `{ event }`, something that happened and is nobody's words: said as it is. */
+export const heardFrom = (inbox) => (inbox?.() ?? []).map((said) => ({ type: 'text', text: typeof said === 'string' ? `The user says, while you work: ${said}` : said.event }));
+
+/**
+ * What a conversation's tool results are watched for, on Claude (`converse`) and on Cursor (src/cursor.mjs) alike. `mark` takes a
+ * round of calls and their results (tool_result blocks), adds to a result what the model is told of it — the same call again and
+ * again, a round gone round, a file changed too often, an error come back — and says whether to stop: going round, or declined
+ * too often. `circles` puts the last calls to the local model every so many requests; `notes` are said after the results — near
+ * the budget, near the time limit, near the turn limit (at that request, or with `past`, at the first one past it); `reminder` is
+ * the caller's plan; `outOfTurns`, the turn limit.
+ */
+export function roundWatch({ ctx = null, budget = null, clock = null, circling = null, remind = null, now }) {
+  /** The last call made and answered, and how many times in a row it has been exactly that. */
+  const repeat = { key: null, count: 0 };
+  /** The last calls made, by name and input, to find a round in; and how many times the editor changed each file. */
+  const trail = [];
+  const edited = new Map();
+  /** How many times each error has come back from a failed command, and the last calls made, as the local model is shown them. */
+  const errors = new Map();
+  const recent = [];
+  let declined = 0;
+  let toldLast = false;
+  // How long a job has run, from the start of its run.
+  const ranMs = () => Date.parse(now()) - clock.from;
+  return {
+    get toldLast() {
+      return toldLast;
+    },
+    mark(calls, results) {
+      // A call made again and again with the same answer is going nowhere: the model is told so, and then stopped. So is a round of
+      // a few calls gone round with the same answers. A file changed again and again is said once, and the run goes on; so is the
+      // same error back from failed commands, try after try, whatever else the commands did.
+      let looping = false;
+      for (const [i, call] of calls.entries()) {
+        const key = sameAs(call, results[i]);
+        const error = call.name === BASH_TOOL.name && results[i].is_error ? errorOf(results[i].content) : null;
+        repeat.count = key === repeat.key ? repeat.count + 1 : 1;
+        repeat.key = key;
+        if (repeat.count >= REPEAT_STOP_AT) looping = true;
+        else if (repeat.count >= REPEAT_NUDGE_AT) results[i] = { ...results[i], content: `${results[i].content}${repeated(repeat.count)}` };
+        trail.push(key);
+        if (trail.length > TRAIL_LENGTH) trail.shift();
+        const round = roundOf(trail);
+        if (round && round.rounds >= REPEAT_STOP_AT) looping = true;
+        else if (round && round.rounds >= REPEAT_NUDGE_AT) results[i] = { ...results[i], content: `${results[i].content}${roundAgain(round)}` };
+        if (call.name === EDITOR_TOOL.name && CHANGES.includes(call.input?.command) && !results[i].is_error) {
+          const path = resolve(ctx?.cwd ?? '', String(call.input.path));
+          const count = (edited.get(path) ?? 0) + 1;
+          edited.set(path, count);
+          if (count === EDITS_NOTE_AFTER + 1) results[i] = { ...results[i], content: `${results[i].content}${editedOften(path, count)}` };
+        }
+        if (error) {
+          const count = (errors.get(error.key) ?? 0) + 1;
+          errors.set(error.key, count);
+          if (count === ERROR_NOTE_AT) results[i] = { ...results[i], content: `${results[i].content}${errorAgain(count, error.line)}` };
+        }
+        if (circling) {
+          recent.push(`${call.name} ${JSON.stringify(call.input ?? {})}`.slice(0, circling.chars));
+          if (recent.length > circling.calls) recent.shift();
+        }
+      }
+      // A model the user has said no to, again and again: each no is final, and three of them end the conversation.
+      declined += results.filter((r) => r.content === DECLINED).length;
+      return { looping, declined: declined >= DECLINE_STOP_AT };
+    },
+    // Every so many requests a job's last calls are put to the local model — free, and never for longer than its cap; a yes rides on the last answer, with why.
+    async circles(turns, results, signal) {
+      if (circling && turns % circling.every === 0 && recent.length > 0) {
+        const why = await within(Promise.resolve().then(() => circling.ask([...recent])), circling.ms, signal);
+        if (typeof why === 'string' && why.trim()) results[results.length - 1] = { ...results.at(-1), content: `${results.at(-1).content}${inCircles(recent.length, why.trim())}` };
+      }
+    },
+    notes(turns, spent, { past = false } = {}) {
+      const low = budget !== null && !budget.warned && spent() >= budget.usd * BUDGET_WARN_AT ? [{ type: 'text', text: BUDGET_LOW(spent(), budget.usd) }] : [];
+      if (low.length > 0) budget.warned = true;
+      const late = clock !== null && !clock.warned && ranMs() >= clock.ms * TIME_WARN_AT ? [{ type: 'text', text: TIME_LOW(ranMs(), clock.ms) }] : [];
+      if (late.length > 0) clock.warned = true;
+      const at = MAX_TURNS - CLOSING_TURNS;
+      const last = !toldLast && (past ? turns >= at : turns === at) ? [{ type: 'text', text: LAST_TURN }] : [];
+      if (last.length > 0) toldLast = true;
+      return [...low, ...late, ...last];
+    },
+    // What the caller keeps in the model's view — a job's plan, from runJob — goes last with the results, when it has something to say.
+    reminder: (turns) => remind?.(turns),
+    outOfTurns: (turns) => turns >= MAX_TURNS,
+  };
+}
+
 /**
  * Runs one conversation from its current messages until the model stops
  * calling tools. `send` is the transport (canned in tests); `beforeTool` may
@@ -430,21 +519,12 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
   let toldLast = false;
   // The ledger names the model that answered: with a fallback that is not always the one asked for.
   const log = (result, note, model = params.model) => logRun(db, { kind: ledger.kind, model, result, note, now: now(), jobId: ledger.jobId ?? null, sessionId: ledger.sessionId ?? null });
-  // What the inbox hands over is the user's words — or, as `{ event }`, something that happened and is nobody's words: said as it is.
-  const heard = () => (inbox?.() ?? []).map((said) => ({ type: 'text', text: typeof said === 'string' ? `The user says, while you work: ${said}` : said.event }));
+  const heard = () => heardFrom(inbox);
   const interrupted = () => {
     log({ ok: false, usage: usageOf(params.model, null) }, `turn ${turns}: interrupted`);
     return { turns, stop: 'interrupted', error: null, text, totals, toldLast };
   };
-  /** The last call made and answered, and how many times in a row it has been exactly that. */
-  const repeat = { key: null, count: 0 };
-  /** The last calls made, by name and input, to find a round in; and how many times the editor changed each file. */
-  const trail = [];
-  const edited = new Map();
-  /** How many times each error has come back from a failed command, and the last calls made, as the local model is shown them. */
-  const errors = new Map();
-  const recent = [];
-  let declined = 0;
+  const watch = roundWatch({ ctx, budget, clock, circling, remind, now });
   // What a job has spent, over this run and the one before it.
   const costSoFar = () => (budget?.spent ?? 0) + totals.costUsd;
   const overBudget = () => budget !== null && costSoFar() >= budget.usd;
@@ -626,63 +706,22 @@ export async function converse(db, params, { send = sendToApi, ctx, ledger, befo
       stop = 'interrupted';
       break;
     }
-    // A call made again and again with the same answer is going nowhere: the model is told so, and then stopped. So is a round of
-    // a few calls gone round with the same answers. A file changed again and again is said once, and the run goes on; so is the
-    // same error back from failed commands, try after try, whatever else the commands did.
-    let looping = false;
-    for (const [i, call] of calls.entries()) {
-      const key = sameAs(call, results[i]);
-      const error = call.name === BASH_TOOL.name && results[i].is_error ? errorOf(results[i].content) : null;
-      repeat.count = key === repeat.key ? repeat.count + 1 : 1;
-      repeat.key = key;
-      if (repeat.count >= REPEAT_STOP_AT) looping = true;
-      else if (repeat.count >= REPEAT_NUDGE_AT) results[i] = { ...results[i], content: `${results[i].content}${repeated(repeat.count)}` };
-      trail.push(key);
-      if (trail.length > TRAIL_LENGTH) trail.shift();
-      const round = roundOf(trail);
-      if (round && round.rounds >= REPEAT_STOP_AT) looping = true;
-      else if (round && round.rounds >= REPEAT_NUDGE_AT) results[i] = { ...results[i], content: `${results[i].content}${roundAgain(round)}` };
-      if (call.name === EDITOR_TOOL.name && CHANGES.includes(call.input?.command) && !results[i].is_error) {
-        const path = resolve(ctx?.cwd ?? '', String(call.input.path));
-        const count = (edited.get(path) ?? 0) + 1;
-        edited.set(path, count);
-        if (count === EDITS_NOTE_AFTER + 1) results[i] = { ...results[i], content: `${results[i].content}${editedOften(path, count)}` };
-      }
-      if (error) {
-        const count = (errors.get(error.key) ?? 0) + 1;
-        errors.set(error.key, count);
-        if (count === ERROR_NOTE_AT) results[i] = { ...results[i], content: `${results[i].content}${errorAgain(count, error.line)}` };
-      }
-      if (circling) {
-        recent.push(`${call.name} ${JSON.stringify(call.input ?? {})}`.slice(0, circling.chars));
-        if (recent.length > circling.calls) recent.shift();
-      }
-    }
     // The advisor asked again and again is the same, and its tool cannot be taken away: the model is told so once, and then stopped.
-    // So is a model the user has said no to, again and again: each no is final, and three of them end the conversation.
-    declined += results.filter((r) => r.content === DECLINED).length;
-    if (looping || advisor.asked >= ADVISOR_STOP_AT || declined >= DECLINE_STOP_AT) {
+    const marked = watch.mark(calls, results);
+    if (marked.looping || advisor.asked >= ADVISOR_STOP_AT || marked.declined) {
       params.messages.push({ role: 'user', content: results });
-      stop = looping ? 'loop' : declined >= DECLINE_STOP_AT ? 'declined' : 'advisor';
+      stop = marked.looping ? 'loop' : marked.declined ? 'declined' : 'advisor';
       break;
     }
-    // Every so many requests a job's last calls are put to the local model — free, and never for longer than its cap; a yes rides on the last answer, with why.
-    if (circling && turns % circling.every === 0 && recent.length > 0) {
-      const why = await within(Promise.resolve().then(() => circling.ask([...recent])), circling.ms, signal);
-      if (typeof why === 'string' && why.trim()) results[results.length - 1] = { ...results.at(-1), content: `${results.at(-1).content}${inCircles(recent.length, why.trim())}` };
-    }
+    await watch.circles(turns, results, signal);
     const enough = advisor.asked >= ADVISOR_SPENT_AT && !advisor.told ? [{ type: 'text', text: ADVISOR_SPENT }] : [];
     if (enough.length > 0) advisor.told = true;
-    const low = budget !== null && !budget.warned && costSoFar() >= budget.usd * BUDGET_WARN_AT ? [{ type: 'text', text: BUDGET_LOW(costSoFar(), budget.usd) }] : [];
-    if (low.length > 0) budget.warned = true;
-    const late = clock !== null && !clock.warned && ranMs() >= clock.ms * TIME_WARN_AT ? [{ type: 'text', text: TIME_LOW(ranMs(), clock.ms) }] : [];
-    if (late.length > 0) clock.warned = true;
-    const last = turns === MAX_TURNS - CLOSING_TURNS ? [{ type: 'text', text: LAST_TURN }] : [];
-    if (last.length > 0) toldLast = true;
-    params.messages.push({ role: 'user', content: [...results, ...heard(), ...enough, ...low, ...late, ...last] });
+    const notes = watch.notes(turns, costSoFar);
+    if (watch.toldLast) toldLast = true;
+    params.messages.push({ role: 'user', content: [...results, ...heard(), ...enough, ...notes] });
 
     // What the caller keeps in the model's view — a job's plan, from runJob — goes last with these results, when it has something to say.
-    const reminder = remind?.(turns);
+    const reminder = watch.reminder(turns);
     if (reminder) params.messages.at(-1).content.push({ type: 'text', text: reminder });
 
     // Past the band where the work must either stop or shed its past: the conversation so far is summarized server-side, here, at the
@@ -743,13 +782,12 @@ export const networkOn = (db) => shellSwitch(db, 'shell.network') !== 'off';
  * was given one, settled before the run returns (`settle`, src/jobs.mjs): what
  * became of it is in `settled`, and in the report.
  */
-export async function runJob(db, id, { send = sendToApi, now, signal = null, onStart = null, onTool = null, onResult = null, onTurn = null, onThinking = null, onRetry = null, onCompact = null, inbox = null, approve = null } = {}) {
+export async function runJob(db, id, { send = sendToApi, cursorSdk = null, now, signal = null, onStart = null, onTool = null, onResult = null, onTurn = null, onThinking = null, onRetry = null, onCompact = null, inbox = null, approve = null } = {}) {
   const job = getJob(db, id);
   if (job.status !== 'running' && job.status !== 'needs_input') throw new UsageError(`j${id} is ${job.status} — only a running job can be run`);
   if (!job.model) throw new UsageError(`j${id} has no route — it was created before routing existed; create it again`);
-  if (MODELS.includes(job.model) && !usableModels(db).includes(job.model)) {
-    throw new UsageError(`j${id} is routed to ${job.model}, which is off — turn it on under API models, on the settings page (sumo config), or abandon it and create it again`);
-  }
+  const off = JOB_MODELS.includes(job.model) ? offLine(db, job.model, 'abandon it and create it again') : null;
+  if (off) throw new UsageError(`j${id} cannot run: ${off}`);
   const project = getProject(db, job.project);
   const tree = treeOf(db, id);
   if (tree && !existsSync(tree.path)) throw new UsageError(`j${id}'s worktree, ${tree.path}, no longer exists — abandon it and create it again`);
@@ -768,9 +806,10 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
   const ctx = { ...contextFor(project, { jobId: id, sandbox: sandboxOn(db), network: networkOn(db), tree: tree?.path }), approve: approve && ((ask) => approve({ ...ask, job: id })), opened: new Set(), background: new Set() };
   // The workflow gate holds a job's commands as it holds the chat's: once per session for this job, which has a context of its own,
   // and with the job's own project in scope whether or not its card came up in the session.
-  const gate = (call) => {
-    if (isJobTool(call)) return runJobTool(call, { job, ctx, signal });
-    if (isMcpTool(call.name)) return gateMcp(call, { approve, signal, job: id });
+  // A call on Cursor is handed its run's own signal, which also ends when that run does; on Claude, the job's.
+  const gate = (call, { signal: until = signal } = {}) => {
+    if (isJobTool(call)) return runJobTool(call, { job, ctx, signal: until });
+    if (isMcpTool(call.name)) return gateMcp(call, { approve, signal: until, job: id });
     if (call.name !== BASH_TOOL.name) return null;
     if (grantsItself(String(call.input?.command ?? ''))) return { content: SELF_GRANT_REFUSED, isError: true };
     // A job created where no session had begun is still gated, under a session of its own: it holds no turns, only what was shown.
@@ -816,12 +855,24 @@ export async function runJob(db, id, { send = sendToApi, now, signal = null, onS
     // a page told the job.
     const told = (call) => {
       if (isWebTool(call) || isMcpTool(call.name)) {
-        noteOutsideRead(id, call.name);
+        noteOutsideRead(db, id, call.name);
         noteSessionOutside(db, job.session_id, call.name);
       }
       onTool?.(call);
     };
-    const run = () => converse(db, params, { send, now, signal, onTool: told, onResult, onTurn, onThinking, onRetry, onCompact, compact, budget, clock, circling, remind, inbox: heard, beforeTool: gate, ctx, ledger: { kind: job.agent, jobId: id, sessionId: job.session_id } });
+    const ledger = { kind: job.agent, jobId: id, sessionId: job.session_id };
+    // On a Cursor model the loop is Cursor's (src/cursor.mjs): Sumo's tools, gate and caps the same, and its web search unseen —
+    // so a job given it (a scout, as on Claude) is taken to have read the web before it starts, and what it learns is held for
+    // the user, as above. A worker or a reviewer is given none, and is not marked.
+    const onCursor = laneOf(job.model) === 'cursor';
+    if (onCursor && params.tools.some(isWebTool)) {
+      noteOutsideRead(db, id, 'web_search');
+      noteSessionOutside(db, job.session_id, 'web_search');
+    }
+    const run = () =>
+      onCursor
+        ? converseCursor(db, params, { ctx, ledger, beforeTool: gate, onTool: told, onResult, signal, budget, clock, circling, remind, inbox: heard, now, sdk: cursorSdk })
+        : converse(db, params, { send, now, signal, onTool: told, onResult, onTurn, onThinking, onRetry, onCompact, compact, budget, clock, circling, remind, inbox: heard, beforeTool: gate, ctx, ledger });
     let outcome = await run();
     if (outcome.stop === 'end_turn' && getJob(db, id).status === 'running') {
       params.messages.push({ role: 'user', content: [{ type: 'text', text: UNCLOSED }] });

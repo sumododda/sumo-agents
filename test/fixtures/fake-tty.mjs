@@ -27,7 +27,9 @@ export function fakeTty({ columns = 80, rows = 40 } = {}) {
   });
 
   const stdin = new EventEmitter();
-  let pending = null;
+  // Keys wait their turn, as a terminal's do: one slot, overwritten by the next key before a slow machine read it, lost
+  // keys on CI — a test once stopped a row short of where it pressed to.
+  const pending = [];
   Object.assign(stdin, {
     isTTY: true,
     setEncoding() {},
@@ -37,9 +39,7 @@ export function fakeTty({ columns = 80, rows = 40 } = {}) {
     resume() {},
     pause() {},
     read() {
-      const chunk = pending;
-      pending = null;
-      return chunk;
+      return pending.shift() ?? null;
     },
   });
 
@@ -61,7 +61,7 @@ export function fakeTty({ columns = 80, rows = 40 } = {}) {
     /** Keys, as the terminal would send them; each chunk is given time to be read as its own keypress. */
     async type(...chunks) {
       for (const chunk of chunks) {
-        pending = chunk;
+        pending.push(chunk);
         stdin.emit('readable');
         await new Promise((r) => setTimeout(r, 40));
       }

@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { copyFileSync, cpSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ownGit } from './sandbox.mjs';
 import { DIFF } from './verify.mjs';
 
 /**
@@ -10,13 +11,13 @@ import { DIFF } from './verify.mjs';
  * branches, and what the work changed is brought back to the project at the end. Nothing here knows about jobs.
  */
 
-/** Sumo's own git calls: no hook of the user's runs, nothing is signed, and a commit has an author where git has no identity. */
-const OWN = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=sumo', '-c', 'user.email=sumo@localhost'];
+/** Sumo's own git calls: nothing the project's git files name runs (`ownGit`), nothing is signed, and a commit has an author where git has no identity. */
+const OWN = ['-c', 'commit.gpgsign=false', '-c', 'user.name=sumo', '-c', 'user.email=sumo@localhost'];
 
-const git = (root, args) => execFileSync('git', ['-C', root, ...OWN, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 }).trim();
+const git = (root, args) => execFileSync('git', ['-C', root, ...OWN, ...ownGit(args)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 }).trim();
 /** How a git command that reads a patch on stdin went: whether it succeeded, and the first lines of what it said, on one line. */
 const fed = (root, args, patch, env = {}) => {
-  const run = spawnSync('git', ['-C', root, ...OWN, ...args], { input: patch, env: { ...process.env, ...env }, stdio: ['pipe', 'ignore', 'pipe'], encoding: 'utf8' });
+  const run = spawnSync('git', ['-C', root, ...OWN, ...ownGit(args)], { input: patch, env: { ...process.env, ...env }, stdio: ['pipe', 'ignore', 'pipe'], encoding: 'utf8' });
   return { ok: run.status === 0, said: (run.stderr ?? '').split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 3).join('; ') };
 };
 /** The paths a NUL-separated git listing names. */
@@ -79,6 +80,15 @@ const within = (root, path) => {
   const rel = relative(root, path);
   return rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel);
 };
+/** Where a path leads, or null for a link to nothing: that loads nothing, so it is no one's source. */
+const realOrNull = (path) => {
+  try {
+    return realpathSync(path);
+  } catch (cause) {
+    if (cause.code === 'ENOENT') return null;
+    throw cause;
+  }
+};
 
 /** Inspect package-manager links, including scoped packages and pnpm's virtual store. */
 function nodeLoadsOriginal(modules, repository, candidate) {
@@ -96,19 +106,19 @@ function nodeLoadsOriginal(modules, repository, candidate) {
         for (const name of readdirSync(path)) if (isDir(join(path, name, 'node_modules'))) queue.push(join(path, name, 'node_modules'));
       } else if (entry.name.startsWith('@') && entry.isDirectory()) queue.push(path);
       else if (entry.isSymbolicLink()) {
-        const target = realpathSync(path);
-        if (within(repository, target) && !within(installed, target) && !within(candidate, target)) return true;
+        const target = realOrNull(path);
+        if (target && within(repository, target) && !within(installed, target) && !within(candidate, target)) return true;
       } else if (entry.isDirectory() && isDir(join(path, 'node_modules'))) queue.push(join(path, 'node_modules'));
     }
   }
   return false;
 }
 
-/** Common editable-install formats: PEP 610/660 metadata, path-based .pth files and legacy egg links. */
-function pythonLoadsOriginal(env, repository, candidate, shared) {
+/** Common editable-install formats: PEP 610/660 metadata, path-based .pth files and legacy egg links — each judged by where it points. */
+function pythonLoadsOriginal(env, repository, candidate) {
   function loadsOriginal(path) {
-    const target = realpathSync(path);
-    return within(repository, target) && !within(candidate, target);
+    const target = realOrNull(path);
+    return target !== null && within(repository, target) && !within(candidate, target);
   }
   const lib = join(env, 'lib');
   const sites = [join(env, 'Lib', 'site-packages')];
@@ -116,7 +126,6 @@ function pythonLoadsOriginal(env, repository, candidate, shared) {
   for (const site of sites.filter(isDir)) {
     for (const name of readdirSync(site)) {
       const file = join(site, name);
-      if (shared && (name.endsWith('.egg-link') || name.startsWith('__editable__'))) return true;
       if (name.endsWith('.egg-link') || name.endsWith('.pth')) {
         for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
           const path = line.trim();
@@ -125,7 +134,7 @@ function pythonLoadsOriginal(env, repository, candidate, shared) {
       }
       if (name.endsWith('.dist-info') && taken(join(file, 'direct_url.json'))) {
         const metadata = JSON.parse(readFileSync(join(file, 'direct_url.json'), 'utf8'));
-        if (metadata.dir_info?.editable && (shared || (metadata.url?.startsWith('file:') && loadsOriginal(fileURLToPath(metadata.url))))) return true;
+        if (metadata.dir_info?.editable && metadata.url?.startsWith('file:') && loadsOriginal(fileURLToPath(metadata.url))) return true;
       }
     }
   }
@@ -140,11 +149,9 @@ export function sharedSourceDependencies(tree, project) {
     const dependency = join(tree.path, name);
     if (!taken(dependency)) continue;
     try {
-      const original = join(project, name);
-      const sharedInstall = taken(original) && realpathSync(dependency) === realpathSync(original);
       const candidate = realpathSync(tree.top);
       const repository = realpathSync(git(project, ['rev-parse', '--show-toplevel']));
-      if (name === 'node_modules' ? nodeLoadsOriginal(dependency, repository, candidate) : pythonLoadsOriginal(dependency, repository, candidate, sharedInstall)) shared.push(name);
+      if (name === 'node_modules' ? nodeLoadsOriginal(dependency, repository, candidate) : pythonLoadsOriginal(dependency, repository, candidate)) shared.push(name);
     } catch {
       shared.push(name); // Unreadable installation or link: its source cannot be verified.
     }
@@ -155,7 +162,7 @@ export function sharedSourceDependencies(tree, project) {
 /** Everything changed in the tree since it was made, new files included, as git itself writes a diff: with `binary`, whole enough to apply. */
 export function treeDiff({ top, prefix, base }, { binary = false } = {}) {
   git(top, ['add', '-A']);
-  return execFileSync('git', ['-C', top, ...DIFF, '--cached', ...(binary ? ['--binary'] : []), base, '--', prefix || '.'], {
+  return execFileSync('git', ['-C', top, ...ownGit([...DIFF, '--cached', ...(binary ? ['--binary'] : []), base, '--', prefix || '.'])], {
     encoding: binary ? 'buffer' : 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     maxBuffer: 256 * 1024 * 1024,

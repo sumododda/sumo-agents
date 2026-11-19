@@ -4,11 +4,12 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { withLock } from '../src/scribe.mjs';
+import { startOf, withLock } from '../src/scribe.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
 
 const ran = async () => 'ran';
-const SKIPPED = { skipped: 'another run is in progress' };
+const SKIPPED = { skipped: 'another run is in progress', locked: true };
+/** When a process started, as `ps` says it: what a lock names beside the pid, so a pid handed out again is not its holder. */
 
 /** Runs `fn` with the path of the scribe's lock file in a throwaway home. */
 async function withLockFile(fn) {
@@ -25,10 +26,23 @@ const age = (file, minutes) => {
 test('a lock is held for as long as the run that took it is alive, however long that is', async () => {
   await withLockFile(async (lock) => {
     // A model call that timed out and was retried twice: well past five minutes, and still going.
-    writeFileSync(lock, String(process.pid));
+    const mine = `${process.pid} ${startOf(process.pid)}`;
+    writeFileSync(lock, mine);
     age(lock, 10);
     assert.deepEqual(await withLock('scribe', ran), SKIPPED);
-    assert.equal(readFileSync(lock, 'utf8'), String(process.pid));
+    assert.equal(readFileSync(lock, 'utf8'), mine);
+  });
+});
+
+test('a lock naming a live process that did not take it — a pid handed out again after a crash, or a line written by hand — is taken over: only the run that took it holds it', async () => {
+  await withLockFile(async (lock) => {
+    // launchd: alive for as long as the machine is up, and not ours to signal.
+    for (const line of ['1', `1 ${startOf(1)}`.replace(/\d{4}$/, '1999'), `${process.pid} Thu Jan  1 00:00:00 1970`]) {
+      writeFileSync(lock, line);
+      age(lock, 10);
+      assert.equal(await withLock('scribe', ran), 'ran', line);
+      assert.equal(existsSync(lock), false);
+    }
   });
 });
 
@@ -148,4 +162,16 @@ test('a writer paused before publishing its PID cannot lose its lock', { timeout
     assert.equal(results.filter((result) => result?.skipped === SKIPPED.skipped).length, 1);
     assert.equal(existsSync(lock), false);
   });
+});
+
+test('a lock reads the same in any locale and time zone: a shell set to German or to UTC does not take a live run for a dead one', () => {
+  const before = { LC_ALL: process.env.LC_ALL, TZ: process.env.TZ };
+  const here = startOf(process.pid);
+  try {
+    process.env.LC_ALL = 'de_DE.UTF-8';
+    process.env.TZ = 'Asia/Tokyo';
+    assert.equal(startOf(process.pid), here);
+  } finally {
+    for (const [k, v] of Object.entries(before)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
 });

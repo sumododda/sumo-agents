@@ -1,19 +1,18 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, closeSync, openSync, readFileSync, rmSync, statSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { applyOps } from './apply.mjs';
 import { resolveAnthropicCredential } from './auth.mjs';
 import { MODELS, offLine, usableModels } from './catalog.mjs';
-import { getMeta, openDb, tx } from './db.mjs';
+import { openDb, tx } from './db.mjs';
 import { judgeNewPairs } from './dream.mjs';
-import { extractorVersion, filingState, notePass } from './ledger.mjs';
+import { extractorVersion, filingState, memoryModel, notePass } from './ledger.mjs';
 import { callModel, failure, logRun } from './model.mjs';
 import { appendLog } from './logs.mjs';
 import { paths, REPO_ROOT, SELF } from './paths.mjs';
 import { aliasesOf, listProjects } from './projects.mjs';
 import { line } from './render.mjs';
 import { currentProject, markScribed, sessionJournal, sessionsAwaitingExtraction, turnsAwaitingExtraction } from './sessions.mjs';
-import { CONFIG_DEFAULTS } from './setup.mjs';
 import { ftsQuery, head } from './text.mjs';
 import { abridge } from './transcript.mjs';
 
@@ -35,8 +34,6 @@ const ATTEMPTS = 3;
 const NO_USAGE = { inputTokens: 0, outputTokens: 0, costUsd: 0, cacheReadTokens: null, cacheCreationTokens: null };
 const added = (x, y) => ({ ...x, inputTokens: x.inputTokens + y.inputTokens, outputTokens: x.outputTokens + y.outputTokens, costUsd: x.costUsd + y.costUsd });
 
-/** The model the pass is set to: `memory.model`, the one setting. */
-const memoryModel = (db) => getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model'];
 /** Whether the user turned the writer off: nothing gets filed, so nothing should wait for it to be. */
 const writerOff = (db) => memoryModel(db) === 'off';
 
@@ -47,7 +44,7 @@ const writerOff = (db) => memoryModel(db) === 'off';
 export function shouldRun(db, { now }) {
   if (writerOff(db)) return false;
   if (sessionsAwaitingExtraction(db, { now, limit: 1 }).length === 0) return false;
-  return !filingState(db, now).paused;
+  return !filingState(db).paused;
 }
 
 /**
@@ -70,24 +67,59 @@ export function spawnDetached(args) {
   child.unref();
 }
 
+/** When a process started, as `ps` says it, or '' when there is no such process: with the pid, which run it is. */
+export function startOf(pid) {
+  // In one locale and one zone, whoever asks: the words and the hour `ps` gives follow LC_TIME and TZ, and a lock read in another
+  // shell's would be taken for another run's.
+  return spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', env: { PATH: '/bin:/usr/bin', LC_ALL: 'C', TZ: 'UTC' } }).stdout?.trim() ?? '';
+}
+
+/** What a lock says of the run that holds it: its pid and when it started, so a pid handed out again is not taken for it. */
+let mine = null;
+const ownLine = () => (mine ??= `${process.pid} ${startOf(process.pid)}`);
+
+/** A lock taken a moment ago, whose holder cannot be told yet: believed for a while, then taken for one left behind. */
+const young = (file) => Date.now() - statSync(file).mtimeMs <= LOCK_STALE_MS;
+
 /**
- * Whether the run that took a lock is still going. Its pid says so; a model call that is retried can outlast any
- * fixed age. Only a lock that died before it named a pid is judged by its age.
+ * Whether the run that took a lock is still going: its process is alive, and started when the lock says — a pid is
+ * handed out again once its process is gone, and a model call that is retried can outlast any fixed age. A lock that
+ * names no pid yet is judged by its age, and so is a live pid with no start beside it (written by hand, or by a sumo
+ * from before).
  */
 function held(file) {
-  const pid = Number(readFileSync(file, 'utf8'));
-  if (!Number.isInteger(pid) || pid <= 0) return Date.now() - statSync(file).mtimeMs <= LOCK_STALE_MS;
+  const [pidText = '', ...rest] = readFileSync(file, 'utf8').trim().split(' ');
+  const pid = Number(pidText);
+  if (!pidText || !Number.isInteger(pid) || pid <= 0) return young(file);
   try {
     process.kill(pid, 0);
-    return true;
   } catch (cause) {
-    return cause.code === 'EPERM'; // alive, and someone else's
+    if (cause.code !== 'EPERM') return false; // EPERM: alive, and someone else's
+  }
+  const started = rest.join(' ');
+  return started ? startOf(pid) === started : young(file);
+}
+
+const lockFile = (name) => join(paths().home, `${name}.lock`);
+
+/**
+ * The run holding a pass's lock, for whoever checks on it: `{ pid, since }` (since: when it was taken, in
+ * milliseconds), or null when no live run holds it — a lock left by one that died is taken over by the next.
+ */
+export function lockHolder(name) {
+  const file = lockFile(name);
+  try {
+    return held(file) ? { pid: Number(readFileSync(file, 'utf8').split(' ')[0]), since: statSync(file).mtimeMs } : null;
+  } catch (cause) {
+    if (cause.code === 'ENOENT') return null;
+    throw cause;
   }
 }
 
 /** One writer at a time. A lock whose run has died is taken over. */
 export async function withLock(name, fn) {
-  const file = join(paths().home, `${name}.lock`);
+  const file = lockFile(name);
+  const ours = ownLine();
   let fd;
   // Serialize observation, replacement and PID publication so a paused owner cannot lose its fresh lock.
   const db = openDb();
@@ -106,7 +138,7 @@ export async function withLock(name, fn) {
         return undefined;
       }
       try {
-        writeSync(acquired, String(process.pid));
+        writeSync(acquired, ours);
       } catch (cause) {
         closeSync(acquired);
         rmSync(file);
@@ -117,14 +149,15 @@ export async function withLock(name, fn) {
   } finally {
     db.close();
   }
-  if (fd === undefined) return { skipped: 'another run is in progress' };
+  // `locked`: nothing ran because another run had it — for whoever must say that was not done.
+  if (fd === undefined) return { skipped: 'another run is in progress', locked: true };
   try {
     return await fn();
   } finally {
     closeSync(fd);
     // Only while it is still ours: a lock taken over meanwhile belongs to the run that took it.
     try {
-      if (readFileSync(file, 'utf8') === String(process.pid)) rmSync(file);
+      if (readFileSync(file, 'utf8') === ours) rmSync(file);
     } catch {
       // Already gone.
     }
@@ -310,18 +343,21 @@ const EXTRACTS = ['add', 'supersede', 'gotcha', 'checkpoint'];
  * model that could not answer (server down, bundle past its context, answer cut off) is one failed row of the model
  * ledger, then one more try on the hosted fallback — when a credential is there to pay for it and a model is on to
  * take it — and `fallbackUsed` says so; `fallback: false` keeps the call on the model as set, for a pass that has
- * paid for as much as it may. `quiet` keeps the model ledger out of it: a dry run writes nothing.
+ * paid for as much as it may. `quiet` keeps the local model's calls out of the ledger, for a run that files nothing —
+ * never a hosted model's: what was paid for is always in the ledger, the answer that came back noted `said`.
  */
-async function ask(db, { bundle, now, quiet = false, fallback: mayPay = true }) {
+async function ask(db, { bundle, now, quiet = false, fallback: mayPay = true, said = 'read for a run that files nothing' }) {
   let model = memoryModel(db);
+  let paid = false;
   const log = (result, note) => {
-    if (!quiet) logRun(db, { kind: 'scribe', model, result, note, now });
+    if (!quiet || paid) logRun(db, { kind: 'scribe', model, result, note, now });
   };
   const system = readFileSync(join(REPO_ROOT, 'prompts', 'scribe.md'), 'utf8').trim();
   const schema = opsSchema(db, EXTRACTS);
   // A writer set to a model the user has since turned off is not called: the refusal is the pass's failure, in the ledger like any other.
   const off = MODELS.includes(model) ? offLine(db, model, 'set Memory › Filed by to local there') : null;
   let result = off ? failure(off) : await callModel(db, { system, prompt: bundle.prompt, schema, model, kind: 'scribe' });
+  paid = !off && model !== 'local';
   // A local answer that failed (server down, bundle past its context, answer cut off) is one failed row, then one more try —
   // when a credential is there to pay for it and a model is on to take it.
   const fallback = mayPay && !result.ok && model === 'local' && resolveAnthropicCredential() ? fallbackModel(db) : null;
@@ -329,6 +365,7 @@ async function ask(db, { bundle, now, quiet = false, fallback: mayPay = true }) 
     log(result, `${result.error} — retrying on ${fallback}`);
     model = fallback;
     result = await callModel(db, { system, prompt: bundle.prompt, schema, model, kind: 'scribe' });
+    paid = true;
   }
   const answered = { usage: result.usage, model, result, fallbackUsed: Boolean(fallback), log };
   if (!result.ok) {
@@ -341,6 +378,7 @@ async function ask(db, { bundle, now, quiet = false, fallback: mayPay = true }) 
     log({ ...result, ok: false }, error);
     return { ...answered, ok: false, error, ops: null };
   }
+  if (quiet) log(result, said);
   return { ...answered, ok: true, error: null, ops: result.data.ops };
 }
 
@@ -366,16 +404,16 @@ async function fileOps(db, ops, ctx) {
  * One batch read and filed, with its row of the extraction ledger: written `running` before the model is called, so a
  * pass that dies leaves the attempt behind it; closed `ok` with the model's answer as it came, or `failed` with why.
  */
-async function readBatch(db, { sessionId, batch, attempts, version, now, fallback }) {
+async function readBatch(db, { sessionId, batch, attempts, version, now, at, fallback }) {
   const bundle = bundleOf(db, sessionId, batch, { now });
   const ids = batch.map((u) => u.turn.id);
   const runId = Number(
     db
       .prepare(`INSERT INTO extractions (session_id, extractor_version, status, attempts, first_turn, last_turn, started_at) VALUES (?, ?, 'running', ?, ?, ?, ?)`)
-      .run(sessionId, version, attempts, ids[0], ids.at(-1), now).lastInsertRowid,
+      .run(sessionId, version, attempts, ids[0], ids.at(-1), at()).lastInsertRowid,
   );
   const close = (status, { ops = null, error = null } = {}) =>
-    db.prepare('UPDATE extractions SET status = ?, ops_json = ?, error = ?, ended_at = ? WHERE id = ?').run(status, ops === null ? null : JSON.stringify(ops), error, now, runId);
+    db.prepare('UPDATE extractions SET status = ?, ops_json = ?, error = ?, ended_at = ? WHERE id = ?').run(status, ops === null ? null : JSON.stringify(ops), error, at(), runId);
 
   const asked = await ask(db, { bundle, now, fallback });
   if (!asked.ok) {
@@ -402,13 +440,13 @@ async function readBatch(db, { sessionId, batch, attempts, version, now, fallbac
 }
 
 /** A turn that failed three times alone is set aside, in the ledger and counted, so the turns after it are read. */
-function quarantine(db, { sessionId, turn, attempts, version, now }) {
+function quarantine(db, { sessionId, turn, attempts, version, at }) {
   const last = db
     .prepare(`SELECT error FROM extractions WHERE session_id = ? AND extractor_version = ? AND first_turn = ? AND last_turn = ? AND status = 'failed' ORDER BY id DESC LIMIT 1`)
     .get(sessionId, version, turn.id, turn.id);
   tx(db, () => {
     db.prepare(`INSERT INTO extractions (session_id, extractor_version, status, attempts, first_turn, last_turn, error, started_at, ended_at) VALUES (?, ?, 'quarantined', ?, ?, ?, ?, ?, ?)`)
-      .run(sessionId, version, attempts, turn.id, turn.id, last?.error ?? null, now, now);
+      .run(sessionId, version, attempts, turn.id, turn.id, last?.error ?? null, at(), at());
     markScribed(db, [turn.id]);
   });
   return `t${turn.id} was set aside: read alone it failed ${attempts} times — ${last?.error ?? 'no reason kept'}`;
@@ -422,9 +460,10 @@ function quarantine(db, { sessionId, turn, attempts, version, now }) {
 async function modelAnswers(db, now, fallback) {
   const turn = { id: 0, session_id: '', ts: now, text: 'hello', project: null };
   const bundle = bundleOf(db, '', [{ turn, text: turn.text, replies: [] }], { now, related: false });
-  const asked = await ask(db, { bundle, now, quiet: true, fallback });
-  // In the model ledger when it read or cost something; a call that reached no model is the failed row already there.
-  if (asked.usage.inputTokens + asked.usage.outputTokens > 0) {
+  const asked = await ask(db, { bundle, now, quiet: true, fallback, said: 'asked whether the model answers at all: it does' });
+  // In the model ledger when it read something (a hosted model's call is there already); a call that reached no model
+  // is the failed row already there.
+  if (asked.model === 'local' && asked.usage.inputTokens + asked.usage.outputTokens > 0) {
     logRun(db, { kind: 'scribe', model: asked.model, result: asked.ok ? asked.result : { ...asked.result, ok: false }, note: `asked whether the model answers at all: ${asked.ok ? 'it does' : asked.error}`, now });
   }
   return { ok: asked.ok, fallbackUsed: asked.fallbackUsed };
@@ -442,14 +481,17 @@ async function modelAnswers(db, now, fallback) {
  * against the batch, and three such passes in a row pause filing.
  */
 export async function runScribe(db, { now = new Date().toISOString(), auto = false } = {}) {
-  if (writerOff(db)) return { skipped: 'memory.model is off' };
-
   return withLock('scribe', async () => {
-    const version = extractorVersion(db);
-    const state = filingState(db, now);
-    if (auto && state.paused) return { skipped: `filing is paused: ${state.reason}`, paused: true };
-    // The lock is ours: a row still `running` belongs to a pass that died, and is one failed attempt.
+    // The lock is ours: a row still `running` belongs to a pass that died, and is one failed attempt — closed before
+    // anything can turn this pass away, or a pass that is off or paused would leave it running for ever.
     db.prepare(`UPDATE extractions SET status = 'failed', error = 'the pass that started it died before it finished', ended_at = ? WHERE status = 'running'`).run(now);
+    if (writerOff(db)) return { skipped: 'memory.model is off' };
+    const version = extractorVersion(db);
+    const state = filingState(db);
+    if (auto && state.paused) return { skipped: `filing is paused: ${state.reason}`, paused: true };
+    // Each batch's row says when that batch started and ended, on the pass's clock: a pass long at work is not one that died.
+    const began = Date.now();
+    const at = () => new Date(Date.parse(now) + Date.now() - began).toISOString();
 
     const sessions = sessionsAwaitingExtraction(db, { now, limit: MAX_SESSIONS, includeOpen: !auto });
     if (sessions.length === 0) return { skipped: 'nothing new was said' };
@@ -465,7 +507,7 @@ export async function runScribe(db, { now = new Date().toISOString(), auto = fal
         const next = nextBatch(db, session.id, version);
         if (!next) break;
         if (next.quarantine) {
-          pass.notes.push(quarantine(db, { sessionId: session.id, turn: next.batch[0].turn, attempts: next.attempts, version, now }));
+          pass.notes.push(quarantine(db, { sessionId: session.id, turn: next.batch[0].turn, attempts: next.attempts, version, at }));
           continue;
         }
         if (!mayPay()) {
@@ -473,7 +515,7 @@ export async function runScribe(db, { now = new Date().toISOString(), auto = fal
           break reading;
         }
         calls++;
-        const outcome = await readBatch(db, { sessionId: session.id, batch: next.batch, attempts: next.attempts, version, now, fallback: true });
+        const outcome = await readBatch(db, { sessionId: session.id, batch: next.batch, attempts: next.attempts, version, now, at, fallback: true });
         if (outcome.fallbackUsed) paid++;
         pass.usage = added(pass.usage, outcome.usage);
         pass.fallbackUsed ||= outcome.fallbackUsed;
@@ -519,9 +561,11 @@ export async function runScribe(db, { now = new Date().toISOString(), auto = fal
  * memory stands. `{ ok, error, wouldFile, dropped, batches }` — `wouldFile` as `applyOps` gives `filed`, `dropped`
  * the proposals the rules refused; `batches` what was read, as `{ sessionId, turnIds, ops }`, for whoever then applies it (rebuild.mjs).
  * The model is shown the conversation and no memory, so the answer is the conversation's alone. Only what the user
- * stated is asked of it here: a trap or a checkpoint drawn from a reply cites no turn to be rebuilt from.
+ * stated is asked of it here: a trap or a checkpoint drawn from a reply cites no turn to be rebuilt from. `fallback:
+ * false` asks the model as set alone, never the hosted fallback: for a run the user did not ask for. A hosted call made
+ * is in the ledger of model runs.
  */
-export async function extract(db, { turnIds, now = new Date().toISOString() }) {
+export async function extract(db, { turnIds, now = new Date().toISOString(), fallback = true }) {
   const out = { ok: true, error: null, wouldFile: [], dropped: [], batches: [], usage: NO_USAGE };
   if (writerOff(db)) return { ...out, ok: false, error: 'memory.model is off' };
   const wanted = [...new Set(turnIds)].filter(Number.isInteger);
@@ -536,7 +580,7 @@ export async function extract(db, { turnIds, now = new Date().toISOString() }) {
       const batch = naturalBatch(rest);
       rest = rest.slice(batch.length);
       const bundle = bundleOf(db, sessionId, batch, { now, related: false });
-      const asked = await ask(db, { bundle, now, quiet: true });
+      const asked = await ask(db, { bundle, now, quiet: true, fallback });
       out.usage = added(out.usage, asked.usage);
       if (!asked.ok) {
         out.ok = false;

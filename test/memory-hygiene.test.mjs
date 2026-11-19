@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { applyOps } from '../src/apply.mjs';
+import { applyOps, raiseNotice } from '../src/apply.mjs';
 import { openDb } from '../src/db.mjs';
 import { add, markHits, search } from '../src/memory.mjs';
 import { preferences, prime } from '../src/prime.mjs';
@@ -295,5 +295,23 @@ test('a pass says exactly which memories it wrote — not one already there, not
     const dream = applyOps(db, [...ops, gotcha], { source: 'dream', turns, now: NOW });
     assert.deepEqual(dream.written, [db.prepare(`SELECT id FROM memories WHERE body = ?`).get(gotcha.body).id]);
     assert.deepEqual(applyOps(db, 'not a list', { source: 'worker', turns: new Map(), now: NOW }).written, []);
+  });
+});
+
+test('a contradiction is asked before look-alikes the user has left standing: two old look-alikes never keep it out of the block', async () => {
+  await withHome(freshHome(), {}, () => {
+    const db = openDb();
+    try {
+      const now = '2026-11-18T10:00:00.000Z';
+      const m = (body) => add(db, { type: 'preference', body, writtenBy: 'user', now }).memory.id;
+      // Two pairs the user looked at and left standing, as the notice says to when both hold; then a clash.
+      for (const [a, b] of [['use eslint for linting js', 'use eslint for linting ts'], ['short answers in chat', 'short answers in reviews']]) raiseNotice(db, { kind: 'lookalike', a: m(a), b: m(b), note: 'they look alike — if both hold, leave them', now });
+      raiseNotice(db, { kind: 'contradiction', a: m('slate uses pnpm'), b: m('slate uses bun'), note: 'they cannot both be true', now });
+      const asked = prime(db, { now }).split('\n').filter((l) => l.startsWith('Ask the user'));
+      assert.match(asked[0], /^Ask the user: m5 and m6 disagree — they cannot both be true/);
+      assert.equal(asked.length, 2, 'still two a session');
+    } finally {
+      db.close();
+    }
   });
 });

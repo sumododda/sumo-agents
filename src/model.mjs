@@ -35,6 +35,11 @@ const PRICES = {
   // Where a declined reply is run again (`fallbacks`): the API names the model by the category; the ledger must price what it answered on.
   'claude-opus-4-8': { input: 5, output: 25, cacheRead: 0.1 },
   'claude-sonnet-5': { input: 2, output: 10, cacheRead: 0.1 },
+  // Cursor's own models, at the standard variants Sumo asks for (cursor.com/docs/models, Nov 18 2026). Paid plans draw them from
+  // a weekly pool first: these are what the same tokens cost past it, so a job on them is never priced below what it could cost.
+  // Cursor lists no cache-write rate; a write is priced as the others are.
+  'composer-2.5': { input: 0.5, output: 2.5, cacheRead: 0.4 },
+  'grok-4.7': { input: 2, output: 6, cacheRead: 0.25 },
 };
 /** What writing to the cache costs relative to input: the five-minute cache every request here writes. */
 export const CACHE_WRITE = 1.25;

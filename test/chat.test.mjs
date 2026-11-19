@@ -13,11 +13,12 @@ import { closeJobTab, openWatchTab, reportAgent, startWatcher } from '../src/her
 import { finish, takeInbox } from '../src/jobs.mjs';
 import { add, UsageError } from '../src/memory.mjs';
 import { ENTRY, paths, REPO_ROOT, SELF } from '../src/paths.mjs';
-import { closeMcp, readConfig, writeConfig } from '../src/mcp.mjs';
+import { closeMcp, readConfig } from '../src/mcp.mjs';
 import { addProject } from '../src/projects.mjs';
 import { lockFile, pruneStates, shortId, stateFile, withoutThinking } from '../src/sessions.mjs';
 import { styles } from '../src/tty.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
+import { writeConfig } from './fixtures/mcp-servers.mjs';
 
 const NOW = '2026-09-30T12:00:00.000Z';
 const reply = (stop, content, usage = { input_tokens: 100, output_tokens: 10 }) => ({ stop_reason: stop, content, usage, model: 'claude-opus-5-5' });
@@ -1195,7 +1196,7 @@ test('the commands of the menu work from inside a project: the guide comes with 
 
       // The guide is named, and comes through the prompt hook as an operator message — not a path the tools cannot reach from the project.
       assert.deepEqual(session.expand('/fix the login bug'), { text: 'Fix this: the login bug', said: 'the login bug', guide: 'fix' });
-      assert.equal(session.expand('/toString').error, 'no command /toString — one of: /fix /feature /review /model /memory /mcp /resume /copy /undo /stop /context /export /thinking /config /help /handoff /new /exit');
+      assert.equal(session.expand('/toString').error, 'no command /toString — one of: /fix /feature /review /model /memory /mcp /resume /copy /undo /stop /context /scorecard /export /thinking /config /help /handoff /new /exit');
 
       await session.say('tidy my memory');
       assert.match(seen[1].messages.at(-1).content[0].content, /^(?:tidy: )?(?:nothing to do — |read \d+ sessions)/m, 'the pass ran in this process, and tidied when asked');

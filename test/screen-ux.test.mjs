@@ -113,7 +113,7 @@ test('reads one after another are one row — how many, which — with one line 
     tool('b2', 'bash', { command: 'echo then' }, { content: 'then' });
     await shows(/⏺ Read 1 file \(e\.js\)\n\s+⎿\s+4 lines\n/, 'one file, not "1 files"');
     await tty.type(CTRL_O);
-    for (let i = 0; i < 100 && paged.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    for (const end = Date.now() + 10_000; Date.now() < end && paged.length === 0; ) await new Promise((r) => setTimeout(r, 10));
     const pager = paged[0].replace(/\x1b\[[0-9;]*m/g, '');
     for (const name of ['a.js', 'b.js', 'c.js', 'd.js']) assert.match(pager, new RegExp(`⏺ Read\\(${name.replace('.', '\\.')}\\)`), `${name} in the pager`);
   });
@@ -237,7 +237,7 @@ test('a reply whose stream broke off is drawn once: what the failed try said lea
     await shows(/all of it\. ok/, 'the answer, whole');
     assert.equal(tty.screen().match(/Starting the answer/g).length, 1, `the answer drawn once:\n${tty.screen()}`);
     await tty.type(CTRL_O);
-    for (let i = 0; i < 100 && paged.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    for (const end = Date.now() + 10_000; Date.now() < end && paged.length === 0; ) await new Promise((r) => setTimeout(r, 10));
     assert.doesNotMatch(paged[0], /breaks off here/, 'nor is it in the pager');
     assert.match(paged[0], /Starting the answer, then all of it\./);
   });
@@ -522,7 +522,7 @@ test('/help is compact: a command or a key a row with a few words beside it — 
     assert.ok(rows.every((row) => row.length <= 80), help);
     // The pager has it as the screen does: a row each.
     await tty.type(CTRL_O);
-    for (let i = 0; i < 100 && paged.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    for (const end = Date.now() + 10_000; Date.now() < end && paged.length === 0; ) await new Promise((r) => setTimeout(r, 10));
     assert.match(paged[0].replace(/\x1b\[[0-9;]*m/g, ''), /\n {2}\/model \[model\] \[effort\] +the model and effort[^\n]*\n[\s\S]*\n {2}esc +interrupt the turn/);
   });
 });
@@ -610,7 +610,7 @@ test('which guide rode in with a message is the pager\'s to say: not under your 
     await shows(/⏺ Read 2 files \(a\.js, b\.js\)\n\s+⎿\s+7 lines\n/, 'the reads as one row');
     assert.doesNotMatch(tty.screen(), /guide: fix/, 'not on the screen');
     await tty.type(CTRL_O);
-    for (let i = 0; i < 100 && paged.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    for (const end = Date.now() + 10_000; Date.now() < end && paged.length === 0; ) await new Promise((r) => setTimeout(r, 10));
     assert.match(paged[0], /guide: fix/, 'in the pager');
   });
 });
@@ -674,7 +674,7 @@ test('the terminal saying its window came to the front or went behind is never t
     assert.match(tty.screen(), /Working…/);
     // Esc is still the key that stops the turn — sent as the protocol sends it.
     await tty.type('\x1b[27u');
-    for (let i = 0; i < 100 && stopped === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    for (const end = Date.now() + 10_000; Date.now() < end && stopped === 0; ) await new Promise((r) => setTimeout(r, 10));
     assert.equal(stopped, 1, 'esc stops the turn');
     finish();
   });

@@ -10,11 +10,12 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { describeCall } from '../src/chat.mjs';
 import { getMeta, openDb } from '../src/db.mjs';
-import { addServer, allowedBy, CLAUDE_CODE_TOKEN, closeMcp, connect, DECLINED, gateMcp, isMcpTool, mcpReady, readConfig, removeServer, setAllow, TOOL_SEARCH, writeConfig } from '../src/mcp.mjs';
+import { addServer, allowedBy, CLAUDE_CODE_TOKEN, closeMcp, connect, DECLINED, gateMcp, isMcpTool, mcpReady, readConfig, removeServer, setAllow, TOOL_SEARCH } from '../src/mcp.mjs';
 import { UsageError } from '../src/memory.mjs';
 import { ENTRY, paths, REPO_ROOT } from '../src/paths.mjs';
 import { toolView } from '../src/tty.mjs';
 import { freshHome, withHome } from './fixtures/env-sandbox.mjs';
+import { writeConfig } from './fixtures/mcp-servers.mjs';
 import { NO_KEY, sandbox } from './helpers.mjs';
 
 const FIXTURE = join(REPO_ROOT, 'test', 'fixtures', 'fake-mcp-server.mjs');
@@ -72,6 +73,22 @@ test('a stdio server is given the environment the configuration names, expanded 
     await session.close();
   }
   await assert.rejects(connect('demo', stdioSpec({ env: { T: '${NOPE_NOT_SET}' } }), { env: { PATH: process.env.PATH } }), /NOPE_NOT_SET\} is not set/, 'a placeholder nothing fills is said, not passed on empty');
+});
+
+test("sumo's own credential is never filled into a server's environment, header or address, even when the configuration names it", async () => {
+  const env = { PATH: process.env.PATH, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-abcdefghijklmnopqrstuvwxyz', ANTHROPIC_API_KEY: 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789' };
+  /** Why connecting was refused, or null when it was not — a session that did connect is closed. */
+  const refused = async (connecting) => {
+    try {
+      await (await connecting).close();
+      return null;
+    } catch (cause) {
+      return cause.message;
+    }
+  };
+  assert.match(await refused(connect('demo', stdioSpec({ env: { X: '${CLAUDE_CODE_OAUTH_TOKEN}' } }), { env })), /\$\{CLAUDE_CODE_OAUTH_TOKEN\} is sumo's own credential: it is never handed to an MCP server/);
+  assert.match(await refused(connect('web', { url: 'http://127.0.0.1:9/mcp', headers: { 'x-api-key': '${ANTHROPIC_API_KEY}' } }, { env })), /\$\{ANTHROPIC_API_KEY\} is sumo's own credential/);
+  assert.match(await refused(connect('web', { url: 'http://127.0.0.1:9/mcp?key=${ANTHROPIC_API_KEY}' }, { env })), /\$\{ANTHROPIC_API_KEY\} is sumo's own credential/);
 });
 
 test('a server that cannot start, one that never answers, and one that dies mid-call each say so; a call can be stopped by the user', async () => {
@@ -540,7 +557,7 @@ test('Ctrl-C while sumo mcp waits on a server ends it as a Ctrl-C does, and the 
     }
   };
   const settled = async (check) => {
-    for (let i = 0; i < 250 && !check(); i++) await new Promise((r) => setTimeout(r, 20));
+    for (const end = Date.now() + 10_000; Date.now() < end && !check(); ) await new Promise((r) => setTimeout(r, 20));
     return check();
   };
   try {

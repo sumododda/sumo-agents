@@ -1,14 +1,14 @@
 import { getMeta, setMeta } from './db.mjs';
 import { replaySetAside } from './hooks.mjs';
 import { tidyDue } from './dream.mjs';
-import { emptyRun, extractorVersion, filingState } from './ledger.mjs';
+import { emptyRun, extractorVersion, filingState, memoryModel } from './ledger.mjs';
 import { localServerStatus } from './local-server.mjs';
 import { paths } from './paths.mjs';
 import { heartbeat } from './prime.mjs';
-import { modelStats } from './scribe.mjs';
+import { lockHolder, modelStats } from './scribe.mjs';
 import { searchAll } from './search.mjs';
-import { lastHeard, sessionsAwaitingExtraction } from './sessions.mjs';
-import { CONFIG_DEFAULTS, modelFileOf } from './setup.mjs';
+import { FINISHED_AFTER_MS, lastHeard, sessionsAwaitingExtraction } from './sessions.mjs';
+import { modelFileOf } from './setup.mjs';
 import { spoolStatus } from './spool.mjs';
 import { STOPWORDS } from './text.mjs';
 
@@ -48,7 +48,7 @@ const EMPTY_RUN_WARN = 10;
  * said — the command that reads it is in the line.
  */
 function unreadLong(db, now) {
-  if ((getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model']) === 'off') return { count: 0, since: null };
+  if (memoryModel(db) === 'off') return { count: 0, since: null };
   const cutoff = new Date(Date.parse(now) - UNREAD_FAIL_MS).toISOString();
   const answered = db.prepare('SELECT MAX(ts) AS at FROM replies WHERE session_id = ?');
   const quietSince = (s) => {
@@ -70,7 +70,7 @@ function unreadLong(db, now) {
  * - `emptyRun`: how many conversations read last, in a row, filed nothing (ledger.mjs).
  * `filing` is handed in by a caller that already read it.
  */
-export function memoryHealth(db, now = new Date().toISOString(), { filing = filingState(db, now) } = {}) {
+export function memoryHealth(db, now = new Date().toISOString(), { filing = filingState(db) } = {}) {
   const scans = db
     .prepare(`SELECT slug, scanned_at FROM projects WHERE status = 'active' AND scanned_at IS NOT NULL ORDER BY scanned_at`)
     .all()
@@ -123,13 +123,11 @@ const CANARY_MIN = 3;
 const CANARY_SHOWN = 50;
 /** A backup older than this is said: one is made weekly, at a session's start. */
 const BACKUP_STALE_DAYS = 14;
-/** A pass still `running` after this long was left by a process that died: a batch takes minutes. */
+/** A pass still `running` after this long was left by a process that died, and one holding its lock this long is stuck: a batch takes minutes. */
 const RUN_DEAD_AFTER_MS = 30 * 60_000;
 /** The finished conversations of a harness looked at for replies, and how many without one are no accident. */
 const REPLY_LOOKS = 10;
 const REPLY_MISSING = 3;
-/** A conversation nobody has spoken in for this long is over (as in sessions.mjs). */
-const FINISHED_AFTER_MS = 30 * 60_000;
 
 /** What SQLite says is wrong with a full-text index — its own structure, and against the table it indexes — or null. */
 function indexProblem(db, name) {
@@ -220,7 +218,7 @@ function repliesCheck(db, now) {
  * `sumo doctor` carries them. `fix: true` rebuilds an index that fails, and replays the spool's set-aside lines, before judging. `filing` is handed in by a
  * caller that already read it.
  */
-export function memoryCheck(db, now = new Date().toISOString(), { fix = false, filing = filingState(db, now) } = {}) {
+export function memoryCheck(db, now = new Date().toISOString(), { fix = false, filing = filingState(db) } = {}) {
   const checks = [];
   const check = (name, { ok, label, fix: how = '' }) => checks.push({ name, ok, label, fix: ok ? '' : how });
 
@@ -255,10 +253,14 @@ export function memoryCheck(db, now = new Date().toISOString(), { fix = false, f
   check('backup', backupCheck(db, now));
 
   const dead = db.prepare(`SELECT COUNT(*) AS n, MIN(started_at) AS since FROM extractions WHERE status = 'running' AND started_at < ?`).get(new Date(Date.parse(now) - RUN_DEAD_AFTER_MS).toISOString());
+  // A lock a live pass has held past any batch's time: every pass after it is turned away while it holds on.
+  const stuck = ['scribe', 'dream'].map(lockHolder).find((h) => h && Date.parse(now) - h.since > RUN_DEAD_AFTER_MS);
   check('passes', {
-    ok: dead.n === 0,
-    label: dead.n === 0 ? 'no memory pass was left unfinished' : `${many(dead.n, 'memory pass', 'memory passes')} left running by a process that died (since ${dead.since?.slice(0, 16)})`,
-    fix: 'sumo memory run reads those conversations again',
+    ok: dead.n === 0 && !stuck,
+    label: stuck
+      ? `the memory pass has been held by process ${stuck.pid} for ${Math.floor((Date.parse(now) - stuck.since) / 60_000)} minutes`
+      : dead.n === 0 ? 'no memory pass was left unfinished' : `${many(dead.n, 'memory pass', 'memory passes')} left running by a process that died (since ${dead.since?.slice(0, 16)})`,
+    fix: stuck ? `a pass takes minutes: if process ${stuck.pid} is stuck, end it (kill ${stuck.pid}) and the next pass takes over` : 'sumo memory run reads those conversations again',
   });
 
   check('replies', repliesCheck(db, now));
@@ -339,9 +341,9 @@ const row = (label, value) => `${label.padEnd(LABEL_WIDTH)}${value}`;
  * and not heard.
  */
 export async function memoryStatus(db, now = new Date().toISOString()) {
-  const filing = filingState(db, now);
+  const filing = filingState(db);
   const health = memoryHealthLine(memoryHealth(db, now, { filing }), now);
-  const model = getMeta(db, 'config.memory.model') ?? CONFIG_DEFAULTS['memory.model'];
+  const model = memoryModel(db);
   const server = model === 'local' ? await localServerStatus(db, { file: modelFileOf(db) }) : null;
   const rung = model === 'off' ? 'none: the pass is off, what is said is still kept and found by search' : filing.fallbackUsed ? 'the fallback: the local model could not answer the last pass' : model === 'local' ? 'the local model' : `${model}, as set`;
   const version = extractorVersion(db);

@@ -59,3 +59,22 @@ test('nothing in src/ is exported that no other file names: what only its own fi
   }
   assert.deepEqual(dead, [], `exported and named by no other file:\n${dead.join('\n')}`);
 });
+
+test('no module in src/ imports itself back through others: the standalone binary once spun for ever loading such a cycle before any job could start', () => {
+  const src = join(REPO_ROOT, 'src');
+  const edges = Object.fromEntries(
+    readdirSync(src)
+      .filter((f) => f.endsWith('.mjs'))
+      .map((f) => [f, [...readFileSync(join(src, f), 'utf8').matchAll(/^import [^;]*? from '\.\/([^']+)';/gm)].map((m) => m[1])]),
+  );
+  const cycles = [];
+  const done = new Set();
+  const visit = (file, path) => {
+    if (path.includes(file)) return cycles.push([...path.slice(path.indexOf(file)), file].join(' → '));
+    if (done.has(file)) return;
+    for (const next of edges[file] ?? []) visit(next, [...path, file]);
+    done.add(file);
+  };
+  for (const file of Object.keys(edges)) visit(file, []);
+  assert.deepEqual(cycles, []);
+});

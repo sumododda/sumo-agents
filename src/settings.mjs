@@ -3,11 +3,12 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Box, render, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
 import { createElement as h, useReducer } from 'react';
-import { discoverModels, discoverySummary, MODEL_IDS, MODELS, modelStates, setModel } from './catalog.mjs';
+import { ALL_MODELS, cursorSummary, discoverCursor, discoverModels, discoverySummary, JOB_MODELS, laneOf, modelId, MODELS, modelStates, setModel } from './catalog.mjs';
+import { refreshScorecard, scorecardSummary } from './scorecard.mjs';
 import { getMeta, openDb } from './db.mjs';
 import { addServer, allowedBy, CLAUDE_CODE_TOKEN, connect, readConfig, removeServer, setAllow } from './mcp.mjs';
 import { redact } from './redact.mjs';
-import { CHAT_EFFORTS, CONFIG_DEFAULTS, config, fetchModel } from './setup.mjs';
+import { CHAT_EFFORTS, CONFIG_DEFAULTS, config, fetchModel, modelUrlOrRefuse } from './setup.mjs';
 
 /**
  * The settings page: every setting Sumo has, on one page, changed with the arrow keys and saved the moment it changes —
@@ -22,7 +23,12 @@ import { CHAT_EFFORTS, CONFIG_DEFAULTS, config, fetchModel } from './setup.mjs';
  */
 
 const ACCENT = '#d77757';
-const TONES = { acc: { color: ACCENT }, b: { bold: true }, d: { dimColor: true }, g: { color: 'green' }, r: { color: 'red' }, y: { color: 'yellow' }, gr: { color: 'gray' }, v: { inverse: true } };
+const TONES = { acc: { color: ACCENT }, b: { bold: true }, d: { dimColor: true }, g: { color: 'green' }, r: { color: 'red' }, y: { color: 'yellow' }, gr: { color: 'gray' } };
+/**
+ * Reverse video, whatever the colour — the cursor in a field (`v`): NO_COLOR asks for no colour, and chalk, told so,
+ * drops every style with it. This is not colour, and is kept, as the chat's box keeps its cursor.
+ */
+const reverse = (text) => `\x1b[7m${text}\x1b[27m`;
 const VALUE_WIDTH = 18;
 /** A value typed here with no `${NAME}` in it would be stored, and a header is where a token goes. */
 const NAMED = /\$\{[A-Za-z_][A-Za-z0-9_]*\}/;
@@ -95,7 +101,7 @@ export function claudeCodeServers(cwd = process.cwd(), env = process.env) {
   const out = [];
   for (const [name, s] of Object.entries(found)) {
     if (!s || typeof s !== 'object') continue;
-    const literal = (values) => Object.values(values ?? {}).some((v) => !NAMED.test(String(v)) && redact(String(v)) !== String(v));
+    const literal = (values) => Object.values(values ?? {}).some((v) => !NAMED.test(String(v)) && redact(String(v)).count > 0);
     if (s.url) {
       const headers = s.headers && Object.keys(s.headers).length > 0 ? s.headers : null;
       const why = s.type === 'sse' ? 'an SSE server — Sumo speaks stdio and streamable HTTP' : headers && Object.values(headers).some((v) => !NAMED.test(String(v))) ? "its header holds a token in Claude Code's file — add it here with ${NAME}" : null;
@@ -135,17 +141,17 @@ export function keyName(input, key) {
 }
 
 /**
- * The page. `live` is what the chat lends it: `route(args)` switches the chat's model and effort as the page changes
+ * The page. `live` is what the chat lends it: `route(args)` switches the chat's model and effort as the page changes, `current()` is the route it is on,
  * them, `servers()` says how its MCP servers connected, `left()` is the status line's left side. Without it (`sumo
- * config`) a change is for the next chat. `toolsOf`, `download`, `discover` and `claude` are the slow or outside parts,
+ * config`) a change is for the next chat. `toolsOf`, `download`, `discover`, `cursor`, `score` and `claude` are the slow or outside parts,
  * passed in so a test can stand in for them.
  */
-export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNames, download = fetchModel, discover = discoverModels, claude = () => claudeCodeServers(cwd), onChange = () => {} } = {}) {
+export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNames, download = fetchModel, discover = discoverModels, cursor = discoverCursor, score = refreshScorecard, claude = () => claudeCodeServers(cwd), onChange = () => {} } = {}) {
   const db = openDb();
   const values = () => Object.fromEntries(Object.keys(CONFIG_DEFAULTS).map((k) => [k, getMeta(db, `config.${k}`) ?? CONFIG_DEFAULTS[k]]));
-  const switches = () => Object.fromEntries(MODELS.map((m) => [m, modelStates(db)[m].on]));
+  const switches = () => Object.fromEntries(ALL_MODELS.map((m) => [m, modelStates(db)[m].on]));
   const serversNow = () => Object.entries(readConfig().mcpServers).map(([name, spec]) => ({ name, spec }));
-  const S = { v: values(), on: switches(), servers: [], view: 'page', f: 0, tf: 0, sv: 0, edit: null, msg: null, ask: null, add: null, tools: null, busy: 0, scroll: {}, log: [], closed: false };
+  const S = { v: values(), on: switches(), servers: [], view: 'page', f: 0, tf: 0, sv: 0, edit: null, msg: null, ask: null, add: null, tools: null, busy: 0, scroll: {}, log: [], closed: false, fetching: null };
   try {
     S.servers = serversNow();
   } catch (cause) {
@@ -174,14 +180,14 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
 
   const sections = () => [
     ['Chat', [
-      { id: 'chat.model', label: 'Model', type: 'choice', opts: () => ['auto', ...MODELS], disabled: (o) => o !== 'auto' && !S.on[o], when: live.route ? 'this chat too' : 'from the next chat', hint: 'the model chats run on — auto: the router picks one each turn' },
+      { id: 'chat.model', label: 'Model', type: 'choice', opts: () => ['auto', ...ALL_MODELS], disabled: (o) => o !== 'auto' && !S.on[o], when: live.route ? 'this chat too' : 'from the next chat', hint: 'the model chats run on — auto: the router picks one each turn' },
       { id: 'chat.effort', label: 'Effort', type: 'choice', opts: () => CHAT_EFFORTS, when: live.route ? 'this chat too' : 'from the next chat', hint: 'how much the model thinks before it acts' },
       { id: 'chat.budget', label: 'Spend notice', type: 'money', step: 1, unit: 'a session', zero: 'never', when: live.route ? 'this chat too' : '', hint: 'what a chat may cost before the screen says so, once — ←→ by $1 or type it, 0 for never' },
       { id: 'chat.notify', label: 'Notify', type: 'toggle', when: 'from the next chat', hint: 'the bell and a notification when a long turn ends behind another window' },
       { id: 'chat.screen', label: 'Screen', type: 'choice', opts: () => ['full', 'still', 'plain'], when: 'from the next chat', hint: 'full: colours flow through the working line · still: nothing moves · plain: for a screen reader' },
     ]],
     ['Jobs', [
-      { id: 'jobs.floor', label: 'Smallest model', type: 'choice', opts: () => MODELS, disabled: (o) => !S.on[o], when: 'jobs from now on', hint: 'the smallest model a job may run on — haiku holds nothing back' },
+      { id: 'jobs.floor', label: 'Smallest model', type: 'choice', opts: () => JOB_MODELS, disabled: (o) => !S.on[o], when: 'jobs from now on', hint: 'the smallest model a job may run on — haiku holds nothing back' },
       { id: 'jobs.budget', label: 'Budget', type: 'money', step: 1, unit: 'a job', zero: 'no cap', when: 'jobs from now on', hint: 'what one job may spend before it is stopped — 0 for no cap' },
       { id: 'jobs.minutes', label: 'Time limit', type: 'minutes', step: 15, zero: 'no limit', when: 'jobs from now on', hint: 'how long one job may run before it is stopped — ←→ by 15 or type it, 0 for no limit' },
       { id: 'jobs.review', label: 'Review', type: 'choice', opts: () => ['risky', 'all', 'off'], when: 'jobs from now on', hint: 'which workers that finish DONE are reviewed unasked: the risky ones, every one, or none' },
@@ -197,8 +203,8 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
     ]],
     ['Projects', [{ id: 'projects.home', label: 'New ones go in', type: 'path', action: 'enter: change', when: 'at once', hint: 'the folder a new project is made in' }]],
     ['API models', [
-      ...MODELS.map((m) => ({ id: `model:${m}`, label: cap(m), type: 'model', m, hint: 'on: offered for chats, jobs and memory · off: never used' })),
-      { id: 'discover', label: 'Discover', type: 'action', text: 'ask the API which this login can use', action: 'enter', hint: 'sets the switches from the answer — one you turned off stays off' },
+      ...ALL_MODELS.map((m) => ({ id: `model:${m}`, label: cap(m), type: 'model', m, hint: laneOf(m) === 'cursor' ? 'on: offered for chats and jobs, run through Cursor with CURSOR_API_KEY · off: never used' : 'on: offered for chats, jobs and memory · off: never used' })),
+      { id: 'discover', label: 'Discover', type: 'action', text: 'ask Anthropic and Cursor which this login can use', action: 'enter', hint: 'sets the switches from the answer — one you turned off stays off — and fetches the scorecard routing reads' },
     ]],
     ['MCP servers', [
       ...S.servers.map((s, i) => ({ id: `server:${s.name}`, label: s.name, type: 'server', s, i, action: 'enter: tools', hint: `${s.spec.url ?? [s.spec.command, ...(s.spec.args ?? [])].join(' ')} — enter: its tools, and which run without asking` })),
@@ -285,7 +291,7 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
       case 'model': {
         const t = tog(S.on[r.m]);
         t[0][0] = t[0][0].padEnd(plain ? 3 : 5);
-        return [...t, [`   ${MODEL_IDS[r.m]}`, 'd']];
+        return [...t, [`   ${modelId(r.m)}`, 'd']];
       }
       case 'action':
         return r.text ? [[r.text, 'd']] : [];
@@ -422,6 +428,7 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
   function set(r, value) {
     const old = S.v[r.id];
     if (old === value) return;
+    if (r.id === 'model.url') return fetchFirst(r, old, value);
     try {
       config(r.id, value);
     } catch (cause) {
@@ -430,19 +437,46 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
     S.v[r.id] = value;
     S.msg = { ok: `saved · ${r.label.toLowerCase()}: ${show(r, old)} → ${show(r, value)}${r.when ? ` · ${r.when}` : ''}` };
     if (r.id === 'shell.sandbox' && value === 'off') S.msg = { warn: "saved · sandbox off from the next chat — the model's shell can write anywhere you can" };
+    // Only what changed moves in the chat: a model picked there with /model stays when the effort changes, and the
+    // effort it is on when the model does (`/model <model>` keeps it). A chat on auto has the router pick its effort.
     if ((r.id === 'chat.model' || r.id === 'chat.effort') && live.route) {
       try {
-        live.route(S.v['chat.model'] === 'auto' ? 'auto' : `${S.v['chat.model']} ${S.v['chat.effort']}`);
+        const now = live.current();
+        if (r.id === 'chat.model') live.route(value);
+        else if (now.model === 'auto') S.msg = { ok: `saved · ${r.label.toLowerCase()}: ${show(r, old)} → ${show(r, value)} · this chat is on auto, which picks the effort each turn` };
+        else live.route(`${now.model} ${value}`);
       } catch (cause) {
         S.msg = { warn: `saved for new chats; this one did not switch: ${cause.message}` };
       }
     }
-    if (r.id === 'model.url') {
-      S.msg = { info: `saved · downloading ${show(r, value)}… — the old model is used until it is here` };
-      later(download(), (said, cause) => {
-        S.msg = cause ? { err: cause.message } : /not|fail|could/i.test(String(said)) ? { warn: String(said).replace(/^model\s+/, '') } : { ok: String(said ?? 'downloaded').replace(/^model\s+/, '') };
-      });
+  }
+  /**
+   * A new local model, downloaded first and stored only once it is here (`download` stores it then, and stops the
+   * server that ran the old one): until then, and for good if it never comes, the model in use stays in use.
+   */
+  function fetchFirst(r, old, value) {
+    try {
+      modelUrlOrRefuse(value);
+    } catch (cause) {
+      return err(cause.message);
     }
+    S.msg = { info: `downloading ${show(r, value)}… — the model in use stays until it is here` };
+    const done = Promise.resolve(download(value)).then(
+      (got) => {
+        if (got?.ok) S.v[r.id] = value;
+        S.fetching = null;
+        return got;
+      },
+      (cause) => {
+        S.fetching = null;
+        throw cause;
+      },
+    );
+    S.fetching = { from: show(r, old), to: show(r, value), done };
+    later(done, (got, cause) => {
+      const said = String(cause?.message ?? got?.line ?? '').replace(/^model\s+/, '');
+      S.msg = got?.ok ? { ok: `saved · ${r.label.toLowerCase()}: ${show(r, old)} → ${show(r, value)} · ${said}` } : { err: said || 'the download failed' };
+    });
   }
   function change(r, d) {
     if (r.type === 'choice') {
@@ -471,7 +505,8 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
     if (S.on[m]) {
       const users = [['chat.model', "the chat's model"], ['jobs.floor', "the jobs' smallest model"], ['memory.model', 'the model that files memory']].filter(([k]) => S.v[k] === m);
       if (users.length > 0) return err(`${m} is ${users[0][1]} — pick another there first`);
-      if (MODELS.filter((x) => S.on[x]).length === 1) return err('one model stays on: chats and jobs need one');
+      // A Claude model stays on: the chat and the memory pass run on nothing else. Cursor's are for jobs, and may all be off.
+      if (laneOf(m) === 'claude' && MODELS.filter((x) => S.on[x]).length === 1) return err('one model stays on: chats and jobs need one');
     }
     setModel(db, m, !S.on[m]);
     S.on = switches();
@@ -512,10 +547,18 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
         return openTools(r);
     }
     if (r.id === 'discover') {
-      S.msg = { info: 'asking the API which models this login can use…' };
-      later(discover(db), (found, cause) => {
+      S.msg = { info: 'asking Anthropic and Cursor which models this login can use, and fetching the scorecard…' };
+      // Each is asked on its own: Cursor needs only its key, and the scorecard no login at all. One that fails is said, never thrown.
+      const settled = (work) => Promise.resolve().then(work).catch((cause) => ({ ok: false, error: cause.message }));
+      later(Promise.all([discover(db), settled(() => cursor(db)), settled(() => score(db))]), (all, cause) => {
         S.on = switches();
-        S.msg = cause ? { err: cause.message } : found.ok ? { ok: discoverySummary(found) } : { err: found.error };
+        if (cause) {
+          S.msg = { err: cause.message };
+          return;
+        }
+        const [found, fromCursor, card] = all;
+        const said = `${found.ok ? discoverySummary(found) : found.error} — ${cursorSummary(fromCursor)} — ${scorecardSummary(card)}`;
+        S.msg = found.ok && card.ok ? { ok: said } : { err: said };
       });
     }
     if (r.id === 'add') {
@@ -547,7 +590,15 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
     const stem = full.slice(at + 1);
     let names = [];
     try {
-      names = readdirSync(dir).filter((n) => n.startsWith(stem) && (stem.startsWith('.') || !n.startsWith('.')) && statSync(join(dir, n)).isDirectory());
+      // Each name on its own: a link that leads nowhere is no folder, and no reason the others are not.
+      const isFolder = (n) => {
+        try {
+          return statSync(join(dir, n)).isDirectory();
+        } catch {
+          return false;
+        }
+      };
+      names = readdirSync(dir).filter((n) => n.startsWith(stem) && (stem.startsWith('.') || !n.startsWith('.')) && isFolder(n));
     } catch {
       names = [];
     }
@@ -583,7 +634,7 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
     if (a.login === 1) {
       const pairs = wordsOf(cred).map((p) => /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(p));
       if (pairs.length === 0 || pairs.some((p) => !p)) throw new Error('variables as NAME=${NAME}, one or more');
-      if (pairs.some((p) => !NAMED.test(p[2]) && redact(p[2]) !== p[2])) throw new Error('a token typed here would be stored — write ${NAME} and keep the token in your shell');
+      if (pairs.some((p) => !NAMED.test(p[2]) && redact(p[2]).count > 0)) throw new Error('a token typed here would be stored — write ${NAME} and keep the token in your shell');
       return { command, args, env: Object.fromEntries(pairs.map((p) => [p[1], p[2]])) };
     }
     return { command, args };
@@ -633,8 +684,13 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
   }
   function toggleTool(s, t) {
     const on = allowedBy(s.spec, t);
-    setAllow(s.name, t, !on, S.tools.names);
-    S.servers = serversNow();
+    // Changed elsewhere meanwhile — removed by another sumo, say — is said, like a remove or an add that fails.
+    try {
+      setAllow(s.name, t, !on, S.tools.names);
+      S.servers = serversNow();
+    } catch (cause) {
+      return err(cause.message);
+    }
     if (!S.log.includes(`${s.name} allow list`)) S.log.push(`${s.name} allow list`);
     S.msg = { ok: `${t} ${on ? 'asks first again' : 'runs without asking'}${live.route ? ' · from the next chat' : ''}` };
   }
@@ -692,8 +748,12 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
     } else if (k === 'a' || k === 'A') {
       if (!S.tools?.names?.length) return err('no tools to switch: it has not connected');
       const every = s.spec.allow === 'all' || S.tools.names.every((t) => allowedBy(s.spec, t));
-      setAllow(s.name, 'all', !every);
-      S.servers = serversNow();
+      try {
+        setAllow(s.name, 'all', !every);
+        S.servers = serversNow();
+      } catch (cause) {
+        return err(cause.message);
+      }
       if (!S.log.includes(`${s.name} allow list`)) S.log.push(`${s.name} allow list`);
       S.msg = every ? { ok: `every ${s.name} tool asks first again` } : { warn: `every ${s.name} tool runs without asking — new ones it adds too` };
     } else if (['left', 'right', 'enter', 'space'].includes(k) && r?.type === 'tool') toggleTool(s, r.t);
@@ -823,8 +883,13 @@ export function settingsPage({ live = {}, cwd = process.cwd(), toolsOf = toolNam
       for (const [, rows] of sections()) {
         for (const r of rows) if (r.id in snap.v && snap.v[r.id] !== S.v[r.id]) out.push(`${r.label.toLowerCase()} ${show(r, snap.v[r.id])} → ${show(r, S.v[r.id])}`);
       }
-      for (const m of MODELS) if (snap.on[m] !== S.on[m]) out.push(`${m} ${S.on[m] ? 'on' : 'off'}`);
+      for (const m of ALL_MODELS) if (snap.on[m] !== S.on[m]) out.push(`${m} ${S.on[m] ? 'on' : 'off'}`);
+      if (S.fetching) out.push(`local model ${S.fetching.from} → ${S.fetching.to} once it has downloaded — the one in use stays until then`);
       return [...out, ...S.log];
+    },
+    /** A local model still downloading — what it is, and the promise of how it went — or null. */
+    get fetching() {
+      return S.fetching;
     },
     get closed() {
       return S.closed;
@@ -837,11 +902,15 @@ const toneOf = (cls) => Object.assign({}, ...String(cls ?? '').split(' ').filter
 /** The page's lines on an Ink screen. */
 export function SettingsView({ page, columns, rows, plain = false }) {
   const lines = page.lines({ columns, rows, plain });
-  return h(Box, { flexDirection: 'column' }, ...lines.map((l, i) => h(Text, { key: i, wrap: 'truncate' }, ...(l.length === 0 ? [' '] : l.map(([t, c], j) => h(Text, { key: j, ...toneOf(c) }, t))))));
+  const drawn = (t, c) => (String(c ?? '').split(' ').includes('v') ? reverse(t) : t);
+  return h(Box, { flexDirection: 'column' }, ...lines.map((l, i) => h(Text, { key: i, wrap: 'truncate' }, ...(l.length === 0 ? [' '] : l.map(([t, c], j) => h(Text, { key: j, ...toneOf(c) }, drawn(t, c)))))));
 }
 
-/** `sumo config` at a terminal: the page on its own, until Esc; then what changed, said once. */
-export async function runSettings({ stdin = process.stdin, stdout = process.stdout, plain = false } = {}) {
+/**
+ * `sumo config` at a terminal: the page on its own, until Esc; then what changed, said once. A local model still
+ * downloading is said and waited for — Ctrl-C stops it, and the model in use stays. `options` are the page's.
+ */
+export async function runSettings({ stdin = process.stdin, stdout = process.stdout, plain = false, ...options } = {}) {
   let wake = () => {};
   function App() {
     const { exit } = useApp();
@@ -859,10 +928,18 @@ export async function runSettings({ stdin = process.stdin, stdout = process.stdo
     // One row short of the window: Ink draws a frame that fills it as a full screen, wiping what was above.
     return h(SettingsView, { page, columns, rows: Math.max(8, rows - 1), plain });
   }
-  const page = settingsPage({ onChange: () => wake() });
+  const page = settingsPage({ ...options, onChange: () => wake() });
   const app = render(h(App), { stdin, stdout, exitOnCtrlC: false, interactive: Boolean(stdout.isTTY) });
   await app.waitUntilExit();
-  const changed = page.summary();
-  return changed.length > 0 ? changed.map((c) => `saved: ${c}`) : ['nothing changed'];
+  const pending = page.fetching;
+  let failed = null;
+  if (pending) {
+    stdout.write(`still downloading ${pending.to} — the model in use stays until it is here; Ctrl-C stops it and changes nothing\n`);
+    const got = await pending.done.catch((cause) => ({ ok: false, line: cause.message }));
+    if (!got?.ok) failed = `not saved: local model ${pending.to} — ${String(got?.line ?? '').replace(/^model\s+/, '')}`;
+  }
+  const changed = page.summary().map((c) => `saved: ${c}`);
+  if (failed) changed.push(failed);
+  return changed.length > 0 ? changed : ['nothing changed'];
 }
 

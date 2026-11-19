@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { isSecretPath } from './guard.mjs';
 import { UsageError } from './memory.mjs';
 import { secretShape } from './redact.mjs';
+import { ownGit } from './sandbox.mjs';
 import { readPlainFile, verifyCommands } from './scan.mjs';
-import { killGroup } from './tools.mjs';
+import { digest, killGroup } from './tools.mjs';
 
 /**
  * A job's work, judged by running things rather than by reading the report.
@@ -44,7 +45,7 @@ const LOOKS_AWAY =
 
 function git(root, args) {
   try {
-    return execFileSync('git', ['-C', root, '-c', 'core.quotePath=false', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
+    return execFileSync('git', ['-C', root, '-c', 'core.quotePath=false', ...ownGit(args)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
   } catch {
     return null;
   }
@@ -69,7 +70,7 @@ function hashesOf(root, files) {
   const there = files.filter((f) => !f.endsWith('/') && existsSync(join(root, f)));
   if (there.length === 0) return new Map();
   try {
-    const out = execFileSync('git', ['-C', root, 'hash-object', '--stdin-paths'], { input: `${there.join('\n')}\n`, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
+    const out = execFileSync('git', ['-C', root, ...ownGit(['hash-object', '--stdin-paths'])], { input: `${there.join('\n')}\n`, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
     return new Map(out.split('\n').slice(0, there.length).map((hash, i) => [there[i], hash]));
   } catch {
     // One path git will not hash (a directory, an odd name) must not hide the others: they are asked one at a time.
@@ -136,7 +137,7 @@ function checkOutput(fd, failed) {
   const lines = bytes.subarray(0, readSync(fd, bytes, 0, bytes.length, start)).toString('utf8').trimEnd().split('\n');
   // Read from inside a line, the first piece is half of one.
   if (start > 0 && lines.length > 1) lines.shift();
-  const failures = failed && start === 0 ? namedFailures(lines) : [];
+  const failures = (failed && start === 0 && namedFailures(lines)) || [];
   return { output: lines.slice(-OUTPUT_TAIL_LINES).join('\n'), failures };
 }
 
@@ -191,19 +192,74 @@ const FAILURE_LINE = /\b(?:fail(?:s|ed|ing|ures?)?|errors?|not ok)\b|[✗✕✖]
 /** A time a runner prints, which differs from one run to the next when nothing else does. */
 const TIMING = /\b\d+(?:\.\d+)?\s?m?s\b/g;
 
-/** Named cases printed by common test reporters. A wrapper's exit message or a failure count alone identifies no test. */
+/** How long a named case took, after its name — `(0.84ms)`, `(5.1 s)`, vitest's bare `50ms`: it differs from one run to the next. */
+const CASE_TIME = /\s*(?:\(\d+(?:\.\d+)?\s?m?s\)|\s\d+(?:\.\d+)?\s?m?s)$/;
+const countOf = (line, pattern) => Number(pattern.exec(line)?.[1] ?? 0);
+/** A runner's own count of what failed — a line that is never a name — and how many it says. */
+const COUNTS = [
+  // pytest: `==== 1 failed, 2 passed, 1 error in 0.02s ====`, bare under -q.
+  [/^=*\s*\d+ (?:failed|passed|errors?|skipped|deselected|xfailed|xpassed|warnings?|rerun)\b.* in \d+(?:\.\d+)?s\b/, (l) => countOf(l, /(\d+) failed/) + countOf(l, /(\d+) errors?\b/)],
+  // unittest: `FAILED (failures=1, errors=1)`.
+  [/^FAILED \(\w+=\d+(?:, \w+=\d+)*\)$/, (l) => countOf(l, /\bfailures=(\d+)/) + countOf(l, /\berrors=(\d+)/)],
+  // jest `Tests:  1 failed, 1 passed`, vitest `Tests  1 failed | 1 passed`; node:test's spec and TAP; cargo, a line a target; mocha.
+  [/^Tests:?\s+\d+ failed\b/, (l) => countOf(l, /(\d+) failed/)],
+  [/^(?:ℹ|#) fail \d+$/, (l) => countOf(l, /(\d+)/)],
+  [/^test result: FAILED\./, (l) => countOf(l, /(\d+) failed/)],
+  [/^\d+ failing$/, (l) => countOf(l, /(\d+)/)],
+];
+
+/**
+ * The cases a check's runner says failed, each under the file, target or package it printed it under — two tests called
+ * `works` in two files are two cases — or null when they cannot be compared: fewer named than the runner's own count, or
+ * a run it stopped before the rest of the suite ran, which hides whatever it never reached. A count is never a name.
+ */
 function namedFailures(lines) {
   const names = [];
+  let total = null;
+  // Where the cases that follow were printed: a cargo target, node's `test at <file>`. Go's are placed by the `FAIL<tab><package>`
+  // line that ends their package; node's spec reporter lists its failures again under their files, and that list names them.
+  let where = '';
+  let unplaced = [];
+  let listed = [];
+  let summary = false;
+  let tap = null;
+  let rerun = false;
+  let everyTarget = false;
   for (const raw of lines) {
     const line = raw.replace(/\x1b\[[0-9;]*m/g, '').trim();
-    const match = /^(?:not ok(?: \d+)? - |--- FAIL: |(?:FAIL|FAILED) +|[✗✕✖×●] +)(.+)$/.exec(line)
-      ?? /^test (.+?) \.\.\. FAILED$/.exec(line);
-    if (match) {
-      const name = match[1].replace(/\s*\(\d+(?:\.\d+)?\s?m?s\)$/, '').trim();
-      if (name) names.push(createHash('sha256').update(name).digest('hex'));
+    if (/^!+ stopping after \d+ failures? !+$|^Interrupted: /.test(line)) return null;
+    if (/^error: test failed, to rerun pass\b/.test(line)) rerun = true;
+    if (/^error: \d+ targets? failed:$/.test(line)) everyTarget = true;
+    const count = COUNTS.find(([pattern]) => pattern.test(line));
+    if (count) {
+      total = (total ?? 0) + count[1](line);
+      continue;
+    }
+    let m;
+    if ((m = /^Running (?:unittests )?(\S+)/.exec(line) ?? /^(Doc-tests \S+)/.exec(line) ?? /^test at (.+?)(?::\d+)*$/.exec(line))) where = m[1];
+    else if ((m = /^location: '(.+?)(?::\d+)*'$/.exec(line))) {
+      if (tap !== null) names[tap] = `${m[1]} ${names[tap]}`;
+      tap = null;
+    } else if (/^✖ failing tests:$/.test(line)) [summary, listed] = [true, []];
+    else if ((m = /^--- FAIL: (.+)$/.exec(line))) unplaced.push(m[1].replace(CASE_TIME, ''));
+    else if ((m = /^FAIL\t(\S+)(?:\t\S+)?(?: (\[[^\]]+\]))?$/.exec(line))) {
+      names.push(...unplaced.map((name) => `${m[1]} ${name}`), [m[1], m[2]].filter(Boolean).join(' '));
+      unplaced = [];
+    } else if ((m = /^(FAILED|ERROR) (\S+\.py\b.*?)(?: - .*)?$/.exec(line) ?? /^(FAIL|ERROR): (.+)$/.exec(line))) names.push(`${m[1]} ${m[2]}`);
+    else if ((m = /^test (.+?) \.\.\. FAILED$/.exec(line))) names.push(`${where} ${m[1]}`.trim());
+    else if ((m = /^not ok(?: \d+)? - (.+)$/.exec(line))) tap = names.push(m[1].replace(CASE_TIME, '')) - 1;
+    else if ((m = /^(✖|[✗✕×●]|FAIL|FAILED) +(.+)$/.exec(line))) {
+      const name = m[2].replace(CASE_TIME, '').trim();
+      if (!name || /^\(?\w+=\d+(?:,\s*\w+=\d+)*\)?$|^\d+ (?:failed|failing|errors?|tests?)\b/.test(name)) continue;
+      if (m[1] !== '✖') names.push(name);
+      else if (summary) names.push(`${where} ${name}`.trim());
+      else listed.push(name);
     }
   }
-  return names;
+  if (rerun && !everyTarget) return null;
+  names.push(...unplaced, ...listed);
+  if (total !== null && names.length < total) return null;
+  return names.map(digest);
 }
 
 /** A new failure must not be forgiven just because the same command was red before. Count duplicate case names as well. */
@@ -406,7 +462,7 @@ export function writeChanges(root, snap, file) {
   // What git never tracked has no earlier side to show: a new file, and one changed outside git, are given whole.
   for (const created of [...changes.created, ...outside.filter((c) => c.status === 'M').map((c) => c.path)]) {
     // `--no-index` exits 1 when the files differ, which is every time; the diff is on stdout either way.
-    const run = spawnSync('git', ['-C', root, '-c', 'core.quotePath=false', ...DIFF, '--no-index', '--', '/dev/null', created], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const run = spawnSync('git', ['-C', root, '-c', 'core.quotePath=false', ...ownGit([...DIFF, '--no-index', '--', '/dev/null', created])], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     parts.push(run.stdout?.trimEnd() ?? '');
   }
   writeFileSync(file, `${parts.filter(Boolean).join('\n')}\n`, { mode: 0o600 });

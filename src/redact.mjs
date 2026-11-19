@@ -6,6 +6,8 @@
  * plus a digit: without that it eats long file paths and 40-char git SHAs,
  * which memories legitimately contain.
  */
+import { CREDENTIAL_NAMES } from './auth.mjs';
+
 const PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\bsk-[A-Za-z0-9_-]{20,}/g,
@@ -149,8 +151,18 @@ function redactReadable(text) {
     return MARK;
   };
 
+  // The credentials Sumo itself runs on, by their values, whatever their shape: a Cursor key has none the patterns know,
+  // and a file the model may read (~/.zshrc) can hold one in a form no assignment rule sees.
+  let out = text;
+  for (const name of CREDENTIAL_NAMES) {
+    const value = process.env[name]?.trim();
+    if (!value || value.length < 16 || !out.includes(value)) continue;
+    const parts = out.split(value);
+    count += parts.length - 1;
+    out = parts.join(MARK);
+  }
   // The URL first: a vendor token used as its password goes once, with the URL around it kept.
-  let out = text.replace(URL_PASSWORD, (_m, head) => {
+  out = out.replace(URL_PASSWORD, (_m, head) => {
     count++;
     return `${head}${MARK}@`;
   });

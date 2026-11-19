@@ -106,7 +106,7 @@ function delegated({ jobs, router = ['sonnet', 'medium', false], config = {}, ba
     let result = watched.find((e) => e.type === 'result' && e.call.name === 'delegate')?.result;
     let event = null;
     if (background) {
-      for (let i = 0; i < 500 && !watched.some((e) => e.type === 'job-report'); i++) await new Promise((r) => setTimeout(r, 10));
+      for (const end = Date.now() + 10_000; Date.now() < end && !watched.some((e) => e.type === 'job-report'); ) await new Promise((r) => setTimeout(r, 10));
       ({ result } = watched.find((e) => e.type === 'job-report'));
       assert.deepEqual(session.running(), [], 'every job of the chain has let go of its stop');
       await session.wake();

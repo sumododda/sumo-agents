@@ -17,7 +17,7 @@ import { readBackwards } from './transcript.mjs';
 const JOURNAL_MAX_CHARS = 64_000;
 const CUT = ' …[cut]';
 /** A conversation nobody has spoken in for this long is over, as far as reading it for memory goes. */
-const FINISHED_AFTER_MS = 30 * 60_000;
+export const FINISHED_AFTER_MS = 30 * 60_000;
 
 /**
  * Where a session starts costing quality. The numbers are absolute tokens, not
@@ -570,8 +570,9 @@ function summaryOf(file) {
 }
 
 /**
- * The sessions that can be picked up, newest first — every one still on disk, the heavy ones marked. `except` is the
- * session asking, which cannot resume itself.
+ * The sessions that can be picked up, newest first — every one still on disk that a conversation in the journal stands
+ * behind, the heavy ones marked. Newest is by the journal's own time, the last thing said in it, never by what a file
+ * says of itself: a file is not the hand that wrote it. `except` is the session asking, which cannot resume itself.
  */
 export function savedSessions(db, { now, except = null } = {}) {
   let names;
@@ -583,19 +584,20 @@ export function savedSessions(db, { now, except = null } = {}) {
   }
   const firstTurn = db.prepare('SELECT text FROM user_turns WHERE session_id = ? ORDER BY id LIMIT 1');
   const turns = db.prepare('SELECT COUNT(*) AS n FROM user_turns WHERE session_id = ?');
-  const row = db.prepare('SELECT last_turn_at FROM sessions WHERE id = ?');
+  const row = db.prepare('SELECT COALESCE(last_turn_at, started_at) AS at FROM sessions WHERE id = ?');
   return names
     .filter((name) => name.endsWith('.state.json'))
     .map((name) => name.slice(0, -'.state.json'.length))
     .filter((id) => id !== except)
     .map((id) => {
-      const summary = summaryOf(stateFile(id));
+      const heard = row.get(id)?.at;
+      const summary = heard ? summaryOf(stateFile(id)) : null;
       if (!summary?.savedAt) return null;
       const tokens = summary.contextTokens ?? 0;
       return {
         id,
         savedAt: summary.savedAt,
-        lastTurnAt: row.get(id)?.last_turn_at ?? summary.savedAt,
+        lastTurnAt: heard,
         cwd: summary.cwd ?? null,
         project: currentProject(db, id),
         title: firstTurn.get(id)?.text ?? '',
@@ -606,7 +608,7 @@ export function savedSessions(db, { now, except = null } = {}) {
       };
     })
     .filter(Boolean)
-    .sort((a, b) => (a.savedAt < b.savedAt ? 1 : a.savedAt > b.savedAt ? -1 : 0));
+    .sort((a, b) => (a.lastTurnAt < b.lastTurnAt ? 1 : a.lastTurnAt > b.lastTurnAt ? -1 : 0));
 }
 
 /** The saved session `ref` names: `last` for the newest, otherwise the one id that starts with it. Anything else is said. */

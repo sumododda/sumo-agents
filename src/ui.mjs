@@ -12,6 +12,7 @@ import { INPUT_SHOWN } from './mcp.mjs';
 import { paths } from './paths.mjs';
 import { scratchDir } from './projects.mjs';
 import { redact } from './redact.mjs';
+import { ownGit } from './sandbox.mjs';
 import { keyName, settingsPage, SettingsView } from './settings.mjs';
 import { elapsed } from './text.mjs';
 import { cleanPaste, editor, keysOf, matchFiles, menuOf, paste, press, under } from './editor.mjs';
@@ -143,7 +144,7 @@ const inTerminal = (program, file) =>
 /** The files of the project at `cwd` as git knows them, the untracked ones it does not ignore included; none where there is no repository. */
 const gitFiles = (cwd) =>
   new Promise((resolve) => {
-    execFile('git', ['ls-files', '-co', '--exclude-standard'], { cwd, maxBuffer: 32 * 1024 * 1024 }, (error, out) => resolve(error ? [] : out.split('\n').filter(Boolean)));
+    execFile('git', ownGit(['ls-files', '-co', '--exclude-standard']), { cwd, maxBuffer: 32 * 1024 * 1024 }, (error, out) => resolve(error ? [] : out.split('\n').filter(Boolean)));
   });
 
 /**
@@ -1461,9 +1462,7 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       }
       if (control === 'context') {
         record({ kind: 'user', text: line });
-        const turns = state.log.filter((entry) => entry.kind === 'user' && !/^[/!]/.test(entry.text)).length;
-        const calls = state.log.filter((entry) => entry.kind === 'tool').length;
-        return record({ kind: 'reply', raw: contextReport({ contextTokens: session.contextTokens, rows: session.usage(), turns, calls }), own: true });
+        return record({ kind: 'reply', raw: contextReport({ contextTokens: session.contextTokens, rows: session.usage(), ...session.counts }), own: true });
       }
       if (control === 'thinking') {
         record({ kind: 'user', text: line });
@@ -1494,8 +1493,18 @@ function App({ session, events, messages, cwd, block, opening, logo, clipboard, 
       if (control === 'config') {
         record({ kind: 'user', text: line });
         const left = () => `${routeLine(session)}   ${state.where.name}${state.where.branch ? ` (${state.where.branch})` : ''}`;
-        state.settings = settingsPage({ live: { route: (to) => session.route(to), servers: () => session.mcpServers(), left }, cwd: state.where.cwd, onChange: redraw });
+        state.settings = settingsPage({ live: { route: (to) => session.route(to), current: () => ({ model: session.model, effort: session.effort }), servers: () => session.mcpServers(), left }, cwd: state.where.cwd, onChange: redraw });
         return;
+      }
+      // Each source as a step of its own, said as it is read; then what was saved, as a table.
+      if (control === 'scorecard') {
+        record({ kind: 'user', text: line });
+        state.working = pickMessage(messages);
+        redraw();
+        const report = await session.scorecard((source) =>
+          record({ kind: 'tool', call: { id: `scorecard-${source.id}`, name: 'Fetch', input: { text: source.name } }, result: { content: source.steps.join('\n'), isError: !source.ok }, took: source.ms }),
+        );
+        return record({ kind: 'reply', raw: report, own: true });
       }
       if (control === 'memory' || control === 'mcp' || control === 'undo') {
         record({ kind: 'user', text: line });
